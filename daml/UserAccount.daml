@@ -1,0 +1,54 @@
+module UserAccount where
+
+import DA.Assert
+import DA.Time
+
+-- User account template for managing token balances
+template UserAccount
+  with
+    party : Party
+    balances : Map Text Decimal
+    operator : Party
+  where
+    signatory operator
+    observer party
+
+    -- Deposit tokens into the account
+    choice Deposit : ()
+      with
+        token : Text
+        amount : Decimal
+      controller party
+      do
+        assert (amount > 0.0) "Deposit amount must be positive"
+        let newBalances = insertWith (+) token amount balances
+        create this with balances = newBalances
+
+    -- Withdraw tokens from the account
+    choice Withdraw : ()
+      with
+        token : Text
+        amount : Decimal
+      controller party
+      do
+        assert (amount > 0.0) "Withdraw amount must be positive"
+        let currentBalance = fromMaybe 0.0 (lookup token balances)
+        assert (currentBalance >= amount) "Insufficient balance"
+        let newBalances = insertWith (-) token amount balances
+        create this with balances = newBalances
+
+    -- Get current balance for a token
+    choice GetBalance : Decimal
+      with
+        token : Text
+      controller party
+      do
+        return (fromMaybe 0.0 (lookup token balances))
+
+    -- Get all balances
+    choice GetAllBalances : Map Text Decimal
+      with
+      controller party
+      do
+        return balances
+

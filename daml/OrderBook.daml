@@ -1,0 +1,191 @@
+module OrderBook where
+
+import Order
+import UserAccount
+import Trade
+import DA.Assert
+import DA.Time
+import DA.List
+
+-- Order book template for managing buy and sell orders for a trading pair
+template OrderBook
+  with
+    tradingPair : Text
+    buyOrders : [ContractId Order]
+    sellOrders : [ContractId Order]
+    operator : Party
+  where
+    signatory operator
+
+    -- Add a new order to the order book
+    choice AddOrder : ContractId Order
+      with
+        orderId : Text
+        owner : Party
+        orderType : Text
+        orderMode : Text
+        price : Optional Decimal
+        quantity : Decimal
+      controller owner
+      do
+        assert (orderType == "BUY" || orderType == "SELL") "Invalid order type"
+        assert (quantity > 0.0) "Quantity must be positive"
+        
+        now <- getTime
+        let newOrder = Order with
+          orderId = orderId
+          owner = owner
+          orderType = orderType
+          orderMode = orderMode
+          tradingPair = tradingPair
+          price = price
+          quantity = quantity
+          filled = 0.0
+          status = "OPEN"
+          timestamp = now
+          operator = operator
+        
+        orderCid <- create newOrder
+        
+        let updatedBuyOrders = if orderType == "BUY" then buyOrders ++ [orderCid] else buyOrders
+        let updatedSellOrders = if orderType == "SELL" then sellOrders ++ [orderCid] else sellOrders
+        
+        orderBookCid <- create this with
+          buyOrders = updatedBuyOrders
+          sellOrders = updatedSellOrders
+        
+        -- Try to match orders immediately
+        exercise orderBookCid MatchOrders
+        
+        return orderCid
+
+    -- Match compatible buy and sell orders
+    choice MatchOrders : ()
+      controller operator
+      do
+        -- Get active buy and sell orders with their contract IDs
+        buyOrderPairs <- mapA (\cid -> do
+          order <- fetch cid
+          return (cid, order)
+        ) buyOrders
+        
+        sellOrderPairs <- mapA (\cid -> do
+          order <- fetch cid
+          return (cid, order)
+        ) sellOrders
+        
+        -- Filter only open orders
+        let activeBuys = filter (\(_, o) -> o.status == "OPEN") buyOrderPairs
+        let activeSells = filter (\(_, o) -> o.status == "OPEN") sellOrderPairs
+        
+        -- Sort buy orders by price (highest first) and sell orders by price (lowest first)
+        let sortedBuys = sortBy (\(_, a) (\(_, b) -> 
+          case (a.price, b.price) of
+            (Some pa, Some pb) -> if pa > pb then GT else if pa < pb then LT else EQ
+            (None, Some _) -> GT  -- Market orders have priority
+            (Some _, None) -> LT
+            (None, None) -> EQ
+          ) activeBuys
+        
+        let sortedSells = sortBy (\(_, a) (\(_, b) ->
+          case (a.price, b.price) of
+            (Some pa, Some pb) -> if pa < pb then GT else if pa > pb then LT else EQ
+            (None, Some _) -> GT  -- Market orders have priority
+            (Some _, None) -> LT
+            (None, None) -> EQ
+          ) activeSells
+        
+        -- Match orders - try to match first buy with first sell
+        matched <- matchFirstPair sortedBuys sortedSells
+        
+        -- Update order book by fetching current status of all orders
+        updatedBuyPairs <- mapA (\(cid, _) -> do
+          order <- fetch cid
+          return (cid, order)
+        ) buyOrders
+        
+        updatedSellPairs <- mapA (\(cid, _) -> do
+          order <- fetch cid
+          return (cid, order)
+        ) sellOrders
+        
+        -- Keep only open orders
+        let remainingBuys = filter (\(_, o) -> o.status == "OPEN") updatedBuyPairs
+        let remainingSells = filter (\(_, o) -> o.status == "OPEN") updatedSellPairs
+        
+        let remainingBuyCids = map (\(cid, _) -> cid) remainingBuys
+        let remainingSellCids = map (\(cid, _) -> cid) remainingSells
+        
+        create this with
+          buyOrders = remainingBuyCids
+          sellOrders = remainingSellCids
+
+    -- Helper function to match first compatible pair
+    matchFirstPair : [(ContractId Order, Order)] -> [(ContractId Order, Order)] -> Update ()
+    matchFirstPair [] _ = return ()
+    matchFirstPair _ [] = return ()
+    matchFirstPair ((buyCid, buyOrder) : buyRest) ((sellCid, sellOrder) : sellRest) = do
+      -- Check if orders can match
+      let canMatch = case (buyOrder.price, sellOrder.price) of
+        (Some buyPrice, Some sellPrice) -> buyPrice >= sellPrice
+        (None, _) -> True  -- Market buy matches any sell
+        (_, None) -> True  -- Market sell matches any buy
+        _ -> False
+      
+      if canMatch then do
+        let buyRemaining = buyOrder.quantity - buyOrder.filled
+        let sellRemaining = sellOrder.quantity - sellOrder.filled
+        let tradeQuantity = min buyRemaining sellRemaining
+        
+        -- Determine trade price (use limit order price if available, otherwise market order)
+        let tradePrice = case (buyOrder.price, sellOrder.price) of
+          (Some bp, Some sp) -> (bp + sp) / 2.0  -- Average for limit orders
+          (Some bp, None) -> bp  -- Use buy limit price
+          (None, Some sp) -> sp  -- Use sell limit price
+          (None, None) -> 0.0  -- Should not happen, but handle it
+        
+        -- Fill both orders
+        exercise buyCid FillOrder with fillQuantity = tradeQuantity
+        exercise sellCid FillOrder with fillQuantity = tradeQuantity
+        
+        -- Create trade record
+        now <- getTime
+        let tradeIdText = buyOrder.orderId <> "-" <> sellOrder.orderId <> "-" <> show now
+        create Trade with
+          tradeId = tradeIdText
+          buyer = buyOrder.owner
+          seller = sellOrder.owner
+          tradingPair = tradingPair
+          price = tradePrice
+          quantity = tradeQuantity
+          timestamp = now
+          buyOrderId = buyOrder.orderId
+          sellOrderId = sellOrder.orderId
+        
+        -- Fetch updated orders to check if they're filled
+        updatedBuy <- fetch buyCid
+        updatedSell <- fetch sellCid
+        
+        -- Continue matching if orders are still open
+        let nextBuys = if updatedBuy.filled >= updatedBuy.quantity then buyRest else ((buyCid, updatedBuy) : buyRest)
+        let nextSells = if updatedSell.filled >= updatedSell.quantity then sellRest else ((sellCid, updatedSell) : sellRest)
+        
+        matchFirstPair nextBuys nextSells
+      else
+        return ()
+
+    -- Remove a cancelled or filled order from the book
+    choice RemoveOrder : ()
+      with
+        orderCid : ContractId Order
+      controller operator
+      do
+        order <- fetch orderCid
+        assert (order.status == "FILLED" || order.status == "CANCELLED") "Can only remove filled or cancelled orders"
+        
+        let updatedBuyOrders = filter (\cid -> cid /= orderCid) buyOrders
+        let updatedSellOrders = filter (\cid -> cid /= orderCid) sellOrders
+        
+        create this with
+          buyOrders = updatedBuyOrders
+          sellOrders = updatedSellOrders

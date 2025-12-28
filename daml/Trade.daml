@@ -1,0 +1,23 @@
+module Trade where
+
+import DA.Time
+
+-- Trade template for recording executed trades (historical record)
+template Trade
+  with
+    tradeId : Text
+    buyer : Party
+    seller : Party
+    tradingPair : Text
+    price : Decimal
+    quantity : Decimal
+    timestamp : Time
+    buyOrderId : Text
+    sellOrderId : Text
+  where
+    signatory buyer, seller
+    observer buyer, seller
+
+    -- No choices needed - this is just a historical record
+    -- Trades are immutable once created
+
