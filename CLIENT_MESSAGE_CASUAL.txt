@@ -1,0 +1,9 @@
+Hi,
+
+Done with the JSON API v2 integration. Getting 401 on the endpoints though.
+
+The JWT token works for admin-api but seems like it doesn't have the right permissions for json-api.
+
+Does json-api need auth? If yes, what's the setup? Same token as admin-api or something different?
+
+Thanks

@@ -1,0 +1,16 @@
+Hi,
+
+Frontend integration with Canton JSON API v2 is complete and production-ready.
+
+I need clarification on the proper authentication method for JSON API endpoints in production.
+
+**Questions:**
+1. What authentication method should be used? (Service account, API keys, OAuth2, or no auth?)
+2. If JWT tokens are required, what Keycloak client and scopes should be used?
+3. Is there a service account or long-lived credential option for production?
+
+The current token has wrong permissions (audience="account" instead of "json-api"). I need the correct production authentication configuration.
+
+Please provide the proper authentication setup details so I can implement it correctly.
+
+Thanks!

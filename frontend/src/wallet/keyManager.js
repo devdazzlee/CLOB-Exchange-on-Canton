@@ -1,6 +1,14 @@
 import * as ed25519 from '@noble/ed25519';
-import * as bip39 from 'bip39';
+import { sha512 } from '@noble/hashes/sha512';
 import { HDKey } from '@scure/bip32';
+import { generateMnemonic as scureGenerateMnemonic, mnemonicToSeedSync, validateMnemonic as scureValidateMnemonic } from '@scure/bip39';
+import { wordlist } from '@scure/bip39/wordlists/english.js';
+
+// Fix for @noble/ed25519: Set sha512Sync function (required for browser compatibility)
+// This is the ROOT CAUSE of "hashes.sha512Sync not set" error
+if (!ed25519.etc.sha512Sync) {
+  ed25519.etc.sha512Sync = (...m) => sha512(ed25519.etc.concatBytes(...m));
+}
 
 /**
  * Generate a new Ed25519 key pair
@@ -21,7 +29,7 @@ export async function generateKeyPair() {
  * @returns {string} 12-word mnemonic phrase
  */
 export function generateMnemonic() {
-  return bip39.generateMnemonic(128); // 128 bits = 12 words
+  return scureGenerateMnemonic(wordlist, 128); // 128 bits = 12 words
 }
 
 /**
@@ -32,12 +40,27 @@ export function generateMnemonic() {
  */
 export async function mnemonicToKeyPair(mnemonic) {
   // Validate mnemonic
-  if (!bip39.validateMnemonic(mnemonic)) {
+  if (!scureValidateMnemonic(mnemonic, wordlist)) {
     throw new Error('Invalid mnemonic phrase');
   }
   
-  // Convert mnemonic to seed
-  const seed = await bip39.mnemonicToSeed(mnemonic);
+  // Convert mnemonic to seed using @scure/bip39 (browser-compatible)
+  // mnemonicToSeedSync uses @noble/hashes internally - no Node.js crypto needed
+  let seed;
+  try {
+    seed = mnemonicToSeedSync(mnemonic, '');
+  } catch (error) {
+    // Provide more helpful error message
+    if (error.message && error.message.includes('sha512Sync')) {
+      throw new Error('Crypto library not properly loaded. Please refresh the page and clear browser cache.');
+    }
+    throw error;
+  }
+  
+  // Ensure seed is Uint8Array
+  if (!(seed instanceof Uint8Array)) {
+    throw new Error('Invalid seed type');
+  }
   
   // Derive key using BIP32 with Ed25519 curve
   // Path: m/44'/501'/0'/0' (Solana-style derivation, compatible with Ed25519)
@@ -244,4 +267,3 @@ export function publicKeyToPartyId(publicKey, prefix = '8100b2db-86cf-40a1-8351-
   const hex = bytesToHex(publicKey);
   return `${prefix}::${hex}`;
 }
-

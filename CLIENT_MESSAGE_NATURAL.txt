@@ -1,0 +1,11 @@
+Hey,
+
+Frontend is integrated with the JSON API v2 endpoints. Everything looks good on my end.
+
+Getting 401 errors when hitting the JSON API. The token I'm using works for admin-api but doesn't have permissions for json-api endpoints.
+
+Quick question - does the JSON API need authentication? If yes, should I use the same JWT token approach as admin-api, or is there a different way to authenticate?
+
+Let me know and I'll get it sorted.
+
+Thanks

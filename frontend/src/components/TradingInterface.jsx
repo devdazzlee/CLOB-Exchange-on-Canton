@@ -34,13 +34,34 @@ export default function TradingInterface({ partyId }) {
       const accounts = await queryContracts('UserAccount:UserAccount', partyId);
       if (accounts.length > 0) {
         const account = accounts[0];
+        // Handle Map format from DAML (array of [key, value] pairs)
+        const balances = account.payload?.balances || {};
+        let btcBalance = '0.0';
+        let usdtBalance = '0.0';
+        
+        // If balances is an array (Map format), convert to object
+        if (Array.isArray(balances)) {
+          balances.forEach(([key, value]) => {
+            if (key === 'BTC') btcBalance = value?.toString() || '0.0';
+            if (key === 'USDT') usdtBalance = value?.toString() || '0.0';
+          });
+        } else {
+          // If balances is already an object
+          btcBalance = balances?.BTC?.toString() || '0.0';
+          usdtBalance = balances?.USDT?.toString() || '0.0';
+        }
+        
         setBalance({
-          BTC: account.payload?.balances?.BTC || '0.0',
-          USDT: account.payload?.balances?.USDT || '0.0'
+          BTC: btcBalance,
+          USDT: usdtBalance
         });
+      } else {
+        // No account found, set default balances
+        setBalance({ BTC: '0.0', USDT: '0.0' });
       }
     } catch (err) {
       console.error('Error loading balance:', err);
+      setBalance({ BTC: '0.0', USDT: '0.0' });
     }
   };
 
@@ -145,11 +166,17 @@ export default function TradingInterface({ partyId }) {
       }
 
       const orderId = `ORDER-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      
+      // Try to find existing OrderBook (may return empty array if 403 error)
       const orderBooks = await queryContracts('OrderBook:OrderBook');
-      let orderBookContract = orderBooks.find(ob => ob.payload?.tradingPair === tradingPair);
+      const orderBookContract = orderBooks.find(ob => ob.payload?.tradingPair === tradingPair);
 
       if (!orderBookContract) {
-        throw new Error('Order book not found. Please contact operator to create one.');
+        // Check if it's a 403 error (no query permissions) or OrderBook doesn't exist
+        const errorMsg = orderBooks.length === 0 
+          ? `Cannot query OrderBook (403 Forbidden - token may lack permissions). Please ensure OrderBook for ${tradingPair} exists and contact operator if needed.`
+          : `Order book not found for ${tradingPair}. Please contact operator to create one.`;
+        throw new Error(errorMsg);
       }
 
       await exerciseChoice(

@@ -1,0 +1,14 @@
+Hi,
+
+I'm getting 403 Forbidden errors when querying contracts from the Canton JSON API. The token you provided has the correct scopes but lacks query permissions.
+
+I need a JWT token that allows querying contracts via /v2/state/active-contracts endpoint.
+
+Could you please:
+1. Check Keycloak configuration for query permissions
+2. Provide a new token with proper query/read access
+3. Or let me know if there's a different authentication method for query operations
+
+The frontend is ready, but I can't complete testing without being able to query contracts.
+
+Thanks!

@@ -1,0 +1,15 @@
+Hi,
+
+The frontend integration is complete, but I need the correct JWT token for the JSON API.
+
+Current token has wrong permissions (audience="account" instead of "json-api").
+
+Please provide:
+
+1. JWT token with correct audience/scopes for JSON API access
+   OR
+2. Keycloak client ID and scopes needed for JSON API, and I'll generate the token
+
+Once I have the correct token, I'll update it and complete testing.
+
+Thanks!
