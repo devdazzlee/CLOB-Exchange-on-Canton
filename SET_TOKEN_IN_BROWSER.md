@@ -1,0 +1,32 @@
+# How to Set JWT Token in Browser
+
+## Quick Method (Browser Console)
+
+1. Open your browser's Developer Console (F12 or Cmd+Option+I)
+2. Go to the **Console** tab
+3. Paste this command and press Enter:
+
+```javascript
+localStorage.setItem('canton_jwt_token', 'eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICJDdjhRQVpEa3pYTlVvSXdNTnpZQWxBSmlBWlUtbmlvelV4VG96R0I4eXM0In0.eyJleHAiOjE3NjcyMDEwMzEsImlhdCI6MTc2NzE5OTIzMSwiYXV0aF90aW1lIjoxNzY3MTgxMjc1LCJqdGkiOiJvZnJ0cnQ6MWE1NGUxZWMtOGI4Mi03YTk1LTBhYjYtMGVkMGRlODcxM2Y3IiwiaXNzIjoiaHR0cHM6Ly9rZXljbG9hay53b2xmZWRnZWxhYnMuY29tOjg0NDMvcmVhbG1zL2NhbnRvbi1kZXZuZXQiLCJhdWQiOlsiaHR0cHM6Ly9jYW50b24ubmV0d29yay5nbG9iYWwiLCJodHRwczovL3ZhbGlkYXRvci13YWxsZXQudGFpbGViNGY1Ni50cy5uZXQiLCJodHRwczovL3dhbGxldC52YWxpZGF0b3IuZGV2LmNhbnRvbi53b2xmZWRnZWxhYnMuY29tIiwiYWNjb3VudCJdLCJzdWIiOiI4MTAwYjJkYi04NmNmLTQwYTEtODM1MS01NTQ4M2MxNTFjZGMiLCJ0eXAiOiJCZWFyZXIiLCJhenAiOiI0cm9oOVg3eTRUeVQ4OWZlSnU3QW5NMnNNWmJSOXhoNyIsInNpZCI6Ijk4ODRmMTYwLTZkNDctNGU5YS1hMGZhLTBmOTc0ZmI2ZDkzMyIsImFjciI6IjEiLCJhbGxvd2VkLW9yaWdpbnMiOlsiaHR0cHM6Ly9zeW5jaW5zaWdodHMtYXBwLmRldi5jYW50b24ud29sZmVkZ2VsYWJzLmNvbSIsImh0dHBzOi8vd2FsbGV0Mi52YWxpZGF0b3IuZGV2LmNhbnRvbi53b2xmZWRnZWxhYnMuY29tIiwiaHR0cHM6Ly93YWxsZXQxLnZhbGlkYXRvci5kZXYuY2FudG9uLndvbGZlZGdlbGFicy5jb20iLCJodHRwczovL3dhbGxldC52YWxpZGF0b3Iud29sZmVkZ2VsYWJzLmNvbSIsImh0dHBzOi8vd2FsbGV0LnZhbGlkYXRvci5kZXYuY2FudG9uLndvbGZlZGdlbGFicy5jb20iLCJodHRwczovL3ZhbGlkYXRvci13YWxsZXQtY2FudG9uLWRldm5ldC50YWlsZWI0ZjU2LnRzLm5ldCJdLCJyZWFsbV9hY2Nlc3MiOnsicm9sZXMiOlsiZGVmYXVsdC1yb2xlcy1jYW50b24tZGV2bmV0Iiwib2ZmbGluZV9hY2Nlc3MiLCJ1bWFfYXV0aG9yaXphdGlvbiJdfSwicmVzb3VyY2VfYWNjZXNzIjp7ImFjY291bnQiOnsicm9sZXMiOlsibWFuYWdlLWFjY291bnQiLCJtYW5hZ2UtYWNjb3VudC1saW5rcyIsInZpZXctcHJvZmlsZSJdfX0sInNjb3BlIjoib3BlbmlkIG9mZmxpbmVfYWNjZXNzIHByb2ZpbGUgZGFtbF9sZWRnZXJfYXBpIHdhbGxldF9hdWRpZW5jZSBlbWFpbCIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJuYW1lIjoiWm95YSBNdWhhbW1hZCIsInByZWZlcnJlZF91c2VybmFtZSI6InpveWEiLCJnaXZlbl9uYW1lIjoiWm95YSIsImZhbWlseV9uYW1lIjoiTXVoYW1tYWQiLCJlbWFpbCI6InpveWFtdWhhbW1hZDk5QGdtYWlsLmNvbSJ9.zeiAtQHWrJEtiHhFY4hEl1H_7j7oQTvXBDa5t39YJcnjFrOM2N8Wx3c50UejJTmrnVyvMJqgBMYbFgsPW4lcvFMNZbZ_lFkc0rb3omkjcLDLpBZV0dVnT5YSpwG7QKePCiP3qssoZl-k11_TPT7goKzXjVDJW1bsbAbKfjuF0-MBpDWaRAmVXsDUmkA9wKXExiX2ULfLekyus0h9RDTyB0L8qGARLk7Z3cq9GO8Joi1zb23x_SV5RZXgohaFnu5cmOB19Z7em20jhPxYFIT-tFQiR2x0Fnm8BrCM88fFwOJ_7QVT-PUyrodmULQ-Q26xe79BMP2ZRQQM-AfYrRd9Mw');
+console.log('✅ Token set! Refresh the page.');
+```
+
+4. **Refresh the page** (F5 or Cmd+R)
+5. Check the browser console for API calls - you should see `[Auth] Using token from localStorage`
+
+## Verify Token is Set
+
+Run this in the console to check:
+
+```javascript
+console.log('Token:', localStorage.getItem('canton_jwt_token') ? '✅ Set' : '❌ Not set');
+```
+
+## Test API Call
+
+After setting the token, try placing an order or viewing the order book. Check the Network tab (F12 → Network) to see if the Authorization header is being sent.
+
+---
+
+**Note:** The token is still returning 403 errors when tested directly. This suggests the token may need additional permissions configured in Keycloak, or there may be a different authentication method required for query operations.
+

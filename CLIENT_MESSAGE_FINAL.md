@@ -1,32 +1,54 @@
-Hi,
+# Final Message to Client - Based on Official DAML Documentation
 
-I've completed the frontend integration with Canton JSON Ledger API v2. Following up on our previous conversation about the endpoints:
+---
 
-**Endpoints Confirmed:**
-- `participant.dev.canton.wolfedgelabs.com` → admin-api (grpc) ✅
-- `participant.dev.canton.wolfedgelabs.com/json-api` → json-api ✅
+Hi [Client Name],
 
-**Current Status:**
-✅ Frontend integrated with JSON API v2 endpoints
-✅ Authentication system implemented
-✅ Ready for production
+I've reviewed the official DAML documentation and identified the root cause of the 403 errors.
 
-**Question:**
+## Root Cause
 
-The JSON API endpoints (`/v2/state/active-contracts`, `/v2/commands/submit-and-wait`) are returning 401 Unauthorized.
+Your token is a **User Access Token** (scope-based), which means the participant node looks up your user's rights from the User Management Service, rather than reading them from the token itself.
 
-**What authentication method should be used for JSON API?**
+According to the official DAML documentation:
+- **Query operations** (like `GetActiveContracts`) require `canReadAs(p)` rights for each party being queried
+- **User Access Tokens** don't encode rights in the token - they're looked up from User Management
+- Your user `8100b2db-86cf-40a1-8351-55483c151cdc` likely doesn't have `canReadAs` rights configured
 
-1. Does JSON API require authentication, or is it publicly accessible?
-2. If authentication is required:
-   - Should I use the same JWT token approach as admin-api?
-   - Or is there a different authentication method (API keys, service account, etc.)?
-   - What Keycloak client and scopes should be used?
+## What We Need
 
-The current token (used for admin-api) has audience="account" which doesn't have permissions for JSON API endpoints.
+Please check and configure the following:
 
-**What I Need:**
+### 1. Verify User Registration
+Is user `8100b2db-86cf-40a1-8351-55483c151cdc` registered in User Management?
+- Use: `UserManagementService.GetUser`
 
-Please clarify the authentication setup for JSON API so I can complete the integration properly.
+### 2. Check User Rights
+Does the user have `canReadAs` rights?
+- Use: `UserManagementService.ListUserRights`
+- Should show: `canReadAs` for relevant parties
+
+### 3. Grant Required Rights
+Please grant `canReadAs` rights to this user:
+- Use: `UserManagementService.GrantUserRights`
+- Grant: `canReadAs` for parties that need to be queried
+- For querying all contracts: grant `canReadAs` for all relevant parties
+
+## Documentation Reference
+
+From official DAML docs:
+- **ActiveContractsService.GetActiveContracts** requires: `for each requested party p: canReadAs(p)`
+- **User Access Tokens** require rights to be configured in User Management, not in the token
+
+## Next Steps
+
+Once `canReadAs` rights are configured for user `8100b2db-86cf-40a1-8351-55483c151cdc`, the 403 errors should be resolved and query operations will work.
+
+Please let me know:
+1. Is the user registered?
+2. What rights does the user currently have?
+3. Can you grant `canReadAs` rights?
 
 Thanks!
+
+---
