@@ -168,3 +168,25 @@ export async function fetchContract(contractId) {
   }
 }
 
+/**
+ * Fetch multiple contracts by their IDs
+ * @param {Array<string>} contractIds - Array of contract IDs
+ * @returns {Promise<Array<object>>} Array of contract data
+ */
+export async function fetchContracts(contractIds) {
+  try {
+    // Fetch all contracts in parallel
+    const promises = contractIds.map(cid => fetchContract(cid).catch(err => {
+      console.warn(`Failed to fetch contract ${cid}:`, err);
+      return null; // Return null for failed fetches
+    }));
+    
+    const results = await Promise.all(promises);
+    // Filter out null results (failed fetches)
+    return results.filter(r => r !== null);
+  } catch (error) {
+    console.error('Error fetching contracts:', error);
+    throw error;
+  }
+}
+

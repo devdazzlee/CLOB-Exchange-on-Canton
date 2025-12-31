@@ -1,13 +1,18 @@
 module UserAccount where
 
-import DA.Assert
-import DA.Time
+import qualified DA.Map as Map
+
+-- Helper to get balance, defaulting to 0.0 if not found
+getBalanceDefault : Map.Map Text Decimal -> Text -> Decimal
+getBalanceDefault balances token = case Map.lookup token balances of
+  None -> 0.0
+  Some b -> b
 
 -- User account template for managing token balances
 template UserAccount
   with
     party : Party
-    balances : Map Text Decimal
+    balances : Map.Map Text Decimal
     operator : Party
   where
     signatory operator
@@ -20,9 +25,10 @@ template UserAccount
         amount : Decimal
       controller party
       do
-        assert (amount > 0.0) "Deposit amount must be positive"
-        let newBalances = insertWith (+) token amount balances
-        create this with balances = newBalances
+        assert (amount > 0.0)
+        let newBalances = Map.insertWith (+) token amount balances
+        _ <- create this with balances = newBalances
+        return ()
 
     -- Withdraw tokens from the account
     choice Withdraw : ()
@@ -31,11 +37,12 @@ template UserAccount
         amount : Decimal
       controller party
       do
-        assert (amount > 0.0) "Withdraw amount must be positive"
-        let currentBalance = fromMaybe 0.0 (lookup token balances)
-        assert (currentBalance >= amount) "Insufficient balance"
-        let newBalances = insertWith (-) token amount balances
-        create this with balances = newBalances
+        assert (amount > 0.0)
+        let currentBalance = getBalanceDefault balances token
+        assert (currentBalance >= amount)
+        let newBalances = Map.insertWith (-) token amount balances
+        _ <- create this with balances = newBalances
+        return ()
 
     -- Get current balance for a token
     choice GetBalance : Decimal
@@ -43,10 +50,10 @@ template UserAccount
         token : Text
       controller party
       do
-        return (fromMaybe 0.0 (lookup token balances))
+        return (getBalanceDefault balances token)
 
     -- Get all balances
-    choice GetAllBalances : Map Text Decimal
+    choice GetAllBalances : Map.Map Text Decimal
       with
       controller party
       do

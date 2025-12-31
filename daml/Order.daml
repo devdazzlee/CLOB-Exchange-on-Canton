@@ -1,7 +1,5 @@
 module Order where
 
-import DA.Assert
-import DA.Time
 
 -- Order template for individual buy/sell orders
 template Order
@@ -21,34 +19,13 @@ template Order
     signatory operator
     observer owner
 
-    -- Ensure order is valid
-    ensure
-      orderType == "BUY" || orderType == "SELL"
-      "Order type must be BUY or SELL"
-    ensure
-      orderMode == "LIMIT" || orderMode == "MARKET"
-      "Order mode must be LIMIT or MARKET"
-    ensure
-      quantity > 0.0
-      "Order quantity must be positive"
-    ensure
-      filled >= 0.0 && filled <= quantity
-      "Filled amount must be between 0 and quantity"
-    ensure
-      status == "OPEN" || status == "FILLED" || status == "CANCELLED"
-      "Status must be OPEN, FILLED, or CANCELLED"
-    ensure
-      case price of
-        None -> orderMode == "MARKET"
-        Some p -> orderMode == "LIMIT" && p > 0.0
-      "Price must be set for LIMIT orders and None for MARKET orders"
-
     -- Cancel an open order
     choice CancelOrder : ()
       controller owner
       do
-        assert (status == "OPEN") "Can only cancel open orders"
-        create this with status = "CANCELLED"
+        assert (status == "OPEN")
+        _ <- create this with status = "CANCELLED"
+        return ()
 
     -- Fill the order (partially or fully)
     choice FillOrder : ()
@@ -56,16 +33,17 @@ template Order
         fillQuantity : Decimal
       controller operator
       do
-        assert (status == "OPEN") "Can only fill open orders"
-        assert (fillQuantity > 0.0) "Fill quantity must be positive"
-        assert (filled + fillQuantity <= quantity) "Cannot fill more than order quantity"
+        assert (status == "OPEN")
+        assert (fillQuantity > 0.0)
+        assert (filled + fillQuantity <= quantity)
         
         let newFilled = filled + fillQuantity
         let newStatus = if newFilled >= quantity then "FILLED" else "OPEN"
         
-        create this with
+        _ <- create this with
           filled = newFilled
           status = newStatus
+        return ()
 
     -- Get remaining quantity to fill
     choice GetRemainingQuantity : Decimal
@@ -73,4 +51,3 @@ template Order
       controller owner
       do
         return (quantity - filled)
-

@@ -1,4 +1,4 @@
-sdk-version: 2.9.3
+sdk-version: 3.4.9
 name: clob-exchange
 version: 1.0.0
 source: daml

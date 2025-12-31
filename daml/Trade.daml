@@ -1,7 +1,5 @@
 module Trade where
 
-import DA.Time
-
 -- Trade template for recording executed trades (historical record)
 template Trade
   with

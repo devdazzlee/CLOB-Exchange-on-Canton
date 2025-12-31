@@ -7,12 +7,117 @@ import DA.Assert
 import DA.Time
 import DA.List
 
+-- Helper function to fetch orders with their contract IDs
+fetchOrderPairs : [ContractId Order] -> Update [(ContractId Order, Order)]
+fetchOrderPairs cids = if null cids then
+  return []
+  else do
+    let cid = head cids
+    let rest = tail cids
+    order <- fetch cid
+    restPairs <- fetchOrderPairs rest
+    let pair = (cid, order)
+    return ([pair] ++ restPairs)
+
+-- Helper function to compare buy orders (highest price first)
+compareBuyOrders : (ContractId Order, Order) -> (ContractId Order, Order) -> Ordering
+compareBuyOrders (_, a) (_, b) = case (a.price, b.price) of
+  (Some pa, Some pb) -> if pa > pb then GT else if pa < pb then LT else EQ
+  (None, Some _) -> GT  -- Market orders have priority
+  (Some _, None) -> LT
+  (None, None) -> EQ
+
+-- Helper function to compare sell orders (lowest price first)
+compareSellOrders : (ContractId Order, Order) -> (ContractId Order, Order) -> Ordering
+compareSellOrders (_, a) (_, b) = case a.price of
+  Some pa -> case b.price of
+    Some pb -> if pa < pb then GT else if pa > pb then LT else EQ
+    None -> LT
+  None -> case b.price of
+    Some _ -> GT
+    None -> EQ
+
+-- Helper function to check if two orders can match
+canOrdersMatch : Order -> Order -> Bool
+canOrdersMatch buyOrder sellOrder = case buyOrder.price of
+  Some buyPrice -> case sellOrder.price of
+    Some sellPrice -> buyPrice >= sellPrice
+    None -> True
+  None -> True
+
+-- Helper function to determine trade price
+determineTradePrice : Order -> Order -> Decimal
+determineTradePrice buyOrder sellOrder = case buyOrder.price of
+  Some bp -> case sellOrder.price of
+    Some sp -> (bp + sp) / 2.0
+    None -> bp
+  None -> case sellOrder.price of
+    Some sp -> sp
+    None -> 0.0
+
+-- Helper function to match first compatible pair
+-- Returns: lastTradePrice (most recent trade price, or None if no trades)
+matchFirstPair : Text -> [(ContractId Order, Order)] -> [(ContractId Order, Order)] -> Update (Optional Decimal)
+matchFirstPair tradingPair buyList sellList = 
+  if null buyList || null sellList then
+    return None
+  else do
+    let (buyCid, buyOrder) = head buyList
+    let buyRest : [(ContractId Order, Order)] = tail buyList
+    let (sellCid, sellOrder) = head sellList
+    let sellRest : [(ContractId Order, Order)] = tail sellList
+    -- Check if orders can match
+    let canMatch = canOrdersMatch buyOrder sellOrder
+    
+    if canMatch then do
+      let buyRemaining = buyOrder.quantity - buyOrder.filled
+      let sellRemaining = sellOrder.quantity - sellOrder.filled
+      let tradeQuantity = min buyRemaining sellRemaining
+      
+      -- Determine trade price (use limit order price if available, otherwise market order)
+      let tradePrice = determineTradePrice buyOrder sellOrder
+      
+      -- Fill both orders
+      _ <- exercise buyCid FillOrder with fillQuantity = tradeQuantity
+      _ <- exercise sellCid FillOrder with fillQuantity = tradeQuantity
+      
+      -- Create trade record
+      now <- getTime
+      let tradeIdText = buyOrder.orderId <> "-" <> sellOrder.orderId <> "-" <> show now
+      _ <- create Trade with
+        tradeId = tradeIdText
+        buyer = buyOrder.owner
+        seller = sellOrder.owner
+        tradingPair = tradingPair
+        price = tradePrice
+        quantity = tradeQuantity
+        timestamp = now
+        buyOrderId = buyOrder.orderId
+        sellOrderId = sellOrder.orderId
+      
+      -- Fetch updated orders to check if they're filled
+      updatedBuy <- fetch buyCid
+      updatedSell <- fetch sellCid
+      
+      -- Continue matching if orders are still open
+      let nextBuyPair = (buyCid, updatedBuy)
+      let nextSellPair = (sellCid, updatedSell)
+      let nextBuys = if updatedBuy.filled >= updatedBuy.quantity then buyRest else ([nextBuyPair] ++ buyRest)
+      let nextSells = if updatedSell.filled >= updatedSell.quantity then sellRest else ([nextSellPair] ++ sellRest)
+      
+      nextPrice <- matchFirstPair tradingPair nextBuys nextSells
+      -- Return the most recent trade price (this trade takes precedence over subsequent trades)
+      return (Some tradePrice)
+    else
+      return None
+
 -- Order book template for managing buy and sell orders for a trading pair
 template OrderBook
   with
     tradingPair : Text
     buyOrders : [ContractId Order]
     sellOrders : [ContractId Order]
+    lastPrice : Optional Decimal
     operator : Party
   where
     signatory operator
@@ -28,24 +133,19 @@ template OrderBook
         quantity : Decimal
       controller owner
       do
-        assert (orderType == "BUY" || orderType == "SELL") "Invalid order type"
-        assert (quantity > 0.0) "Quantity must be positive"
-        
         now <- getTime
-        let newOrder = Order with
-          orderId = orderId
-          owner = owner
-          orderType = orderType
-          orderMode = orderMode
-          tradingPair = tradingPair
-          price = price
-          quantity = quantity
-          filled = 0.0
-          status = "OPEN"
-          timestamp = now
-          operator = operator
-        
-        orderCid <- create newOrder
+        orderCid <- create Order with
+            orderId = orderId
+            owner = owner
+            orderType = orderType
+            orderMode = orderMode
+            tradingPair = tradingPair
+            price = price
+            quantity = quantity
+            filled = 0.0 : Decimal
+            status = "OPEN"
+            timestamp = now
+            operator = operator
         
         let updatedBuyOrders = if orderType == "BUY" then buyOrders ++ [orderCid] else buyOrders
         let updatedSellOrders = if orderType == "SELL" then sellOrders ++ [orderCid] else sellOrders
@@ -53,6 +153,7 @@ template OrderBook
         orderBookCid <- create this with
           buyOrders = updatedBuyOrders
           sellOrders = updatedSellOrders
+          lastPrice = None  -- Initialize with None for new order books
         
         -- Try to match orders immediately
         exercise orderBookCid MatchOrders
@@ -64,50 +165,23 @@ template OrderBook
       controller operator
       do
         -- Get active buy and sell orders with their contract IDs
-        buyOrderPairs <- mapA (\cid -> do
-          order <- fetch cid
-          return (cid, order)
-        ) buyOrders
-        
-        sellOrderPairs <- mapA (\cid -> do
-          order <- fetch cid
-          return (cid, order)
-        ) sellOrders
+        buyOrderPairs <- fetchOrderPairs buyOrders
+        sellOrderPairs <- fetchOrderPairs sellOrders
         
         -- Filter only open orders
         let activeBuys = filter (\(_, o) -> o.status == "OPEN") buyOrderPairs
         let activeSells = filter (\(_, o) -> o.status == "OPEN") sellOrderPairs
         
         -- Sort buy orders by price (highest first) and sell orders by price (lowest first)
-        let sortedBuys = sortBy (\(_, a) (\(_, b) -> 
-          case (a.price, b.price) of
-            (Some pa, Some pb) -> if pa > pb then GT else if pa < pb then LT else EQ
-            (None, Some _) -> GT  -- Market orders have priority
-            (Some _, None) -> LT
-            (None, None) -> EQ
-          ) activeBuys
-        
-        let sortedSells = sortBy (\(_, a) (\(_, b) ->
-          case (a.price, b.price) of
-            (Some pa, Some pb) -> if pa < pb then GT else if pa > pb then LT else EQ
-            (None, Some _) -> GT  -- Market orders have priority
-            (Some _, None) -> LT
-            (None, None) -> EQ
-          ) activeSells
+        let sortedBuys = sortBy compareBuyOrders activeBuys
+        let sortedSells = sortBy compareSellOrders activeSells
         
         -- Match orders - try to match first buy with first sell
-        matched <- matchFirstPair sortedBuys sortedSells
+        matchedPrice <- matchFirstPair tradingPair sortedBuys sortedSells
         
         -- Update order book by fetching current status of all orders
-        updatedBuyPairs <- mapA (\(cid, _) -> do
-          order <- fetch cid
-          return (cid, order)
-        ) buyOrders
-        
-        updatedSellPairs <- mapA (\(cid, _) -> do
-          order <- fetch cid
-          return (cid, order)
-        ) sellOrders
+        updatedBuyPairs <- fetchOrderPairs buyOrders
+        updatedSellPairs <- fetchOrderPairs sellOrders
         
         -- Keep only open orders
         let remainingBuys = filter (\(_, o) -> o.status == "OPEN") updatedBuyPairs
@@ -116,62 +190,15 @@ template OrderBook
         let remainingBuyCids = map (\(cid, _) -> cid) remainingBuys
         let remainingSellCids = map (\(cid, _) -> cid) remainingSells
         
-        create this with
+        -- Update lastPrice if a trade occurred
+        newLastPrice <- case matchedPrice of
+            Some p -> return (Some p)
+            None -> return lastPrice
+        
+        _ <- create this with
           buyOrders = remainingBuyCids
           sellOrders = remainingSellCids
-
-    -- Helper function to match first compatible pair
-    matchFirstPair : [(ContractId Order, Order)] -> [(ContractId Order, Order)] -> Update ()
-    matchFirstPair [] _ = return ()
-    matchFirstPair _ [] = return ()
-    matchFirstPair ((buyCid, buyOrder) : buyRest) ((sellCid, sellOrder) : sellRest) = do
-      -- Check if orders can match
-      let canMatch = case (buyOrder.price, sellOrder.price) of
-        (Some buyPrice, Some sellPrice) -> buyPrice >= sellPrice
-        (None, _) -> True  -- Market buy matches any sell
-        (_, None) -> True  -- Market sell matches any buy
-        _ -> False
-      
-      if canMatch then do
-        let buyRemaining = buyOrder.quantity - buyOrder.filled
-        let sellRemaining = sellOrder.quantity - sellOrder.filled
-        let tradeQuantity = min buyRemaining sellRemaining
-        
-        -- Determine trade price (use limit order price if available, otherwise market order)
-        let tradePrice = case (buyOrder.price, sellOrder.price) of
-          (Some bp, Some sp) -> (bp + sp) / 2.0  -- Average for limit orders
-          (Some bp, None) -> bp  -- Use buy limit price
-          (None, Some sp) -> sp  -- Use sell limit price
-          (None, None) -> 0.0  -- Should not happen, but handle it
-        
-        -- Fill both orders
-        exercise buyCid FillOrder with fillQuantity = tradeQuantity
-        exercise sellCid FillOrder with fillQuantity = tradeQuantity
-        
-        -- Create trade record
-        now <- getTime
-        let tradeIdText = buyOrder.orderId <> "-" <> sellOrder.orderId <> "-" <> show now
-        create Trade with
-          tradeId = tradeIdText
-          buyer = buyOrder.owner
-          seller = sellOrder.owner
-          tradingPair = tradingPair
-          price = tradePrice
-          quantity = tradeQuantity
-          timestamp = now
-          buyOrderId = buyOrder.orderId
-          sellOrderId = sellOrder.orderId
-        
-        -- Fetch updated orders to check if they're filled
-        updatedBuy <- fetch buyCid
-        updatedSell <- fetch sellCid
-        
-        -- Continue matching if orders are still open
-        let nextBuys = if updatedBuy.filled >= updatedBuy.quantity then buyRest else ((buyCid, updatedBuy) : buyRest)
-        let nextSells = if updatedSell.filled >= updatedSell.quantity then sellRest else ((sellCid, updatedSell) : sellRest)
-        
-        matchFirstPair nextBuys nextSells
-      else
+          lastPrice = newLastPrice
         return ()
 
     -- Remove a cancelled or filled order from the book
@@ -181,11 +208,12 @@ template OrderBook
       controller operator
       do
         order <- fetch orderCid
-        assert (order.status == "FILLED" || order.status == "CANCELLED") "Can only remove filled or cancelled orders"
+        assert (order.status == "FILLED" || order.status == "CANCELLED")
         
         let updatedBuyOrders = filter (\cid -> cid /= orderCid) buyOrders
         let updatedSellOrders = filter (\cid -> cid /= orderCid) sellOrders
         
-        create this with
+        _ <- create this with
           buyOrders = updatedBuyOrders
           sellOrders = updatedSellOrders
+        return ()

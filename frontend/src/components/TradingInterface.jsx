@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { createContract, exerciseChoice, queryContracts } from '../services/cantonApi';
+import { createContract, exerciseChoice, queryContracts, fetchContracts } from '../services/cantonApi';
 
 export default function TradingInterface({ partyId }) {
   const [tradingPair, setTradingPair] = useState('BTC/USDT');
@@ -18,8 +18,16 @@ export default function TradingInterface({ partyId }) {
       loadBalance();
       loadOrders();
       loadOrderBook();
+      
+      // Refresh order book every 5 seconds
+      const interval = setInterval(() => {
+        loadOrderBook();
+        loadOrders();
+      }, 5000);
+      
+      return () => clearInterval(interval);
     }
-  }, [partyId]);
+  }, [partyId, tradingPair]);
 
   const loadBalance = async () => {
     try {
@@ -58,26 +66,67 @@ export default function TradingInterface({ partyId }) {
   const loadOrderBook = async () => {
     try {
       const orderBooks = await queryContracts('OrderBook:OrderBook');
-      if (orderBooks.length > 0) {
-        const book = orderBooks[0];
-        const buyCids = book.payload?.buyOrders || [];
-        const sellCids = book.payload?.sellOrders || [];
-        
-        setOrderBook({
-          buys: buyCids.map((cid, i) => ({
-            price: `50000${i}`,
-            quantity: '0.1',
-            type: 'BUY'
-          })),
-          sells: sellCids.map((cid, i) => ({
-            price: `51000${i}`,
-            quantity: '0.1',
-            type: 'SELL'
-          }))
-        });
+      const book = orderBooks.find(ob => ob.payload?.tradingPair === tradingPair);
+      
+      if (!book) {
+        setOrderBook({ buys: [], sells: [] });
+        return;
       }
+
+      const buyCids = book.payload?.buyOrders || [];
+      const sellCids = book.payload?.sellOrders || [];
+      
+      // Fetch all order contracts
+      const allCids = [...buyCids, ...sellCids];
+      const orderContracts = await fetchContracts(allCids);
+      
+      // Process buy orders
+      const buyOrders = orderContracts
+        .filter((contract, index) => index < buyCids.length && contract?.payload?.status === 'OPEN')
+        .map(contract => ({
+          price: contract.payload?.price?.Some || null,
+          quantity: parseFloat(contract.payload?.quantity || 0),
+          filled: parseFloat(contract.payload?.filled || 0),
+          remaining: parseFloat(contract.payload?.quantity || 0) - parseFloat(contract.payload?.filled || 0),
+          timestamp: contract.payload?.timestamp || 0
+        }))
+        .filter(order => order.remaining > 0) // Only show orders with remaining quantity
+        .sort((a, b) => {
+          // Sort buy orders: highest price first, then by timestamp (oldest first)
+          if (a.price === null && b.price === null) return a.timestamp - b.timestamp;
+          if (a.price === null) return 1; // Market orders go to end
+          if (b.price === null) return -1;
+          if (b.price !== a.price) return b.price - a.price; // Higher price first
+          return a.timestamp - b.timestamp; // Older first for same price
+        });
+
+      // Process sell orders
+      const sellOrders = orderContracts
+        .filter((contract, index) => index >= buyCids.length && contract?.payload?.status === 'OPEN')
+        .map(contract => ({
+          price: contract.payload?.price?.Some || null,
+          quantity: parseFloat(contract.payload?.quantity || 0),
+          filled: parseFloat(contract.payload?.filled || 0),
+          remaining: parseFloat(contract.payload?.quantity || 0) - parseFloat(contract.payload?.filled || 0),
+          timestamp: contract.payload?.timestamp || 0
+        }))
+        .filter(order => order.remaining > 0) // Only show orders with remaining quantity
+        .sort((a, b) => {
+          // Sort sell orders: lowest price first, then by timestamp (oldest first)
+          if (a.price === null && b.price === null) return a.timestamp - b.timestamp;
+          if (a.price === null) return 1; // Market orders go to end
+          if (b.price === null) return -1;
+          if (a.price !== b.price) return a.price - b.price; // Lower price first
+          return a.timestamp - b.timestamp; // Older first for same price
+        });
+
+      setOrderBook({
+        buys: buyOrders,
+        sells: sellOrders
+      });
     } catch (err) {
       console.error('Error loading order book:', err);
+      setOrderBook({ buys: [], sells: [] });
     }
   };
 
@@ -304,7 +353,16 @@ export default function TradingInterface({ partyId }) {
 
       {/* Order Book */}
       <div className="card">
-        <h3 className="text-lg font-semibold text-white mb-4">Order Book - {tradingPair}</h3>
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-lg font-semibold text-white">Order Book - {tradingPair}</h3>
+          <button
+            onClick={loadOrderBook}
+            className="text-sm text-blue-400 hover:text-blue-300 transition-colors"
+            title="Refresh order book"
+          >
+            ↻ Refresh
+          </button>
+        </div>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           <div>
             <h4 className="text-sm font-medium text-red-400 mb-3">Sell Orders</h4>
@@ -314,19 +372,25 @@ export default function TradingInterface({ partyId }) {
                   <tr className="border-b border-gray-700">
                     <th className="text-left py-2 px-3 text-sm font-medium text-gray-400">Price</th>
                     <th className="text-right py-2 px-3 text-sm font-medium text-gray-400">Quantity</th>
+                    <th className="text-right py-2 px-3 text-sm font-medium text-gray-400">Total</th>
                   </tr>
                 </thead>
                 <tbody>
                   {orderBook.sells.length > 0 ? (
                     orderBook.sells.map((order, i) => (
                       <tr key={i} className="border-b border-gray-700/50 hover:bg-gray-700/30">
-                        <td className="py-2 px-3 text-red-400 font-mono">{order.price}</td>
-                        <td className="py-2 px-3 text-right text-gray-300">{order.quantity}</td>
+                        <td className="py-2 px-3 text-red-400 font-mono">
+                          {order.price !== null ? order.price.toLocaleString() : 'Market'}
+                        </td>
+                        <td className="py-2 px-3 text-right text-gray-300">{order.remaining.toFixed(8)}</td>
+                        <td className="py-2 px-3 text-right text-gray-400 text-sm">
+                          {order.price !== null ? (order.price * order.remaining).toLocaleString(undefined, { maximumFractionDigits: 2 }) : '-'}
+                        </td>
                       </tr>
                     ))
                   ) : (
                     <tr>
-                      <td colSpan="2" className="py-8 text-center text-gray-500 text-sm">No sell orders</td>
+                      <td colSpan="3" className="py-8 text-center text-gray-500 text-sm">No sell orders</td>
                     </tr>
                   )}
                 </tbody>
@@ -341,19 +405,25 @@ export default function TradingInterface({ partyId }) {
                   <tr className="border-b border-gray-700">
                     <th className="text-left py-2 px-3 text-sm font-medium text-gray-400">Price</th>
                     <th className="text-right py-2 px-3 text-sm font-medium text-gray-400">Quantity</th>
+                    <th className="text-right py-2 px-3 text-sm font-medium text-gray-400">Total</th>
                   </tr>
                 </thead>
                 <tbody>
                   {orderBook.buys.length > 0 ? (
                     orderBook.buys.map((order, i) => (
                       <tr key={i} className="border-b border-gray-700/50 hover:bg-gray-700/30">
-                        <td className="py-2 px-3 text-green-400 font-mono">{order.price}</td>
-                        <td className="py-2 px-3 text-right text-gray-300">{order.quantity}</td>
+                        <td className="py-2 px-3 text-green-400 font-mono">
+                          {order.price !== null ? order.price.toLocaleString() : 'Market'}
+                        </td>
+                        <td className="py-2 px-3 text-right text-gray-300">{order.remaining.toFixed(8)}</td>
+                        <td className="py-2 px-3 text-right text-gray-400 text-sm">
+                          {order.price !== null ? (order.price * order.remaining).toLocaleString(undefined, { maximumFractionDigits: 2 }) : '-'}
+                        </td>
                       </tr>
                     ))
                   ) : (
                     <tr>
-                      <td colSpan="2" className="py-8 text-center text-gray-500 text-sm">No buy orders</td>
+                      <td colSpan="3" className="py-8 text-center text-gray-500 text-sm">No buy orders</td>
                     </tr>
                   )}
                 </tbody>
