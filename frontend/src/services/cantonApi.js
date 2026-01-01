@@ -114,6 +114,7 @@ function parseContractResponse(result) {
   // Handle different response formats:
   // 1. Array format (what Canton actually returns)
   // 2. Object with activeContracts property (documented format)
+  // 3. With verbose: true, response structure may differ
   let contractEntries = [];
   if (Array.isArray(result)) {
     contractEntries = result;
@@ -123,20 +124,33 @@ function parseContractResponse(result) {
     contractEntries = [result];
   }
   
+  console.log('[API] Parsing response:', {
+    isArray: Array.isArray(result),
+    hasActiveContracts: !!result.activeContracts,
+    entriesCount: contractEntries.length,
+    firstEntry: contractEntries[0] ? Object.keys(contractEntries[0]) : null
+  });
+  
   // Transform nested structure to flat contract format
   return contractEntries.map(entry => {
     // Handle nested structure: contractEntry.JsActiveContract.createdEvent
+    // With verbose: true, structure might be: entry.argument, entry.contractId, etc.
     const contractData = entry.contractEntry?.JsActiveContract?.createdEvent || 
                         entry.createdEvent || 
                         entry;
     
+    // With verbose: true, contractId and argument might be at top level
+    const contractId = contractData.contractId || entry.contractId;
+    const templateId = contractData.templateId || entry.templateId;
+    const payload = contractData.createArgument || contractData.argument || contractData.payload || entry.argument;
+    
     return {
-      contractId: contractData.contractId,
-      templateId: contractData.templateId,
-      payload: contractData.createArgument || contractData.payload,
-      signatories: contractData.signatories || [],
-      observers: contractData.observers || [],
-      offset: contractData.offset
+      contractId: contractId,
+      templateId: templateId,
+      payload: payload,
+      signatories: contractData.signatories || entry.signatories || [],
+      observers: contractData.observers || entry.observers || [],
+      offset: contractData.offset || entry.offset
     };
   });
 }
@@ -161,18 +175,28 @@ export async function queryContractsAtOffset(templateId, party = null, offset = 
       console.log('[API] Party ID extracted from token:', party);
     }
     
+    // CRITICAL: Ensure party is a string, not an array
+    if (Array.isArray(party)) {
+      console.warn('[API] Party parameter is an array, using first element:', party);
+      party = party[0];
+    }
+    if (typeof party !== 'string') {
+      throw new Error(`Invalid party parameter: expected string, got ${typeof party}`);
+    }
+    
     // Qualify template ID with package ID
     const qualifiedTemplateId = await qualifyTemplateId(templateId);
     
     // Convert offset to string if it's a number
     const offsetStr = typeof offset === 'number' ? offset.toString() : offset;
     
+    // CRITICAL FIX: Use verbose: true for better contract data
     // ALWAYS use filtersByParty (filtersForAnyParty requires admin privileges)
     // IMPORTANT: readAs is REQUIRED by Canton JSON API v2 for authorization
     const requestBody = {
-      readAs: [party], // REQUIRED: Explicitly declare which party is reading
+      readAs: [party], // REQUIRED: Explicitly declare which party is reading (must be array of strings)
       activeAtOffset: offsetStr, // Use provided offset (or "0" for current ledger end)
-      verbose: false, // Required field: whether to include event metadata
+      verbose: true, // CRITICAL: Set to true to get full contract data including contractId
       filter: {
         filtersByParty: {
           [party]: {
@@ -250,16 +274,28 @@ export async function queryContracts(templateId, party = null) {
       console.log('[API] Party ID extracted from token:', party);
     }
     
+    // CRITICAL: Ensure party is a string, not an array
+    if (Array.isArray(party)) {
+      console.warn('[API] Party parameter is an array, using first element:', party);
+      party = party[0];
+    }
+    if (typeof party !== 'string') {
+      throw new Error(`Invalid party parameter: expected string, got ${typeof party}`);
+    }
+    
     // Qualify template ID with package ID
     const qualifiedTemplateId = await qualifyTemplateId(templateId);
     
+    // CRITICAL FIX: Use verbose: true and proper filter structure per ChatGPT suggestions
+    // According to ChatGPT: Use templateIds filter and verbose: true for better results
     // ALWAYS use filtersByParty (filtersForAnyParty requires admin privileges)
     // Reference: https://docs.digitalasset.com/build/latest/explanations/json-api/queries.html
     // IMPORTANT: readAs is REQUIRED by Canton JSON API v2 for authorization
+    // IMPORTANT: activeAtOffset is REQUIRED by Canton JSON API v2 (400 error if missing)
     const requestBody = {
-      readAs: [party], // REQUIRED: Explicitly declare which party is reading
-      activeAtOffset: "0", // "0" means "current ledger end" (must be string representation of Long)
-      verbose: false, // Required field: whether to include event metadata
+      readAs: [party], // REQUIRED: Explicitly declare which party is reading (must be array of strings)
+      activeAtOffset: "0", // REQUIRED: "0" means current ledger end, "latest" also works
+      verbose: true, // CRITICAL: Set to true to get full contract data including contractId
       filter: {
         filtersByParty: {
           [party]: {
@@ -560,27 +596,67 @@ export async function createContract(templateId, payload, party) {
  * @param {string} contractId - Contract ID
  * @param {string} choice - Choice name
  * @param {object} argument - Choice argument
- * @param {string} party - Party ID
+ * @param {string|string[]} party - Party ID(s) - can be single party or array of parties for multi-party authorization
+ * @param {string} templateId - Optional template ID (will be fetched if not provided)
  * @returns {Promise<object>} Exercise result
  */
-export async function exerciseChoice(contractId, choice, argument, party) {
+export async function exerciseChoice(contractId, choice, argument, party, templateId = null) {
   try {
     // commandId is REQUIRED by SubmitAndWaitRequest schema (JSON API Commands docs)
     // IMPORTANT: commandId must be at the TOP LEVEL, not inside each command object
     const commandId = `exercise-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    
+    // Handle both single party and array of parties
+    const actAsParties = Array.isArray(party) ? party : [party];
+    
+    // If templateId not provided, try to fetch it from the contract or infer from choice
+    let qualifiedTemplateId = templateId;
+    if (!qualifiedTemplateId) {
+      try {
+        // Fetch the contract to get its templateId
+        const contract = await fetchContract(contractId, actAsParties[0]);
+        qualifiedTemplateId = contract?.templateId;
+        if (qualifiedTemplateId) {
+          console.log('[Exercise Choice] Fetched templateId from contract:', qualifiedTemplateId);
+        }
+      } catch (err) {
+        console.warn('[Exercise Choice] Could not fetch templateId from contract:', err);
+      }
+      
+      // If still not found, try to infer from choice name (fallback)
+      if (!qualifiedTemplateId) {
+        if (choice === 'AddOrder') {
+          qualifiedTemplateId = await qualifyTemplateId('OrderBook:OrderBook');
+        } else if (choice === 'CancelOrder' || choice === 'FillOrder') {
+          qualifiedTemplateId = await qualifyTemplateId('Order:Order');
+        } else {
+          // Last resort: try to qualify a generic template ID
+          console.warn('[Exercise Choice] Could not determine templateId, using generic fallback');
+          qualifiedTemplateId = await qualifyTemplateId('OrderBook:OrderBook');
+        }
+      }
+    } else {
+      // Qualify the template ID if it's not already fully qualified
+      qualifiedTemplateId = await qualifyTemplateId(qualifiedTemplateId);
+    }
+    
+    if (!qualifiedTemplateId) {
+      throw new Error(`Could not determine templateId for contract ${contractId} and choice ${choice}`);
+    }
     
     const requestBody = {
       commands: [
         {
           ExerciseCommand: {
             contractId: contractId, // Contract to exercise choice on
+            templateId: qualifiedTemplateId, // REQUIRED by Canton JSON API v2
             choice: choice, // Choice name from template
-            exerciseArgument: argument // Arguments matching choice signature
+            choiceArgument: argument // REQUIRED: Use choiceArgument (not exerciseArgument)
           }
         }
       ],
       commandId: commandId, // Required by SubmitAndWaitRequest schema - MUST be at top level
-      actAs: [party] // Party executing the command (required by SubmitAndWaitRequest schema)
+      actAs: actAsParties // Party(ies) executing the command (required by SubmitAndWaitRequest schema)
     };
 
     const headers = getHeaders();
@@ -686,7 +762,7 @@ export async function exerciseChoice(contractId, choice, argument, party) {
  * @param {string} party - Party ID (required - extracted from token if not provided)
  * @returns {Promise<object>} Contract data
  */
-export async function fetchContract(contractId, party = null) {
+export async function fetchContract(contractId, party = null, offset = null) {
   try {
     // Extract party ID from token if not provided
     if (!party) {
@@ -696,12 +772,24 @@ export async function fetchContract(contractId, party = null) {
       }
     }
     
+    // CRITICAL: Ensure party is a string, not an array
+    if (Array.isArray(party)) {
+      console.warn('[API] Party parameter is an array, using first element:', party);
+      party = party[0];
+    }
+    if (typeof party !== 'string') {
+      throw new Error(`Invalid party parameter: expected string, got ${typeof party}`);
+    }
+    
+    // Use provided offset or default to "0" (current ledger end)
+    const offsetStr = offset !== null ? offset.toString() : "0";
+    
     // ALWAYS use filtersByParty (filtersForAnyParty requires admin privileges)
     // IMPORTANT: readAs is REQUIRED by Canton JSON API v2 for authorization
     const requestBody = {
-      readAs: [party], // REQUIRED: Explicitly declare which party is reading
-      activeAtOffset: "0", // "0" means "current ledger end" (must be string representation of Long)
-      verbose: false, // Required field: whether to include event metadata
+      readAs: [party], // REQUIRED: Explicitly declare which party is reading (must be array of strings)
+      activeAtOffset: offsetStr, // Use provided offset or "0" for current ledger end
+      verbose: true, // CRITICAL: Set to true to get full contract data
       filter: {
         filtersByParty: {
           [party]: {
@@ -712,6 +800,8 @@ export async function fetchContract(contractId, party = null) {
         }
       }
     };
+    
+    console.log('[API] Fetching contract by ID:', contractId.substring(0, 20) + '...', 'at offset:', offsetStr);
 
     const headers = getHeaders();
     const response = await fetch(`${CANTON_API_BASE}/${API_VERSION}/state/active-contracts`, {
@@ -754,7 +844,7 @@ export async function fetchContract(contractId, party = null) {
  * @param {string} party - Party ID (required - extracted from token if not provided)
  * @returns {Promise<Array<object>>} Array of contract data
  */
-export async function fetchContracts(contractIds, party = null) {
+export async function fetchContracts(contractIds, party = null, offset = null) {
   try {
     if (!contractIds || contractIds.length === 0) {
       return [];
@@ -767,13 +857,25 @@ export async function fetchContracts(contractIds, party = null) {
         throw new Error('Party ID is required. Cannot extract from token. Please provide party ID or ensure token is valid.');
       }
     }
+    
+    // CRITICAL: Ensure party is a string, not an array
+    if (Array.isArray(party)) {
+      console.warn('[API] Party parameter is an array, using first element:', party);
+      party = party[0];
+    }
+    if (typeof party !== 'string') {
+      throw new Error(`Invalid party parameter: expected string, got ${typeof party}`);
+    }
+
+    // Use provided offset or default to "0" (current ledger end)
+    const offsetStr = offset !== null ? offset.toString() : "0";
 
     // ALWAYS use filtersByParty (filtersForAnyParty requires admin privileges)
     // IMPORTANT: readAs is REQUIRED by Canton JSON API v2 for authorization
     const requestBody = {
       readAs: [party], // REQUIRED: Explicitly declare which party is reading
-      activeAtOffset: "0", // "0" means "current ledger end" (must be string representation of Long)
-      verbose: false, // Required field: whether to include event metadata
+      activeAtOffset: offsetStr, // Use provided offset or "0" for current ledger end
+      verbose: true, // CRITICAL: Set to true to get full contract data
       filter: {
         filtersByParty: {
           [party]: {
@@ -784,6 +886,8 @@ export async function fetchContracts(contractIds, party = null) {
         }
       }
     };
+    
+    console.log('[API] Fetching', contractIds.length, 'contracts by ID at offset:', offsetStr);
 
     const headers = getHeaders();
     const response = await fetch(`${CANTON_API_BASE}/${API_VERSION}/state/active-contracts`, {

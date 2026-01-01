@@ -1,11 +1,13 @@
 import { useState, useEffect } from 'react';
 import { getStoredToken, getTokenExpirationString, isTokenExpired, storeToken, checkTokenStatus } from '../services/tokenManager';
+import { useConfirmationModal } from './ConfirmationModal';
 
 export default function TokenManager() {
   const [token, setToken] = useState('');
   const [tokenInput, setTokenInput] = useState('');
   const [expirationInfo, setExpirationInfo] = useState('');
   const [showInput, setShowInput] = useState(false);
+  const { showModal, ModalComponent } = useConfirmationModal();
 
   useEffect(() => {
     updateTokenInfo();
@@ -28,9 +30,14 @@ export default function TokenManager() {
     }
   };
 
-  const handleSetToken = () => {
+  const handleSetToken = async () => {
     if (!tokenInput.trim()) {
-      alert('Please enter a token');
+      await showModal({
+        title: 'Token Required',
+        message: 'Please enter a token',
+        type: 'warning',
+        confirmText: 'OK',
+      });
       return;
     }
 
@@ -40,11 +47,25 @@ export default function TokenManager() {
     setTokenInput('');
     setShowInput(false);
     updateTokenInfo();
-    alert('Token updated successfully!');
+    await showModal({
+      title: 'Token Updated',
+      message: 'Token updated successfully!',
+      type: 'success',
+      confirmText: 'OK',
+    });
   };
 
-  const handleClearToken = () => {
-    if (confirm('Clear stored token? You will need to set a new one.')) {
+  const handleClearToken = async () => {
+    const confirmed = await showModal({
+      title: 'Clear Token',
+      message: 'Clear stored token? You will need to set a new one.',
+      type: 'warning',
+      showCancel: true,
+      confirmText: 'Clear',
+      cancelText: 'Cancel',
+    });
+    
+    if (confirmed) {
       localStorage.removeItem('canton_jwt_token');
       localStorage.removeItem('canton_jwt_token_expires');
       updateTokenInfo();
@@ -53,7 +74,9 @@ export default function TokenManager() {
 
   if (!token) {
     return (
-      <div className="bg-danger-light border border-danger rounded-lg p-3 mb-4">
+      <>
+        <ModalComponent />
+        <div className="bg-danger-light border border-danger rounded-lg p-3 mb-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center space-x-2">
             <svg className="w-5 h-5 text-danger" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -87,6 +110,7 @@ export default function TokenManager() {
           </div>
         )}
       </div>
+      </>
     );
   }
 
@@ -94,7 +118,9 @@ export default function TokenManager() {
   const isExpiringSoon = expirationInfo.includes('minutes') && parseInt(expirationInfo) < 5;
 
   return (
-    <div className={`border rounded-lg p-3 mb-4 ${
+    <>
+      <ModalComponent />
+      <div className={`border rounded-lg p-3 mb-4 ${
       isExpired 
         ? 'bg-danger-light border-danger' 
         : isExpiringSoon 
@@ -156,5 +182,6 @@ export default function TokenManager() {
         </div>
       )}
     </div>
+    </>
   );
 }
