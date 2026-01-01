@@ -3,6 +3,9 @@
  * This handles CORS for production deployments
  * 
  * Routes: /api/canton/* -> https://participant.dev.canton.wolfedgelabs.com/json-api/*
+ * 
+ * Vercel automatically recognizes files in the /api directory as serverless functions
+ * This function uses the catch-all route [...path] to handle all /api/canton/* requests
  */
 
 const CANTON_API_BASE = 'https://participant.dev.canton.wolfedgelabs.com/json-api';
@@ -27,6 +30,12 @@ export default async function handler(req, res) {
     const path = req.query.path || [];
     const apiPath = Array.isArray(path) ? path.join('/') : path;
     
+    // Handle empty path (shouldn't happen, but just in case)
+    if (!apiPath) {
+      res.status(400).json({ error: 'Invalid API path' });
+      return;
+    }
+    
     // Construct the full URL
     // CANTON_API_BASE already includes /json-api, so just append the path
     // Result: https://participant.dev.canton.wolfedgelabs.com/json-api/v2/packages
@@ -48,13 +57,21 @@ export default async function handler(req, res) {
     }
 
     console.log(`[Vercel Proxy] ${req.method} ${url}`);
-    console.log(`[Vercel Proxy] Headers:`, Object.keys(headers));
+    console.log(`[Vercel Proxy] Path segments:`, path);
+    console.log(`[Vercel Proxy] Query:`, req.query);
+
+    // Prepare request body
+    let body = undefined;
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      // req.body is already parsed by Vercel if Content-Type is application/json
+      body = typeof req.body === 'string' ? req.body : JSON.stringify(req.body || {});
+    }
 
     // Make the request to Canton API
     const response = await fetch(url, {
       method: req.method,
       headers: headers,
-      body: req.method !== 'GET' && req.method !== 'HEAD' ? JSON.stringify(req.body) : undefined,
+      body: body,
     });
 
     // Get response data
@@ -80,9 +97,11 @@ export default async function handler(req, res) {
     }
   } catch (error) {
     console.error('[Vercel Proxy] Error:', error);
+    console.error('[Vercel Proxy] Stack:', error.stack);
     res.status(500).json({
       error: 'Proxy error',
       message: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined,
     });
   }
 }
