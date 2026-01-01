@@ -15,10 +15,10 @@ import { getStoredToken, isTokenExpired, checkTokenStatus } from './tokenManager
 // Canton JSON API endpoint
 // Based on official documentation: https://docs.digitalasset.com/build/3.4/reference/json-api/openapi.html
 // User info: "participant.dev.canton.wolfedgelabs.com/json-api points to json-api"
-// Use proxy in development to avoid CORS issues
-const CANTON_API_BASE = import.meta.env.DEV 
-  ? '/api/canton'  // Use Vite proxy in development (rewrites to /json-api)
-  : 'https://participant.dev.canton.wolfedgelabs.com/json-api';  // Direct in production
+// Use proxy in both development and production to avoid CORS issues
+// In development: Vite proxy handles it
+// In production: Vercel serverless function handles it
+const CANTON_API_BASE = '/api/canton';  // Always use proxy (Vite in dev, Vercel function in prod)
 const API_VERSION = 'v2';
 
 /**
