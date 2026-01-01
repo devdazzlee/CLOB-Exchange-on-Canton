@@ -30,3 +30,5 @@ After setting the token, try placing an order or viewing the order book. Check t
 
 **Note:** The token is still returning 403 errors when tested directly. This suggests the token may need additional permissions configured in Keycloak, or there may be a different authentication method required for query operations.
 
+
+

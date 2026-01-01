@@ -62,3 +62,5 @@ Even without Canton, you can test:
 - ❌ Order book (needs Canton)
 - ❌ Balance display (needs Canton)
 
+
+

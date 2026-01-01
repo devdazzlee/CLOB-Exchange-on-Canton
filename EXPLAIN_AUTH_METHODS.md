@@ -103,3 +103,5 @@ Ask the client to:
 
 **TL;DR**: Query (read) and Command (write) operations might need different permissions. Your token might work for writing but not reading, or vice versa.
 
+
+

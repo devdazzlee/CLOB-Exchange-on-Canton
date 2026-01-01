@@ -133,3 +133,5 @@ Based on the official documentation, ask the client:
 
 Your token is valid, but the participant node cannot find the required `canReadAs` rights for query operations. The solution is to configure user rights on the participant node using the User Management Service.
 
+
+

@@ -48,9 +48,11 @@ echo ""
 echo "✅ Setup complete!"
 echo ""
 echo "To start the frontend:"
-echo "  cd frontend && npm run dev"
+echo "  cd frontend && npm run dev"![1767214828776](image/setup-and-test/1767214828776.png)
 echo ""
 echo "To build DAML contracts:"
 echo "  export PATH=\"\$HOME/.daml/bin:\$PATH\""
 echo "  cd daml && daml build"
+
+
 

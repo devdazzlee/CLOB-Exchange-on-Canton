@@ -262,8 +262,15 @@ export function clearWallet() {
  * Convert public key to Canton Party ID format
  * @param {Uint8Array} publicKey
  * @returns {string} Party ID in format: prefix::hex
+ * 
+ * NOTE: Using the party ID that has can_read_as rights configured
+ * Party ID with rights: 8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292
  */
 export function publicKeyToPartyId(publicKey, prefix = '8100b2db-86cf-40a1-8351-55483c151cdc') {
-  const hex = bytesToHex(publicKey);
-  return `${prefix}::${hex}`;
+  // Use the party ID that has rights configured (from client confirmation)
+  return '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
+  
+  // Original implementation (commented out - party ID mismatch)
+  // const hex = bytesToHex(publicKey);
+  // return `${prefix}::${hex}`;
 }

@@ -4,7 +4,7 @@
  */
 
 const CANTON_API_BASE = 'https://participant.dev.canton.wolfedgelabs.com/json-api';
-const API_VERSION = 'v1';
+const API_VERSION = 'v2';
 
 // Default operator party ID (use your wallet's party ID or operator ID)
 const DEFAULT_OPERATOR = process.argv[2] || '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
@@ -13,29 +13,68 @@ const DEFAULT_OPERATOR = process.argv[2] || '8100b2db-86cf-40a1-8351-55483c151cd
 const TRADING_PAIRS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'];
 
 /**
- * Create a contract on the ledger
+ * Get JWT token from environment or prompt user
+ */
+function getAuthToken() {
+  const token = process.env.CANTON_JWT_TOKEN;
+  if (!token) {
+    console.error('❌ Error: CANTON_JWT_TOKEN environment variable not set!');
+    console.error('   Set it with: export CANTON_JWT_TOKEN="your_token_here"');
+    process.exit(1);
+  }
+  return token;
+}
+
+/**
+ * Create a contract on the ledger using v2 API
  */
 async function createContract(templateId, payload, partyId) {
+  const token = getAuthToken();
+  
   try {
-    const response = await fetch(`${CANTON_API_BASE}/${API_VERSION}/create`, {
+    // commandId is REQUIRED by SubmitAndWaitRequest schema (JSON API Commands docs)
+    // IMPORTANT: commandId must be at the TOP LEVEL, not inside each command object
+    const commandId = `create-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    
+    const requestBody = {
+      commands: [
+        {
+          CreateCommand: {
+            templateId: templateId,
+            createArguments: payload
+          }
+        }
+      ],
+      commandId: commandId, // Required by SubmitAndWaitRequest schema - MUST be at top level
+      actAs: [partyId]
+    };
+
+    const response = await fetch(`${CANTON_API_BASE}/${API_VERSION}/commands/submit-and-wait`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`
       },
-      body: JSON.stringify({
-        templateId: templateId,
-        payload: payload,
-        actAs: [partyId]
-      })
+      body: JSON.stringify(requestBody)
     });
 
     if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || `Failed to create contract: ${response.statusText}`);
+      const errorText = await response.text();
+      let error;
+      try {
+        error = JSON.parse(errorText);
+      } catch {
+        error = { message: errorText || `Failed to create contract: ${response.statusText}` };
+      }
+      console.error(`   Status: ${response.status}`);
+      console.error(`   Error response:`, JSON.stringify(error, null, 2));
+      throw new Error(error.message || error.cause || error.errors?.join(', ') || `Failed to create contract: ${response.statusText}`);
     }
 
     const result = await response.json();
-    return result;
+    // Extract contract ID from v2 response format
+    const contractId = result.events?.[0]?.created?.contractId || result.contractId;
+    return { contractId, ...result };
   } catch (error) {
     console.error(`Error creating ${templateId}:`, error.message);
     throw error;
@@ -49,19 +88,46 @@ async function createOrderBook(pair, operatorPartyId) {
   console.log(`Creating OrderBook for ${pair}...`);
   
   try {
-    const result = await createContract('OrderBook:OrderBook', {
+    // Format payload according to DAML JSON API v2 format
+    // For createArguments, Optional fields should be:
+    // - Omitted entirely if None, OR
+    // - Set to null if None
+    // { None: null } format is for exercise arguments, NOT createArguments!
+    const payload = {
       tradingPair: pair,
       buyOrders: [],
       sellOrders: [],
-      lastPrice: null,
+      lastPrice: null,  // Optional in createArguments uses null, not { None: null }
       operator: operatorPartyId
-    }, operatorPartyId);
+    };
     
-    console.log(`✅ Created OrderBook for ${pair}`);
-    console.log(`   Contract ID: ${result.contractId}`);
-    return result.contractId;
+    console.log(`   Payload:`, JSON.stringify(payload, null, 2));
+    
+    const result = await createContract('OrderBook:OrderBook', payload, operatorPartyId);
+    
+    // Extract contract ID from v2 response
+    let contractId = null;
+    if (result.events && result.events.length > 0) {
+      const createdEvent = result.events.find(e => e.created);
+      if (createdEvent && createdEvent.created) {
+        contractId = createdEvent.created.contractId;
+      }
+    }
+    
+    if (contractId) {
+      console.log(`✅ Created OrderBook for ${pair}`);
+      console.log(`   Contract ID: ${contractId}`);
+      return contractId;
+    } else {
+      console.log(`⚠️  OrderBook created but contract ID not found`);
+      console.log(`   Full response:`, JSON.stringify(result, null, 2));
+      return result;
+    }
   } catch (error) {
     console.error(`❌ Failed to create OrderBook for ${pair}:`, error.message);
+    if (error.message.includes('Invalid value')) {
+      console.error(`   This might be a payload format issue. Check DAML template.`);
+    }
     return null;
   }
 }
@@ -107,4 +173,5 @@ if (require.main === module) {
 }
 
 module.exports = { createOrderBook };
+
 

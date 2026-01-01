@@ -257,3 +257,5 @@ Based on deep documentation analysis:
 2. Verify party registration with client
 3. Request token with explicit query permissions
 
+
+

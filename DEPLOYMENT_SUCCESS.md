@@ -92,3 +92,5 @@ curl -X POST https://participant.dev.canton.wolfedgelabs.com/json-api/v1/query \
 
 All contracts are deployed and ready. Start the frontend and begin testing!
 
+
+
