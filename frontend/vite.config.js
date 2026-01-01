@@ -27,6 +27,19 @@ export default defineConfig({
           proxy.on('proxyReq', (proxyReq, req, res) => {
             console.log(`[Proxy] ${req.method} ${req.url} -> ${proxyReq.path}`);
             
+            // Handle preflight OPTIONS requests
+            if (req.method === 'OPTIONS') {
+              res.writeHead(200, {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+                'Access-Control-Allow-Credentials': 'true',
+                'Access-Control-Max-Age': '86400'
+              });
+              res.end();
+              return;
+            }
+            
             // Check if Authorization header is already present from client
             const existingAuth = proxyReq.getHeader('Authorization');
             if (existingAuth) {
@@ -48,6 +61,12 @@ export default defineConfig({
           });
           proxy.on('proxyRes', (proxyRes, req, res) => {
             console.log(`[Proxy] Response: ${proxyRes.statusCode} for ${req.url}`);
+            
+            // Add CORS headers for development
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+            res.setHeader('Access-Control-Allow-Credentials', 'true');
           });
           proxy.on('error', (err, req, res) => {
             console.error('[Proxy Error]', err.message);
