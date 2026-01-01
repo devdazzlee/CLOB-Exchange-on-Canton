@@ -10,7 +10,13 @@
 
 const CANTON_API_BASE = 'https://participant.dev.canton.wolfedgelabs.com/json-api';
 
+// Vercel serverless function handler
+// Must be default export for Vercel to recognize it
 export default async function handler(req, res) {
+  // Log the request for debugging
+  console.log(`[Vercel Function] ${req.method} ${req.url}`);
+  console.log(`[Vercel Function] Query:`, req.query);
+  console.log(`[Vercel Function] Path:`, req.query.path);
   // Enable CORS for all origins
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');

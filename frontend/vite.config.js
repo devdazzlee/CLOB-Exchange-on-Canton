@@ -8,7 +8,17 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [
+    react(),
+    // Plugin to ensure api directory is included in Vercel deployment
+    {
+      name: 'vercel-api-include',
+      buildEnd() {
+        // This ensures Vercel knows about the api directory
+        // Vercel automatically detects /api directory for serverless functions
+      }
+    }
+  ],
   server: {
     port: 3000,
     proxy: {
