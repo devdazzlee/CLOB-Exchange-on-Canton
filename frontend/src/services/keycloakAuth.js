@@ -69,18 +69,21 @@ async function generatePKCE() {
 function storeTokens(accessToken, refreshToken, expiresIn) {
   const expiresAt = Date.now() + (expiresIn * 1000);
   
-  localStorage.setItem('canton_access_token', accessToken);
-  localStorage.setItem('canton_refresh_token', refreshToken);
-  localStorage.setItem('canton_token_expires_at', expiresAt.toString());
+  localStorage.setItem('canton_jwt_token', accessToken); // Use consistent key
+  localStorage.setItem('canton_jwt_token_expires', expiresAt);
   
-  console.log('[Keycloak] Tokens stored. Expires in:', expiresIn, 'seconds');
+  if (refreshToken) {
+    localStorage.setItem('canton_jwt_refresh_token', refreshToken);
+  }
+  
+  console.log('[Keycloak] Tokens stored successfully');
 }
 
 /**
  * Get stored access token
  */
 function getStoredAccessToken() {
-  return localStorage.getItem('canton_access_token');
+  return localStorage.getItem('canton_jwt_token'); // Use consistent key
 }
 
 /**
