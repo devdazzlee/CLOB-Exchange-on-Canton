@@ -48,8 +48,22 @@ export default async function handler(req, res) {
     const targetUrl = cleanPath ? `${cantonApiUrl}${cleanPath}` : cantonApiUrl;
     console.log('Proxying Canton API request to:', targetUrl);
 
-    // TEMP FIX: Use browser JWT instead of static token until static token is provided
-    const cantonToken = req.headers.authorization || 'Bearer temp-token';
+    // Get JWT from request header or use fallback
+    let cantonToken = req.headers.authorization;
+    
+    // If no token in header, try to get from environment (like old code)
+    if (!cantonToken) {
+      const envToken = process.env.VITE_CANTON_JWT_TOKEN;
+      if (envToken) {
+        cantonToken = `Bearer ${envToken}`;
+        console.log('[Proxy] Using token from environment variable');
+      }
+    }
+    
+    // Final fallback
+    if (!cantonToken) {
+      cantonToken = 'Bearer temp-token';
+    }
     
     // Forward the request to Canton API
     const response = await fetch(targetUrl, {
