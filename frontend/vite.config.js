@@ -8,35 +8,70 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 export default defineConfig({
-  plugins: [
-    react(),
-    // Plugin to ensure api directory is included in Vercel deployment
-    {
-      name: 'vercel-api-include',
-      buildEnd() {
-        // This ensures Vercel knows about the api directory
-        // Vercel automatically detects /api directory for serverless functions
-      }
-    }
-  ],
+  plugins: [react()],
   server: {
     port: 3000,
     proxy: {
-      '/json-api': {
+      '/api/canton': {
         target: 'https://participant.dev.canton.wolfedgelabs.com',
         changeOrigin: true,
-        secure: true,
-        configure: (proxy, _options) => {
-          proxy.on('error', (err, _req, _res) => {
-            console.log('proxy error', err);
-          });
-          proxy.on('proxyReq', (proxyReq, req, _res) => {
-            console.log('Sending Request to the Target:', req.method, req.url);
-          });
-          proxy.on('proxyRes', (proxyRes, req, _res) => {
-            console.log('Received Response from the Target:', proxyRes.statusCode, req.url);
-          });
+        rewrite: (path) => {
+          // /api/canton/v1/query -> /json-api/v1/query
+          // Based on user info: "participant.dev.canton.wolfedgelabs.com/json-api points to json-api"
+          const rewritten = path.replace(/^\/api\/canton/, '/json-api');
+          return rewritten;
         },
+        secure: true,
+        ws: false,
+        configure: (proxy, options) => {
+          proxy.on('proxyReq', (proxyReq, req, res) => {
+            console.log(`[Proxy] ${req.method} ${req.url} -> ${proxyReq.path}`);
+            
+            // Handle preflight OPTIONS requests
+            if (req.method === 'OPTIONS') {
+              res.writeHead(200, {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+                'Access-Control-Allow-Credentials': 'true',
+                'Access-Control-Max-Age': '86400'
+              });
+              res.end();
+              return;
+            }
+            
+            // Check if Authorization header is already present from client
+            const existingAuth = proxyReq.getHeader('Authorization');
+            if (existingAuth) {
+              console.log('[Proxy] Authorization header already present from client');
+            } else {
+              // Add JWT token from environment variable if not present
+              // Load .env file manually since Vite proxy runs in Node context
+              const envPath = path.join(__dirname, '.env');
+              if (fs.existsSync(envPath)) {
+                const envContent = fs.readFileSync(envPath, 'utf8');
+                const match = envContent.match(/VITE_CANTON_JWT_TOKEN=(.+)/);
+                if (match && match[1]) {
+                  const jwtToken = match[1].trim();
+                  proxyReq.setHeader('Authorization', `Bearer ${jwtToken}`);
+                  console.log('[Proxy] Added JWT token from .env file');
+                }
+              }
+            }
+          });
+          proxy.on('proxyRes', (proxyRes, req, res) => {
+            console.log(`[Proxy] Response: ${proxyRes.statusCode} for ${req.url}`);
+            
+            // Add CORS headers for development
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+            res.setHeader('Access-Control-Allow-Credentials', 'true');
+          });
+          proxy.on('error', (err, req, res) => {
+            console.error('[Proxy Error]', err.message);
+          });
+        }
       }
     }
   },

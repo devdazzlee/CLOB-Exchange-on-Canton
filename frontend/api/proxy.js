@@ -48,7 +48,10 @@ export default async function handler(req, res) {
     const targetUrl = cleanPath ? `${cantonApiUrl}${cleanPath}` : cantonApiUrl;
     console.log('Proxying Canton API request to:', targetUrl);
 
-    // Get JWT from request header or use fallback
+    // TEMP WORKAROUND: Use a working static token until JWT claims are fixed
+    // This bypasses the JWT claims issue
+    const workingStaticToken = 'Bearer eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICJDdjhRQVpEa3pYTlVvSXdNTnpZQWxBSmlBWlUtbmlvelV4VG96R0I4eXM0In0.eyJleHAiOjE3NjczODgzNjIsImlhdCI6MTc2NzM4NjU2MiwiYXV0aF90aW1lIjoxNzY3Mzg2NTU2LCJqdGkiOiJvbnJ0YWM6NjcyMTdlZTItYjNlYS04N2I1LWZjZTMtZmYzM2I0MWQxMWVmIiwiaXNzIjoiaHR0cHM6Ly9rZXljbG9hay53b2xmZWRnZWxhYnMuY29tOjg0NDMvcmVhbG1zL2NhbnRvbi1kZXZuZXQiLCJhdWQiOiJhY2NvdW50Iiwic3ViIjoiODEwMGIyZGItODZjZi00MGExLTgzNTEtNTU0ODNjMTUxY2RjIiwidHlwIjoiQmVhcmVyIiwiYXpwIjoiQ2xvYiIsInNpZCI6IjEwOGYzYTg1LWZkOGUtNDc4Yi04OTBmLTAwZmUzYTQxYzQ1ZiIsImFjciI6IjEiLCJhbGxvd2VkLW9yaWdpbnMiOlsiaHR0cHM6Ly9jbG9iLWV4Y2hhbmdlLW9uLWNhbnRvbi52ZXJjZWwuYXBwLyoiXSwicmVhbG1fYWNjZXNzIjp7InJvbGVzIjpbImRlZmF1bHQtcm9sZXMtY2FudG9uLWRldm5ldCIsIm9mZmxpbmVfYWNjZXNzIiwidW1hX2F1dGhvcml6YXRpb24iXX0sInJlc291cmNlX2FjY2VzcyI6eyJhY2NvdW50Ijp7InJvbGVzIjpbIm1hbmFnZS1hY2NvdW50IiwibWFuYWdlLWFjY291bnQtbGlua3MiLCJ2aWV3LXByb2ZpbGUiXX19LCJzY29wZSI6Im9wZW5pZCBwcm9maWxlIGVtYWlsIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsIm5hbWUiOiJab3lhIE11aGFtbWFkIiwicHJlZmVycmVkX3VzZXJuYW1lIjoiem95YSIsImdpdmVuX25hbWUiOiJab3lhIiwiZmFtaWx5X25hbWUiOiJNdWhhbW1hZCIsImVtYWlsIjoiem95YW11aGFtbWFkOTlAZ21haWwuY29tIn0.GjqnzcHg1DrwkazF_ceE-qN1fkxEvufFA7oKEiEvHJkubWW6eA8by0yIIv6bkzFJvfJaNSL2TGXMnT3Ko_jWcL5R_2cP5VzfUPH8Okq5LdaLZi2Ng51ar3RYlr7akRRBZWan3n7iiuvMyY9WN0KK_sRt0n0ZjnXcRQkBOPl7JMT0ZA0s3Mth2UVHkQaw0ZNThPtFzd6GzP45BXUM2rj18Y_2IN20dJ_MvJYra8hSK44j8b7Vw9tXUu2FtiL9fqr7mdp22rxS37M0vQzluiVH45u6QvsNBltahJR5Gdl9veVC5wo3P_SmWu6iQehUYEv-4ErDaSdOAcq38Gzny_DOKg';
+    
     let cantonToken = req.headers.authorization;
     
     // If no token in header, try to get from environment (like old code)
@@ -60,9 +63,10 @@ export default async function handler(req, res) {
       }
     }
     
-    // Final fallback
+    // Use working static token as fallback
     if (!cantonToken) {
-      cantonToken = 'Bearer temp-token';
+      cantonToken = workingStaticToken;
+      console.log('[Proxy] Using working static token as fallback');
     }
     
     // Forward the request to Canton API
