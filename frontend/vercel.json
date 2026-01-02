@@ -4,6 +4,10 @@
   "framework": null,
   "rewrites": [
     {
+      "source": "/api/proxy/keycloak-token",
+      "destination": "/api/proxy"
+    },
+    {
       "source": "/api/proxy/(.*)",
       "destination": "/api/proxy"
     },

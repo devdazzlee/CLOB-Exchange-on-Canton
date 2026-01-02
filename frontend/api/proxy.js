@@ -1,4 +1,4 @@
-// Vercel serverless function to proxy Canton API requests
+// Vercel serverless function to proxy Canton API requests and Keycloak token exchange
 // This handles CORS issues by routing requests through Vercel
 
 export default async function handler(req, res) {
@@ -14,13 +14,33 @@ export default async function handler(req, res) {
   }
 
   try {
+    // Handle Keycloak token exchange
+    if (req.url.includes('/keycloak-token')) {
+      const { tokenUrl, tokenData } = req.body;
+      
+      console.log('Proxying Keycloak token request to:', tokenUrl);
+      
+      const response = await fetch(tokenUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams(tokenData),
+      });
+
+      const data = await response.json();
+      res.status(response.status).json(data);
+      return;
+    }
+
+    // Handle Canton API requests
     const cantonApiUrl = 'https://participant.dev.canton.wolfedgelabs.com/json-api';
     
     // Get the path from the request URL
     const path = req.url.replace('/api/proxy', '');
     const targetUrl = `${cantonApiUrl}${path}`;
 
-    console.log('Proxying request to:', targetUrl);
+    console.log('Proxying Canton API request to:', targetUrl);
 
     // Forward the request to Canton API
     const response = await fetch(targetUrl, {

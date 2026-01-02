@@ -299,27 +299,49 @@ export async function handleAuthCallback(code) {
     throw new Error('PKCE verifier not found');
   }
 
-  const tokenUrl = getTokenUrl();
-
   try {
     // Use different redirect URIs for development vs production
     const redirectUri = import.meta.env.DEV 
       ? 'http://localhost:3000/auth/callback'  // Local development
       : 'https://clob-exchange-on-canton.vercel.app/auth/callback'; // Production
 
-    const response = await fetch(tokenUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: new URLSearchParams({
-        grant_type: 'authorization_code',
-        code: code,
-        redirect_uri: redirectUri,
-        client_id: config.clientId,
-        code_verifier: verifier,
-      }),
-    });
+    // In production, use proxy to avoid CORS issues
+    const tokenUrl = import.meta.env.DEV
+      ? getTokenUrl()  // Direct call in development
+      : '/api/proxy/keycloak-token'; // Use proxy in production
+
+    const tokenData = {
+      grant_type: 'authorization_code',
+      code: code,
+      redirect_uri: redirectUri,
+      client_id: config.clientId,
+      code_verifier: verifier,
+    };
+
+    let response;
+    
+    if (import.meta.env.DEV) {
+      // Direct call in development
+      response = await fetch(tokenUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams(tokenData),
+      });
+    } else {
+      // Use proxy in production to avoid CORS
+      response = await fetch(tokenUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          tokenUrl: getTokenUrl(),
+          tokenData: tokenData
+        }),
+      });
+    }
 
     if (!response.ok) {
       const error = await response.text();
