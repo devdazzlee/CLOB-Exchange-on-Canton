@@ -3,12 +3,15 @@ import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-d
 import WalletSetup from './components/WalletSetup';
 import TradingInterface from './components/TradingInterface';
 import TokenManager from './components/TokenManager';
+import AuthGuard from './components/AuthGuard';
+import AuthCallback from './components/AuthCallback';
 import { loadWallet, publicKeyToPartyId } from './wallet/keyManager';
 import './index.css';
 
 function App() {
   const [partyId, setPartyId] = useState(null);
   const [walletReady, setWalletReady] = useState(false);
+  const [copiedPartyId, setCopiedPartyId] = useState(false);
 
   useEffect(() => {
     // Check if wallet exists
@@ -23,6 +26,16 @@ function App() {
   const handleWalletReady = (newPartyId) => {
     setPartyId(newPartyId);
     setWalletReady(true);
+  };
+
+  const handleCopyPartyId = async () => {
+    try {
+      await navigator.clipboard.writeText(partyId);
+      setCopiedPartyId(true);
+      setTimeout(() => setCopiedPartyId(false), 2000); // Reset after 2 seconds
+    } catch (err) {
+      console.error('Failed to copy Party ID:', err);
+    }
   };
 
   return (
@@ -46,18 +59,40 @@ function App() {
                   <code className="px-3 py-1.5 bg-[#1E2329] border border-[#2B3139] rounded-md text-[#F0B90B] font-mono text-xs">
                     {partyId.substring(0, 30)}...
                   </code>
+                  <button
+                    onClick={handleCopyPartyId}
+                    className="p-1.5 hover:bg-[#2B3139] rounded-md transition-colors group"
+                    title={copiedPartyId ? "Copied!" : "Copy Party ID"}
+                  >
+                    {copiedPartyId ? (
+                      <svg className="w-4 h-4 text-success transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                      </svg>
+                    ) : (
+                      <svg className="w-4 h-4 text-[#848E9C] group-hover:text-[#F0B90B] transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                      </svg>
+                    )}
+                  </button>
                 </div>
               )}
+              <div className="flex items-center space-x-3">
+                <TokenManager />
+              </div>
             </div>
           </div>
         </header>
 
         {/* Main Content */}
         <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-          {/* Token Manager - Show on all pages */}
-          <TokenManager />
+          {/* Token Manager - Simple token input */}
+          {/* <TokenManager /> */}
           
           <Routes>
+            <Route
+              path="/auth/callback"
+              element={<AuthCallback />}
+            />
             <Route
               path="/"
               element={
@@ -89,11 +124,9 @@ function App() {
             <Route
               path="/trading"
               element={
-                walletReady ? (
+                <AuthGuard>
                   <TradingInterface partyId={partyId} />
-                ) : (
-                  <Navigate to="/" replace />
-                )
+                </AuthGuard>
               }
             />
           </Routes>
