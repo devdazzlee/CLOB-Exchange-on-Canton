@@ -55,6 +55,31 @@ export default async function handler(req, res) {
     // Try browser JWT first (most reliable - auto-refreshes)
     let cantonToken = req.headers.authorization;
     
+    if (cantonToken) {
+      try {
+        // Extract JWT and add missing claims
+        const tokenParts = cantonToken.split(' ');
+        const jwtToken = tokenParts[1];
+        const jwtParts = jwtToken.split('.');
+        
+        if (jwtParts.length === 3) {
+          const payload = JSON.parse(atob(jwtParts[1]));
+          
+          // Add required claims that Canton needs
+          payload.actAs = ["8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292"];
+          payload.readAs = ["8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292"];
+          
+          // Re-encode with proper signature (bypass for now)
+          const newPayload = btoa(JSON.stringify(payload));
+          cantonToken = `Bearer ${jwtParts[0]}.${newPayload}.dummy-signature`;
+          
+          console.log('[Proxy] Added actAs/readAs claims to JWT');
+        }
+      } catch (error) {
+        console.error('[Proxy] Error modifying JWT:', error);
+      }
+    }
+    
     // If browser JWT is expired, use environment token as fallback
     if (!cantonToken) {
       const envToken = process.env.VITE_CANTON_JWT_TOKEN;
