@@ -38,10 +38,14 @@ export default async function handler(req, res) {
     
     // Get the path from the request URL
     const path = req.url.replace('/api/proxy', '');
+    console.log('Original path:', path);
+    
     // Remove leading slash to avoid double slash
     const cleanPath = path.startsWith('/') ? path.substring(1) : path;
-    const targetUrl = `${cantonApiUrl}/${cleanPath}`;
-
+    console.log('Clean path:', cleanPath);
+    
+    // Construct target URL without double slash
+    const targetUrl = cleanPath ? `${cantonApiUrl}/${cleanPath}` : cantonApiUrl;
     console.log('Proxying Canton API request to:', targetUrl);
 
     // Forward the request to Canton API
