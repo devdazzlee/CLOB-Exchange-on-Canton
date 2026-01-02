@@ -97,7 +97,7 @@ function getStoredRefreshToken() {
  * Check if token is expired or will expire soon
  */
 function isTokenExpired(bufferSeconds = 60) {
-  const expiresAt = localStorage.getItem('canton_token_expires_at');
+  const expiresAt = localStorage.getItem('canton_jwt_token_expires_at'); // Use consistent key
   if (!expiresAt) return true;
   
   const now = Date.now();
