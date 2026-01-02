@@ -70,13 +70,14 @@ function storeTokens(accessToken, refreshToken, expiresIn) {
   const expiresAt = Date.now() + (expiresIn * 1000);
   
   localStorage.setItem('canton_jwt_token', accessToken); // Use consistent key
-  localStorage.setItem('canton_jwt_token_expires', expiresAt);
+  localStorage.setItem('canton_jwt_token_expires_at', expiresAt); // Use consistent key
   
   if (refreshToken) {
     localStorage.setItem('canton_jwt_refresh_token', refreshToken);
   }
   
   console.log('[Keycloak] Tokens stored successfully');
+  console.log('[Keycloak] Expiration timestamp stored:', new Date(expiresAt).toISOString());
 }
 
 /**
