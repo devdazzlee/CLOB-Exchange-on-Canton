@@ -24,15 +24,26 @@ export default function AuthCallback() {
       return;
     }
 
+    // Add timeout to prevent infinite loading
+    const timeout = setTimeout(() => {
+      setError('Authentication timed out. Please try again.');
+      setLoading(false);
+    }, 10000); // 10 seconds timeout
+
     // Exchange code for tokens
+    console.log('[AuthCallback] Starting token exchange with code:', code);
     handleAuthCallback(code)
       .then(() => {
+        clearTimeout(timeout);
+        console.log('[AuthCallback] Token exchange successful');
         // Redirect to trading page or previous location
         const returnTo = sessionStorage.getItem('auth_return_to') || '/trading';
         sessionStorage.removeItem('auth_return_to');
+        console.log('[AuthCallback] Redirecting to:', returnTo);
         navigate(returnTo);
       })
       .catch((err) => {
+        clearTimeout(timeout);
         console.error('[AuthCallback] Error:', err);
         setError(err.message || 'Authentication failed');
         setLoading(false);
