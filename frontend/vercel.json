@@ -4,9 +4,18 @@
   "framework": null,
   "rewrites": [
     {
+      "source": "/api/proxy/(.*)",
+      "destination": "/api/proxy"
+    },
+    {
       "source": "/(.*)",
       "destination": "/index.html"
     }
-  ]
+  ],
+  "functions": {
+    "api/proxy.js": {
+      "runtime": "nodejs18.x"
+    }
+  }
 }
 
