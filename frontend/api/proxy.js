@@ -48,12 +48,15 @@ export default async function handler(req, res) {
     const targetUrl = cleanPath ? `${cantonApiUrl}${cleanPath}` : cantonApiUrl;
     console.log('Proxying Canton API request to:', targetUrl);
 
+    // Use static ledger token instead of browser JWT for Canton API
+    const cantonToken = 'Bearer YOUR_STATIC_LEDGER_TOKEN_HERE';
+    
     // Forward the request to Canton API
     const response = await fetch(targetUrl, {
       method: req.method,
       headers: {
         'Content-Type': req.headers['content-type'] || 'application/json',
-        'Authorization': req.headers.authorization || '',
+        'Authorization': cantonToken,
       },
       body: req.method !== 'GET' && req.method !== 'HEAD' ? JSON.stringify(req.body) : undefined,
     });
