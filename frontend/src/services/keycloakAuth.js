@@ -154,10 +154,17 @@ async function refreshAccessToken() {
  * Get valid access token (refresh if needed)
  */
 export async function getValidAccessToken() {
+  console.log('[Keycloak] getValidAccessToken called');
+  
   // Check if we have a token and if it's still valid
-  if (!isTokenExpired()) {
+  const expired = isTokenExpired();
+  console.log('[Keycloak] Token expired check:', expired);
+  
+  if (!expired) {
     const token = getStoredAccessToken();
+    console.log('[Keycloak] Stored token:', token ? 'Found' : 'Not found');
     if (token) {
+      console.log('[Keycloak] Returning valid token');
       return token;
     }
   }
@@ -380,7 +387,10 @@ export function clearTokens() {
  * Check if user is authenticated
  */
 export function isAuthenticated() {
-  return !!getStoredAccessToken() && !isTokenExpired();
+  const token = getStoredAccessToken();
+  const expired = isTokenExpired();
+  console.log('[Keycloak] isAuthenticated check - Token:', !!token, 'Expired:', expired);
+  return !!token && !expired;
 }
 
 /**

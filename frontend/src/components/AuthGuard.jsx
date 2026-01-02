@@ -13,28 +13,36 @@ export default function AuthGuard({ children }) {
   }, []);
 
   const checkAuth = async () => {
+    console.log('[AuthGuard] Starting auth check');
     try {
       // Check if user is authenticated
-      if (isAuthenticated()) {
+      const authStatus = isAuthenticated();
+      console.log('[AuthGuard] isAuthenticated result:', authStatus);
+      
+      if (authStatus) {
+        console.log('[AuthGuard] User appears authenticated, verifying token...');
         // Verify token is still valid
         try {
-          await getValidAccessToken();
+          const token = await getValidAccessToken();
+          console.log('[AuthGuard] Token validation successful');
           setIsAuth(true);
           setIsChecking(false);
           return;
         } catch (error) {
           // Token refresh failed, need to login again
-          console.log('[AuthGuard] Token refresh failed, redirecting to login');
+          console.log('[AuthGuard] Token refresh failed, redirecting to login:', error.message);
         }
       }
 
       // Not authenticated - redirect to login
+      console.log('[AuthGuard] User not authenticated, redirecting to login');
       // Store current location to return after login
       sessionStorage.setItem('auth_return_to', location.pathname);
       initiateLogin();
     } catch (error) {
       console.error('[AuthGuard] Auth check error:', error);
       // On error, redirect to login
+      console.log('[AuthGuard] Auth check error, redirecting to login');
       sessionStorage.setItem('auth_return_to', location.pathname);
       initiateLogin();
     }
