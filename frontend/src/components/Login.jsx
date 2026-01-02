@@ -32,7 +32,7 @@ export default function Login({ onLoginSuccess }) {
       
       {error && (
         <div className="bg-danger-light border border-danger rounded-lg p-4 mb-4">
-          <p className="text-danger text-sm">{error}</p>
+          <p className="text-danger text-sm whitespace-pre-line">{error}</p>
         </div>
       )}
 

@@ -273,7 +273,7 @@ export async function initiateLogin() {
       client_id: config.clientId,
       redirect_uri: redirectUri,
       response_type: 'code',
-      scope: 'openid profile email daml_ledger_api wallet_audience',
+      scope: 'openid profile email', // Use only standard OAuth scopes
       code_challenge: challenge,
       code_challenge_method: 'S256',
     });
