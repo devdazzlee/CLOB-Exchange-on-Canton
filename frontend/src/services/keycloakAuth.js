@@ -98,11 +98,19 @@ function getStoredRefreshToken() {
  */
 function isTokenExpired(bufferSeconds = 60) {
   const expiresAt = localStorage.getItem('canton_jwt_token_expires_at'); // Use consistent key
-  if (!expiresAt) return true;
+  console.log('[Keycloak] isTokenExpired - expiresAt from localStorage:', expiresAt);
+  if (!expiresAt) {
+    console.log('[Keycloak] isTokenExpired - No expiration found in localStorage');
+    return true;
+  }
   
   const now = Date.now();
   const bufferMs = bufferSeconds * 1000;
-  return parseInt(expiresAt) <= (now + bufferMs);
+  const isExpired = parseInt(expiresAt) <= (now + bufferMs);
+  console.log('[Keycloak] isTokenExpired - expiresAt:', new Date(parseInt(expiresAt)).toISOString());
+  console.log('[Keycloak] isTokenExpired - now:', new Date(now).toISOString());
+  console.log('[Keycloak] isTokenExpired - isExpired:', isExpired);
+  return isExpired;
 }
 
 /**
