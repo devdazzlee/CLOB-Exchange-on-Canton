@@ -48,52 +48,13 @@ export default async function handler(req, res) {
     const targetUrl = cleanPath ? `${cantonApiUrl}${cleanPath}` : cantonApiUrl;
     console.log('Proxying Canton API request to:', targetUrl);
 
-    // SOLUTION: Use a hardcoded working token with proper claims
-    // This bypasses the JWT signature issue
-    const workingToken = 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjk5OTk5OTk5OTksImlhdCI6MTY3NzM4NjU2MiwiYXV0aF90aW1lIjoxNjY3Mzg2NTU2LCJqdGkiOiJvbnJ0YWM6NjcyMTdlZTItYjNlYS04N2I1LWZjZTMtZmYzM2I0MWQxMWVmIiwiaXNzIjoiaHR0cHM6Ly9rZXljbG9hay53b2xmZWRnZWxhYnMuY29tOjg0NDMvcmVhbG1zL2NhbnRvbi1kZXZuZXQiLCJhdWQiOiJhY2NvdW50Iiwic3ViIjoiODEwMGIyZGItODZjZi00MGExLTgzNTEtNTU0ODNjMTUxY2RjIiwiYWN0QXMiOlsiODEwMGIyZGItODZjZi00MGExLTgzNTEtNTU0ODNjMTUxY2RjOjoxMjIwODdmYTM3OWMzNzMzMmE3NTMzNzljNThlMThkMzk3ZTM5Y2I4MmM2OGMxNWU0YWY3MTM0YmU0NjU2MTk3NDI5MiJdLCJyZWFkQXMiOlsiODEwMGIyZGItODZjZi00MGExLTgzNTEtNTU0ODNjMTUxY2RjOjoxMjIwODdmYTM3OWMzNzMzMmE3NTMzNzljNThlMThkMzk3ZTM5Y2I4MmM2OGMxNWU0YWY3MTM0YmU0NjU2MTk3NDI5MiJdLCJ0eXBlIjoiQmVhcmVyIiwiYXpwIjoiQ2xvYiIsInNpZCI6IjEwOGYzYTg1LWZkOGUtNDc4Yi04OTBmLTAwZmUzYTQxYzQ1ZiIsImFjciI6IjEiLCJhbGxvd2VkLW9yaWdpbnMiOlsiaHR0cHM6Ly9jbG9iLWV4Y2hhbmdlLW9uLWNhbnRvbi52ZXJjZWwuYXBwLyoiXSwicmVhbG1fYWNjZXNzIjp7InJvbGVzIjpbImRlZmF1bHQtcm9sZXMtY2FudG9uLWRldm5ldCIsIm9mZmxpbmVfYWNjZXNzIiwidW1hX2F1dGhvcml6YXRpb24iXX0sInJlc291cmNlX2FjY2VzcyI6eyJhY2NvdW50Ijp7InJvbGVzIjpbIm1hbmFnZS1hY2NvdW50IiwibWFuYWdlLWFjY291bnQtbGlua3MiLCJ2aWV3LXByb2ZpbGUiXX19LCJzY29wZSI6Im9wZW5pZCBwcm9maWxlIGVtYWlsIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsIm5hbWUiOiJab3lhIE11aGFtbWFkIiwicHJlZmVycmVkX3VzZXJuYW1lIjoiem95YSIsImdpdmVuX25hbWUiOiJab3lhIiwiZmFtaWx5X25hbWUiOiJNdWhhbW1hZCIsImVtYWlsIjoiem95YW11aGFtbWFkOTlAZ21haWwuY29tIn0.invalid-signature';
+    // SOLUTION: Use static token from client (has proper claims and signature)
+    const staticToken = 'eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICJDdjhRQVpEa3pYTlVvSXdNTnpZQWxBSmlBWlUtbmlvelV4VG96R0I4eXM0In0.eyJleHAiOjE3Njc1MjAzOTUsImlhdCI6MTc2NzUxODU5NSwiYXV0aF90aW1lIjoxNzY3NTE4NTk0LCJqdGkiOiJvZnJ0YWM6MGNiNGY4ZDktYjE2MC1kM2Q2LTU5ZmEtYjNhYTE3ZWU1ODQ2IiwiaXNzIjoiaHR0cHM6Ly9rZXljbG9hay53b2xmZWRnZWxhYnMuY29tOjg0NDMvcmVhbG1zL2NhbnRvbi1kZXZuZXQiLCJhdWQiOlsiaHR0cHM6Ly9jYW50b24ubmV0d29yay5nbG9iYWwiLCJodHRwczovL3ZhbGlkYXRvci13YWxsZXQudGFpbGViNGY1Ni50cy5uZXQiLCJodHRwczovL3dhbGxldC52YWxpZGF0b3IuZGV2LmNhbnRvbi53b2xmZWRnZWxhYnMuY29tIiwiYWNjb3VudCJdLCJzdWIiOiI4MTAwYjJkYi04NmNmLTQwYTEtODM1MS01NTQ4M2MxNTFjZGMiLCJ0eXAiOiJCZWFyZXIiLCJhenAiOiI0cm9oOVg3eTRUeVQ4OWZlSnU3QW5NMnNNWmJSOXhoNyIsInNpZCI6Ijg5NTJlMmFjLTBlN2EtNGE1Ni1iYTNhLTgxZjM4MDUzMzkxZiIsImFjciI6IjEiLCJhbGxvd2VkLW9yaWdpbnMiOlsiaHR0cHM6Ly9zeW5jaW5zaWdodHMtYXBwLmRldi5jYW50b24ud29sZmVkZ2VsYWJzLmNvbSIsImh0dHBzOi8vd2FsbGV0Mi52YWxpZGF0b3IuZGV2LmNhbnRvbi53b2xmZWRnZWxhYnMuY29tIiwiaHR0cHM6Ly93YWxsZXQxLnZhbGlkYXRvci5kZXYuY2FudG9uLndvbGZlZGdlbGFicy5jb20iLCJodHRwczovL3dhbGxldC52YWxpZGF0b3Iud29sZmVkZ2VsYWJzLmNvbSIsImh0dHBzOi8vd2FsbGV0LnZhbGlkYXRvci5kZXYuY2FudG9uLndvbGZlZGdlbGFicy5jb20iLCJodHRwczovL3ZhbGlkYXRvci13YWxsZXQtY2FudG9uLWRldm5ldC50YWlsZWI0ZjU2LnRzLm5ldCJdLCJyZWFsbV9hY2Nlc3MiOnsicm9sZXMiOlsiZGVmYXVsdC1yb2xlcy1jYW50b24tZGV2bmV0Iiwib2ZmbGluZV9hY2Nlc3MiLCJ1bWFfYXV0aG9yaXphdGlvbiJdfSwicmVzb3VyY2VfYWNjZXNzIjp7ImFjY291bnQiOnsicm9sZXMiOlsibWFuYWdlLWFjY291bnQiLCJtYW5hZ2UtYWNjb3VudC1saW5rcyIsInZpZXctcHJvZmlsZSJdfX0sInNjb3BlIjoib3BlbmlkIG9mZmxpbmVfYWNjZXNzIHByb2ZpbGUgZGFtbF9sZWRnZXJfYXBpIHdhbGxldF9hdWRpZW5jZSBlbWFpbCIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJuYW1lIjoiWm95YSBNdWhhbW1hZCIsInByZWZlcnJlZF91c2VybmFtZSI6InpveWEiLCJnaXZlbl9uYW1lIjoiWm95YSIsImZhbWlseV9uYW1lIjoiTXVoYW1tYWQiLCJlbWFpbCI6InpveWFtdWhhbW1hZDk5QGdtYWlsLmNvbSJ9.IPIXZFL1u-dmQQsI05ttwYYD5YDIAcvnGKms8u_2MQk2wM09K4AgSEc36a0RfsMx6kuCOmUvah8NbB7b7wedBkjoFzoPXNLW9-SBEZ9voVGNRkK2S8QXAwpkcRcTtNcTvfcuH-aKICNuRj4dHLgOSxzYFNVzMAPmATSTt9_mBd2FWlinDt_roCpWddtAWnSui_MVNlyz55Rf8ZAXkMoEROs_FMyAQIsoYifrmU8cskL2wigke_KmHT0W5TtPpqHiYUxuakFVe_Bg8AnZ0lhTXki7lEuk4cW2aSq2fYd17CcezBWqem83VmbUlI3JuT2MH-c6fuuRp3G5XXzOPCQfAw';
     
-    // Try browser JWT first (most reliable - auto-refreshes)
-    let cantonToken = req.headers.authorization;
+    // Use static token (has proper claims and signature)
+    let cantonToken = `Bearer ${staticToken}`;
     
-    if (cantonToken) {
-      try {
-        // Extract JWT and add missing claims
-        const tokenParts = cantonToken.split(' ');
-        const jwtToken = tokenParts[1];
-        const jwtParts = jwtToken.split('.');
-        
-        if (jwtParts.length === 3) {
-          const payload = JSON.parse(atob(jwtParts[1]));
-          
-          // Add required claims that Canton needs
-          payload.actAs = ["8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292"];
-          payload.readAs = ["8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292"];
-          
-          // Re-encode with proper signature (bypass for now)
-          const newPayload = btoa(JSON.stringify(payload));
-          cantonToken = `Bearer ${jwtParts[0]}.${newPayload}.dummy-signature`;
-          
-          console.log('[Proxy] Added actAs/readAs claims to JWT');
-        }
-      } catch (error) {
-        console.error('[Proxy] Error modifying JWT:', error);
-      }
-    }
-    
-    // If browser JWT is expired, use environment token as fallback
-    if (!cantonToken) {
-      const envToken = process.env.VITE_CANTON_JWT_TOKEN;
-      if (envToken) {
-        cantonToken = `Bearer ${envToken}`;
-        console.log('[Proxy] Using environment token (browser JWT missing)');
-      }
-    }
-    
-    // Final fallback to static token
-    if (!cantonToken) {
-      cantonToken = `Bearer ${workingToken}`;
-      console.log('[Proxy] Using static token fallback');
-    }
+    console.log('[Proxy] Using static token with proper claims');
     
     // Forward the request to Canton API
     const response = await fetch(targetUrl, {
