@@ -7,6 +7,7 @@ export default function TokenManager() {
   const [token, setToken] = useState('');
   const [expirationInfo, setExpirationInfo] = useState('');
   const [showLogin, setShowLogin] = useState(false);
+  const [isChecking, setIsChecking] = useState(true);
   const { showModal, ModalComponent } = useConfirmationModal();
 
   const handleClearToken = async () => {
@@ -32,8 +33,11 @@ export default function TokenManager() {
   };
 
   useEffect(() => {
-    // Initial check
+    // Initial check with loading state
+    setIsChecking(true);
     updateTokenInfo();
+    // Mark checking as complete after initial load
+    setTimeout(() => setIsChecking(false), 100);
     
     // Check frequently (every 5 seconds) for immediate updates after login
     const interval = setInterval(updateTokenInfo, 5000);
@@ -42,6 +46,7 @@ export default function TokenManager() {
     const handleStorageChange = (e) => {
       if (e.key === 'canton_jwt_token' || e.key === 'canton_jwt_token_expires_at') {
         console.log('[TokenManager] Storage change detected, updating token info');
+        // Don't show loader for storage changes - just update silently
         updateTokenInfo();
       }
     };
@@ -50,6 +55,7 @@ export default function TokenManager() {
     // Listen for custom auth events (for same-tab updates)
     const handleAuthEvent = () => {
       console.log('[TokenManager] Auth event received, updating token info');
+      // Don't show loader for auth events - just update silently
       updateTokenInfo();
     };
     window.addEventListener('auth-token-stored', handleAuthEvent);
@@ -58,6 +64,8 @@ export default function TokenManager() {
     const handleVisibilityChange = () => {
       if (!document.hidden) {
         console.log('[TokenManager] Page visible, checking token');
+        // Show brief loader when returning from OAuth
+        setIsChecking(true);
         updateTokenInfo();
       }
     };
@@ -66,6 +74,8 @@ export default function TokenManager() {
     // Check when window gains focus (user returns from OAuth redirect)
     const handleFocus = () => {
       console.log('[TokenManager] Window focused, checking token');
+      // Show brief loader when returning from OAuth
+      setIsChecking(true);
       updateTokenInfo();
     };
     window.addEventListener('focus', handleFocus);
@@ -91,7 +101,27 @@ export default function TokenManager() {
     } else {
       setExpirationInfo('No token');
     }
+    
+    // Mark checking as complete after update
+    setIsChecking(false);
   };
+
+  // Show loader while checking token status
+  if (isChecking) {
+    return (
+      <>
+        <ModalComponent />
+        <div className="bg-[#1E2329] border border-[#2B3139] rounded-lg p-3 mb-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-2">
+              <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-primary"></div>
+              <span className="text-[#848E9C] font-semibold">Checking authentication...</span>
+            </div>
+          </div>
+        </div>
+      </>
+    );
+  }
 
   // No token - show login prompt
   if (!token) {
