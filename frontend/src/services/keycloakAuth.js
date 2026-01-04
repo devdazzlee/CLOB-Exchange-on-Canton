@@ -209,7 +209,7 @@ export async function loginWithPassword(username, password) {
         client_id: config.clientId,
         username: username,
         password: password,
-        scope: 'openid profile email',
+        scope: 'openid profile email daml_ledger_api',
       }),
     });
 

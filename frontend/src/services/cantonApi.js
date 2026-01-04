@@ -11,6 +11,8 @@
  */
 
 import { getStoredToken, isTokenExpired, checkTokenStatus } from './tokenManager';
+import apiClient from './apiClient';
+import { getValidAccessToken } from './keycloakAuth';
 
 // Canton JSON API endpoint
 // Use Vite proxy in development, direct calls in production (like old working code)
@@ -57,49 +59,34 @@ function getPartyIdFromToken() {
 }
 
 /**
- * Get JWT token from localStorage or environment
- * Simple token-based authentication
+ * Get JWT token - uses Keycloak OAuth token with automatic refresh
+ * This is the enterprise-grade approach - single source of truth
  */
-function getAuthToken() {
-  // Check localStorage first (for user-provided tokens)
-  const storedToken = getStoredToken();
-  if (storedToken) {
-    checkTokenStatus(storedToken);
-    return storedToken;
-  }
-  
-  // Check environment variable (for development)
-  const envToken = import.meta.env.VITE_CANTON_JWT_TOKEN;
-  if (envToken) {
-    if (isTokenExpired(envToken)) {
-      console.warn('[Auth] Environment token is expired! Update VITE_CANTON_JWT_TOKEN in .env');
-      return null;
+async function getAuthToken() {
+  try {
+    // Use Keycloak token management with automatic refresh
+    const token = await getValidAccessToken();
+    return token;
+  } catch (error) {
+    console.warn('[Auth] Failed to get valid access token:', error.message);
+    // Fallback to stored token for backward compatibility
+    const storedToken = getStoredToken();
+    if (storedToken) {
+      return storedToken;
     }
-    checkTokenStatus(envToken);
-    return envToken;
+    return null;
   }
-  
-  console.warn('[Auth] No JWT token found! Requests will fail with 401.');
-  console.warn('[Auth] Set token: localStorage.setItem("canton_jwt_token", "your_token")');
-  return null;
 }
 
 /**
- * Get headers with authentication if token is available
+ * Get headers with authentication - uses enterprise API client
+ * @deprecated Use apiClient directly instead
  */
 function getHeaders() {
-  const headers = {
+  // This is kept for backward compatibility but should use apiClient
+  return {
     'Content-Type': 'application/json',
   };
-  
-  const token = getAuthToken();
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  } else {
-    console.warn('[Auth] No token available - request will likely fail');
-  }
-  
-  return headers;
 }
 
 /**
@@ -983,29 +970,20 @@ export async function getPackageId(forceRefresh = false, party = null) {
     
     // METHOD 1: Try to get package ID from /v2/packages endpoint
     // This doesn't require contracts to exist and doesn't need read permissions
+    // Uses enterprise API client with automatic token refresh and retry
     try {
       console.log('[API] Trying /v2/packages endpoint...');
-      const headers = getHeaders();
-      const packagesResponse = await fetch(`${CANTON_API_BASE}/${API_VERSION}/packages`, {
-        method: 'GET',
-        headers: headers
-      });
+      const packagesResult = await apiClient.get('/packages');
+      const packageIds = packagesResult.packageIds || [];
       
-      if (packagesResponse.ok) {
-        const packagesResult = await packagesResponse.json();
-        const packageIds = packagesResult.packageIds || [];
-        
-        if (packageIds.length > 0) {
-          // Use the most recent package ID (last in array, or we can try to match by DAR)
-          // For now, use the last one as it's likely the most recently deployed
-          const latestPackageId = packageIds[packageIds.length - 1];
-          cachedPackageId = latestPackageId;
-          console.log('[API] Package ID from /v2/packages endpoint:', cachedPackageId);
-          console.log('[API] Total packages found:', packageIds.length);
-          return cachedPackageId;
-        }
-      } else {
-        console.log('[API] /v2/packages endpoint returned:', packagesResponse.status);
+      if (packageIds.length > 0) {
+        // Use the most recent package ID (last in array, or we can try to match by DAR)
+        // For now, use the last one as it's likely the most recently deployed
+        const latestPackageId = packageIds[packageIds.length - 1];
+        cachedPackageId = latestPackageId;
+        console.log('[API] Package ID from /v2/packages endpoint:', cachedPackageId);
+        console.log('[API] Total packages found:', packageIds.length);
+        return cachedPackageId;
       }
     } catch (packagesError) {
       console.warn('[API] Failed to get package ID from /v2/packages:', packagesError);
@@ -1032,24 +1010,26 @@ export async function getPackageId(forceRefresh = false, party = null) {
       }
     };
 
-    const headers = getHeaders();
-    const response = await fetch(`${CANTON_API_BASE}/${API_VERSION}/state/active-contracts`, {
-      method: 'POST',
-      headers: headers,
-      body: JSON.stringify(requestBody)
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      let error;
-      try {
-        error = JSON.parse(errorText);
-      } catch {
-        error = { message: errorText };
-      }
+    // Use enterprise API client with automatic token refresh and retry
+    try {
+      const result = await apiClient.post('/state/active-contracts', requestBody);
+      const contracts = parseContractResponse(result);
       
+      if (contracts.length > 0 && contracts[0].templateId) {
+        // Extract package ID from fully qualified templateId
+        // Format: <package-id>:<module>:<template>
+        const templateId = contracts[0].templateId;
+        const parts = templateId.split(':');
+        if (parts.length >= 3) {
+          cachedPackageId = parts[0];
+          console.log('[API] Package ID detected from UserAccount:', cachedPackageId);
+          return cachedPackageId;
+        }
+      }
+    } catch (error) {
       // If 403 or 404, try OrderBook as fallback (UserAccount might not be visible to this party)
-      if (response.status === 403 || response.status === 404) {
+      const errorMessage = error.message || String(error);
+      if (errorMessage.includes('403') || errorMessage.includes('404')) {
         console.log('[API] UserAccount query failed, trying OrderBook as fallback...');
         const orderBookRequestBody = {
           readAs: [party], // REQUIRED: Explicitly declare which party is reading
@@ -1066,55 +1046,31 @@ export async function getPackageId(forceRefresh = false, party = null) {
           }
         };
 
-        const orderBookResponse = await fetch(`${CANTON_API_BASE}/${API_VERSION}/state/active-contracts`, {
-          method: 'POST',
-          headers: headers,
-          body: JSON.stringify(orderBookRequestBody)
-        });
-
-        if (!orderBookResponse.ok) {
-          const orderBookErrorText = await orderBookResponse.text();
-          throw new Error(`Failed to query package ID from both UserAccount and OrderBook. UserAccount error (${response.status}): ${errorText}. OrderBook error (${orderBookResponse.status}): ${orderBookErrorText}. Ensure contracts are deployed and you have read permissions.`);
-        }
-
-        const orderBookResult = await orderBookResponse.json();
-        const contracts = parseContractResponse(orderBookResult);
+        try {
+          const orderBookResult = await apiClient.post('/state/active-contracts', orderBookRequestBody);
+          const contracts = parseContractResponse(orderBookResult);
         
-        if (contracts.length > 0 && contracts[0].templateId) {
-          // Extract package ID from fully qualified templateId
-          // Format: <package-id>:<module>:<template>
-          const templateId = contracts[0].templateId;
-          const parts = templateId.split(':');
-          if (parts.length >= 3) {
-            cachedPackageId = parts[0];
-            console.log('[API] Package ID detected from OrderBook:', cachedPackageId);
-            return cachedPackageId;
+          if (contracts.length > 0 && contracts[0].templateId) {
+            // Extract package ID from fully qualified templateId
+            // Format: <package-id>:<module>:<template>
+            const templateId = contracts[0].templateId;
+            const parts = templateId.split(':');
+            if (parts.length >= 3) {
+              cachedPackageId = parts[0];
+              console.log('[API] Package ID detected from OrderBook:', cachedPackageId);
+              return cachedPackageId;
+            }
           }
-        }
         
-        throw new Error("Could not determine package ID from OrderBook. Ensure contracts are deployed and you have read permissions.");
+          throw new Error("Could not determine package ID from OrderBook. Ensure contracts are deployed and you have read permissions.");
+        } catch (orderBookError) {
+          throw new Error(`Failed to query package ID from both UserAccount and OrderBook: ${errorMessage}. OrderBook error: ${orderBookError.message}`);
+        }
       }
       
-      // For other errors, throw immediately
-      throw new Error(`Failed to query package ID: ${response.statusText}. ${errorText}`);
+      // For other errors, rethrow
+      throw error;
     }
-
-    const result = await response.json();
-    const contracts = parseContractResponse(result);
-    
-    if (contracts.length > 0 && contracts[0].templateId) {
-      // Extract package ID from fully qualified templateId
-      // Format: <package-id>:<module>:<template>
-      const templateId = contracts[0].templateId;
-      const parts = templateId.split(':');
-      if (parts.length >= 3) {
-        cachedPackageId = parts[0];
-        console.log('[API] Package ID detected:', cachedPackageId);
-        return cachedPackageId;
-      }
-    }
-    
-    throw new Error("Could not determine package ID from query results. Ensure contracts are deployed.");
   } catch (error) {
     console.error('[API] Error getting package ID:', error);
     throw error;

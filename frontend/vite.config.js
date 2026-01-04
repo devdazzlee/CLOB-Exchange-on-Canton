@@ -40,12 +40,13 @@ export default defineConfig({
               return;
             }
             
-            // Check if Authorization header is already present from client
+            // Always prefer client's OAuth token from Authorization header
             const existingAuth = proxyReq.getHeader('Authorization');
             if (existingAuth) {
-              console.log('[Proxy] Authorization header already present from client');
+              console.log('[Dev Proxy] Using client OAuth token from Authorization header');
             } else {
-              // Add JWT token from environment variable if not present
+              // DEV ONLY: Fallback to .env token for development convenience
+              // WARNING: This is for local development only - production proxy requires client token
               // Load .env file manually since Vite proxy runs in Node context
               const envPath = path.join(__dirname, '.env');
               if (fs.existsSync(envPath)) {
@@ -54,8 +55,12 @@ export default defineConfig({
                 if (match && match[1]) {
                   const jwtToken = match[1].trim();
                   proxyReq.setHeader('Authorization', `Bearer ${jwtToken}`);
-                  console.log('[Proxy] Added JWT token from .env file');
+                  console.warn('[Dev Proxy] WARNING: Using .env token fallback - this is DEV ONLY. Production requires client OAuth token.');
+                } else {
+                  console.warn('[Dev Proxy] No Authorization header and no .env token found - request may fail');
                 }
+              } else {
+                console.warn('[Dev Proxy] No Authorization header and no .env file found - request may fail');
               }
             }
           });
