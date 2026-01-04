@@ -32,10 +32,51 @@ export default function TokenManager() {
   };
 
   useEffect(() => {
+    // Initial check
     updateTokenInfo();
-    // Check token status every minute
-    const interval = setInterval(updateTokenInfo, 60000);
-    return () => clearInterval(interval);
+    
+    // Check frequently (every 5 seconds) for immediate updates after login
+    const interval = setInterval(updateTokenInfo, 5000);
+    
+    // Listen for storage changes (when token is stored after OAuth)
+    const handleStorageChange = (e) => {
+      if (e.key === 'canton_jwt_token' || e.key === 'canton_jwt_token_expires_at') {
+        console.log('[TokenManager] Storage change detected, updating token info');
+        updateTokenInfo();
+      }
+    };
+    window.addEventListener('storage', handleStorageChange);
+    
+    // Listen for custom auth events (for same-tab updates)
+    const handleAuthEvent = () => {
+      console.log('[TokenManager] Auth event received, updating token info');
+      updateTokenInfo();
+    };
+    window.addEventListener('auth-token-stored', handleAuthEvent);
+    
+    // Check when page becomes visible (user returns from OAuth redirect)
+    const handleVisibilityChange = () => {
+      if (!document.hidden) {
+        console.log('[TokenManager] Page visible, checking token');
+        updateTokenInfo();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    
+    // Check when window gains focus (user returns from OAuth redirect)
+    const handleFocus = () => {
+      console.log('[TokenManager] Window focused, checking token');
+      updateTokenInfo();
+    };
+    window.addEventListener('focus', handleFocus);
+    
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('storage', handleStorageChange);
+      window.removeEventListener('auth-token-stored', handleAuthEvent);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('focus', handleFocus);
+    };
   }, []);
 
   const updateTokenInfo = () => {

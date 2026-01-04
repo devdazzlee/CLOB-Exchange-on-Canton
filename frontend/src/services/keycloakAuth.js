@@ -78,6 +78,12 @@ function storeTokens(accessToken, refreshToken, expiresIn) {
   
   console.log('[Keycloak] Tokens stored successfully');
   console.log('[Keycloak] Expiration timestamp stored:', new Date(expiresAt).toISOString());
+  
+  // Dispatch custom event to notify components that token was stored
+  // This allows immediate UI updates without waiting for intervals
+  window.dispatchEvent(new CustomEvent('auth-token-stored', { 
+    detail: { token: accessToken, expiresAt } 
+  }));
 }
 
 /**
@@ -292,7 +298,7 @@ export async function initiateLogin() {
       client_id: config.clientId,
       redirect_uri: redirectUri,
       response_type: 'code',
-      scope: 'openid profile email', // Use only standard OAuth scopes
+      scope: 'openid profile email daml_ledger_api', // Include daml_ledger_api scope for Canton API access
       code_challenge: challenge,
       code_challenge_method: 'S256',
     });
@@ -369,6 +375,39 @@ export async function handleAuthCallback(code) {
     }
 
     const data = await response.json();
+    
+    // Validate that token has required scopes
+    if (data.access_token) {
+      try {
+        const tokenParts = data.access_token.split('.');
+        if (tokenParts.length === 3) {
+          const payload = JSON.parse(atob(tokenParts[1]));
+          const scopes = payload.scope || '';
+          
+          if (!scopes.includes('daml_ledger_api')) {
+            console.error('[Keycloak] ⚠️ WARNING: Token missing daml_ledger_api scope!');
+            console.error('[Keycloak] Token scopes received:', scopes);
+            console.error('[Keycloak] This will cause 401 errors when calling Canton API.');
+            console.error('[Keycloak] Action required: Configure Keycloak client "Clob" to allow daml_ledger_api scope.');
+            console.error('[Keycloak] See: MESSAGE_FOR_CLIENT_KEYCLOAK_CONFIG.md for configuration steps.');
+            
+            // Store token anyway - user can still try, but API calls will fail
+            // Show user-friendly error message
+            const errorMsg = 'Token missing required scope: daml_ledger_api. API calls will fail with 401. Please ask admin to configure Keycloak client.';
+            console.error('[Keycloak]', errorMsg);
+            
+            // Don't throw - let user proceed but they'll see 401 errors
+            // The API client will handle 401 errors gracefully
+          } else {
+            console.log('[Keycloak] ✅ Token has required daml_ledger_api scope');
+          }
+        }
+      } catch (parseError) {
+        console.warn('[Keycloak] Could not parse token to validate scopes:', parseError);
+        // Continue anyway - token might still work
+      }
+    }
+    
     storeTokens(data.access_token, data.refresh_token, data.expires_in);
     
     // Clear PKCE verifier
