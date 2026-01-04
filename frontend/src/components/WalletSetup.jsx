@@ -18,6 +18,7 @@ export default function WalletSetup({ onWalletReady }) {
   const [partyId, setPartyId] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [copiedPartyId, setCopiedPartyId] = useState(false);
 
   useEffect(() => {
     const existingWallet = loadWallet();
@@ -27,6 +28,16 @@ export default function WalletSetup({ onWalletReady }) {
       setPartyId(derivedPartyId);
     }
   }, []);
+
+  const handleCopyPartyId = async () => {
+    try {
+      await navigator.clipboard.writeText(partyId);
+      setCopiedPartyId(true);
+      setTimeout(() => setCopiedPartyId(false), 2000); // Reset after 2 seconds
+    } catch (err) {
+      console.error('Failed to copy Party ID:', err);
+    }
+  };
 
   const handleCreateWallet = async () => {
     setLoading(true);
@@ -123,7 +134,24 @@ export default function WalletSetup({ onWalletReady }) {
           <h2 className="text-3xl font-bold text-[#EAECEF] mb-2">Wallet Ready</h2>
           <p className="text-[#848E9C] mb-6">Your wallet is set up and ready to use.</p>
           <div className="bg-[#1E2329] border border-[#2B3139] rounded-lg p-5 mb-6">
-            <p className="text-sm text-[#848E9C] mb-3 font-medium">Your Party ID</p>
+            <div className="flex items-center justify-between mb-3">
+              <p className="text-sm text-[#848E9C] font-medium">Your Party ID</p>
+              <button
+                onClick={handleCopyPartyId}
+                className="p-2 hover:bg-[#2B3139] rounded-md transition-colors group"
+                title={copiedPartyId ? "Copied!" : "Copy Party ID"}
+              >
+                {copiedPartyId ? (
+                  <svg className="w-4 h-4 text-success transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                  </svg>
+                ) : (
+                  <svg className="w-4 h-4 text-[#848E9C] group-hover:text-[#F0B90B] transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                  </svg>
+                )}
+              </button>
+            </div>
             <code className="block text-primary font-mono text-sm break-all bg-[#0B0E11] p-4 rounded border border-[#2B3139]">
               {partyId}
             </code>

@@ -1,0 +1,25 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "framework": null,
+  "rewrites": [
+    {
+      "source": "/api/proxy/keycloak-token",
+      "destination": "/api/proxy"
+    },
+    {
+      "source": "/api/proxy/(.*)",
+      "destination": "/api/proxy"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ],
+  "functions": {
+    "api/proxy.js": {
+      "runtime": "@vercel/node@3.2.0"
+    }
+  }
+}
+

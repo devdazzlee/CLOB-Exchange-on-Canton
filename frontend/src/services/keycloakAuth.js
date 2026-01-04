@@ -5,7 +5,7 @@
 
 const KEYCLOAK_BASE_URL = 'https://keycloak.wolfedgelabs.com:8443';
 const REALM = 'canton-devnet';
-const CLIENT_ID = '4roh9X7y4TyT89feJu7AnM2sMZbR9xh7'; // From JWT token
+const CLIENT_ID = 'Clob'; // Updated to new client ID from client
 
 /**
  * Get Keycloak configuration
@@ -69,18 +69,22 @@ async function generatePKCE() {
 function storeTokens(accessToken, refreshToken, expiresIn) {
   const expiresAt = Date.now() + (expiresIn * 1000);
   
-  localStorage.setItem('canton_access_token', accessToken);
-  localStorage.setItem('canton_refresh_token', refreshToken);
-  localStorage.setItem('canton_token_expires_at', expiresAt.toString());
+  localStorage.setItem('canton_jwt_token', accessToken); // Use consistent key
+  localStorage.setItem('canton_jwt_token_expires_at', expiresAt); // Use consistent key
   
-  console.log('[Keycloak] Tokens stored. Expires in:', expiresIn, 'seconds');
+  if (refreshToken) {
+    localStorage.setItem('canton_jwt_refresh_token', refreshToken);
+  }
+  
+  console.log('[Keycloak] Tokens stored successfully');
+  console.log('[Keycloak] Expiration timestamp stored:', new Date(expiresAt).toISOString());
 }
 
 /**
  * Get stored access token
  */
 function getStoredAccessToken() {
-  return localStorage.getItem('canton_access_token');
+  return localStorage.getItem('canton_jwt_token'); // Use consistent key
 }
 
 /**
@@ -94,12 +98,20 @@ function getStoredRefreshToken() {
  * Check if token is expired or will expire soon
  */
 function isTokenExpired(bufferSeconds = 60) {
-  const expiresAt = localStorage.getItem('canton_token_expires_at');
-  if (!expiresAt) return true;
+  const expiresAt = localStorage.getItem('canton_jwt_token_expires_at'); // Use consistent key
+  console.log('[Keycloak] isTokenExpired - expiresAt from localStorage:', expiresAt);
+  if (!expiresAt) {
+    console.log('[Keycloak] isTokenExpired - No expiration found in localStorage');
+    return true;
+  }
   
   const now = Date.now();
   const bufferMs = bufferSeconds * 1000;
-  return parseInt(expiresAt) <= (now + bufferMs);
+  const isExpired = parseInt(expiresAt) <= (now + bufferMs);
+  console.log('[Keycloak] isTokenExpired - expiresAt:', new Date(parseInt(expiresAt)).toISOString());
+  console.log('[Keycloak] isTokenExpired - now:', new Date(now).toISOString());
+  console.log('[Keycloak] isTokenExpired - isExpired:', isExpired);
+  return isExpired;
 }
 
 /**
@@ -151,10 +163,17 @@ async function refreshAccessToken() {
  * Get valid access token (refresh if needed)
  */
 export async function getValidAccessToken() {
+  console.log('[Keycloak] getValidAccessToken called');
+  
   // Check if we have a token and if it's still valid
-  if (!isTokenExpired()) {
+  const expired = isTokenExpired();
+  console.log('[Keycloak] Token expired check:', expired);
+  
+  if (!expired) {
     const token = getStoredAccessToken();
+    console.log('[Keycloak] Stored token:', token ? 'Found' : 'Not found');
     if (token) {
+      console.log('[Keycloak] Returning valid token');
       return token;
     }
   }
@@ -171,45 +190,121 @@ export async function getValidAccessToken() {
 }
 
 /**
- * Initiate OAuth login flow
+ * Login using password grant flow (no redirect needed)
+ * Professional flow - user enters credentials in app
+ */
+export async function loginWithPassword(username, password) {
+  const config = getKeycloakConfig();
+  const tokenUrl = getTokenUrl();
+
+  try {
+    // Try password grant - this might not work if client doesn't support it
+    const response = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        grant_type: 'password',
+        client_id: config.clientId,
+        username: username,
+        password: password,
+        scope: 'openid profile email',
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      let errorMessage = 'Login failed';
+      try {
+        const errorData = JSON.parse(errorText);
+        errorMessage = errorData.error_description || errorData.error || errorMessage;
+      } catch {
+        errorMessage = errorText || errorMessage;
+      }
+      
+      // If password grant not supported, throw specific error
+      if (response.status === 400) {
+        throw new Error(`Password grant not supported for this client. ${errorMessage}`);
+      }
+      throw new Error(errorMessage);
+    }
+
+    const data = await response.json();
+    storeTokens(data.access_token, data.refresh_token, data.expires_in);
+    
+    console.log('[Keycloak] Login successful');
+    return data.access_token;
+  } catch (error) {
+    console.error('[Keycloak] Login error:', error);
+    throw error;
+  }
+}
+
+/**
+ * Store token manually (fallback if password grant doesn't work)
+ */
+export function storeManualToken(token) {
+  // Remove "Bearer " prefix if present
+  const cleanToken = token.replace(/^Bearer\s+/i, '');
+  
+  // Parse token to get expiration
+  try {
+    const parts = cleanToken.split('.');
+    if (parts.length === 3) {
+      const payload = JSON.parse(atob(parts[1]));
+      const expiresIn = payload.exp ? (payload.exp * 1000 - Date.now()) / 1000 : 3600;
+      storeTokens(cleanToken, null, expiresIn);
+      return true;
+    }
+  } catch (e) {
+    console.error('[Keycloak] Error parsing token:', e);
+  }
+  
+  // Fallback: store with default expiration
+  storeTokens(cleanToken, null, 3600);
+  return true;
+}
+
+/**
+ * Initiate OAuth login flow (requires redirect URI configuration)
+ * Falls back to password grant if redirect URI not configured
  */
 export async function initiateLogin() {
-  const config = getKeycloakConfig();
-  const { verifier, challenge } = await generatePKCE();
-  
-  // Store verifier for later verification
-  sessionStorage.setItem('pkce_verifier', verifier);
-  
-  // Redirect URI - must match Keycloak client configuration
-  // Common patterns that might be configured:
-  // 1. Exact: http://localhost:3000/auth/callback
-  // 2. Wildcard path: http://localhost:3000/*
-  // 3. Wildcard port: http://localhost:*/auth/callback
-  // 4. All localhost: http://localhost:*/*
-  
-  // Keycloak requires EXACT match - no wildcards!
-  // Must add this exact URI to Keycloak client configuration
-  const redirectUri = window.location.origin + '/auth/callback';
-  
-  console.log('[Keycloak] Using redirect URI:', redirectUri);
-  console.log('[Keycloak] ⚠️  MUST ADD TO KEYCLOAK:');
-  console.log('[Keycloak]    1. https://keycloak.wolfedgelabs.com:8443');
-  console.log('[Keycloak]    2. Clients → 4roh9X7y4TyT89feJu7AnM2sMZbR9xh7');
-  console.log('[Keycloak]    3. Settings → Valid redirect URIs');
-  console.log('[Keycloak]    4. Add:', redirectUri);
-  console.log('[Keycloak]    5. Save');
-  
-  const params = new URLSearchParams({
-    client_id: config.clientId,
-    redirect_uri: redirectUri,
-    response_type: 'code',
-    scope: 'openid profile email daml_ledger_api wallet_audience',
-    code_challenge: challenge,
-    code_challenge_method: 'S256',
-  });
+  // Try OAuth redirect flow first
+  try {
+    const config = getKeycloakConfig();
+    const { verifier, challenge } = await generatePKCE();
+    
+    sessionStorage.setItem('pkce_verifier', verifier);
+    
+    // For local development, we need to handle the redirect URI issue
+    // The client needs to add http://localhost:3000/auth/callback to Keycloak
+    // Until then, we'll show a helpful error message
+    if (import.meta.env.DEV) {
+      throw new Error('DEV_REDIRECT_URI_NOT_CONFIGURED');
+    }
+    
+    // Production redirect URI
+    const redirectUri = 'https://clob-exchange-on-canton.vercel.app/auth/callback';
+    
+    const params = new URLSearchParams({
+      client_id: config.clientId,
+      redirect_uri: redirectUri,
+      response_type: 'code',
+      scope: 'openid profile email', // Use only standard OAuth scopes
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+    });
 
-  const authUrl = `${getAuthUrl()}?${params.toString()}`;
-  window.location.href = authUrl;
+    const authUrl = `${getAuthUrl()}?${params.toString()}`;
+    console.log('[Keycloak] Redirecting to:', authUrl);
+    console.log('[Keycloak] Redirect URI:', redirectUri);
+    window.location.href = authUrl;
+  } catch (error) {
+    console.error('[Keycloak] OAuth flow failed:', error);
+    throw error;
+  }
 }
 
 /**
@@ -223,25 +318,53 @@ export async function handleAuthCallback(code) {
     throw new Error('PKCE verifier not found');
   }
 
-  const tokenUrl = getTokenUrl();
-
   try {
-    const response = await fetch(tokenUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: new URLSearchParams({
-        grant_type: 'authorization_code',
-        code: code,
-        redirect_uri: window.location.origin + '/auth/callback',
-        client_id: config.clientId,
-        code_verifier: verifier,
-      }),
-    });
+    // Use different redirect URIs for development vs production
+    const redirectUri = import.meta.env.DEV 
+      ? 'http://localhost:3000/auth/callback'  // Local development
+      : 'https://clob-exchange-on-canton.vercel.app/auth/callback'; // Production
+
+    // In production, use proxy to avoid CORS issues
+    const tokenUrl = import.meta.env.DEV
+      ? getTokenUrl()  // Direct call in development
+      : '/api/proxy/keycloak-token'; // Use proxy in production
+
+    const tokenData = {
+      grant_type: 'authorization_code',
+      code: code,
+      redirect_uri: redirectUri,
+      client_id: config.clientId,
+      code_verifier: verifier,
+    };
+
+    let response;
+    
+    if (import.meta.env.DEV) {
+      // Direct call in development
+      response = await fetch(tokenUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams(tokenData),
+      });
+    } else {
+      // Use proxy in production to avoid CORS
+      response = await fetch(tokenUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          tokenUrl: getTokenUrl(),
+          tokenData: tokenData
+        }),
+      });
+    }
 
     if (!response.ok) {
       const error = await response.text();
+      console.error('[Keycloak] Token exchange failed:', error);
       throw new Error(`Token exchange failed: ${error}`);
     }
 
@@ -273,7 +396,10 @@ export function clearTokens() {
  * Check if user is authenticated
  */
 export function isAuthenticated() {
-  return !!getStoredAccessToken() && !isTokenExpired();
+  const token = getStoredAccessToken();
+  const expired = isTokenExpired();
+  console.log('[Keycloak] isAuthenticated check - Token:', !!token, 'Expired:', expired);
+  return !!token && !expired;
 }
 
 /**

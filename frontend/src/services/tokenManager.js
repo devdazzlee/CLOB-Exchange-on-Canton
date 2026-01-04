@@ -31,11 +31,16 @@ export function getTokenExpiration(token) {
  */
 export function isTokenExpired(token, bufferSeconds = 60) {
   const expiration = getTokenExpiration(token);
+  console.log('[TokenManager] Token expiration:', expiration ? new Date(expiration).toISOString() : 'Invalid');
   if (!expiration) return true;
   
   const now = Date.now();
   const bufferMs = bufferSeconds * 1000;
-  return expiration <= (now + bufferMs);
+  const isExpired = expiration <= (now + bufferMs);
+  console.log('[TokenManager] Current time:', new Date(now).toISOString());
+  console.log('[TokenManager] Buffer time:', bufferSeconds, 'seconds');
+  console.log('[TokenManager] Is expired:', isExpired);
+  return isExpired;
 }
 
 /**
@@ -80,14 +85,18 @@ export function storeToken(token) {
  */
 export function getStoredToken() {
   const token = localStorage.getItem('canton_jwt_token');
+  console.log('[TokenManager] Getting stored token:', token ? 'Found' : 'Not found');
   if (!token) return null;
   
   // Check if expired
-  if (isTokenExpired(token)) {
+  const expired = isTokenExpired(token);
+  console.log('[TokenManager] Token expired check:', expired);
+  if (expired) {
     console.warn('[TokenManager] Stored token is expired');
     return null;
   }
   
+  console.log('[TokenManager] Returning valid token');
   return token;
 }
 
