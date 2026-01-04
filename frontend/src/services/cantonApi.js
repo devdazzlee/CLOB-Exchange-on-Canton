@@ -79,14 +79,30 @@ async function getAuthToken() {
 }
 
 /**
- * Get headers with authentication - uses enterprise API client
- * @deprecated Use apiClient directly instead
+ * Get headers with authentication - sync version for backward compatibility
+ * @deprecated Use apiClient directly instead - this is for backward compatibility
+ * Gets token from localStorage directly (sync) to avoid breaking existing code
  */
 function getHeaders() {
-  // This is kept for backward compatibility but should use apiClient
-  return {
+  const headers = {
     'Content-Type': 'application/json',
   };
+  
+  // Get token from localStorage directly (sync) - matches what getStoredToken does
+  try {
+    const token = localStorage.getItem('canton_jwt_token');
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+      console.log('[Auth] Token found in localStorage, adding to headers');
+    } else {
+      console.warn('[Auth] No token in localStorage - request may fail with 401');
+      console.warn('[Auth] Available localStorage keys:', Object.keys(localStorage).filter(k => k.includes('token') || k.includes('auth')));
+    }
+  } catch (error) {
+    console.warn('[Auth] Error getting token from localStorage:', error);
+  }
+  
+  return headers;
 }
 
 /**
