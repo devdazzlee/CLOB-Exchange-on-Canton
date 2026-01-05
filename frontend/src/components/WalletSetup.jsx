@@ -7,6 +7,8 @@ import {
   loadWallet,
   publicKeyToPartyId
 } from '../wallet/keyManager';
+import { createPartyForUser } from '../services/partyService';
+import { storeTokens } from '../services/keycloakAuth';
 import PasswordInput from './PasswordInput';
 
 export default function WalletSetup({ onWalletReady }) {
@@ -69,16 +71,34 @@ export default function WalletSetup({ onWalletReady }) {
     setError('');
 
     try {
+      // 1. Create wallet locally
       const { publicKey, privateKey } = await mnemonicToKeyPair(mnemonic);
       const encryptedPrivateKey = await encryptPrivateKey(privateKey, password);
       storeWallet(encryptedPrivateKey, publicKey);
-      const derivedPartyId = publicKeyToPartyId(publicKey);
+      
+      // 2. Create party ID on backend (on behalf of user)
+      console.log('[WalletSetup] Creating party ID on backend...');
+      const partyResult = await createPartyForUser(publicKey);
+      
+      // 3. Store the party ID
+      const derivedPartyId = partyResult.partyId;
       setPartyId(derivedPartyId);
+      
+      // 4. If backend provided a token, store it
+      if (partyResult.token) {
+        console.log('[WalletSetup] Storing authentication token from backend...');
+        // Store token with 30 minute expiry (adjust as needed)
+        storeTokens(partyResult.token, null, 1800);
+      } else {
+        console.warn('[WalletSetup] No token provided by backend. User may need to authenticate separately.');
+      }
+      
       setStep('ready');
       if (onWalletReady) {
         onWalletReady(derivedPartyId);
       }
     } catch (err) {
+      console.error('[WalletSetup] Error creating wallet/party:', err);
       setError('Failed to create wallet: ' + err.message);
     } finally {
       setLoading(false);
@@ -106,16 +126,34 @@ export default function WalletSetup({ onWalletReady }) {
     setError('');
 
     try {
+      // 1. Import wallet locally
       const { publicKey, privateKey } = await mnemonicToKeyPair(importMnemonic.trim());
       const encryptedPrivateKey = await encryptPrivateKey(privateKey, password);
       storeWallet(encryptedPrivateKey, publicKey);
-      const derivedPartyId = publicKeyToPartyId(publicKey);
+      
+      // 2. Create party ID on backend (on behalf of user)
+      console.log('[WalletSetup] Creating party ID on backend for imported wallet...');
+      const partyResult = await createPartyForUser(publicKey);
+      
+      // 3. Store the party ID
+      const derivedPartyId = partyResult.partyId;
       setPartyId(derivedPartyId);
+      
+      // 4. If backend provided a token, store it
+      if (partyResult.token) {
+        console.log('[WalletSetup] Storing authentication token from backend...');
+        // Store token with 30 minute expiry (adjust as needed)
+        storeTokens(partyResult.token, null, 1800);
+      } else {
+        console.warn('[WalletSetup] No token provided by backend. User may need to authenticate separately.');
+      }
+      
       setStep('ready');
       if (onWalletReady) {
         onWalletReady(derivedPartyId);
       }
     } catch (err) {
+      console.error('[WalletSetup] Error importing wallet/party:', err);
       setError('Failed to import wallet: ' + err.message);
     } finally {
       setLoading(false);

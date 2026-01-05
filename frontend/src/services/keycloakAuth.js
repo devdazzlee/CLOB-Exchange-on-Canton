@@ -66,7 +66,7 @@ async function generatePKCE() {
 /**
  * Store tokens securely
  */
-function storeTokens(accessToken, refreshToken, expiresIn) {
+export function storeTokens(accessToken, refreshToken, expiresIn) {
   const expiresAt = Date.now() + (expiresIn * 1000);
   
   localStorage.setItem('canton_jwt_token', accessToken); // Use consistent key
