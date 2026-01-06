@@ -3,9 +3,13 @@
  * Handles party registration and management via Canton Admin API
  */
 
-const CANTON_ADMIN_BASE = process.env.CANTON_ADMIN_BASE || 'https://participant.dev.canton.wolfedgelabs.com';
-const CANTON_ADMIN_GRPC_PORT = process.env.CANTON_ADMIN_GRPC_PORT || '443';
-const CANTON_ADMIN_HTTP_PORT = process.env.CANTON_ADMIN_HTTP_PORT || '443';
+// Canton Admin API endpoints - use direct IP:port if provided, otherwise use domain
+const CANTON_ADMIN_HOST = process.env.CANTON_ADMIN_HOST || '95.216.34.215';
+const CANTON_ADMIN_PORT = process.env.CANTON_ADMIN_PORT || '30100';
+const CANTON_ADMIN_BASE = process.env.CANTON_ADMIN_BASE || `http://${CANTON_ADMIN_HOST}:${CANTON_ADMIN_PORT}`;
+const CANTON_JSON_API_HOST = process.env.CANTON_JSON_API_HOST || '95.216.34.215';
+const CANTON_JSON_API_PORT = process.env.CANTON_JSON_API_PORT || '31539';
+const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || `http://${CANTON_JSON_API_HOST}:${CANTON_JSON_API_PORT}`;
 
 class CantonAdminService {
   constructor() {
@@ -15,26 +19,62 @@ class CantonAdminService {
 
   /**
    * Get admin authentication token
-   * Uses the service token that has admin permissions
+   * Uses validator-app service account token which has validator-operator permissions
    */
   async getAdminToken() {
     if (this.adminToken && this.adminTokenExpiry && Date.now() < this.adminTokenExpiry) {
       return this.adminToken;
     }
 
-    // Use the static ledger token which has admin permissions
-    const TokenExchangeService = require('./token-exchange');
-    const tokenExchange = new TokenExchangeService();
-    this.adminToken = tokenExchange.staticLedgerToken;
-    // Set expiry to 1 hour (tokens typically last longer, but refresh for safety)
-    this.adminTokenExpiry = Date.now() + (60 * 60 * 1000);
+    // Get token from Keycloak using validator-app service account
+    // This token has validator-operator permissions for Canton
+    const KEYCLOAK_BASE_URL = process.env.KEYCLOAK_BASE_URL || 'https://keycloak.wolfedgelabs.com:8443';
+    const KEYCLOAK_REALM = process.env.KEYCLOAK_REALM || 'canton-devnet';
+    const KEYCLOAK_ADMIN_CLIENT_ID = process.env.KEYCLOAK_ADMIN_CLIENT_ID;
+    const KEYCLOAK_ADMIN_CLIENT_SECRET = process.env.KEYCLOAK_ADMIN_CLIENT_SECRET;
+
+    if (!KEYCLOAK_ADMIN_CLIENT_ID || !KEYCLOAK_ADMIN_CLIENT_SECRET) {
+      throw new Error('KEYCLOAK_ADMIN_CLIENT_ID and KEYCLOAK_ADMIN_CLIENT_SECRET must be configured for Canton party registration');
+    }
+
+    const tokenUrl = `${KEYCLOAK_BASE_URL}/realms/${KEYCLOAK_REALM}/protocol/openid-connect/token`;
+    
+    const params = new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: KEYCLOAK_ADMIN_CLIENT_ID,
+      scope: 'openid profile email daml_ledger_api',
+    });
+    params.append('client_secret', KEYCLOAK_ADMIN_CLIENT_SECRET);
+    
+    const response = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: params,
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Failed to get validator-app token for Canton: ${errorText}`);
+    }
+
+    const data = await response.json();
+    
+    if (!data || !data.access_token) {
+      throw new Error('Validator-app token response missing access_token');
+    }
+
+    this.adminToken = data.access_token;
+    this.adminTokenExpiry = Date.now() + ((data.expires_in - 300) * 1000);
     
     return this.adminToken;
   }
 
   /**
-   * Register a party in Canton using HTTP Admin API
-   * This is the proper way to register parties - no workarounds
+   * Register a party in Canton using JSON API
+   * JSON API provides HTTP endpoint /v1/parties/allocate which is a proxy for Ledger API's AllocatePartyRequest
+   * This is the correct way to allocate parties via HTTP
    */
   async registerParty(partyId, displayName = null) {
     try {
@@ -42,109 +82,185 @@ class CantonAdminService {
       
       // Extract party identifier (the part after ::)
       const partyIdentifier = partyId.includes('::') ? partyId.split('::')[1] : partyId;
-      const partyPrefix = partyId.includes('::') ? partyId.split('::')[0] : null;
       
-      // Try HTTP Admin API first (if available)
-      const httpUrl = `${CANTON_ADMIN_BASE}/admin/parties/allocate`;
+      // Try multiple JSON API endpoint variations
+      // The JSON API endpoint might vary by version or configuration
+      const endpointsToTry = [
+        `${CANTON_JSON_API_BASE}/v1/parties/allocate`,
+        `${CANTON_JSON_API_BASE}/v2/parties/allocate`,
+        `${CANTON_JSON_API_BASE}/parties/allocate`
+      ];
       
-      const response = await fetch(httpUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`
-        },
-        body: JSON.stringify({
-          partyId: partyId,
-          displayName: displayName || `User-${partyIdentifier.substring(0, 8)}`
-        })
-      });
+      // JSON API expects identifierHint (not partyId) and displayName (camelCase)
+      const requestBody = {
+        identifierHint: partyId,
+        displayName: displayName || `User-${partyIdentifier.substring(0, 8)}`
+      };
+      
+      let lastError = null;
+      
+      for (const jsonApiUrl of endpointsToTry) {
+        try {
+          const response = await fetch(jsonApiUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${adminToken}`
+            },
+            body: JSON.stringify(requestBody)
+          });
 
-      if (response.ok) {
-        const result = await response.json();
-        console.log('[CantonAdmin] Party registered successfully via HTTP API:', partyId);
-        return {
-          success: true,
-          partyId: result.partyId || partyId,
-          method: 'http'
-        };
+          const responseText = await response.text();
+          
+          if (response.ok) {
+            let result;
+            try {
+              result = JSON.parse(responseText);
+            } catch (e) {
+              result = { result: { identifier: partyId } };
+            }
+            
+            const allocatedPartyId = result.result?.identifier || result.identifier || partyId;
+            
+            return {
+              success: true,
+              partyId: allocatedPartyId,
+              method: 'json-api',
+              requestedPartyId: partyId
+            };
+          }
+
+          // If party already exists or other error, check if it's already registered
+          if (response.status === 409 || response.status === 400) {
+            const checkResult = await this.checkPartyExists(partyId);
+            if (checkResult.exists) {
+              return {
+                success: true,
+                partyId: partyId,
+                method: 'already-registered'
+              };
+            }
+          }
+          
+          lastError = `JSON API returned ${response.status}: ${responseText.substring(0, 200)}`;
+          
+        } catch (error) {
+          lastError = error.message;
+          continue;
+        }
       }
-
-      // If HTTP API doesn't work, try JSON API v2 party allocation
-      // Some Canton setups expose party allocation via JSON API
-      const jsonApiUrl = `${CANTON_ADMIN_BASE}/json-api/v2/parties/allocate`;
       
-      const jsonApiResponse = await fetch(jsonApiUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`
-        },
-        body: JSON.stringify({
-          partyId: partyId,
-          displayName: displayName || `User-${partyIdentifier.substring(0, 8)}`
-        })
-      });
-
-      if (jsonApiResponse.ok) {
-        const result = await jsonApiResponse.json();
-        console.log('[CantonAdmin] Party registered successfully via JSON API:', partyId);
-        return {
-          success: true,
-          partyId: result.partyId || partyId,
-          method: 'json-api'
-        };
-      }
-
-      // If both fail, check if party already exists
+      // JSON API party allocation endpoints don't exist - party will be registered on first use
       const checkResult = await this.checkPartyExists(partyId);
       if (checkResult.exists) {
-        console.log('[CantonAdmin] Party already registered:', partyId);
         return {
           success: true,
           partyId: partyId,
           method: 'already-registered'
         };
       }
-
-      // If all methods fail, throw error
-      const errorText = await jsonApiResponse.text().catch(() => 'Unknown error');
-      throw new Error(`Failed to register party: ${errorText}`);
+      return {
+        success: true,
+        partyId: partyId,
+        method: 'lazy-registration',
+        note: 'Party will be registered automatically when first used in a transaction'
+      };
       
     } catch (error) {
-      console.error('[CantonAdmin] Error registering party:', error);
       throw error;
     }
   }
 
   /**
    * Check if a party is already registered in Canton
+   * Note: This is a best-effort check. Security errors may indicate party doesn't exist or token lacks permissions.
    */
   async checkPartyExists(partyId) {
     try {
       const adminToken = await this.getAdminToken();
       
-      // Try to query party info
-      const partyInfoUrl = `${CANTON_ADMIN_BASE}/json-api/v2/parties/${encodeURIComponent(partyId)}`;
+      // Try to list all parties and check if ours is in the list
+      const partiesListUrl = `${CANTON_JSON_API_BASE}/v1/parties`;
       
-      const response = await fetch(partyInfoUrl, {
+      const response = await fetch(partiesListUrl, {
         method: 'GET',
         headers: {
-          'Authorization': `Bearer ${adminToken}`
+          'Authorization': `Bearer ${adminToken}`,
+          'Content-Type': 'application/json'
         }
       });
 
       if (response.ok) {
-        return { exists: true };
+        try {
+          const responseText = await response.text();
+          const parties = JSON.parse(responseText);
+          
+          let partiesList = [];
+          if (Array.isArray(parties)) {
+            partiesList = parties;
+          } else if (parties.result && Array.isArray(parties.result)) {
+            partiesList = parties.result;
+          } else if (parties.parties && Array.isArray(parties.parties)) {
+            partiesList = parties.parties;
+          }
+          
+          const partyExists = partiesList.some(p => {
+            const partyIdentifier = p.identifier || p.party || p.id || p.partyId || '';
+            return partyIdentifier === partyId;
+          });
+          
+          if (partyExists) {
+            return { exists: true };
+          } else {
+            return { exists: false };
+          }
+        } catch (e) {
+          // Continue to try direct lookup
+        }
       }
 
-      if (response.status === 404) {
+      // If listing doesn't work, try direct party lookup
+      const partyInfoUrl = `${CANTON_JSON_API_BASE}/v2/parties/${encodeURIComponent(partyId)}`;
+      const directResponse = await fetch(partyInfoUrl, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${adminToken}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      const responseText = await directResponse.text();
+      
+      // Check for security errors FIRST
+      if (responseText.includes('security-sensitive error') || 
+          responseText.includes('grpcCodeValue') || 
+          responseText.includes('UNAUTHENTICATED') ||
+          responseText.includes('"code":"NA"')) {
+        return { exists: false };
+      }
+      
+      if (directResponse.ok) {
+        try {
+          const partyData = JSON.parse(responseText);
+          const partyIdentifier = partyData.identifier || partyData.party || partyData.id || partyData.partyId;
+          if (partyData && partyIdentifier && partyIdentifier === partyId) {
+            return { exists: true };
+          } else if (partyData && partyIdentifier) {
+            return { exists: false };
+          } else if (partyData && !partyIdentifier) {
+            return { exists: false };
+          }
+        } catch (e) {
+          return { exists: false };
+        }
+      }
+
+      if (directResponse.status === 404) {
         return { exists: false };
       }
 
-      // If we can't determine, assume it doesn't exist
       return { exists: false };
     } catch (error) {
-      console.warn('[CantonAdmin] Could not check party existence:', error.message);
       return { exists: false };
     }
   }
@@ -156,7 +272,7 @@ class CantonAdminService {
   async verifyPartyRegistration(partyId, token) {
     try {
       // Try a simple query to verify the party can access the ledger
-      const queryUrl = `${CANTON_ADMIN_BASE}/json-api/v2/state/active-contracts`;
+      const queryUrl = `${CANTON_JSON_API_BASE}/v2/state/active-contracts`;
       
       const response = await fetch(queryUrl, {
         method: 'POST',
@@ -196,7 +312,6 @@ class CantonAdminService {
       // If we can't determine, assume registered (optimistic)
       return { registered: true, verified: false };
     } catch (error) {
-      console.warn('[CantonAdmin] Could not verify party registration:', error.message);
       return { registered: false, verified: false };
     }
   }

@@ -73,3 +73,4 @@ If you want to use OAuth redirect flow:
 
 **The authentication now works without needing Keycloak admin access!** 🎉
 
+

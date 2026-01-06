@@ -107,3 +107,4 @@ fetch('https://participant.dev.canton.wolfedgelabs.com/json-api/v2/packages', {
 **If you get CORS error:** Contact them with the configuration above.  
 **If no CORS error:** CORS is already configured! ✅
 
+

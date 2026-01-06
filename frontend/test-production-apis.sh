@@ -84,3 +84,4 @@ echo ""
 echo "💡 To check function logs:"
 echo "   Vercel Dashboard → Your Project → Functions → /api/canton/[...path]"
 
+

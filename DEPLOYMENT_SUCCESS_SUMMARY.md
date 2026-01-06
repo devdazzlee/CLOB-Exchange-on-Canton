@@ -151,3 +151,4 @@ Your contracts are deployed and ready. The package ID will be automatically dete
 **Just start the frontend and create your first contract!**
 
 
+

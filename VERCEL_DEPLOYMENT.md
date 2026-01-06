@@ -125,3 +125,4 @@ frontend/
 - Works for all API endpoints automatically
 - Handles authentication headers properly
 
+

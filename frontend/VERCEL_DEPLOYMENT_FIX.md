@@ -132,3 +132,4 @@ If issues persist, check the Vercel deployment logs:
 - The function automatically handles CORS for all origins
 - Request/response bodies are automatically parsed by Vercel
 
+

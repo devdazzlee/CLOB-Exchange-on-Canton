@@ -255,3 +255,4 @@ This is **optional** - the application works fine with manual token input. OAuth
 
 Users can start trading immediately by entering their JWT token. The CORS and Keycloak configurations are optimizations that can be done later.
 
+

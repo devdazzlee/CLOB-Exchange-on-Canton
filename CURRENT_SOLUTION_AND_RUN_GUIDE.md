@@ -190,3 +190,4 @@ This works perfectly and you can develop/test all features without any issues.
 - **Vercel issues:** Check Vercel deployment logs
 - **CORS issues:** See `HOW_TO_CONFIGURE_CORS_IN_CANTON.md`
 
+

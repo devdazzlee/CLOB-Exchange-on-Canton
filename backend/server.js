@@ -1,4 +1,5 @@
 // Production Backend Server with Token Exchange and Party Creation
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const TokenExchangeService = require('./token-exchange');
@@ -54,50 +55,21 @@ app.post('/api/create-party', async (req, res) => {
       return res.status(400).json({ error: 'Invalid public key format. Expected hex string.' });
     }
 
-    console.log('[API] Creating party for public key:', publicKeyHex.substring(0, 20) + '...');
+    console.log('[API] POST /api/create-party');
     
     // Create party for user
     let result;
     try {
       result = await partyService.createPartyForUser(publicKeyHex);
     } catch (serviceError) {
-      console.error('[API] PartyService error:', {
-        message: serviceError.message,
-        stack: serviceError.stack,
-        name: serviceError.name
-      });
-      throw serviceError; // Re-throw to be handled by outer catch
+      console.error('[API] Error:', serviceError.message);
+      throw serviceError;
     }
     
     // Validate result before returning
-    if (!result) {
-      console.error('[API] CRITICAL: Party creation returned null/undefined result');
-      throw new Error('Party creation returned null result');
+    if (!result || !result.token || typeof result.token !== 'string' || result.token.trim() === '') {
+      throw new Error('Invalid result from party creation');
     }
-    
-    if (result.token === null || result.token === undefined) {
-      console.error('[API] CRITICAL: Party creation succeeded but token is null/undefined');
-      console.error('[API] Result object keys:', Object.keys(result));
-      console.error('[API] Result object:', JSON.stringify(result, null, 2));
-      throw new Error('Party creation completed but token is missing. This indicates a critical error in token generation.');
-    }
-    
-    if (typeof result.token !== 'string') {
-      console.error('[API] CRITICAL: Token is not a string, type:', typeof result.token);
-      console.error('[API] Token value:', result.token);
-      throw new Error(`Token is not a string (got ${typeof result.token}). This should never happen.`);
-    }
-    
-    if (result.token.trim() === '') {
-      console.error('[API] CRITICAL: Token is empty string');
-      throw new Error('Token is an empty string. This should never happen.');
-    }
-    
-    // Token is already generated in createPartyForUser - no fallbacks needed
-    console.log('[API] Party creation completed successfully');
-    console.log('[API] Party created successfully:', result.partyId);
-    console.log('[API] Token generated, length:', result.token.length);
-    console.log('[API] Token preview:', result.token.substring(0, 50) + '...');
     
     // Final check before sending response
     if (!result.token) {
@@ -161,10 +133,30 @@ app.get('/health', (req, res) => {
   res.json({ status: 'healthy', timestamp: new Date().toISOString() });
 });
 
-// Test Service Account configuration
+// Test Service Account configuration - detailed inspection
 app.get('/api/test-service-account', async (req, res) => {
   try {
     const adminToken = await partyService.getKeycloakAdminToken();
+    
+    // Decode token to inspect its contents
+    let tokenInfo = {};
+    try {
+      const parts = adminToken.split('.');
+      if (parts.length === 3) {
+        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+        tokenInfo = {
+          sub: payload.sub,
+          client_id: payload.client_id || payload.azp,
+          scope: payload.scope,
+          realm_access: payload.realm_access,
+          resource_access: payload.resource_access,
+          realm_roles: payload.realm_access?.roles || [],
+          realm_management_roles: payload.resource_access?.['realm-management']?.roles || [],
+        };
+      }
+    } catch (e) {
+      tokenInfo.error = 'Could not decode token: ' + e.message;
+    }
     
     // Try to list users (minimal permission check)
     const testUrl = `${process.env.KEYCLOAK_BASE_URL || 'https://keycloak.wolfedgelabs.com:8443'}/admin/realms/${process.env.KEYCLOAK_REALM || 'canton-devnet'}/users?max=1`;
@@ -176,41 +168,42 @@ app.get('/api/test-service-account', async (req, res) => {
       },
     });
     
+    const responseText = await testResponse.text();
+    let responseData = null;
+    try {
+      responseData = JSON.parse(responseText);
+    } catch (e) {
+      responseData = { raw: responseText };
+    }
+    
     if (testResponse.ok) {
       res.json({ 
         status: 'success', 
         message: 'Service Account is properly configured and has permissions',
-        canCreateUsers: true 
-      });
-    } else if (testResponse.status === 403) {
-      res.status(403).json({ 
-        status: 'error',
-        message: 'Service Account token obtained but lacks manage-users permission',
-        canCreateUsers: false,
-        fix: 'Assign "manage-users" role from "realm-management" client to the service account'
+        canCreateUsers: true,
+        tokenInfo: tokenInfo,
+        testResponse: responseData
       });
     } else {
       res.status(testResponse.status).json({ 
         status: 'error',
-        message: `Unexpected error: ${testResponse.status}`,
-        canCreateUsers: false
+        message: `Admin API returned ${testResponse.status}`,
+        canCreateUsers: false,
+        tokenInfo: tokenInfo,
+        errorResponse: responseData,
+        hasManageUsersRole: tokenInfo.realm_management_roles?.includes('manage-users') || false,
+        fix: testResponse.status === 403 
+          ? 'Assign "manage-users" role from "realm-management" client to the service account'
+          : `Unexpected error: ${testResponse.status}`
       });
     }
   } catch (error) {
-    if (error.message.includes('Service Accounts')) {
-      res.status(503).json({ 
-        status: 'error',
-        message: 'Service Accounts not enabled',
-        canCreateUsers: false,
-        fix: 'Enable "Service Accounts Enabled" for "Clob" client in Keycloak'
-      });
-    } else {
-      res.status(500).json({ 
-        status: 'error',
-        message: error.message,
-        canCreateUsers: false
-      });
-    }
+    res.status(500).json({ 
+      status: 'error',
+      message: error.message,
+      canCreateUsers: false,
+      stack: error.stack
+    });
   }
 });
 

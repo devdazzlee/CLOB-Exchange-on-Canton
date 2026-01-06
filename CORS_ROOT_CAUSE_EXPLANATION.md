@@ -115,3 +115,4 @@ const CANTON_API_BASE = 'https://participant.dev.canton.wolfedgelabs.com/json-ap
 
 The proxy is a **temporary workaround** until the Canton server is properly configured. Once CORS is fixed on the server, the proxy can be removed.
 
+

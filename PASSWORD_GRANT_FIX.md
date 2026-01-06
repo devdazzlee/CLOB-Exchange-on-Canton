@@ -72,3 +72,4 @@ Copy the `access_token` from response.
 
 **Refresh browser and try the manual token option!** 🎉
 
+

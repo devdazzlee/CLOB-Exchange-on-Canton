@@ -93,3 +93,4 @@ Open: http://localhost:3000
 
 **Once CORS is configured on Canton server, everything will work perfectly without any proxy!** 🎉
 
+

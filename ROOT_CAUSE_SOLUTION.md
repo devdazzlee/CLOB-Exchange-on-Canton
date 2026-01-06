@@ -73,3 +73,4 @@ After adding the redirect URI:
 This is NOT a code issue - it's a **Keycloak configuration issue**. The code is correct, but Keycloak needs to know which redirect URIs are allowed for security reasons. This is standard OAuth 2.0 security practice.
 
 
+

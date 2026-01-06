@@ -117,3 +117,4 @@ const CANTON_API_BASE = 'https://participant.dev.canton.wolfedgelabs.com/json-ap
 
 The `canton.conf` file I created shows exactly what configuration is needed. Once the Canton node operator adds it, you can remove all the proxy code!
 
+

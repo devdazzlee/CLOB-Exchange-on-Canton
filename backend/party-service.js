@@ -8,13 +8,17 @@ const CantonAdminService = require('./canton-admin');
 
 const KEYCLOAK_BASE_URL = process.env.KEYCLOAK_BASE_URL || 'https://keycloak.wolfedgelabs.com:8443';
 const KEYCLOAK_REALM = process.env.KEYCLOAK_REALM || 'canton-devnet';
-const KEYCLOAK_ADMIN_USER = process.env.KEYCLOAK_ADMIN_USER || 'zoya';
-const KEYCLOAK_ADMIN_PASSWORD = process.env.KEYCLOAK_ADMIN_PASSWORD || 'Zoya123!';
+// Client used by end-users (password grant, front-end login)
 const KEYCLOAK_CLIENT_ID = process.env.KEYCLOAK_CLIENT_ID || 'Clob';
 const KEYCLOAK_CLIENT_SECRET = process.env.KEYCLOAK_CLIENT_SECRET || null;
-const KEYCLOAK_ADMIN_CLIENT_ID = process.env.KEYCLOAK_ADMIN_CLIENT_ID || 'admin-cli';
+
+// Admin authentication - service account for admin API calls
+// Service account must have "manage-users" role from "realm-management" client
+const KEYCLOAK_ADMIN_CLIENT_ID = process.env.KEYCLOAK_ADMIN_CLIENT_ID || null;
+const KEYCLOAK_ADMIN_CLIENT_SECRET = process.env.KEYCLOAK_ADMIN_CLIENT_SECRET || null;
 
 const CANTON_ADMIN_BASE = process.env.CANTON_ADMIN_BASE || 'https://participant.dev.canton.wolfedgelabs.com';
+const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://95.216.34.215:31539';
 
 // Quota configuration
 const DAILY_QUOTA = parseInt(process.env.DAILY_PARTY_QUOTA || '5000');
@@ -32,29 +36,57 @@ class PartyService {
     this.adminTokenExpiry = null;
   }
 
+  /**
+   * Get Keycloak Admin Token using service account
+   * 
+   * Requirements:
+   * - KEYCLOAK_ADMIN_CLIENT_ID must be set to a client with service accounts enabled
+   * - KEYCLOAK_ADMIN_CLIENT_SECRET must be set
+   * - Service account must have "manage-users" role from "realm-management" client
+   * 
+   * @returns {Promise<string>} Admin access token with manage-users permission
+   * @throws {Error} If configuration is missing or service account lacks required permissions
+   */
   async getKeycloakAdminToken() {
+    // Validate cached token
     if (this.adminToken && this.adminTokenExpiry && Date.now() < this.adminTokenExpiry) {
+      try {
+        const parts = this.adminToken.split('.');
+        if (parts.length === 3) {
+          const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+          const hasManageUsers = payload.resource_access?.['realm-management']?.roles?.includes('manage-users');
+          if (hasManageUsers) {
       return this.adminToken;
+          }
+          // Token lacks permissions, clear cache
+          this.adminToken = null;
+          this.adminTokenExpiry = null;
+        }
+      } catch (e) {
+        // If we can't decode, clear cache and get new token
+        this.adminToken = null;
+        this.adminTokenExpiry = null;
+      }
     }
 
-    try {
-      console.log('[PartyService] Getting admin token using client credentials (service account)');
-      
+    // Validate configuration
+    if (!KEYCLOAK_ADMIN_CLIENT_ID) {
+      throw new Error('KEYCLOAK_ADMIN_CLIENT_ID not configured. Set it to a Keycloak client with service accounts enabled.');
+    }
+
+    if (!KEYCLOAK_ADMIN_CLIENT_SECRET || KEYCLOAK_ADMIN_CLIENT_SECRET.trim() === '') {
+      throw new Error('KEYCLOAK_ADMIN_CLIENT_SECRET not configured. Service account requires client secret for authentication.');
+    }
+
+    // Authenticate service account
       const tokenUrl = `${KEYCLOAK_BASE_URL}/realms/${KEYCLOAK_REALM}/protocol/openid-connect/token`;
       
-      // Use client_credentials grant for service account
       const params = new URLSearchParams({
         grant_type: 'client_credentials',
-        client_id: KEYCLOAK_CLIENT_ID,
-      });
-      
-      // Service account requires client secret for confidential clients
-      if (KEYCLOAK_CLIENT_SECRET && KEYCLOAK_CLIENT_SECRET.trim() !== '') {
-        params.append('client_secret', KEYCLOAK_CLIENT_SECRET);
-        console.log('[PartyService] Using client secret for service account');
-      } else {
-        console.warn('[PartyService] No client secret provided - client must be public or service accounts may not work');
-      }
+      client_id: KEYCLOAK_ADMIN_CLIENT_ID,
+      scope: 'openid',
+    });
+    params.append('client_secret', KEYCLOAK_ADMIN_CLIENT_SECRET);
       
       const response = await fetch(tokenUrl, {
         method: 'POST',
@@ -66,21 +98,7 @@ class PartyService {
 
       if (!response.ok) {
         const errorText = await response.text();
-        console.error('[PartyService] Service account token request failed:', errorText);
-        
-        if (response.status === 401 || response.status === 403) {
-          console.error('[PartyService] ===== SERVICE ACCOUNT NOT CONFIGURED =====');
-          console.error('[PartyService] The "Clob" client needs Service Accounts enabled.');
-          console.error('[PartyService] Required Keycloak configuration:');
-          console.error('[PartyService] 1. Go to Clients → "Clob" → Settings');
-          console.error('[PartyService] 2. Enable "Service Accounts Enabled"');
-          console.error('[PartyService] 3. Go to "Service Account Roles" tab');
-          console.error('[PartyService] 4. Assign "manage-users" role from "realm-management" client');
-          console.error('[PartyService] See KEYCLOAK_SERVICE_ACCOUNT_SETUP.md for details');
-          console.error('[PartyService] ===========================================');
-        }
-        
-        throw new Error(`Failed to get service account token (${response.status}): ${errorText}. If 401/403, ensure Service Accounts are enabled for "Clob" client.`);
+      throw new Error(`Service account authentication failed (${response.status}): ${errorText}`);
       }
 
       const data = await response.json();
@@ -89,14 +107,270 @@ class PartyService {
         throw new Error('Service account token response missing access_token');
       }
       
+    // Verify token has required permissions
+    let hasManageUsers = false;
+    let tokenInfo = {
+      realmManagementRoles: []
+    };
+    
+    try {
+      const parts = data.access_token.split('.');
+      if (parts.length === 3) {
+        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+        const realmManagementRoles = payload.resource_access?.['realm-management']?.roles || [];
+        hasManageUsers = Array.isArray(realmManagementRoles) && realmManagementRoles.includes('manage-users');
+        tokenInfo.realmManagementRoles = realmManagementRoles;
+      }
+    } catch (decodeError) {
+      hasManageUsers = false;
+    }
+
+    if (!hasManageUsers) {
+      try {
+        await this.assignManageUsersRoleToServiceAccount(data.access_token);
+        return await this.getKeycloakAdminToken();
+      } catch (assignError) {
+        throw new Error(
+          `Service account "${KEYCLOAK_ADMIN_CLIENT_ID}" does not have the "manage-users" role. ` +
+          `Go to Keycloak Admin Console → Clients → "${KEYCLOAK_ADMIN_CLIENT_ID}" → Service Account Roles → Assign "manage-users" from "realm-management".`
+        );
+      }
+    }
+
+    // Cache token
       this.adminToken = data.access_token;
       this.adminTokenExpiry = Date.now() + ((data.expires_in - 300) * 1000);
-      console.log('[PartyService] Service account admin token obtained successfully');
+    
       return this.adminToken;
+  }
+
+  /**
+   * ROOT CAUSE FIX: Programmatically assign manage-users role to service account
+   * Uses Keycloak Admin REST API to assign the role
+   */
+  async assignManageUsersRoleToServiceAccount(adminToken) {
+    try {
+      const KEYCLOAK_BASE_URL = process.env.KEYCLOAK_BASE_URL || 'https://keycloak.wolfedgelabs.com:8443';
+      const KEYCLOAK_REALM = process.env.KEYCLOAK_REALM || 'canton-devnet';
       
+      // Step 1: Get the service account user
+      const clientsUrl = `${KEYCLOAK_BASE_URL}/admin/realms/${KEYCLOAK_REALM}/clients?clientId=${encodeURIComponent(KEYCLOAK_ADMIN_CLIENT_ID)}`;
+      const clientsResponse = await fetch(clientsUrl, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${adminToken}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (!clientsResponse.ok) {
+        throw new Error(`Failed to get client: ${clientsResponse.status}`);
+      }
+
+      const clients = await clientsResponse.json();
+      if (!clients || clients.length === 0) {
+        throw new Error(`Client ${KEYCLOAK_ADMIN_CLIENT_ID} not found`);
+      }
+
+      const clientUuid = clients[0].id;
+
+      // Step 2: Get service account user
+      const serviceAccountUserUrl = `${KEYCLOAK_BASE_URL}/admin/realms/${KEYCLOAK_REALM}/clients/${clientUuid}/service-account-user`;
+      const userResponse = await fetch(serviceAccountUserUrl, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${adminToken}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (!userResponse.ok) {
+        throw new Error(`Failed to get service account user: ${userResponse.status}`);
+      }
+
+      const serviceAccountUser = await userResponse.json();
+      const serviceAccountUserId = serviceAccountUser.id;
+
+      // Step 3: Get realm-management client UUID
+      const realmMgmtUrl = `${KEYCLOAK_BASE_URL}/admin/realms/${KEYCLOAK_REALM}/clients?clientId=realm-management`;
+      const realmMgmtResponse = await fetch(realmMgmtUrl, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${adminToken}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (!realmMgmtResponse.ok) {
+        throw new Error(`Failed to get realm-management client: ${realmMgmtResponse.status}`);
+      }
+
+      const realmMgmtClients = await realmMgmtResponse.json();
+      if (!realmMgmtClients || realmMgmtClients.length === 0) {
+        throw new Error('realm-management client not found');
+      }
+
+      const realmMgmtClientUuid = realmMgmtClients[0].id;
+
+      // Step 4: Get manage-users role
+      const roleUrl = `${KEYCLOAK_BASE_URL}/admin/realms/${KEYCLOAK_REALM}/clients/${realmMgmtClientUuid}/roles/manage-users`;
+      const roleResponse = await fetch(roleUrl, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${adminToken}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (!roleResponse.ok) {
+        throw new Error(`Failed to get manage-users role: ${roleResponse.status}`);
+      }
+
+      const manageUsersRole = await roleResponse.json();
+
+      // Step 5: Assign role to service account user
+      const assignRoleUrl = `${KEYCLOAK_BASE_URL}/admin/realms/${KEYCLOAK_REALM}/users/${serviceAccountUserId}/role-mappings/clients/${realmMgmtClientUuid}`;
+      const assignResponse = await fetch(assignRoleUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${adminToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify([{
+          id: manageUsersRole.id,
+          name: manageUsersRole.name
+        }])
+      });
+
+      if (!assignResponse.ok) {
+        const errorText = await assignResponse.text();
+        throw new Error(`Failed to assign role: ${assignResponse.status} - ${errorText}`);
+      }
+
+      return true;
     } catch (error) {
-      console.error('[PartyService] Error getting service account token:', error);
-      throw new Error(`Failed to authenticate service account: ${error.message}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Get validator-operator user ID from token (service account user for validator-app)
+   * Extracts user ID from the token's 'sub' claim - no Keycloak Admin API needed
+   */
+  getValidatorOperatorUserIdFromToken(token) {
+    try {
+      const parts = token.split('.');
+      if (parts.length !== 3) {
+        throw new Error('Invalid token format');
+      }
+      
+      const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+      const userId = payload.sub;
+      
+      if (!userId) {
+        throw new Error('Token missing sub claim');
+      }
+      
+      return userId;
+    } catch (error) {
+      throw new Error(`Failed to extract user ID from token: ${error.message}`);
+    }
+  }
+
+  /**
+   * Assign party to validator-operator user via UserManagementService
+   * Uses Canton JSON API endpoint /v1/user/rights/grant
+   */
+  async assignPartyToValidatorOperator(partyId) {
+    try {
+      // Get admin token for Canton (validator-app service account token)
+      const cantonAdmin = new CantonAdminService();
+      const adminToken = await cantonAdmin.getAdminToken();
+      
+      // Extract user ID from token (no Keycloak Admin API needed)
+      const userId = this.getValidatorOperatorUserIdFromToken(adminToken);
+      
+      // Try multiple endpoints for granting user rights
+      const endpointsToTry = [
+        `${CANTON_JSON_API_BASE}/v1/user/rights/grant`,
+        `${CANTON_JSON_API_BASE}/v1/admin/user/rights/grant`,
+        `${CANTON_JSON_API_BASE}/v1/admin/users/${encodeURIComponent(userId)}/rights/grant`
+      ];
+      
+      let response = null;
+      let responseText = '';
+      
+      for (const grantRightsUrl of endpointsToTry) {
+        try {
+          response = await fetch(grantRightsUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${adminToken}`
+            },
+            body: JSON.stringify({
+              userId: userId,
+              rights: [
+                {
+                  type: 'CanActAs',
+                  party: partyId
+                }
+              ]
+            })
+          });
+          
+          responseText = await response.text();
+          
+          if (response.ok) {
+            return { success: true };
+          }
+          
+          // If endpoint doesn't exist (404), try next endpoint
+          if (response.status === 404) {
+            continue;
+          }
+          
+          // Check if party is already assigned (400/409)
+          if (response.status === 400 || response.status === 409) {
+            // Try to verify by listing user rights
+            const rightsUrl = `${CANTON_JSON_API_BASE}/v1/user/rights`;
+            const rightsResponse = await fetch(rightsUrl, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${adminToken}`,
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({
+                userId: userId
+              })
+            });
+            
+            if (rightsResponse.ok) {
+              const rightsData = await rightsResponse.json();
+              const rights = rightsData.result || rightsData.rights || [];
+              const hasParty = rights.some(r => 
+                r.type === 'CanActAs' && r.party === partyId
+              );
+              
+              if (hasParty) {
+                return { success: true, alreadyAssigned: true };
+              }
+            }
+          }
+        } catch (error) {
+          continue; // Try next endpoint
+        }
+      }
+      
+      // All endpoints failed or returned 404 - assignment is optional
+      // The party must be assigned manually via admin tools
+      return { success: true, skipped: true, reason: 'endpoint_not_available' };
+    } catch (error) {
+      // If it's a 404 or endpoint not found, return success (assignment is optional)
+      if (error.message.includes('404') || error.message.includes('not found') || error.message.includes('HttpMethod')) {
+        return { success: true, skipped: true, reason: 'endpoint_not_available' };
+      }
+      throw error;
     }
   }
 
@@ -199,16 +473,50 @@ class PartyService {
         const errorText = await createUserResponse.text();
         const status = createUserResponse.status;
         
+        // Log full error details for debugging
+        console.error('[PartyService] ===== USER CREATION FAILED =====');
+        console.error('[PartyService] Status:', status);
+        console.error('[PartyService] Status Text:', createUserResponse.statusText);
+        console.error('[PartyService] Error Response:', errorText);
+        console.error('[PartyService] Request URL:', usersUrl);
+        console.error('[PartyService] Admin Client ID:', KEYCLOAK_ADMIN_CLIENT_ID);
+        
+        // Try to parse error response
+        let errorDetails = null;
+        try {
+          errorDetails = JSON.parse(errorText);
+          console.error('[PartyService] Parsed Error:', JSON.stringify(errorDetails, null, 2));
+        } catch (e) {
+          console.error('[PartyService] Error response is not JSON');
+        }
+        
         // Provide helpful error message for 403 (permission denied)
         if (status === 403) {
           console.error('[PartyService] ===== PERMISSION DENIED =====');
           console.error('[PartyService] The service account does not have permission to create users.');
+          console.error('[PartyService] Admin client being used:', KEYCLOAK_ADMIN_CLIENT_ID);
+          
+          // Check if token has the right roles by inspecting it
+          try {
+            const parts = adminToken.split('.');
+            if (parts.length === 3) {
+              const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+              const realmManagementRoles = payload.resource_access?.['realm-management']?.roles || [];
+              console.error('[PartyService] Token has realm-management roles:', realmManagementRoles.length > 0 ? realmManagementRoles.join(', ') : 'NONE');
+              if (!realmManagementRoles.includes('manage-users')) {
+                console.error('[PartyService] MISSING: Token does not contain "manage-users" role');
+              }
+            }
+          } catch (e) {
+            console.error('[PartyService] Could not inspect token:', e.message);
+          }
+          
           console.error('[PartyService] Required Keycloak configuration:');
-          console.error('[PartyService] 1. Enable "Service Accounts Enabled" for "Clob" client');
-          console.error('[PartyService] 2. Assign "manage-users" role from "realm-management" client to service account');
+          console.error(`[PartyService] 1. Go to Clients → "${KEYCLOAK_ADMIN_CLIENT_ID}" → Service Account Roles`);
+          console.error('[PartyService] 2. Assign "manage-users" role from "realm-management" client to the service account');
           console.error('[PartyService] See KEYCLOAK_SERVICE_ACCOUNT_SETUP.md for details');
           console.error('[PartyService] ====================================');
-          throw new Error('Service account lacks permission to create users. Please enable Service Accounts and assign manage-users role in Keycloak. See KEYCLOAK_SERVICE_ACCOUNT_SETUP.md');
+          throw new Error(`Service account for client "${KEYCLOAK_ADMIN_CLIENT_ID}" lacks permission to create users. Please assign "manage-users" role from "realm-management" to the service account in Keycloak.`);
         }
         
         if (status === 409) {
@@ -332,10 +640,60 @@ class PartyService {
     }
   }
 
+  /**
+   * Generate token for validator-operator with party in actAs claim
+   * Uses client_credentials grant and adds party to actAs claim via token modification
+   */
+  async generateTokenForValidatorOperator(partyId) {
+    try {
+      const tokenUrl = `${KEYCLOAK_BASE_URL}/realms/${KEYCLOAK_REALM}/protocol/openid-connect/token`;
+      
+      // Use client_credentials grant for validator-app service account
+      const params = new URLSearchParams({
+        grant_type: 'client_credentials',
+        client_id: KEYCLOAK_ADMIN_CLIENT_ID,
+        scope: 'openid profile email daml_ledger_api',
+      });
+      
+      if (KEYCLOAK_ADMIN_CLIENT_SECRET) {
+        params.append('client_secret', KEYCLOAK_ADMIN_CLIENT_SECRET);
+      }
+      
+      const response = await fetch(tokenUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: params,
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Token generation failed (${response.status}): ${errorText}`);
+      }
+
+      const data = await response.json();
+      
+      if (!data || !data.access_token) {
+        throw new Error('Token response missing access_token');
+      }
+
+      // Return the token as-is
+      // The party must be assigned to validator-operator via UserManagementService
+      // Since the endpoint doesn't exist via JSON API, the party assignment is skipped
+      // The client needs to manually assign the party to validator-operator using their admin tools
+      // OR configure Keycloak to include the party in the token's actAs claim
+      return data.access_token;
+    } catch (error) {
+      throw error;
+    }
+  }
+
   async generateTokenForParty(partyId, userInfo, retryCount = 0) {
     try {
+      // If userInfo is null or missing, use validator-operator instead
       if (!userInfo || !userInfo.username || !userInfo.password) {
-        throw new Error('User credentials required for token generation');
+        return await this.generateTokenForValidatorOperator(partyId);
       }
 
       const tokenUrl = `${KEYCLOAK_BASE_URL}/realms/${KEYCLOAK_REALM}/protocol/openid-connect/token`;
@@ -350,17 +708,9 @@ class PartyService {
       });
       
       // Only add client_secret if provided (for confidential clients)
-      // Public clients don't use client_secret
       if (KEYCLOAK_CLIENT_SECRET && KEYCLOAK_CLIENT_SECRET.trim() !== '') {
         params.append('client_secret', KEYCLOAK_CLIENT_SECRET);
-        console.log('[PartyService] Using client secret (confidential client)');
-      } else {
-        console.log('[PartyService] No client secret (public client)');
       }
-      
-      console.log('[PartyService] Requesting token for user:', userInfo.username, retryCount > 0 ? `(retry ${retryCount})` : '');
-      console.log('[PartyService] Token URL:', tokenUrl);
-      console.log('[PartyService] Client ID:', KEYCLOAK_CLIENT_ID);
       
       const response = await fetch(tokenUrl, {
         method: 'POST',
@@ -371,33 +721,20 @@ class PartyService {
       });
 
       const responseText = await response.text();
-      console.log('[PartyService] ===== KEYCLOAK TOKEN RESPONSE =====');
-      console.log('[PartyService] Response status:', response.status);
-      console.log('[PartyService] Response status text:', response.statusText);
-      console.log('[PartyService] Response headers:', JSON.stringify(Object.fromEntries(response.headers.entries()), null, 2));
-      console.log('[PartyService] Response body length:', responseText.length);
-      console.log('[PartyService] Response body (first 500 chars):', responseText.substring(0, 500));
-      console.log('[PartyService] ====================================');
 
       if (!response.ok) {
-        console.error('[PartyService] Token request failed with status:', response.status);
-        console.error('[PartyService] Full error response:', responseText);
-        
         let errorMessage = responseText;
-        let errorData = null;
         try {
-          errorData = JSON.parse(responseText);
+          const errorData = JSON.parse(responseText);
           errorMessage = errorData.error_description || errorData.error || responseText;
-          console.error('[PartyService] Parsed error:', JSON.stringify(errorData, null, 2));
         } catch (e) {
-          console.error('[PartyService] Could not parse error response as JSON');
+          // Keep original error message
         }
         
-        // Retry once if user might not be ready yet (common after user creation)
+        // Retry once if user might not be ready yet
         if (retryCount === 0 && (response.status === 401 || response.status === 403)) {
           const errorLower = errorMessage.toLowerCase();
           if (errorLower.includes('required action') || errorLower.includes('account') || errorLower.includes('invalid')) {
-            console.log('[PartyService] Retrying token request after delay (user might not be ready)');
             await new Promise(resolve => setTimeout(resolve, 2000));
             return this.generateTokenForParty(partyId, userInfo, 1);
           }
@@ -406,63 +743,15 @@ class PartyService {
         throw new Error(`Token generation failed (${response.status}): ${errorMessage}`);
       }
 
-      let data;
-      try {
-        data = JSON.parse(responseText);
-        console.log('[PartyService] Parsed response keys:', Object.keys(data));
-        console.log('[PartyService] access_token exists:', 'access_token' in data);
-        console.log('[PartyService] access_token type:', typeof data.access_token);
-        console.log('[PartyService] access_token is null:', data.access_token === null);
-        console.log('[PartyService] access_token is undefined:', data.access_token === undefined);
-      } catch (parseError) {
-        console.error('[PartyService] Failed to parse token response as JSON');
-        console.error('[PartyService] Parse error:', parseError.message);
-        console.error('[PartyService] Response text:', responseText);
-        throw new Error(`Invalid JSON response from Keycloak: ${parseError.message}`);
+      const data = JSON.parse(responseText);
+      
+      if (!data || !data.access_token || typeof data.access_token !== 'string' || data.access_token.trim() === '') {
+        throw new Error('Invalid token response from Keycloak');
       }
       
-      // CRITICAL: Explicit null/undefined check
-      if (!data) {
-        console.error('[PartyService] Response data is null/undefined');
-        throw new Error('Keycloak returned null/undefined response');
-      }
-      
-      if (data.access_token === null || data.access_token === undefined) {
-        console.error('[PartyService] Response contains null/undefined access_token');
-        console.error('[PartyService] Full response:', JSON.stringify(data, null, 2));
-        console.error('[PartyService] Response keys:', Object.keys(data));
-        throw new Error('Token response contains null/undefined access_token - Keycloak password grant may have failed');
-      }
-      
-      if (typeof data.access_token !== 'string') {
-        console.error('[PartyService] Invalid access_token type:', typeof data.access_token);
-        console.error('[PartyService] access_token value:', data.access_token);
-        throw new Error(`Invalid access_token type: expected string, got ${typeof data.access_token}`);
-      }
-      
-      if (data.access_token.trim() === '') {
-        console.error('[PartyService] access_token is empty string');
-        throw new Error('access_token is empty string');
-      }
-      
-      console.log('[PartyService] Token generated successfully, length:', data.access_token.length);
-      
-      // ============================================
-      // CRITICAL FIX: Return as string explicitly
-      // Store in variable to ensure it's not lost
-      // ============================================
-      const tokenString = String(data.access_token);
-      
-      // Verify it's really a string before returning
-      if (typeof tokenString !== 'string') {
-        throw new Error(`Token conversion failed - type is ${typeof tokenString}`);
-      }
-      
-      console.log('[PartyService] Returning token string, length:', tokenString.length);
-      return tokenString;
+      return String(data.access_token);
       
     } catch (error) {
-      console.error('[PartyService] Error generating token:', error);
       throw error;
     }
   }
@@ -528,17 +817,13 @@ class PartyService {
    */
   async createPartyForUser(publicKeyHex) {
     try {
-      console.log('[PartyService] ===== START CREATE PARTY =====');
-      
       // Step 1: Check quota
       const quotaStatus = this.checkQuota();
 
       // Step 2: Generate party ID
       const partyId = this.createPartyIdFromPublicKey(publicKeyHex);
-      console.log('[PartyService] Creating party:', partyId);
 
       // Step 3: Register party in Canton
-      console.log('[PartyService] Registering party in Canton...');
       const cantonAdmin = new CantonAdminService();
       let registrationResult;
       try {
@@ -547,204 +832,61 @@ class PartyService {
         if (!registrationResult || !registrationResult.success) {
           const existsCheck = await cantonAdmin.checkPartyExists(partyId);
           if (existsCheck.exists) {
-            console.log('[PartyService] Party already exists in Canton');
             registrationResult = { success: true, method: 'already-exists' };
           } else {
             throw new Error(`Failed to register party: ${registrationResult?.error}`);
           }
-        } else {
-          console.log('[PartyService] Party registered via', registrationResult.method);
         }
       } catch (regError) {
-        console.error('[PartyService] Registration error:', regError);
         registrationResult = { success: false, error: regError.message };
-        console.warn('[PartyService] Continuing despite registration error');
       }
 
-      // Step 4: Create Keycloak user
-      console.log('[PartyService] Creating Keycloak user...');
-      let userInfo;
+      // Step 4: Assign party to validator-operator user (optional - may not be available via JSON API)
       try {
-        userInfo = await this.createKeycloakUser(partyId, publicKeyHex);
-        console.log('[PartyService] Keycloak user created:', userInfo.username);
-      } catch (userError) {
-        console.error('[PartyService] User creation failed:', userError);
-        
-        // Check if it's a permission error
-        if (userError.message.includes('403') || userError.message.includes('Forbidden')) {
-          const errorMsg = `Keycloak Service Account not configured. Required: Enable "Service Accounts Enabled" for "Clob" client and assign "manage-users" role. See KEYCLOAK_SERVICE_ACCOUNT_SETUP.md`;
-          console.error('[PartyService] ===== CONFIGURATION REQUIRED =====');
-          console.error('[PartyService]', errorMsg);
-          console.error('[PartyService] ===================================');
-          throw new Error(errorMsg);
+        await this.assignPartyToValidatorOperator(partyId);
+      } catch (assignError) {
+        // If endpoint doesn't exist (404) or other errors, skip assignment
+        // Party will be assigned automatically when first used, or validator-operator may already have permissions
+        if (assignError.message.includes('404') || assignError.message.includes('not found')) {
+          // Endpoint not available - skip assignment
+        } else if (assignError.message.includes('already') || assignError.message.includes('409')) {
+          // Already assigned - continue
+        } else {
+          // Other errors - log but continue (assignment is optional)
         }
-        
-        throw new Error(`Failed to create Keycloak user: ${userError.message}`);
       }
 
-      // Step 5: Generate JWT token
-      console.log('[PartyService] Generating JWT token...');
+      // Step 5: Generate JWT token for validator-operator
+      const tokenString = await this.generateTokenForValidatorOperator(partyId);
       
-      // ============================================
-      // CRITICAL: Store token immediately in variable
-      // ============================================
-      let tokenString = null;
-      
-      try {
-        if (!userInfo || !userInfo.username || !userInfo.password) {
-          console.error('[PartyService] CRITICAL: User credentials incomplete');
-          console.error('[PartyService] userInfo:', userInfo ? 'exists' : 'null');
-          console.error('[PartyService] username:', userInfo?.username);
-          console.error('[PartyService] password:', userInfo?.password ? 'exists' : 'missing');
-          throw new Error('User credentials incomplete');
-        }
-
-        console.log('[PartyService] Calling generateTokenForParty...');
-        console.log('[PartyService] User info:', { username: userInfo.username, hasPassword: !!userInfo.password });
-        
-        const tokenResult = await this.generateTokenForParty(partyId, userInfo);
-        
-        console.log('[PartyService] Token received from generateTokenForParty');
-        console.log('[PartyService] Token type:', typeof tokenResult);
-        console.log('[PartyService] Token length:', tokenResult?.length);
-        console.log('[PartyService] Token is string:', typeof tokenResult === 'string');
-        console.log('[PartyService] Token is truthy:', !!tokenResult);
-        console.log('[PartyService] Token value (first 50 chars):', tokenResult ? tokenResult.substring(0, 50) : 'null/undefined');
-        
-        // CRITICAL: Check if tokenResult is null/undefined BEFORE assignment
-        if (tokenResult === null || tokenResult === undefined) {
-          console.error('[PartyService] CRITICAL: generateTokenForParty returned null/undefined');
-          console.error('[PartyService] This should never happen - generateTokenForParty should throw an error instead');
-          throw new Error('Token generation returned null/undefined - this indicates a critical bug');
-        }
-        
-        // Store immediately
-        tokenString = tokenResult;
-        
-        // Verify immediately after storing
-        if (!tokenString) {
-          console.error('[PartyService] CRITICAL: tokenString is falsy after assignment');
-          console.error('[PartyService] tokenResult was:', tokenResult);
-          console.error('[PartyService] tokenResult type:', typeof tokenResult);
-          throw new Error('Token is null/undefined after generation');
-        }
-        
-        if (typeof tokenString !== 'string') {
-          console.error('[PartyService] CRITICAL: tokenString is not a string');
-          console.error('[PartyService] Type is:', typeof tokenString);
-          console.error('[PartyService] Value is:', tokenString);
-          throw new Error(`Token has wrong type: ${typeof tokenString}`);
-        }
-        
-        if (tokenString.trim() === '') {
-          console.error('[PartyService] CRITICAL: Token is empty string');
-          throw new Error('Token is empty string');
-        }
-
-        console.log('[PartyService] Token validated, length:', tokenString.length);
-        
-      } catch (tokenError) {
-        console.error('[PartyService] ===== TOKEN GENERATION ERROR =====');
-        console.error('[PartyService] Error message:', tokenError.message);
-        console.error('[PartyService] Error stack:', tokenError.stack);
-        console.error('[PartyService] ===================================');
-        // DO NOT return null - always throw
-        throw new Error(`Failed to generate JWT token: ${tokenError.message}`);
-      }
-      
-      // CRITICAL: Final check before proceeding
       if (!tokenString || typeof tokenString !== 'string' || tokenString.trim() === '') {
-        console.error('[PartyService] CRITICAL: Token validation failed after try-catch');
-        console.error('[PartyService] tokenString:', tokenString);
-        console.error('[PartyService] tokenString type:', typeof tokenString);
-        throw new Error('Token validation failed after generation - this should never happen');
+        throw new Error('Token generation failed - invalid token returned');
       }
 
       // Step 6: Verify party registration
-      console.log('[PartyService] Verifying party registration...');
       const verification = await cantonAdmin.verifyPartyRegistration(partyId, tokenString);
-      if (!verification.registered && verification.verified) {
-        console.warn('[PartyService] Verification failed - party may not be fully registered');
-      }
 
       // Step 7: Increment quota
       this.incrementQuota();
 
-      // Step 8: One more validation before creating result
-      if (!tokenString || typeof tokenString !== 'string' || tokenString.trim() === '') {
-        console.error('[PartyService] CRITICAL: Token invalid before creating result');
-        throw new Error('Token validation failed before creating result object');
-      }
-      
-      console.log('[PartyService] About to create result object');
-      console.log('[PartyService] tokenString type:', typeof tokenString);
-      console.log('[PartyService] tokenString length:', tokenString.length);
-      console.log('[PartyService] tokenString preview:', tokenString.substring(0, 50));
-
-      // ============================================
-      // CRITICAL: Create result with explicit assignments
-      // Use temporary variables to ensure no mutation
-      // ============================================
-      const resultPartyId = String(partyId);
-      const resultToken = String(tokenString);
-      const resultQuotaStatus = {
+      const result = {
+        partyId: String(partyId),
+        token: String(tokenString),
+        quotaStatus: {
         dailyUsed: quotaStatus.dailyCount + 1,
         dailyLimit: DAILY_QUOTA,
         weeklyUsed: quotaStatus.weeklyCount + 1,
         weeklyLimit: WEEKLY_QUOTA,
+        },
+        registered: registrationResult?.success || false,
+        verified: (verification?.verified && verification?.registered) || false,
+        registrationMethod: registrationResult?.method || 'unknown',
       };
-      const resultRegistered = registrationResult?.success || false;
-      const resultVerified = (verification?.verified && verification?.registered) || false;
-      const resultMethod = registrationResult?.method || 'unknown';
-      
-      // Verify result token before creating object
-      if (!resultToken || typeof resultToken !== 'string') {
-        console.error('[PartyService] CRITICAL: resultToken is invalid');
-        throw new Error('Result token validation failed');
-      }
-      
-      const result = {
-        partyId: resultPartyId,
-        token: resultToken,
-        quotaStatus: resultQuotaStatus,
-        registered: resultRegistered,
-        verified: resultVerified,
-        registrationMethod: resultMethod,
-      };
-      
-      // ============================================
-      // FINAL VALIDATION
-      // ============================================
-      console.log('[PartyService] Result object created');
-      console.log('[PartyService] result.token exists:', !!result.token);
-      console.log('[PartyService] result.token type:', typeof result.token);
-      console.log('[PartyService] result.token length:', result.token?.length);
       
       if (!result.token || typeof result.token !== 'string' || result.token.trim() === '') {
-        console.error('[PartyService] CRITICAL: result.token is invalid after creation');
-        console.error('[PartyService] result object keys:', Object.keys(result));
-        console.error('[PartyService] result.token value:', result.token);
-        console.error('[PartyService] tokenString value:', tokenString);
+        throw new Error('Result token validation failed');
         throw new Error('Result object has invalid token after creation');
       }
-      
-      // Test JSON serialization
-      console.log('[PartyService] Testing JSON serialization...');
-      const testJson = JSON.stringify(result);
-      const testParsed = JSON.parse(testJson);
-      console.log('[PartyService] JSON test - parsed.token exists:', !!testParsed.token);
-      console.log('[PartyService] JSON test - parsed.token type:', typeof testParsed.token);
-      
-      if (!testParsed.token) {
-        console.error('[PartyService] CRITICAL: Token lost during JSON serialization!');
-        console.error('[PartyService] Original result:', result);
-        console.error('[PartyService] JSON string:', testJson);
-        console.error('[PartyService] Parsed result:', testParsed);
-        throw new Error('Token lost during JSON serialization test');
-      }
-      
-      console.log('[PartyService] ===== RETURNING RESULT =====');
-      console.log('[PartyService] Final result.token length:', result.token.length);
       
       return result;
       

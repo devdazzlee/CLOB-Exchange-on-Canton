@@ -150,3 +150,4 @@ If CORS cannot be configured on the Canton server, you could:
 3. ⏳ Test CORS configuration once added
 4. ⏳ Verify frontend works in production
 
+

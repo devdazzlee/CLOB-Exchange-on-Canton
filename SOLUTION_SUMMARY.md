@@ -80,3 +80,4 @@ from origin 'https://clob-exchange-on-canton.vercel.app' has been blocked by COR
 
 **Once CORS is configured on Canton server, everything will work perfectly!** 🎉
 
+

@@ -100,3 +100,4 @@ queryContracts('UserAccount:UserAccount', partyId)
 - No changes needed to existing code - it's all automatic!
 
 
+
