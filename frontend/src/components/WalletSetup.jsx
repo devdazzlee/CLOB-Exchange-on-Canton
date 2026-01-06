@@ -80,16 +80,33 @@ export default function WalletSetup({ onWalletReady }) {
       console.log('[WalletSetup] Creating party ID on backend...');
       const partyResult = await createPartyForUser(publicKey);
       
+      // ============================================
+      // CRITICAL DEBUG: Check what we received
+      // ============================================
+      console.log('[WalletSetup] ===== PARTY RESULT RECEIVED =====');
+      console.log('[WalletSetup] Full partyResult:', partyResult);
+      console.log('[WalletSetup] partyResult.partyId:', partyResult?.partyId);
+      console.log('[WalletSetup] partyResult.token exists:', !!partyResult?.token);
+      console.log('[WalletSetup] partyResult.token type:', typeof partyResult?.token);
+      console.log('[WalletSetup] partyResult.token value:', partyResult?.token);
+      console.log('[WalletSetup] partyResult.token length:', partyResult?.token?.length);
+      console.log('[WalletSetup] ===================================');
+      
       // 3. Store the party ID
       const derivedPartyId = partyResult.partyId;
       setPartyId(derivedPartyId);
       
       // 4. If backend provided a token, store it
       if (partyResult.token) {
-        console.log('[WalletSetup] Storing authentication token from backend...');
+        console.log('[WalletSetup] ✓ Token found! Storing authentication token...');
+        console.log('[WalletSetup] Token length:', partyResult.token.length);
+        console.log('[WalletSetup] Token preview:', partyResult.token.substring(0, 50) + '...');
         // Store token with 30 minute expiry (adjust as needed)
         storeTokens(partyResult.token, null, 1800);
+        console.log('[WalletSetup] ✓ Token stored successfully');
       } else {
+        console.error('[WalletSetup] ✗ CRITICAL: No token in partyResult!');
+        console.error('[WalletSetup] partyResult object:', JSON.stringify(partyResult, null, 2));
         console.warn('[WalletSetup] No token provided by backend. User may need to authenticate separately.');
       }
       
@@ -135,16 +152,33 @@ export default function WalletSetup({ onWalletReady }) {
       console.log('[WalletSetup] Creating party ID on backend for imported wallet...');
       const partyResult = await createPartyForUser(publicKey);
       
+      // ============================================
+      // CRITICAL DEBUG: Check what we received
+      // ============================================
+      console.log('[WalletSetup] ===== PARTY RESULT RECEIVED (IMPORT) =====');
+      console.log('[WalletSetup] Full partyResult:', partyResult);
+      console.log('[WalletSetup] partyResult.partyId:', partyResult?.partyId);
+      console.log('[WalletSetup] partyResult.token exists:', !!partyResult?.token);
+      console.log('[WalletSetup] partyResult.token type:', typeof partyResult?.token);
+      console.log('[WalletSetup] partyResult.token value:', partyResult?.token);
+      console.log('[WalletSetup] partyResult.token length:', partyResult?.token?.length);
+      console.log('[WalletSetup] ===========================================');
+      
       // 3. Store the party ID
       const derivedPartyId = partyResult.partyId;
       setPartyId(derivedPartyId);
       
       // 4. If backend provided a token, store it
       if (partyResult.token) {
-        console.log('[WalletSetup] Storing authentication token from backend...');
+        console.log('[WalletSetup] ✓ Token found! Storing authentication token...');
+        console.log('[WalletSetup] Token length:', partyResult.token.length);
+        console.log('[WalletSetup] Token preview:', partyResult.token.substring(0, 50) + '...');
         // Store token with 30 minute expiry (adjust as needed)
         storeTokens(partyResult.token, null, 1800);
+        console.log('[WalletSetup] ✓ Token stored successfully');
       } else {
+        console.error('[WalletSetup] ✗ CRITICAL: No token in partyResult!');
+        console.error('[WalletSetup] partyResult object:', JSON.stringify(partyResult, null, 2));
         console.warn('[WalletSetup] No token provided by backend. User may need to authenticate separately.');
       }
       

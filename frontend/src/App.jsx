@@ -2,7 +2,6 @@ import { useState, useEffect } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import WalletSetup from './components/WalletSetup';
 import TradingInterface from './components/TradingInterface';
-import TokenManager from './components/TokenManager';
 import AuthGuard from './components/AuthGuard';
 import AuthCallback from './components/AuthCallback';
 import { loadWallet, publicKeyToPartyId } from './wallet/keyManager';
@@ -76,9 +75,6 @@ function App() {
                   </button>
                 </div>
               )}
-              <div className="flex items-center space-x-3">
-                <TokenManager />
-              </div>
             </div>
           </div>
         </header>

@@ -48,16 +48,33 @@ export default function AuthGuard({ children }) {
         try {
           const partyResult = await createPartyForUser(wallet.publicKey);
           
+          // ============================================
+          // CRITICAL DEBUG: Check what we received
+          // ============================================
+          console.log('[AuthGuard] ===== PARTY RESULT RECEIVED =====');
+          console.log('[AuthGuard] Full partyResult:', partyResult);
+          console.log('[AuthGuard] partyResult.partyId:', partyResult?.partyId);
+          console.log('[AuthGuard] partyResult.token exists:', !!partyResult?.token);
+          console.log('[AuthGuard] partyResult.token type:', typeof partyResult?.token);
+          console.log('[AuthGuard] partyResult.token value:', partyResult?.token);
+          console.log('[AuthGuard] partyResult.token length:', partyResult?.token?.length);
+          console.log('[AuthGuard] ===================================');
+          
           // If backend provided a token, store it
           if (partyResult.token) {
-            console.log('[AuthGuard] Storing authentication token from backend...');
+            console.log('[AuthGuard] ✓ Token found! Storing authentication token...');
+            console.log('[AuthGuard] Token length:', partyResult.token.length);
+            console.log('[AuthGuard] Token preview:', partyResult.token.substring(0, 50) + '...');
             storeTokens(partyResult.token, null, 1800);
+            console.log('[AuthGuard] ✓ Token stored successfully');
             setIsAuth(true);
             setIsChecking(false);
             return;
           } else {
             // Party created but no token - this is okay, user can still proceed
             // The token might be generated later or user might need to authenticate differently
+            console.error('[AuthGuard] ✗ CRITICAL: No token in partyResult!');
+            console.error('[AuthGuard] partyResult object:', JSON.stringify(partyResult, null, 2));
             console.warn('[AuthGuard] Party created but no token provided. Proceeding anyway.');
             setIsAuth(true);
             setIsChecking(false);

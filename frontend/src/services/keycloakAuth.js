@@ -67,17 +67,54 @@ async function generatePKCE() {
  * Store tokens securely
  */
 export function storeTokens(accessToken, refreshToken, expiresIn) {
+  // ============================================
+  // CRITICAL DEBUG: Log what we're storing
+  // ============================================
+  console.log('[Keycloak] ===== STORING TOKENS =====');
+  console.log('[Keycloak] accessToken exists:', !!accessToken);
+  console.log('[Keycloak] accessToken type:', typeof accessToken);
+  console.log('[Keycloak] accessToken length:', accessToken?.length);
+  console.log('[Keycloak] accessToken preview:', accessToken?.substring(0, 50) + '...');
+  console.log('[Keycloak] refreshToken exists:', !!refreshToken);
+  console.log('[Keycloak] expiresIn:', expiresIn);
+  
+  if (!accessToken) {
+    console.error('[Keycloak] ✗ CRITICAL: accessToken is null/undefined!');
+    console.error('[Keycloak] Cannot store null token');
+    return;
+  }
+  
+  if (typeof accessToken !== 'string') {
+    console.error('[Keycloak] ✗ CRITICAL: accessToken is not a string!');
+    console.error('[Keycloak] Type:', typeof accessToken);
+    console.error('[Keycloak] Value:', accessToken);
+    return;
+  }
+  
+  if (accessToken.trim() === '') {
+    console.error('[Keycloak] ✗ CRITICAL: accessToken is empty string!');
+    return;
+  }
+  
   const expiresAt = Date.now() + (expiresIn * 1000);
   
   localStorage.setItem('canton_jwt_token', accessToken); // Use consistent key
   localStorage.setItem('canton_jwt_token_expires_at', expiresAt); // Use consistent key
   
+  // Verify it was stored
+  const stored = localStorage.getItem('canton_jwt_token');
+  console.log('[Keycloak] Token stored in localStorage');
+  console.log('[Keycloak] Verification - stored token exists:', !!stored);
+  console.log('[Keycloak] Verification - stored token length:', stored?.length);
+  console.log('[Keycloak] Verification - stored token matches:', stored === accessToken);
+  
   if (refreshToken) {
     localStorage.setItem('canton_jwt_refresh_token', refreshToken);
   }
   
-  console.log('[Keycloak] Tokens stored successfully');
+  console.log('[Keycloak] ✓ Tokens stored successfully');
   console.log('[Keycloak] Expiration timestamp stored:', new Date(expiresAt).toISOString());
+  console.log('[Keycloak] ===========================');
   
   // Dispatch custom event to notify components that token was stored
   // This allows immediate UI updates without waiting for intervals

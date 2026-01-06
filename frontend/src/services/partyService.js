@@ -49,6 +49,30 @@ export async function createPartyForUser(publicKey) {
     }
 
     const result = await response.json();
+    
+    // ============================================
+    // CRITICAL DEBUG: Log the full response
+    // ============================================
+    console.log('[PartyService] ===== BACKEND RESPONSE RECEIVED =====');
+    console.log('[PartyService] Full response object:', result);
+    console.log('[PartyService] Response keys:', Object.keys(result));
+    console.log('[PartyService] result.partyId:', result.partyId);
+    console.log('[PartyService] result.token exists:', !!result.token);
+    console.log('[PartyService] result.token type:', typeof result.token);
+    console.log('[PartyService] result.token value:', result.token);
+    console.log('[PartyService] result.token length:', result.token?.length);
+    console.log('[PartyService] result.quotaStatus:', result.quotaStatus);
+    
+    // Validate token before returning
+    if (result.token) {
+      console.log('[PartyService] ✓ Token is present in response');
+      console.log('[PartyService] Token preview:', result.token.substring(0, 50) + '...');
+    } else {
+      console.error('[PartyService] ✗ CRITICAL: Token is MISSING from response!');
+      console.error('[PartyService] Response object:', JSON.stringify(result, null, 2));
+    }
+    console.log('[PartyService] ======================================');
+    
     console.log('[PartyService] Party created successfully:', result.partyId);
     
     return result;

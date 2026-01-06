@@ -57,18 +57,54 @@ app.post('/api/create-party', async (req, res) => {
     console.log('[API] Creating party for public key:', publicKeyHex.substring(0, 20) + '...');
     
     // Create party for user
-    const result = await partyService.createPartyForUser(publicKeyHex);
-    
-    // Try to generate a token for the party
+    let result;
     try {
-      const token = await partyService.generateTokenForParty(result.partyId);
-      result.token = token;
-    } catch (tokenError) {
-      console.warn('[API] Could not generate token, party created but token generation failed:', tokenError.message);
-      // Continue without token - frontend can handle this
+      result = await partyService.createPartyForUser(publicKeyHex);
+    } catch (serviceError) {
+      console.error('[API] PartyService error:', {
+        message: serviceError.message,
+        stack: serviceError.stack,
+        name: serviceError.name
+      });
+      throw serviceError; // Re-throw to be handled by outer catch
     }
     
+    // Validate result before returning
+    if (!result) {
+      console.error('[API] CRITICAL: Party creation returned null/undefined result');
+      throw new Error('Party creation returned null result');
+    }
+    
+    if (result.token === null || result.token === undefined) {
+      console.error('[API] CRITICAL: Party creation succeeded but token is null/undefined');
+      console.error('[API] Result object keys:', Object.keys(result));
+      console.error('[API] Result object:', JSON.stringify(result, null, 2));
+      throw new Error('Party creation completed but token is missing. This indicates a critical error in token generation.');
+    }
+    
+    if (typeof result.token !== 'string') {
+      console.error('[API] CRITICAL: Token is not a string, type:', typeof result.token);
+      console.error('[API] Token value:', result.token);
+      throw new Error(`Token is not a string (got ${typeof result.token}). This should never happen.`);
+    }
+    
+    if (result.token.trim() === '') {
+      console.error('[API] CRITICAL: Token is empty string');
+      throw new Error('Token is an empty string. This should never happen.');
+    }
+    
+    // Token is already generated in createPartyForUser - no fallbacks needed
+    console.log('[API] Party creation completed successfully');
     console.log('[API] Party created successfully:', result.partyId);
+    console.log('[API] Token generated, length:', result.token.length);
+    console.log('[API] Token preview:', result.token.substring(0, 50) + '...');
+    
+    // Final check before sending response
+    if (!result.token) {
+      console.error('[API] CRITICAL: Token became null right before sending response');
+      throw new Error('Token validation failed at the last moment - this should never happen');
+    }
+    
     res.json(result);
     
   } catch (error) {
@@ -123,6 +159,59 @@ app.all('/api/ledger/*', async (req, res) => {
 // Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+});
+
+// Test Service Account configuration
+app.get('/api/test-service-account', async (req, res) => {
+  try {
+    const adminToken = await partyService.getKeycloakAdminToken();
+    
+    // Try to list users (minimal permission check)
+    const testUrl = `${process.env.KEYCLOAK_BASE_URL || 'https://keycloak.wolfedgelabs.com:8443'}/admin/realms/${process.env.KEYCLOAK_REALM || 'canton-devnet'}/users?max=1`;
+    const testResponse = await fetch(testUrl, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${adminToken}`,
+        'Content-Type': 'application/json',
+      },
+    });
+    
+    if (testResponse.ok) {
+      res.json({ 
+        status: 'success', 
+        message: 'Service Account is properly configured and has permissions',
+        canCreateUsers: true 
+      });
+    } else if (testResponse.status === 403) {
+      res.status(403).json({ 
+        status: 'error',
+        message: 'Service Account token obtained but lacks manage-users permission',
+        canCreateUsers: false,
+        fix: 'Assign "manage-users" role from "realm-management" client to the service account'
+      });
+    } else {
+      res.status(testResponse.status).json({ 
+        status: 'error',
+        message: `Unexpected error: ${testResponse.status}`,
+        canCreateUsers: false
+      });
+    }
+  } catch (error) {
+    if (error.message.includes('Service Accounts')) {
+      res.status(503).json({ 
+        status: 'error',
+        message: 'Service Accounts not enabled',
+        canCreateUsers: false,
+        fix: 'Enable "Service Accounts Enabled" for "Clob" client in Keycloak'
+      });
+    } else {
+      res.status(500).json({ 
+        status: 'error',
+        message: error.message,
+        canCreateUsers: false
+      });
+    }
+  }
 });
 
 const PORT = process.env.PORT || 3001;
