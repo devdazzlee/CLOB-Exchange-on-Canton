@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package com.daml.ledger.api.v1.admin;
+
+service UserManagementService {
+  rpc GrantUserRights(GrantUserRightsRequest) returns (GrantUserRightsResponse);
+  rpc ListUserRights(ListUserRightsRequest) returns (ListUserRightsResponse);
+}
+
+message GrantUserRightsRequest {
+  string user_id = 1;
+  repeated Right rights = 2;
+  string identity_provider_id = 3;
+}
+
+message GrantUserRightsResponse {
+  repeated Right newly_granted_rights = 1;
+}
+
+message ListUserRightsRequest {
+  string user_id = 1;
+  string identity_provider_id = 2;
+}
+
+message ListUserRightsResponse {
+  repeated Right rights = 1;
+}
+
+message Right {
+  oneof right {
+    ParticipantAdmin participant_admin = 1;
+    CanActAs can_act_as = 2;
+    CanReadAs can_read_as = 3;
+  }
+}
+
+message ParticipantAdmin {
+}
+
+message CanActAs {
+  string party = 1;
+}
+
+message CanReadAs {
+  string party = 1;
+}
+

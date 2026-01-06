@@ -5,6 +5,7 @@
 
 const crypto = require('crypto');
 const CantonAdminService = require('./canton-admin');
+const CantonGrpcClient = require('./canton-grpc-client');
 
 const KEYCLOAK_BASE_URL = process.env.KEYCLOAK_BASE_URL || 'https://keycloak.wolfedgelabs.com:8443';
 const KEYCLOAK_REALM = process.env.KEYCLOAK_REALM || 'canton-devnet';
@@ -18,6 +19,8 @@ const KEYCLOAK_ADMIN_CLIENT_ID = process.env.KEYCLOAK_ADMIN_CLIENT_ID || null;
 const KEYCLOAK_ADMIN_CLIENT_SECRET = process.env.KEYCLOAK_ADMIN_CLIENT_SECRET || null;
 
 const CANTON_ADMIN_BASE = process.env.CANTON_ADMIN_BASE || 'https://participant.dev.canton.wolfedgelabs.com';
+const CANTON_ADMIN_HOST = process.env.CANTON_ADMIN_HOST || '95.216.34.215';
+const CANTON_ADMIN_PORT = process.env.CANTON_ADMIN_PORT || '30100';
 const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://95.216.34.215:31539';
 
 // Quota configuration
@@ -291,10 +294,16 @@ class PartyService {
       const userId = this.getValidatorOperatorUserIdFromToken(adminToken);
       
       // Try multiple endpoints for granting user rights
+      // According to DAML docs, the endpoint should be /v1/user/rights/grant
       const endpointsToTry = [
         `${CANTON_JSON_API_BASE}/v1/user/rights/grant`,
         `${CANTON_JSON_API_BASE}/v1/admin/user/rights/grant`,
-        `${CANTON_JSON_API_BASE}/v1/admin/users/${encodeURIComponent(userId)}/rights/grant`
+        `${CANTON_JSON_API_BASE}/v1/admin/users/${encodeURIComponent(userId)}/rights/grant`,
+        // Try with admin prefix
+        `${CANTON_JSON_API_BASE}/v1/admin/user-management/grant-rights`,
+        `${CANTON_JSON_API_BASE}/v1/admin/user-management/users/${encodeURIComponent(userId)}/rights`,
+        // Try direct admin API
+        `http://${CANTON_ADMIN_HOST}:${CANTON_ADMIN_PORT}/v1/admin/user-management/grant-rights`
       ];
       
       let response = null;
@@ -362,9 +371,17 @@ class PartyService {
         }
       }
       
-      // All endpoints failed or returned 404 - assignment is optional
-      // The party must be assigned manually via admin tools
-      return { success: true, skipped: true, reason: 'endpoint_not_available' };
+      // ROOT CAUSE: UserManagementService is not available on this Canton setup
+      // - JSON API endpoint /v1/user/rights/grant returns 404
+      // - gRPC method returns "12 UNIMPLEMENTED: Method not found"
+      //
+      // SOLUTION: The party must be assigned to validator-operator manually via:
+      // 1. Canton Console: Use `parties.enable` and assign to validator-operator
+      // 2. Keycloak: Configure protocol mapper to include party in token's actAs claim
+      //
+      // The code will attempt to configure Keycloak mapper programmatically,
+      // but if that fails, manual configuration is required.
+      return { success: false, skipped: true, reason: 'user_management_service_not_available' };
     } catch (error) {
       // If it's a 404 or endpoint not found, return success (assignment is optional)
       if (error.message.includes('404') || error.message.includes('not found') || error.message.includes('HttpMethod')) {
@@ -641,14 +658,224 @@ class PartyService {
   }
 
   /**
+   * Update validator-operator user attribute with new party
+   * This allows the protocol mapper to include all parties in the token
+   */
+  async updateValidatorOperatorParties(partyId) {
+    try {
+      const adminToken = await this.getKeycloakAdminToken();
+      const userId = this.getValidatorOperatorUserIdFromToken(adminToken);
+      
+      // Get current user
+      const userUrl = `${KEYCLOAK_BASE_URL}/admin/realms/${KEYCLOAK_REALM}/users/${userId}`;
+      const userResponse = await fetch(userUrl, {
+        headers: {
+          'Authorization': `Bearer ${adminToken}`,
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      if (!userResponse.ok) {
+        return { success: false, error: 'Cannot get validator-operator user' };
+      }
+      
+      const user = await userResponse.json();
+      
+      // Get current parties from user attribute
+      const currentParties = user.attributes?.cantonParties || [];
+      const partiesArray = Array.isArray(currentParties) ? currentParties : 
+                          (currentParties[0] ? JSON.parse(currentParties[0]) : []);
+      
+      // Add new party if not already present
+      if (!partiesArray.includes(partyId)) {
+        partiesArray.push(partyId);
+        
+        // Update user attribute
+        const updateUrl = `${KEYCLOAK_BASE_URL}/admin/realms/${KEYCLOAK_REALM}/users/${userId}`;
+        const updateResponse = await fetch(updateUrl, {
+          method: 'PUT',
+          headers: {
+            'Authorization': `Bearer ${adminToken}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            ...user,
+            attributes: {
+              ...user.attributes,
+              cantonParties: [JSON.stringify(partiesArray)]
+            }
+          })
+        });
+        
+        if (!updateResponse.ok) {
+          const errorText = await updateResponse.text();
+          return { success: false, error: `Failed to update user: ${updateResponse.status} - ${errorText}` };
+        }
+      }
+      
+      return { success: true, parties: partiesArray };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Configure Keycloak protocol mapper with current party list
+   * ROOT CAUSE FIX: Updates hardcoded mapper with current parties EVERY TIME
+   */
+  async configureKeycloakMapperForParties(partyId) {
+    try {
+      const adminToken = await this.getKeycloakAdminToken();
+      
+      // Get validator-app client UUID
+      const clientsUrl = `${KEYCLOAK_BASE_URL}/admin/realms/${KEYCLOAK_REALM}/clients?clientId=${encodeURIComponent(KEYCLOAK_ADMIN_CLIENT_ID)}`;
+      const clientsResponse = await fetch(clientsUrl, {
+        headers: {
+          'Authorization': `Bearer ${adminToken}`,
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      if (!clientsResponse.ok) {
+        return { success: false, error: 'Cannot access Keycloak Admin API' };
+      }
+      
+      const clients = await clientsResponse.json();
+      if (!clients || clients.length === 0) {
+        return { success: false, error: 'Client not found' };
+      }
+      
+      const clientId = clients[0].id;
+      const mapperUrl = `${KEYCLOAK_BASE_URL}/admin/realms/${KEYCLOAK_REALM}/clients/${clientId}/protocol-mappers/models`;
+      
+      // Get current parties from user attribute
+      const userId = this.getValidatorOperatorUserIdFromToken(adminToken);
+      const userUrl = `${KEYCLOAK_BASE_URL}/admin/realms/${KEYCLOAK_REALM}/users/${userId}`;
+      const userResponse = await fetch(userUrl, {
+        headers: {
+          'Authorization': `Bearer ${adminToken}`,
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      let parties = [partyId];
+      if (userResponse.ok) {
+        const user = await userResponse.json();
+        const currentParties = user.attributes?.cantonParties || [];
+        if (currentParties.length > 0) {
+          try {
+            const parsed = JSON.parse(currentParties[0]);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              parties = parsed;
+              if (!parties.includes(partyId)) {
+                parties.push(partyId);
+              }
+            }
+          } catch (e) {
+            parties = [partyId];
+          }
+        }
+      }
+      
+      // Get existing mappers
+      const existingMappersResponse = await fetch(mapperUrl, {
+        headers: {
+          'Authorization': `Bearer ${adminToken}`,
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      const mapperName = 'DAML actAs - Hardcoded Parties';
+      let existingMapperId = null;
+      
+      if (existingMappersResponse.ok) {
+        const existingMappers = await existingMappersResponse.json();
+        const existingMapper = existingMappers.find(m => m.name === mapperName);
+        if (existingMapper) {
+          existingMapperId = existingMapper.id;
+          // Delete existing mapper to recreate with updated parties
+          const deleteUrl = `${KEYCLOAK_BASE_URL}/admin/realms/${KEYCLOAK_REALM}/clients/${clientId}/protocol-mappers/models/${existingMapperId}`;
+          await fetch(deleteUrl, {
+            method: 'DELETE',
+            headers: {
+              'Authorization': `Bearer ${adminToken}`,
+              'Content-Type': 'application/json'
+            }
+          });
+        }
+      }
+      
+      // Create/update hardcoded mapper with current parties
+      // Keycloak hardcoded mapper requires the claim value to be a STRING representation of JSON
+      // The claim.name must match exactly what DAML expects: "https://daml.com/ledgerapi"
+      const claimValue = {
+        'actAs': parties,
+        'readAs': parties
+      };
+      
+      const hardcodedMapper = {
+        name: mapperName,
+        protocol: 'openid-connect',
+        protocolMapper: 'oidc-hardcoded-claim-mapper',
+        config: {
+          'claim.value': JSON.stringify(claimValue), // Must be stringified JSON
+          'claim.name': 'https://daml.com/ledgerapi', // Exact claim name DAML expects
+          'jsonType.label': 'JSON', // Tells Keycloak to parse as JSON
+          'access.token.claim': 'true',
+          'id.token.claim': 'true'
+        }
+      };
+      
+      console.log('[PartyService] Creating mapper with parties:', parties);
+      console.log('[PartyService] Claim value (stringified):', JSON.stringify(claimValue));
+      
+      const mapperResponse = await fetch(mapperUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${adminToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(hardcodedMapper)
+      });
+      
+      const responseText = await mapperResponse.text();
+      
+      if (!mapperResponse.ok) {
+        console.error('[PartyService] ✗ Mapper creation FAILED:', mapperResponse.status);
+        console.error('[PartyService] Error response:', responseText);
+        console.error('[PartyService] Mapper config sent:', JSON.stringify(hardcodedMapper, null, 2));
+        return { success: false, error: `Failed to create mapper: ${mapperResponse.status} - ${responseText}` };
+      }
+      
+      let mapperData = null;
+      try {
+        mapperData = responseText ? JSON.parse(responseText) : { id: 'created' };
+      } catch (e) {
+        // 201 Created might return empty body
+        if (mapperResponse.status === 201) {
+          mapperData = { id: 'created' };
+        }
+      }
+      
+      console.log('[PartyService] ✓ Mapper created successfully! Status:', mapperResponse.status);
+      console.log('[PartyService] Mapper ID:', mapperData?.id);
+      console.log('[PartyService] Parties in mapper:', parties);
+      
+      return { success: true, parties, mapperId: mapperData?.id };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
    * Generate token for validator-operator with party in actAs claim
-   * Uses client_credentials grant and adds party to actAs claim via token modification
+   * ROOT CAUSE FIX: Uses token exchange to add party claim, or modifies token directly
    */
   async generateTokenForValidatorOperator(partyId) {
     try {
+      // Step 1: Get base token from Keycloak
       const tokenUrl = `${KEYCLOAK_BASE_URL}/realms/${KEYCLOAK_REALM}/protocol/openid-connect/token`;
       
-      // Use client_credentials grant for validator-app service account
       const params = new URLSearchParams({
         grant_type: 'client_credentials',
         client_id: KEYCLOAK_ADMIN_CLIENT_ID,
@@ -678,12 +905,106 @@ class PartyService {
         throw new Error('Token response missing access_token');
       }
 
-      // Return the token as-is
-      // The party must be assigned to validator-operator via UserManagementService
-      // Since the endpoint doesn't exist via JSON API, the party assignment is skipped
-      // The client needs to manually assign the party to validator-operator using their admin tools
-      // OR configure Keycloak to include the party in the token's actAs claim
-      return data.access_token;
+      const baseToken = data.access_token;
+
+      // Step 2: Update user attribute FIRST
+      console.log('[PartyService] Step 1: Updating validator-operator user attribute with party:', partyId);
+      const updateResult = await this.updateValidatorOperatorParties(partyId);
+      if (!updateResult.success) {
+        console.error('[PartyService] Failed to update user parties:', updateResult.error);
+      } else {
+        console.log('[PartyService] ✓ User attribute updated with parties:', updateResult.parties);
+      }
+
+      // Step 3: Configure mapper with CURRENT party list (including new party)
+      console.log('[PartyService] Step 2: Configuring Keycloak mapper for party:', partyId);
+      const mapperResult = await this.configureKeycloakMapperForParties(partyId);
+      if (!mapperResult.success) {
+        console.error('[PartyService] CRITICAL: Failed to configure mapper:', mapperResult.error);
+        throw new Error(`Keycloak mapper configuration failed: ${mapperResult.error}`);
+      }
+      
+      console.log('[PartyService] ✓ Mapper configured with parties:', mapperResult.parties);
+
+      // Step 4: Wait for Keycloak to process mapper update (longer wait for reliability)
+      console.log('[PartyService] Step 3: Waiting 3 seconds for Keycloak to process mapper...');
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      
+      const newTokenResponse = await fetch(tokenUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: params,
+      });
+
+      if (!newTokenResponse.ok) {
+        const errorText = await newTokenResponse.text();
+        throw new Error(`Token generation failed (${newTokenResponse.status}): ${errorText}`);
+      }
+
+      const newTokenData = await newTokenResponse.json();
+      
+      if (!newTokenData || !newTokenData.access_token) {
+        throw new Error('Token response missing access_token');
+      }
+
+      // Step 5: Verify token includes actAs claim - CRITICAL CHECK
+      const newParts = newTokenData.access_token.split('.');
+      if (newParts.length === 3) {
+        try {
+          const newPayload = JSON.parse(Buffer.from(newParts[1], 'base64').toString());
+          const ledgerApi = newPayload['https://daml.com/ledgerapi'];
+          
+          if (ledgerApi && ledgerApi.actAs && Array.isArray(ledgerApi.actAs) && ledgerApi.actAs.includes(partyId)) {
+            console.log('[PartyService] ✓ Token includes party in actAs claim:', ledgerApi.actAs);
+            return newTokenData.access_token;
+          } else {
+            // Token doesn't have the claim - mapper failed
+            console.error('[PartyService] ✗ CRITICAL: Token missing party in actAs claim');
+            console.error('[PartyService] Token payload keys:', Object.keys(newPayload));
+            console.error('[PartyService] Has ledgerapi claim?', !!ledgerApi);
+            if (ledgerApi) {
+              console.error('[PartyService] ledgerapi content:', JSON.stringify(ledgerApi, null, 2));
+            }
+            
+            // Try one more time with longer wait
+            console.log('[PartyService] Retrying token generation after 2 second wait...');
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+            const retryResponse = await fetch(tokenUrl, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+              },
+              body: params,
+            });
+            
+            if (retryResponse.ok) {
+              const retryData = await retryResponse.json();
+              if (retryData.access_token) {
+                const retryParts = retryData.access_token.split('.');
+                if (retryParts.length === 3) {
+                  const retryPayload = JSON.parse(Buffer.from(retryParts[1], 'base64').toString());
+                  const retryLedgerApi = retryPayload['https://daml.com/ledgerapi'];
+                  if (retryLedgerApi && retryLedgerApi.actAs && retryLedgerApi.actAs.includes(partyId)) {
+                    console.log('[PartyService] ✓ Retry successful - token includes party');
+                    return retryData.access_token;
+                  }
+                }
+              }
+            }
+            
+            // If still failing, throw error - mapper configuration is broken
+            throw new Error(`Keycloak mapper failed - token does not include party ${partyId} in actAs claim. Mapper may not be configured correctly or Keycloak needs manual configuration.`);
+          }
+        } catch (e) {
+          console.error('[PartyService] Failed to decode/verify token:', e.message);
+          throw e;
+        }
+      }
+
+      throw new Error('Invalid token format - cannot verify actAs claim');
     } catch (error) {
       throw error;
     }
