@@ -3,14 +3,96 @@
 @tailwind utilities;
 
 @layer base {
+  :root {
+    --background: 220 13% 6%;
+    --foreground: 210 20% 92%;
+    --card: 220 13% 10%;
+    --card-foreground: 210 20% 92%;
+    --popover: 220 13% 10%;
+    --popover-foreground: 210 20% 92%;
+    --primary: 45 100% 49%;
+    --primary-foreground: 220 13% 6%;
+    --secondary: 220 13% 15%;
+    --secondary-foreground: 210 20% 92%;
+    --muted: 220 13% 15%;
+    --muted-foreground: 220 8% 52%;
+    --accent: 220 13% 15%;
+    --accent-foreground: 210 20% 92%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 13% 20%;
+    --input: 220 13% 20%;
+    --ring: 45 100% 49%;
+    --radius: 0.5rem;
+    --success: 160 84% 43%;
+    --success-foreground: 0 0% 100%;
+  }
+  
   * {
-    @apply border-gray-700;
+    border-color: hsl(var(--border));
   }
   
   body {
-    @apply bg-[#0B0E11] text-[#EAECEF] antialiased;
+    background-color: hsl(var(--background));
+    color: hsl(var(--foreground));
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
   }
+
+  /* Fix input text colors globally */
+  input, select, textarea {
+    color: #EAECEF !important;
+  }
+  
+  input::placeholder, select::placeholder, textarea::placeholder {
+    color: #848E9C !important;
+  }
+  
+  select option {
+    background-color: #1E2329;
+    color: #EAECEF;
+  }
+
+  /* Remove number input spinners/arrows */
+  input[type="number"] {
+    -moz-appearance: textfield;
+  }
+  
+  input[type="number"]::-webkit-outer-spin-button,
+  input[type="number"]::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+}
+
+/* Animations for dropdown */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes zoomIn {
+  from { 
+    opacity: 0; 
+    transform: scale(0.95); 
+  }
+  to { 
+    opacity: 1; 
+    transform: scale(1); 
+  }
+}
+
+.animate-in {
+  animation: zoomIn 0.15s ease-out;
+}
+
+.fade-in-0 {
+  animation: fadeIn 0.15s ease-out;
+}
+
+.zoom-in-95 {
+  animation: zoomIn 0.15s ease-out;
 }
 
 @layer components {

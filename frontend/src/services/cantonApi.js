@@ -28,33 +28,33 @@ const API_VERSION = 'v2';
  * @returns {string|null} Full party ID or null if not found
  */
 function getPartyIdFromToken() {
+  // Prefer the real Canton-allocated party id persisted by the app
+  try {
+    const storedPartyId = localStorage.getItem('canton_party_id');
+    if (storedPartyId) return storedPartyId;
+  } catch {}
+
   const token = getAuthToken();
   if (!token) {
-    // Return known party ID as fallback
-    return '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
+    return null;
   }
   
   try {
     const parts = token.split('.');
     if (parts.length !== 3) {
-      return '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
+      return null;
     }
     
     const payload = JSON.parse(atob(parts[1]));
     const sub = payload.sub; // Subject (party ID prefix only)
     
-    // CRITICAL FIX: The JWT 'sub' field contains only the prefix
-    // But Canton JSON API requires the FULL party ID format: "prefix::suffix"
-    // We use the known full party ID that has canReadAs permissions configured
-    // This party ID was confirmed by the client to have the correct rights
-    const fullPartyId = '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
-    
-    console.log('[Auth] Using full party ID (from token prefix:', sub, '):', fullPartyId);
-    return fullPartyId;
+    // Without a persisted canton_party_id we cannot reliably reconstruct the full party id from token.sub.
+    // Force callers to pass party explicitly or ensure canton_party_id is stored during onboarding.
+    console.warn('[Auth] Token sub present but canton_party_id not stored; cannot infer full party id from token');
+    return null;
   } catch (error) {
     console.error('[Auth] Error extracting party ID from token:', error);
-    // Return known party ID as last resort
-    return '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
+    return null;
   }
 }
 
@@ -1137,6 +1137,29 @@ export async function qualifyTemplateId(templateId, packageId = null) {
     // "Template" -> "<package-id>:Module:Template" (assume module name = template name)
     // For our contracts: UserAccount, Order, OrderBook, Trade
     return `${packageId}:${templateId}:${templateId}`;
+  }
+}
+
+/**
+ * Query all available OrderBooks to get list of trading pairs
+ * This is useful for populating dropdowns with only pairs that have OrderBooks
+ * @param {string} party - Party ID (optional, extracted from token if not provided)
+ * @returns {Promise<Array<string>>} Array of trading pair strings (e.g., ["BTC/USDT", "ETH/USDT"])
+ */
+export async function getAvailableTradingPairs(party = null) {
+  try {
+    const orderBooks = await queryContracts('OrderBook:OrderBook', party);
+    const tradingPairs = orderBooks
+      .map(ob => ob.payload?.tradingPair)
+      .filter(pair => pair && typeof pair === 'string')
+      .filter((pair, index, self) => self.indexOf(pair) === index); // Remove duplicates
+    
+    console.log('[API] Available trading pairs:', tradingPairs);
+    return tradingPairs;
+  } catch (error) {
+    console.error('[API] Error getting available trading pairs:', error);
+    // Return default pairs if query fails
+    return ['BTC/USDT'];
   }
 }
 

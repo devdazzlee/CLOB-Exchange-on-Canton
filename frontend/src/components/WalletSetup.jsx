@@ -5,7 +5,6 @@ import {
   encryptPrivateKey,
   storeWallet,
   loadWallet,
-  publicKeyToPartyId
 } from '../wallet/keyManager';
 import { createPartyForUser } from '../services/partyService';
 import { storeTokens } from '../services/keycloakAuth';
@@ -25,15 +24,38 @@ export default function WalletSetup({ onWalletReady }) {
   useEffect(() => {
     const existingWallet = loadWallet();
     if (existingWallet) {
-      setStep('ready');
       const storedPartyId = localStorage.getItem('canton_party_id');
       if (storedPartyId) {
+        setStep('ready');
         setPartyId(storedPartyId);
-      } else {
-        // Fallback display only (may not match allocated party)
-        const derivedPartyId = publicKeyToPartyId(existingWallet.publicKey);
-        setPartyId(derivedPartyId);
+        return;
       }
+
+      // No fallback: if partyId isn't stored, re-register it via backend using the stored wallet public key.
+      (async () => {
+        try {
+          setLoading(true);
+          setError('');
+          console.log('[WalletSetup] Wallet found but no canton_party_id stored. Re-registering party...');
+          const partyResult = await createPartyForUser(existingWallet.publicKey);
+          const allocatedPartyId = partyResult.partyId;
+          setPartyId(allocatedPartyId);
+          localStorage.setItem('canton_party_id', allocatedPartyId);
+
+          if (partyResult.token) {
+            storeTokens(partyResult.token, null, 1800);
+          }
+
+          setStep('ready');
+          onWalletReady?.(allocatedPartyId);
+        } catch (err) {
+          console.error('[WalletSetup] Failed to re-register party:', err);
+          setError('Wallet found but Party ID is not registered. Please create/register party again: ' + err.message);
+          setStep('select');
+        } finally {
+          setLoading(false);
+        }
+      })();
     }
   }, []);
 

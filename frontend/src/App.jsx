@@ -4,7 +4,7 @@ import WalletSetup from './components/WalletSetup';
 import TradingInterface from './components/TradingInterface';
 import AuthGuard from './components/AuthGuard';
 import AuthCallback from './components/AuthCallback';
-import { loadWallet, publicKeyToPartyId, clearWallet } from './wallet/keyManager';
+import { loadWallet, clearWallet } from './wallet/keyManager';
 import { logout, isAuthenticated } from './services/keycloakAuth';
 import './index.css';
 
@@ -29,9 +29,18 @@ function App() {
     // Check if wallet exists
     const wallet = loadWallet();
     if (wallet) {
-      const derivedPartyId = publicKeyToPartyId(wallet.publicKey);
-      setPartyId(derivedPartyId);
-      setWalletReady(true);
+      // IMPORTANT:
+      // The real party id is allocated by Canton and returned by our backend.
+      // On refresh we must reuse that value, not re-derive a fake partyId from the public key.
+      const storedPartyId = localStorage.getItem('canton_party_id');
+      if (storedPartyId) {
+        setPartyId(storedPartyId);
+        setWalletReady(true);
+      } else {
+        // No fallback: force party registration via backend (WalletSetup will do it)
+        setPartyId(null);
+        setWalletReady(false);
+      }
     }
     
     // Check authentication status
@@ -67,6 +76,7 @@ function App() {
   const handleLogout = () => {
     // Clear all authentication and wallet data
     clearWallet();
+    localStorage.removeItem('canton_party_id');
     logout();
     // Reset all state
     setPartyId(null);
