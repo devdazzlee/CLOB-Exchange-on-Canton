@@ -58,7 +58,38 @@ export default function TradingInterface({ partyId }) {
     // Load available trading pairs on mount
     const loadAvailablePairs = async () => {
       try {
-        const pairs = await getAvailableTradingPairs(partyId);
+        // Try current ledger end first
+        let pairs = await getAvailableTradingPairs(partyId);
+        
+        // If empty, check for stored completion offsets
+        if (pairs.length === 0) {
+          console.log('[TradingInterface] No pairs found at current ledger end, checking stored offsets...');
+          // Check localStorage for any stored OrderBook offsets
+          const allKeys = Object.keys(localStorage);
+          const orderBookKeys = allKeys.filter(k => k.startsWith(`orderBook_`) && k.endsWith(`_${partyId}_offset`));
+          
+          if (orderBookKeys.length > 0) {
+            // Try to query at stored offsets
+            const { queryContractsAtOffset } = await import('../services/cantonApi');
+            for (const key of orderBookKeys) {
+              const offset = localStorage.getItem(key);
+              if (offset) {
+                try {
+                  const orderBooksAtOffset = await queryContractsAtOffset('OrderBook:OrderBook', partyId, offset);
+                  const pairsAtOffset = orderBooksAtOffset
+                    .map(ob => ob.payload?.tradingPair)
+                    .filter(pair => pair && typeof pair === 'string');
+                  pairs.push(...pairsAtOffset);
+                } catch (err) {
+                  console.warn('[TradingInterface] Error querying at stored offset:', err);
+                }
+              }
+            }
+            // Remove duplicates
+            pairs = [...new Set(pairs)];
+          }
+        }
+        
         setAvailablePairs(pairs.length > 0 ? pairs : ['BTC/USDT']);
         // If current trading pair is not available, switch to first available
         if (pairs.length > 0 && !pairs.includes(tradingPair)) {
@@ -129,11 +160,49 @@ export default function TradingInterface({ partyId }) {
 
   const loadOrders = async () => {
     try {
-      const userOrders = await queryContracts('Order:Order', partyId);
+      console.log('[Active Orders] Querying Order contracts for party:', partyId, 'trading pair:', tradingPair);
+      
+      // First try querying at current ledger end
+      let userOrders = await queryContracts('Order:Order', partyId);
+      console.log('[Active Orders] Found', userOrders.length, 'total Order contracts at current ledger end');
+      
+      // If empty, try querying at stored OrderBook completion offset (where orders were created)
+      if (userOrders.length === 0) {
+        const storedOffset = localStorage.getItem(`orderBook_${tradingPair}_${partyId}_offset`);
+        if (storedOffset) {
+          console.log('[Active Orders] No orders at current ledger end, trying stored offset:', storedOffset);
+          try {
+            const { queryContractsAtOffset } = await import('../services/cantonApi');
+            const ordersAtOffset = await queryContractsAtOffset('Order:Order', partyId, storedOffset);
+            console.log('[Active Orders] Found', ordersAtOffset.length, 'Order contracts at stored offset', storedOffset);
+            
+            if (ordersAtOffset.length > 0) {
+              userOrders = ordersAtOffset;
+              console.log('[Active Orders] ✅ Using orders from stored offset');
+            }
+          } catch (err) {
+            console.warn('[Active Orders] Error querying at stored offset:', err);
+          }
+        }
+      }
+      
+      if (userOrders.length > 0) {
+        console.log('[Active Orders] All orders:', userOrders.map(o => ({
+          contractId: o.contractId?.substring(0, 20) + '...',
+          orderId: o.payload?.orderId,
+          status: o.payload?.status,
+          tradingPair: o.payload?.tradingPair,
+          owner: o.payload?.owner,
+          orderType: o.payload?.orderType
+        })));
+      }
+      
       const activeOrders = userOrders.filter(o => 
         o.payload?.status === 'OPEN' && 
         o.payload?.tradingPair === tradingPair
       );
+      
+      console.log('[Active Orders] Filtered to', activeOrders.length, 'OPEN orders for', tradingPair);
       
       setOrders(activeOrders.map(o => ({
         id: o.payload?.orderId,
@@ -147,7 +216,9 @@ export default function TradingInterface({ partyId }) {
         contractId: o.contractId
       })));
     } catch (err) {
-      console.error('[Active Orders] Error:', err);
+      console.error('[Active Orders] Error loading orders:', err);
+      console.error('[Active Orders] Error details:', err.message, err.stack);
+      // Don't set empty array on error - keep existing orders
     }
   };
 
@@ -164,25 +235,48 @@ export default function TradingInterface({ partyId }) {
     }
     
     try {
+      // First try querying at current ledger end
       let orderBooks = await queryContracts('OrderBook:OrderBook', partyId);
+      console.log('[OrderBook] Found', orderBooks.length, 'OrderBooks at current ledger end');
       let book = orderBooks.find(ob => ob.payload?.tradingPair === tradingPair);
       
-      if (book) {
-        localStorage.removeItem(`orderBook_${tradingPair}_${partyId}_offset`);
+      // If not found at current ledger end, try querying at stored completion offset
+      if (!book) {
+        const storedOffset = localStorage.getItem(`orderBook_${tradingPair}_${partyId}_offset`);
+        const storedOrderBookId = localStorage.getItem(`orderBook_${tradingPair}_${partyId}`);
+        
+        if (storedOffset) {
+          console.log('[OrderBook] Not found at current ledger end, trying stored offset:', storedOffset);
+          try {
+            const { queryContractsAtOffset } = await import('../services/cantonApi');
+            const orderBooksAtOffset = await queryContractsAtOffset('OrderBook:OrderBook', partyId, storedOffset);
+            console.log('[OrderBook] Found', orderBooksAtOffset.length, 'OrderBooks at stored offset', storedOffset);
+            book = orderBooksAtOffset.find(ob => ob.payload?.tradingPair === tradingPair);
+            if (book) {
+              console.log('[OrderBook] ✅ Found OrderBook at stored offset:', book.contractId);
+          }
+        } catch (err) {
+          console.warn('[OrderBook] Error querying at stored offset:', err);
+        }
       }
       
-      if (!book) {
-        const storedOrderBookId = localStorage.getItem(`orderBook_${tradingPair}_${partyId}`);
-        if (storedOrderBookId) {
+        // If still not found, try fetching by stored contract ID
+      if (!book && storedOrderBookId) {
+          console.log('[OrderBook] Trying to fetch stored OrderBook by ID:', storedOrderBookId);
         try {
           const storedBook = await fetchContract(storedOrderBookId, partyId);
           if (storedBook && storedBook.payload?.tradingPair === tradingPair) {
+              console.log('[OrderBook] ✅ Found stored OrderBook by ID');
             book = storedBook;
           }
         } catch (err) {
           console.warn('[OrderBook] Could not fetch stored OrderBook:', err);
-          }
         }
+        }
+      } else {
+        // Found at current ledger end - clear stored offset
+        console.log('[OrderBook] ✅ Found at current ledger end, clearing stored offset');
+        localStorage.removeItem(`orderBook_${tradingPair}_${partyId}_offset`);
       }
       
       if (!book) {
@@ -199,6 +293,13 @@ export default function TradingInterface({ partyId }) {
       const buyCids = book.payload?.buyOrders || [];
       const sellCids = book.payload?.sellOrders || [];
       
+      console.log('[OrderBook] OrderBook contains:', {
+        buyOrders: buyCids.length,
+        sellOrders: sellCids.length,
+        buyOrderIds: buyCids.map(cid => cid.substring(0, 20) + '...'),
+        sellOrderIds: sellCids.map(cid => cid.substring(0, 20) + '...')
+      });
+      
       if (buyCids.length === 0 && sellCids.length === 0) {
         setOrderBook({ buys: [], sells: [] });
         setOrderBookExists(true);
@@ -208,7 +309,34 @@ export default function TradingInterface({ partyId }) {
       }
       
       const allCids = [...buyCids, ...sellCids];
-      const orderContracts = await fetchContracts(allCids, partyId);
+      
+      // Try fetching contracts - first try current ledger end
+      let orderContracts = await fetchContracts(allCids, partyId);
+      console.log('[OrderBook] Fetched', orderContracts.length, 'order contracts at current ledger end');
+      
+      // If some contracts are missing, try fetching at stored offset
+      if (orderContracts.length < allCids.length) {
+        const storedOffset = localStorage.getItem(`orderBook_${tradingPair}_${partyId}_offset`);
+        if (storedOffset) {
+          console.log('[OrderBook] Some orders missing, trying to fetch at stored offset:', storedOffset);
+          try {
+            const { queryContractsAtOffset } = await import('../services/cantonApi');
+            const ordersAtOffset = await queryContractsAtOffset('Order:Order', partyId, storedOffset);
+            console.log('[OrderBook] Found', ordersAtOffset.length, 'Order contracts at stored offset');
+            
+            // Merge results - use contracts from offset if they're not already fetched
+            const fetchedIds = new Set(orderContracts.map(c => c.contractId));
+            const missingOrders = ordersAtOffset.filter(o => allCids.includes(o.contractId) && !fetchedIds.has(o.contractId));
+            
+            if (missingOrders.length > 0) {
+              console.log('[OrderBook] Adding', missingOrders.length, 'missing orders from stored offset');
+              orderContracts = [...orderContracts, ...missingOrders];
+          }
+        } catch (err) {
+            console.warn('[OrderBook] Error fetching orders at stored offset:', err);
+          }
+        }
+      }
       
       const buyOrders = orderContracts
         .filter(contract => buyCids.includes(contract.contractId) && contract?.payload?.status === 'OPEN')
@@ -264,6 +392,34 @@ export default function TradingInterface({ partyId }) {
 
   // Order book creation
   const handleCreateOrderBook = async () => {
+    // Check if OrderBook already exists before creating - try stored offset first
+    console.log('[Create OrderBook] Checking if OrderBook already exists for', tradingPair);
+    let existingOrderBooks = await queryContracts('OrderBook:OrderBook', partyId);
+    let existing = existingOrderBooks.find(ob => ob.payload?.tradingPair === tradingPair);
+    
+    // If not found at current ledger end, check stored offset
+    if (!existing) {
+      const storedOffset = localStorage.getItem(`orderBook_${tradingPair}_${partyId}_offset`);
+      if (storedOffset) {
+        console.log('[Create OrderBook] Checking stored offset:', storedOffset);
+        const { queryContractsAtOffset } = await import('../services/cantonApi');
+        const orderBooksAtOffset = await queryContractsAtOffset('OrderBook:OrderBook', partyId, storedOffset);
+        existing = orderBooksAtOffset.find(ob => ob.payload?.tradingPair === tradingPair);
+      }
+    }
+    
+    if (existing) {
+      console.log('[Create OrderBook] OrderBook already exists:', existing.contractId);
+      await showModal({
+        title: 'OrderBook Already Exists',
+        message: `An OrderBook for ${tradingPair} already exists.\n\nContract ID: ${existing.contractId}`,
+        type: 'info',
+        confirmText: 'OK',
+      });
+      setCreatingOrderBook(false);
+      return { success: true, contractId: existing.contractId };
+    }
+    
     const confirmed = await showModal({
       title: 'Create OrderBook',
       message: `Create OrderBook for ${tradingPair}?`,
@@ -279,6 +435,7 @@ export default function TradingInterface({ partyId }) {
     setCreatingOrderBook(true);
 
     try {
+      console.log('[Create OrderBook] Creating new OrderBook for', tradingPair);
       const payload = {
         tradingPair: tradingPair,
         buyOrders: [],
@@ -314,13 +471,41 @@ export default function TradingInterface({ partyId }) {
           });
         }
         
+      // Refresh available pairs after creating OrderBook
+        try {
+          // Query at completion offset to get the newly created OrderBook
+          if (result.completionOffset !== undefined) {
+            const { queryContractsAtOffset } = await import('../services/cantonApi');
+            const pairsAtOffset = await queryContractsAtOffset('OrderBook:OrderBook', partyId, result.completionOffset.toString());
+            const tradingPairs = pairsAtOffset
+              .map(ob => ob.payload?.tradingPair)
+              .filter(pair => pair && typeof pair === 'string')
+              .filter((pair, index, self) => self.indexOf(pair) === index);
+            
+            if (tradingPairs.length > 0) {
+              setAvailablePairs(tradingPairs);
+            }
+          }
+          
+          // Also try current ledger end as fallback
+          const pairs = await getAvailableTradingPairs(partyId);
+          if (pairs.length > 0) {
+            setAvailablePairs(pairs);
+            }
+          } catch (err) {
+          console.error('[Create OrderBook] Error refreshing available pairs:', err);
+        }
+        
         await loadOrderBook(true);
-            } else {
+        return { success: true, contractId, completionOffset: result.completionOffset };
+      } else {
         setError('OrderBook creation failed. Please check the console for details and try again.');
+        return { success: false };
       }
     } catch (err) {
       console.error('[Create OrderBook] Error:', err);
       setError(`Failed to create OrderBook: ${err.message}`);
+      return { success: false, error: err.message };
     } finally {
       setCreatingOrderBook(false);
     }
@@ -343,10 +528,48 @@ export default function TradingInterface({ partyId }) {
 
       const orderId = `ORDER-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
       
-      const orderBooks = await queryContracts('OrderBook:OrderBook', partyId);
+      // Query OrderBooks - try current ledger end first
+      console.log('[Place Order] Querying OrderBooks for party:', partyId);
+      let orderBooks = await queryContracts('OrderBook:OrderBook', partyId);
+      console.log('[Place Order] Found', orderBooks.length, 'OrderBooks at current ledger end');
+      
+      // If not found, try stored completion offset
       let orderBookContract = orderBooks.find(ob => ob.payload?.tradingPair === tradingPair);
+      
+      if (!orderBookContract) {
+        const storedOffset = localStorage.getItem(`orderBook_${tradingPair}_${partyId}_offset`);
+        if (storedOffset) {
+          console.log('[Place Order] Not found at current ledger end, trying stored offset:', storedOffset);
+          const { queryContractsAtOffset } = await import('../services/cantonApi');
+          const orderBooksAtOffset = await queryContractsAtOffset('OrderBook:OrderBook', partyId, storedOffset);
+          console.log('[Place Order] Found', orderBooksAtOffset.length, 'OrderBooks at stored offset');
+            orderBookContract = orderBooksAtOffset.find(ob => ob.payload?.tradingPair === tradingPair);
+            if (orderBookContract) {
+            console.log('[Place Order] ✅ Found OrderBook at stored offset:', orderBookContract.contractId);
+          }
+        }
+      }
+      
+      // Find ALL OrderBooks for this trading pair (if multiple found)
+      const matchingOrderBooks = orderBooks.filter(ob => ob.payload?.tradingPair === tradingPair);
+      
+      if (matchingOrderBooks.length > 1) {
+        console.warn('[Place Order] ⚠️ DUPLICATE ORDERBOOKS DETECTED!', matchingOrderBooks.length, 'OrderBooks for', tradingPair);
+        console.warn('[Place Order] Using the most recent one (highest offset)');
+        // Sort by offset descending and use the most recent one
+        matchingOrderBooks.sort((a, b) => (b.offset || 0) - (a.offset || 0));
+        orderBookContract = matchingOrderBooks[0];
+      }
+      
+      if (orderBookContract) {
+        console.log('[Place Order] Using OrderBook for', tradingPair, ':', orderBookContract.contractId, 'at offset', orderBookContract.offset);
+      } else {
+        console.warn('[Place Order] No OrderBook found for', tradingPair);
+        console.warn('[Place Order] Available pairs:', orderBooks.map(ob => ob.payload?.tradingPair));
+      }
 
       if (!orderBookContract) {
+        console.log('[Place Order] OrderBook not found, prompting user to create...');
         const shouldCreate = await showModal({
           title: 'OrderBook Not Found',
           message: `Order book not found for ${tradingPair}.\n\nWould you like to create it now?`,
@@ -357,26 +580,71 @@ export default function TradingInterface({ partyId }) {
         });
         
         if (shouldCreate) {
-          await handleCreateOrderBook();
-          await new Promise(resolve => setTimeout(resolve, 2000));
+          console.log('[Place Order] User confirmed, creating OrderBook...');
+          const createResult = await handleCreateOrderBook();
           
-          const newOrderBooks = await queryContracts('OrderBook:OrderBook', partyId);
-          orderBookContract = newOrderBooks.find(ob => ob.payload?.tradingPair === tradingPair);
+          if (!createResult || !createResult.success) {
+            setError('Failed to create OrderBook. Please try again.');
+            setLoading(false);
+            return;
+          }
           
-          if (!orderBookContract) {
-            setError('OrderBook was created but not immediately visible. Please refresh.');
+          // Get the completion offset from createResult or stored value
+          const completionOffset = createResult.completionOffset || localStorage.getItem(`orderBook_${tradingPair}_${partyId}_offset`);
+          
+          if (completionOffset) {
+            console.log('[Place Order] Querying newly created OrderBook at completion offset:', completionOffset);
+            // Wait a bit for ledger propagation
+            await new Promise(resolve => setTimeout(resolve, 3000));
+            
+            // Query at the completion offset where the OrderBook was created
+            const { queryContractsAtOffset } = await import('../services/cantonApi');
+            const newOrderBooks = await queryContractsAtOffset('OrderBook:OrderBook', partyId, completionOffset.toString());
+            console.log('[Place Order] Found', newOrderBooks.length, 'OrderBooks at completion offset', completionOffset);
+            
+            orderBookContract = newOrderBooks.find(ob => ob.payload?.tradingPair === tradingPair);
+            
+            if (!orderBookContract) {
+              // Fallback: try current ledger end
+              console.log('[Place Order] Not found at completion offset, trying current ledger end...');
+              const fallbackOrderBooks = await queryContracts('OrderBook:OrderBook', partyId);
+              orderBookContract = fallbackOrderBooks.find(ob => ob.payload?.tradingPair === tradingPair);
+            }
+            
+            if (!orderBookContract) {
+              console.error('[Place Order] OrderBook still not found after creation!');
+              setError('OrderBook was created but not immediately visible. Please refresh the page and try placing the order again.');
           setLoading(false);
           return;
+            }
+            
+            console.log('[Place Order] ✅ Found newly created OrderBook:', orderBookContract.contractId);
+        } else {
+            setError('OrderBook creation succeeded but completion offset not available. Please refresh and try again.');
+            setLoading(false);
+            return;
           }
         } else {
+          console.log('[Place Order] User cancelled OrderBook creation');
           throw new Error(`Order book not found for ${tradingPair}. Please create it first.`);
         }
       }
 
       const operator = orderBookContract.payload?.operator;
       if (!operator) {
+        console.error('[Place Order] OrderBook has no operator!');
         throw new Error('OrderBook operator not found. Cannot place order.');
       }
+      
+      console.log('[Place Order] Exercising AddOrder choice on OrderBook:', orderBookContract.contractId);
+      console.log('[Place Order] Order details:', {
+        orderId,
+        owner: partyId,
+        orderType,
+        orderMode,
+        price: orderMode === 'LIMIT' ? parseFloat(price).toString() : null,
+        quantity: parseFloat(quantity).toString()
+      });
       
       const exerciseResult = await exerciseChoice(
         orderBookContract.contractId,
@@ -396,32 +664,109 @@ export default function TradingInterface({ partyId }) {
       );
       
       if (exerciseResult.updateId && exerciseResult.completionOffset !== undefined) {
+        console.log('[Place Order] Order placement succeeded:', {
+          updateId: exerciseResult.updateId,
+          completionOffset: exerciseResult.completionOffset,
+          createdOrderContractId: exerciseResult.createdOrderContractId
+        });
+        
+        // Store the completion offset for future queries
+        localStorage.setItem(`orderBook_${tradingPair}_${partyId}_offset`, exerciseResult.completionOffset.toString());
+        
+        // Wait for Order contract to be visible
         await new Promise(resolve => setTimeout(resolve, 2000));
         
         try {
-          let updatedOrderBooks = await queryContracts('OrderBook:OrderBook', partyId);
+          // Query OrderBook at completion offset to get the updated one
+          const { queryContractsAtOffset } = await import('../services/cantonApi');
+          let updatedOrderBooks = await queryContractsAtOffset('OrderBook:OrderBook', partyId, exerciseResult.completionOffset);
           let updatedBook = updatedOrderBooks.find(ob => ob.payload?.tradingPair === tradingPair);
             
             if (updatedBook) {
+            console.log('[Place Order] Found updated OrderBook at completion offset:', updatedBook.contractId);
             localStorage.setItem(`orderBook_${tradingPair}_${partyId}`, updatedBook.contractId);
-            localStorage.setItem(`orderBook_${tradingPair}_${partyId}_offset`, exerciseResult.completionOffset.toString());
-          }
-        } catch (err) {
+          } else {
+            // Fallback to current ledger end
+            console.log('[Place Order] OrderBook not found at completion offset, trying current ledger end...');
+            updatedOrderBooks = await queryContracts('OrderBook:OrderBook', partyId);
+            updatedBook = updatedOrderBooks.find(ob => ob.payload?.tradingPair === tradingPair);
+            if (updatedBook) {
+              localStorage.setItem(`orderBook_${tradingPair}_${partyId}`, updatedBook.contractId);
+            }
+              }
+            } catch (err) {
           console.error('[Place Order] Error finding updated OrderBook:', err);
         }
+      } else {
+        console.warn('[Place Order] ⚠️ No updateId or completionOffset in exercise result');
       }
-
+      
+      // Wait a bit longer for Order contract to be visible
+      console.log('[Place Order] Waiting for Order contract to be visible...');
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      
+      // Try to query Order at completion offset if available
+      let newOrder = null;
+      if (exerciseResult.completionOffset !== undefined) {
+        try {
+          const { queryContractsAtOffset } = await import('../services/cantonApi');
+          console.log('[Place Order] Querying Order at completion offset:', exerciseResult.completionOffset);
+          const ordersAtOffset = await queryContractsAtOffset('Order:Order', partyId, exerciseResult.completionOffset);
+          newOrder = ordersAtOffset.find(o => 
+            o.payload?.orderId === orderId && 
+            o.payload?.tradingPair === tradingPair
+          );
+          
+          if (newOrder) {
+            console.log('[Place Order] ✅ Found Order at completion offset:', newOrder.contractId);
+              } else {
+            console.log('[Place Order] Order not found at completion offset, will try current ledger end');
+          }
+        } catch (err) {
+          console.warn('[Place Order] Error querying at completion offset:', err);
+        }
+      }
+      
+      // If not found at offset, try current ledger end
+      if (!newOrder) {
+        console.log('[Place Order] Querying Order at current ledger end...');
+        const updatedOrders = await queryContracts('Order:Order', partyId);
+        newOrder = updatedOrders.find(o => 
+          o.payload?.orderId === orderId && 
+          o.payload?.tradingPair === tradingPair
+        );
+      }
+      
+      // Reload orders and order book
+      console.log('[Place Order] Reloading orders and order book...');
       await loadOrders();
       await loadOrderBook(true);
       await loadBalance(false);
+      
       setPrice('');
       setQuantity('');
+      
+      if (newOrder) {
+        console.log('[Place Order] ✅ Order confirmed visible:', newOrder.contractId);
       await showModal({
         title: 'Order Placed',
-        message: 'Order placed successfully!',
+          message: `Order placed successfully!\n\nOrder ID: ${orderId}\nStatus: ${newOrder.payload?.status || 'OPEN'}`,
         type: 'success',
         confirmText: 'OK',
       });
+      } else {
+        console.warn('[Place Order] ⚠️ Order not yet visible, but transaction succeeded');
+        console.warn('[Place Order] This might indicate:');
+        console.warn('[Place Order] 1. Order contract is not visible to this party');
+        console.warn('[Place Order] 2. Order was immediately matched/filled and archived');
+        console.warn('[Place Order] 3. Ledger propagation delay');
+        await showModal({
+          title: 'Order Placed',
+          message: 'Order placed successfully! It may take a moment to appear in your order list. Please refresh if it doesn\'t appear.',
+          type: 'success',
+          confirmText: 'OK',
+        });
+      }
     } catch (err) {
       setError(err.message || 'Failed to place order');
     } finally {
