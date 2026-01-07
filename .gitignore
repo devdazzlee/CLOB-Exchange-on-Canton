@@ -31,3 +31,8 @@ Thumbs.db
 # Logs
 *.log
 
+# Local docs and helper scripts
+documentation/
+js-scripts/
+shell-scripts/
+
