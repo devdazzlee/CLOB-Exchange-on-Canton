@@ -1,16 +1,12 @@
 import { useEffect, useState } from 'react';
-import { useNavigate, useLocation } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { isAuthenticated, getValidAccessToken } from '../services/keycloakAuth';
-import { loadWallet } from '../wallet/keyManager';
-import { createPartyForUser } from '../services/partyService';
-import { storeTokens } from '../services/keycloakAuth';
 
 export default function AuthGuard({ children }) {
   const [isChecking, setIsChecking] = useState(true);
   const [isAuth, setIsAuth] = useState(false);
   const [error, setError] = useState(null);
   const navigate = useNavigate();
-  const location = useLocation();
 
   useEffect(() => {
     checkAuth();
@@ -19,6 +15,16 @@ export default function AuthGuard({ children }) {
   const checkAuth = async () => {
     console.log('[AuthGuard] Starting auth check');
     try {
+      // Check if user explicitly logged out - don't auto-authenticate
+      const userLoggedOut = sessionStorage.getItem('user_logged_out');
+      if (userLoggedOut === 'true') {
+        console.log('[AuthGuard] User explicitly logged out, redirecting to home...');
+        sessionStorage.removeItem('user_logged_out'); // Clear flag
+        navigate('/');
+        setIsChecking(false);
+        return;
+      }
+      
       // Check if user is authenticated
       const authStatus = isAuthenticated();
       console.log('[AuthGuard] isAuthenticated result:', authStatus);
@@ -33,69 +39,20 @@ export default function AuthGuard({ children }) {
           setIsChecking(false);
           return;
         } catch (error) {
-          // Token refresh failed, but check if we have a wallet
-          console.log('[AuthGuard] Token refresh failed, checking for wallet:', error.message);
-        }
-      }
-
-      // Not authenticated - check if user has a wallet
-      console.log('[AuthGuard] User not authenticated, checking for wallet...');
-      const wallet = loadWallet();
-      
-      if (wallet && wallet.publicKey) {
-        // User has wallet but no token - try to create party and get token
-        console.log('[AuthGuard] Wallet found, creating party on backend...');
-        try {
-          const partyResult = await createPartyForUser(wallet.publicKey);
-          
-          // ============================================
-          // CRITICAL DEBUG: Check what we received
-          // ============================================
-          console.log('[AuthGuard] ===== PARTY RESULT RECEIVED =====');
-          console.log('[AuthGuard] Full partyResult:', partyResult);
-          console.log('[AuthGuard] partyResult.partyId:', partyResult?.partyId);
-          console.log('[AuthGuard] partyResult.token exists:', !!partyResult?.token);
-          console.log('[AuthGuard] partyResult.token type:', typeof partyResult?.token);
-          console.log('[AuthGuard] partyResult.token value:', partyResult?.token);
-          console.log('[AuthGuard] partyResult.token length:', partyResult?.token?.length);
-          console.log('[AuthGuard] ===================================');
-          
-          // If backend provided a token, store it
-          if (partyResult.token) {
-            console.log('[AuthGuard] ✓ Token found! Storing authentication token...');
-            console.log('[AuthGuard] Token length:', partyResult.token.length);
-            console.log('[AuthGuard] Token preview:', partyResult.token.substring(0, 50) + '...');
-            storeTokens(partyResult.token, null, 1800);
-            console.log('[AuthGuard] ✓ Token stored successfully');
-            setIsAuth(true);
-            setIsChecking(false);
-            return;
-          } else {
-            // Party created but no token - this is okay, user can still proceed
-            // The token might be generated later or user might need to authenticate differently
-            console.error('[AuthGuard] ✗ CRITICAL: No token in partyResult!');
-            console.error('[AuthGuard] partyResult object:', JSON.stringify(partyResult, null, 2));
-            console.warn('[AuthGuard] Party created but no token provided. Proceeding anyway.');
-            setIsAuth(true);
-            setIsChecking(false);
-            return;
-          }
-        } catch (partyError) {
-          console.error('[AuthGuard] Error creating party:', partyError);
-          // If quota exceeded or other error, show error message
-          if (partyError.message.includes('quota')) {
-            setError('Daily or weekly quota for new wallets has been exceeded. Please try again later.');
-          } else {
-            setError(`Failed to create party: ${partyError.message}`);
-          }
+          // Token refresh failed - don't auto-authenticate, redirect to home
+          console.log('[AuthGuard] Token refresh failed, redirecting to home:', error.message);
+          navigate('/');
           setIsChecking(false);
           return;
         }
       }
 
-      // No wallet and no token - redirect to wallet setup
-      console.log('[AuthGuard] No wallet found, redirecting to wallet setup');
+      // Not authenticated and no valid token - redirect to home
+      // Don't auto-authenticate even if wallet exists
+      console.log('[AuthGuard] User not authenticated, redirecting to home...');
       navigate('/');
+      setIsChecking(false);
+      return;
     } catch (error) {
       console.error('[AuthGuard] Auth check error:', error);
       setError(`Authentication error: ${error.message}`);

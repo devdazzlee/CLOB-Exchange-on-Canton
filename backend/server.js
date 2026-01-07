@@ -134,6 +134,36 @@ app.get('/health', (req, res) => {
 });
 
 // Test Service Account configuration - detailed inspection
+// Diagnostic endpoint to inspect token claims
+app.post('/api/inspect-token', async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token) {
+      return res.status(400).json({ error: 'Missing token' });
+    }
+    
+    const parts = token.split('.');
+    if (parts.length !== 3) {
+      return res.status(400).json({ error: 'Invalid token format' });
+    }
+    
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+    const ledgerApi = payload['https://daml.com/ledgerapi'];
+    
+    res.json({
+      hasLedgerApiClaim: !!ledgerApi,
+      ledgerApiClaim: ledgerApi,
+      actAs: ledgerApi?.actAs || null,
+      readAs: ledgerApi?.readAs || null,
+      hasParty: ledgerApi?.actAs?.includes ? 'Check actAs array' : 'actAs is not an array',
+      allClaims: Object.keys(payload),
+      payload: payload
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/api/test-service-account', async (req, res) => {
   try {
     const adminToken = await partyService.getKeycloakAdminToken();

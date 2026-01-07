@@ -805,9 +805,42 @@ class PartyService {
         }
       }
       
-      // Create/update hardcoded mapper with current parties
-      // Keycloak hardcoded mapper requires the claim value to be a STRING representation of JSON
-      // The claim.name must match exactly what DAML expects: "https://daml.com/ledgerapi"
+      // Try script mapper first (if available), otherwise use hardcoded mapper
+      // Script mapper can dynamically read from user attributes
+      const scriptMapper = {
+        name: mapperName,
+        protocol: 'openid-connect',
+        protocolMapper: 'oidc-script-based-protocol-mapper',
+        config: {
+          'script': `
+            // Read parties from user attribute
+            var partiesAttr = user.getAttribute('cantonParties');
+            var parties = [];
+            if (partiesAttr && partiesAttr.length > 0) {
+              try {
+                parties = JSON.parse(partiesAttr[0]);
+              } catch (e) {
+                parties = [];
+              }
+            }
+            
+            // Create DAML claim structure
+            var damlClaim = {
+              'actAs': parties,
+              'readAs': parties
+            };
+            
+            // Set the claim
+            token.setOtherClaims('https://daml.com/ledgerapi', damlClaim);
+          `,
+          'claim.name': 'https://daml.com/ledgerapi',
+          'jsonType.label': 'JSON',
+          'access.token.claim': 'true',
+          'id.token.claim': 'true'
+        }
+      };
+      
+      // Fallback: hardcoded mapper if script mapper not available
       const claimValue = {
         'actAs': parties,
         'readAs': parties
@@ -818,32 +851,50 @@ class PartyService {
         protocol: 'openid-connect',
         protocolMapper: 'oidc-hardcoded-claim-mapper',
         config: {
-          'claim.value': JSON.stringify(claimValue), // Must be stringified JSON
-          'claim.name': 'https://daml.com/ledgerapi', // Exact claim name DAML expects
-          'jsonType.label': 'JSON', // Tells Keycloak to parse as JSON
+          'claim.value': JSON.stringify(claimValue),
+          'claim.name': 'https://daml.com/ledgerapi',
+          'jsonType.label': 'JSON',
           'access.token.claim': 'true',
           'id.token.claim': 'true'
         }
       };
       
-      console.log('[PartyService] Creating mapper with parties:', parties);
-      console.log('[PartyService] Claim value (stringified):', JSON.stringify(claimValue));
+      console.log('[PartyService] Attempting to create script mapper with parties:', parties);
       
-      const mapperResponse = await fetch(mapperUrl, {
+      // Try script mapper first
+      let mapperResponse = await fetch(mapperUrl, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${adminToken}`,
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify(hardcodedMapper)
+        body: JSON.stringify(scriptMapper)
       });
       
-      const responseText = await mapperResponse.text();
+      let responseText = await mapperResponse.text();
+      let usedScriptMapper = true;
+      
+      // If script mapper fails (not available in this Keycloak version), use hardcoded mapper
+      if (!mapperResponse.ok) {
+        console.log('[PartyService] Script mapper not available, using hardcoded mapper');
+        usedScriptMapper = false;
+        
+        mapperResponse = await fetch(mapperUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${adminToken}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(hardcodedMapper)
+        });
+        
+        responseText = await mapperResponse.text();
+      }
       
       if (!mapperResponse.ok) {
         console.error('[PartyService] ✗ Mapper creation FAILED:', mapperResponse.status);
         console.error('[PartyService] Error response:', responseText);
-        console.error('[PartyService] Mapper config sent:', JSON.stringify(hardcodedMapper, null, 2));
+        console.error('[PartyService] Mapper type tried:', usedScriptMapper ? 'script' : 'hardcoded');
         return { success: false, error: `Failed to create mapper: ${mapperResponse.status} - ${responseText}` };
       }
       
@@ -851,17 +902,16 @@ class PartyService {
       try {
         mapperData = responseText ? JSON.parse(responseText) : { id: 'created' };
       } catch (e) {
-        // 201 Created might return empty body
         if (mapperResponse.status === 201) {
           mapperData = { id: 'created' };
         }
       }
       
-      console.log('[PartyService] ✓ Mapper created successfully! Status:', mapperResponse.status);
+      console.log('[PartyService] ✓ Mapper created successfully! Type:', usedScriptMapper ? 'script' : 'hardcoded');
       console.log('[PartyService] Mapper ID:', mapperData?.id);
       console.log('[PartyService] Parties in mapper:', parties);
       
-      return { success: true, parties, mapperId: mapperData?.id };
+      return { success: true, parties, mapperId: mapperData?.id, mapperType: usedScriptMapper ? 'script' : 'hardcoded' };
     } catch (error) {
       return { success: false, error: error.message };
     }
@@ -926,9 +976,30 @@ class PartyService {
       
       console.log('[PartyService] ✓ Mapper configured with parties:', mapperResult.parties);
 
-      // Step 4: Wait for Keycloak to process mapper update (longer wait for reliability)
-      console.log('[PartyService] Step 3: Waiting 3 seconds for Keycloak to process mapper...');
-      await new Promise(resolve => setTimeout(resolve, 3000));
+      // Step 4: Verify mapper exists and is configured correctly
+      console.log('[PartyService] Step 3: Verifying mapper configuration...');
+      const verifyMapperUrl = `${KEYCLOAK_BASE_URL}/admin/realms/${KEYCLOAK_REALM}/clients/${clientId}/protocol-mappers/models`;
+      const verifyResponse = await fetch(verifyMapperUrl, {
+        headers: {
+          'Authorization': `Bearer ${adminToken}`,
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      if (verifyResponse.ok) {
+        const allMappers = await verifyResponse.json();
+        const ourMapper = allMappers.find(m => m.name === mapperName);
+        if (ourMapper) {
+          console.log('[PartyService] ✓ Mapper verified:', ourMapper.name, 'ID:', ourMapper.id);
+          console.log('[PartyService] Mapper config:', JSON.stringify(ourMapper.config, null, 2));
+        } else {
+          console.warn('[PartyService] ⚠ Mapper not found in verification - may need manual configuration');
+        }
+      }
+      
+      // Step 5: Wait for Keycloak to process mapper update (longer wait for reliability)
+      console.log('[PartyService] Step 4: Waiting 5 seconds for Keycloak to process mapper...');
+      await new Promise(resolve => setTimeout(resolve, 5000));
       
       const newTokenResponse = await fetch(tokenUrl, {
         method: 'POST',

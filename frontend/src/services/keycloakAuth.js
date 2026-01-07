@@ -462,6 +462,10 @@ export async function handleAuthCallback(code) {
  * Clear all stored tokens
  */
 export function clearTokens() {
+  // Clear all possible token storage keys
+  localStorage.removeItem('canton_jwt_token');
+  localStorage.removeItem('canton_jwt_token_expires_at');
+  localStorage.removeItem('canton_jwt_refresh_token');
   localStorage.removeItem('canton_access_token');
   localStorage.removeItem('canton_refresh_token');
   localStorage.removeItem('canton_token_expires_at');
@@ -483,6 +487,8 @@ export function isAuthenticated() {
  */
 export function logout() {
   clearTokens();
+  // Set logout flag to prevent auto-authentication
+  sessionStorage.setItem('user_logged_out', 'true');
   // Optionally redirect to Keycloak logout
   window.location.href = '/';
 }

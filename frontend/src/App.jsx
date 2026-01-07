@@ -1,18 +1,31 @@
 import { useState, useEffect } from 'react';
-import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
+import { BrowserRouter as Router, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
 import WalletSetup from './components/WalletSetup';
 import TradingInterface from './components/TradingInterface';
 import AuthGuard from './components/AuthGuard';
 import AuthCallback from './components/AuthCallback';
-import { loadWallet, publicKeyToPartyId } from './wallet/keyManager';
+import { loadWallet, publicKeyToPartyId, clearWallet } from './wallet/keyManager';
+import { logout, isAuthenticated } from './services/keycloakAuth';
 import './index.css';
 
 function App() {
   const [partyId, setPartyId] = useState(null);
   const [walletReady, setWalletReady] = useState(false);
   const [copiedPartyId, setCopiedPartyId] = useState(false);
+  const [authenticated, setAuthenticated] = useState(false);
 
   useEffect(() => {
+    // Check if user explicitly logged out - don't load wallet
+    const userLoggedOut = sessionStorage.getItem('user_logged_out');
+    if (userLoggedOut === 'true') {
+      console.log('[App] User logged out, skipping wallet load');
+      sessionStorage.removeItem('user_logged_out');
+      setWalletReady(false);
+      setPartyId(null);
+      setAuthenticated(false);
+      return;
+    }
+    
     // Check if wallet exists
     const wallet = loadWallet();
     if (wallet) {
@@ -20,6 +33,20 @@ function App() {
       setPartyId(derivedPartyId);
       setWalletReady(true);
     }
+    
+    // Check authentication status
+    setAuthenticated(isAuthenticated());
+    
+    // Listen for auth token changes
+    const handleAuthChange = () => {
+      setAuthenticated(isAuthenticated());
+    };
+    
+    window.addEventListener('auth-token-stored', handleAuthChange);
+    
+    return () => {
+      window.removeEventListener('auth-token-stored', handleAuthChange);
+    };
   }, []);
 
   const handleWalletReady = (newPartyId) => {
@@ -37,6 +64,18 @@ function App() {
     }
   };
 
+  const handleLogout = () => {
+    // Clear all authentication and wallet data
+    clearWallet();
+    logout();
+    // Reset all state
+    setPartyId(null);
+    setWalletReady(false);
+    setAuthenticated(false);
+    // Force redirect to home page
+    window.location.href = '/';
+  };
+
   return (
     <Router>
       <div className="min-h-screen bg-[#0B0E11]">
@@ -52,29 +91,39 @@ function App() {
                   CLOB Exchange
                 </h1>
               </div>
-              {partyId && (
-                <div className="hidden md:flex items-center space-x-2 text-sm">
-                  <span className="text-[#848E9C]">Party ID:</span>
-                  <code className="px-3 py-1.5 bg-[#1E2329] border border-[#2B3139] rounded-md text-[#F0B90B] font-mono text-xs">
-                    {partyId.substring(0, 30)}...
-                  </code>
+              <div className="flex items-center space-x-4">
+                {partyId && (
+                  <div className="hidden md:flex items-center space-x-2 text-sm">
+                    <span className="text-[#848E9C]">Party ID:</span>
+                    <code className="px-3 py-1.5 bg-[#1E2329] border border-[#2B3139] rounded-md text-[#F0B90B] font-mono text-xs">
+                      {partyId.substring(0, 30)}...
+                    </code>
+                    <button
+                      onClick={handleCopyPartyId}
+                      className="p-1.5 hover:bg-[#2B3139] rounded-md transition-colors group"
+                      title={copiedPartyId ? "Copied!" : "Copy Party ID"}
+                    >
+                      {copiedPartyId ? (
+                        <svg className="w-4 h-4 text-success transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                        </svg>
+                      ) : (
+                        <svg className="w-4 h-4 text-[#848E9C] group-hover:text-[#F0B90B] transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                        </svg>
+                      )}
+                    </button>
+                  </div>
+                )}
+                {authenticated && (
                   <button
-                    onClick={handleCopyPartyId}
-                    className="p-1.5 hover:bg-[#2B3139] rounded-md transition-colors group"
-                    title={copiedPartyId ? "Copied!" : "Copy Party ID"}
+                    onClick={handleLogout}
+                    className="px-3 py-1.5 rounded-md border border-[#2B3139] text-sm font-medium text-[#EAECEF] hover:bg-[#2B3139] hover:text-white transition-colors"
                   >
-                    {copiedPartyId ? (
-                      <svg className="w-4 h-4 text-success transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
-                      </svg>
-                    ) : (
-                      <svg className="w-4 h-4 text-[#848E9C] group-hover:text-[#F0B90B] transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                      </svg>
-                    )}
+                    Logout
                   </button>
-                </div>
-              )}
+                )}
+              </div>
             </div>
           </div>
         </header>
@@ -92,7 +141,7 @@ function App() {
             <Route
               path="/"
               element={
-                walletReady ? (
+                walletReady && authenticated ? (
                   <Navigate to="/trading" replace />
                 ) : (
                   <div className="max-w-2xl mx-auto">
