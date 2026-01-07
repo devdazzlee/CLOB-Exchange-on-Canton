@@ -281,8 +281,13 @@ class PartyService {
   }
 
   /**
-   * Assign party to validator-operator user via UserManagementService
-   * Uses Canton JSON API endpoint /v1/user/rights/grant
+   * Assign party rights to the validator-operator user via Ledger API gRPC.
+   *
+   * This matches the approach the Canton team recommends:
+   * - The validator-app service account token identifies a Canton "user_id" (JWT `sub`)
+   * - We grant that user `can_act_as` and `can_read_as` for the newly allocated party
+   *
+   * No Keycloak protocol mapper is required for this flow.
    */
   async assignPartyToValidatorOperator(partyId) {
     try {
@@ -292,101 +297,12 @@ class PartyService {
       
       // Extract user ID from token (no Keycloak Admin API needed)
       const userId = this.getValidatorOperatorUserIdFromToken(adminToken);
-      
-      // Try multiple endpoints for granting user rights
-      // According to DAML docs, the endpoint should be /v1/user/rights/grant
-      const endpointsToTry = [
-        `${CANTON_JSON_API_BASE}/v1/user/rights/grant`,
-        `${CANTON_JSON_API_BASE}/v1/admin/user/rights/grant`,
-        `${CANTON_JSON_API_BASE}/v1/admin/users/${encodeURIComponent(userId)}/rights/grant`,
-        // Try with admin prefix
-        `${CANTON_JSON_API_BASE}/v1/admin/user-management/grant-rights`,
-        `${CANTON_JSON_API_BASE}/v1/admin/user-management/users/${encodeURIComponent(userId)}/rights`,
-        // Try direct admin API
-        `http://${CANTON_ADMIN_HOST}:${CANTON_ADMIN_PORT}/v1/admin/user-management/grant-rights`
-      ];
-      
-      let response = null;
-      let responseText = '';
-      
-      for (const grantRightsUrl of endpointsToTry) {
-        try {
-          response = await fetch(grantRightsUrl, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${adminToken}`
-            },
-            body: JSON.stringify({
-              userId: userId,
-              rights: [
-                {
-                  type: 'CanActAs',
-                  party: partyId
-                }
-              ]
-            })
-          });
-          
-          responseText = await response.text();
-          
-          if (response.ok) {
-            return { success: true };
-          }
-          
-          // If endpoint doesn't exist (404), try next endpoint
-          if (response.status === 404) {
-            continue;
-          }
-          
-          // Check if party is already assigned (400/409)
-          if (response.status === 400 || response.status === 409) {
-            // Try to verify by listing user rights
-            const rightsUrl = `${CANTON_JSON_API_BASE}/v1/user/rights`;
-            const rightsResponse = await fetch(rightsUrl, {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${adminToken}`,
-                'Content-Type': 'application/json'
-              },
-              body: JSON.stringify({
-                userId: userId
-              })
-            });
-            
-            if (rightsResponse.ok) {
-              const rightsData = await rightsResponse.json();
-              const rights = rightsData.result || rightsData.rights || [];
-              const hasParty = rights.some(r => 
-                r.type === 'CanActAs' && r.party === partyId
-              );
-              
-              if (hasParty) {
-                return { success: true, alreadyAssigned: true };
-              }
-            }
-          }
-        } catch (error) {
-          continue; // Try next endpoint
-        }
-      }
-      
-      // ROOT CAUSE: UserManagementService is not available on this Canton setup
-      // - JSON API endpoint /v1/user/rights/grant returns 404
-      // - gRPC method returns "12 UNIMPLEMENTED: Method not found"
-      //
-      // SOLUTION: The party must be assigned to validator-operator manually via:
-      // 1. Canton Console: Use `parties.enable` and assign to validator-operator
-      // 2. Keycloak: Configure protocol mapper to include party in token's actAs claim
-      //
-      // The code will attempt to configure Keycloak mapper programmatically,
-      // but if that fails, manual configuration is required.
-      return { success: false, skipped: true, reason: 'user_management_service_not_available' };
+
+      const grpcClient = new CantonGrpcClient();
+      await grpcClient.grantUserRights(userId, partyId, adminToken);
+      return { success: true };
     } catch (error) {
-      // If it's a 404 or endpoint not found, return success (assignment is optional)
-      if (error.message.includes('404') || error.message.includes('not found') || error.message.includes('HttpMethod')) {
-        return { success: true, skipped: true, reason: 'endpoint_not_available' };
-      }
+      console.error('[PartyService] Failed to grant Canton user rights via gRPC:', error.message);
       throw error;
     }
   }
@@ -918,167 +834,13 @@ class PartyService {
   }
 
   /**
-   * Generate token for validator-operator with party in actAs claim
-   * ROOT CAUSE FIX: Uses token exchange to add party claim, or modifies token directly
+   * Generate a token for the validator-app service account (validator-operator user).
+   *
+   * We rely on Canton user rights (UserManagementService) rather than Keycloak token mappers.
    */
   async generateTokenForValidatorOperator(partyId) {
-    try {
-      // Step 1: Get base token from Keycloak
-      const tokenUrl = `${KEYCLOAK_BASE_URL}/realms/${KEYCLOAK_REALM}/protocol/openid-connect/token`;
-      
-      const params = new URLSearchParams({
-        grant_type: 'client_credentials',
-        client_id: KEYCLOAK_ADMIN_CLIENT_ID,
-        scope: 'openid profile email daml_ledger_api',
-      });
-      
-      if (KEYCLOAK_ADMIN_CLIENT_SECRET) {
-        params.append('client_secret', KEYCLOAK_ADMIN_CLIENT_SECRET);
-      }
-      
-      const response = await fetch(tokenUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: params,
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Token generation failed (${response.status}): ${errorText}`);
-      }
-
-      const data = await response.json();
-      
-      if (!data || !data.access_token) {
-        throw new Error('Token response missing access_token');
-      }
-
-      const baseToken = data.access_token;
-
-      // Step 2: Update user attribute FIRST
-      console.log('[PartyService] Step 1: Updating validator-operator user attribute with party:', partyId);
-      const updateResult = await this.updateValidatorOperatorParties(partyId);
-      if (!updateResult.success) {
-        console.error('[PartyService] Failed to update user parties:', updateResult.error);
-      } else {
-        console.log('[PartyService] ✓ User attribute updated with parties:', updateResult.parties);
-      }
-
-      // Step 3: Configure mapper with CURRENT party list (including new party)
-      console.log('[PartyService] Step 2: Configuring Keycloak mapper for party:', partyId);
-      const mapperResult = await this.configureKeycloakMapperForParties(partyId);
-      if (!mapperResult.success) {
-        console.error('[PartyService] CRITICAL: Failed to configure mapper:', mapperResult.error);
-        throw new Error(`Keycloak mapper configuration failed: ${mapperResult.error}`);
-      }
-      
-      console.log('[PartyService] ✓ Mapper configured with parties:', mapperResult.parties);
-
-      // Step 4: Verify mapper exists and is configured correctly
-      console.log('[PartyService] Step 3: Verifying mapper configuration...');
-      const verifyMapperUrl = `${KEYCLOAK_BASE_URL}/admin/realms/${KEYCLOAK_REALM}/clients/${clientId}/protocol-mappers/models`;
-      const verifyResponse = await fetch(verifyMapperUrl, {
-        headers: {
-          'Authorization': `Bearer ${adminToken}`,
-          'Content-Type': 'application/json'
-        }
-      });
-      
-      if (verifyResponse.ok) {
-        const allMappers = await verifyResponse.json();
-        const ourMapper = allMappers.find(m => m.name === mapperName);
-        if (ourMapper) {
-          console.log('[PartyService] ✓ Mapper verified:', ourMapper.name, 'ID:', ourMapper.id);
-          console.log('[PartyService] Mapper config:', JSON.stringify(ourMapper.config, null, 2));
-        } else {
-          console.warn('[PartyService] ⚠ Mapper not found in verification - may need manual configuration');
-        }
-      }
-      
-      // Step 5: Wait for Keycloak to process mapper update (longer wait for reliability)
-      console.log('[PartyService] Step 4: Waiting 5 seconds for Keycloak to process mapper...');
-      await new Promise(resolve => setTimeout(resolve, 5000));
-      
-      const newTokenResponse = await fetch(tokenUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: params,
-      });
-
-      if (!newTokenResponse.ok) {
-        const errorText = await newTokenResponse.text();
-        throw new Error(`Token generation failed (${newTokenResponse.status}): ${errorText}`);
-      }
-
-      const newTokenData = await newTokenResponse.json();
-      
-      if (!newTokenData || !newTokenData.access_token) {
-        throw new Error('Token response missing access_token');
-      }
-
-      // Step 5: Verify token includes actAs claim - CRITICAL CHECK
-      const newParts = newTokenData.access_token.split('.');
-      if (newParts.length === 3) {
-        try {
-          const newPayload = JSON.parse(Buffer.from(newParts[1], 'base64').toString());
-          const ledgerApi = newPayload['https://daml.com/ledgerapi'];
-          
-          if (ledgerApi && ledgerApi.actAs && Array.isArray(ledgerApi.actAs) && ledgerApi.actAs.includes(partyId)) {
-            console.log('[PartyService] ✓ Token includes party in actAs claim:', ledgerApi.actAs);
-            return newTokenData.access_token;
-          } else {
-            // Token doesn't have the claim - mapper failed
-            console.error('[PartyService] ✗ CRITICAL: Token missing party in actAs claim');
-            console.error('[PartyService] Token payload keys:', Object.keys(newPayload));
-            console.error('[PartyService] Has ledgerapi claim?', !!ledgerApi);
-            if (ledgerApi) {
-              console.error('[PartyService] ledgerapi content:', JSON.stringify(ledgerApi, null, 2));
-            }
-            
-            // Try one more time with longer wait
-            console.log('[PartyService] Retrying token generation after 2 second wait...');
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            
-            const retryResponse = await fetch(tokenUrl, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-              },
-              body: params,
-            });
-            
-            if (retryResponse.ok) {
-              const retryData = await retryResponse.json();
-              if (retryData.access_token) {
-                const retryParts = retryData.access_token.split('.');
-                if (retryParts.length === 3) {
-                  const retryPayload = JSON.parse(Buffer.from(retryParts[1], 'base64').toString());
-                  const retryLedgerApi = retryPayload['https://daml.com/ledgerapi'];
-                  if (retryLedgerApi && retryLedgerApi.actAs && retryLedgerApi.actAs.includes(partyId)) {
-                    console.log('[PartyService] ✓ Retry successful - token includes party');
-                    return retryData.access_token;
-                  }
-                }
-              }
-            }
-            
-            // If still failing, throw error - mapper configuration is broken
-            throw new Error(`Keycloak mapper failed - token does not include party ${partyId} in actAs claim. Mapper may not be configured correctly or Keycloak needs manual configuration.`);
-          }
-        } catch (e) {
-          console.error('[PartyService] Failed to decode/verify token:', e.message);
-          throw e;
-        }
-      }
-
-      throw new Error('Invalid token format - cannot verify actAs claim');
-    } catch (error) {
-      throw error;
-    }
+    const cantonAdmin = new CantonAdminService();
+    return await cantonAdmin.getAdminToken();
   }
 
   async generateTokenForParty(partyId, userInfo, retryCount = 0) {
@@ -1199,8 +961,13 @@ class PartyService {
     }
   }
 
-  createPartyIdFromPublicKey(publicKeyHex, prefix = '8100b2db-86cf-40a1-8351-55483c151cdc') {
-    return `${prefix}::${publicKeyHex}`;
+  createPartyHintFromPublicKey(publicKeyHex, prefix = 'external-wallet-user') {
+    // PartyManagementService.AllocateParty takes a *hint*, not a full party id.
+    // Passing values with "::" has been triggering INTERNAL errors on the devnet participant.
+    // We create a stable, short hint derived from the public key.
+    const pubKeyBytes = Buffer.from(publicKeyHex, 'hex');
+    const digestHex = crypto.createHash('sha256').update(pubKeyBytes).digest('hex');
+    return `${prefix}-${digestHex.slice(0, 16)}`;
   }
 
   /**
@@ -1212,57 +979,51 @@ class PartyService {
       // Step 1: Check quota
       const quotaStatus = this.checkQuota();
 
-      // Step 2: Generate party ID
-      const partyId = this.createPartyIdFromPublicKey(publicKeyHex);
+      // Step 2: Generate party allocation hint
+      const partyHint = this.createPartyHintFromPublicKey(publicKeyHex, 'external-wallet-user');
 
       // Step 3: Register party in Canton
       const cantonAdmin = new CantonAdminService();
       let registrationResult;
       try {
-        registrationResult = await cantonAdmin.registerParty(partyId);
+        registrationResult = await cantonAdmin.registerParty(partyHint);
 
         if (!registrationResult || !registrationResult.success) {
-          const existsCheck = await cantonAdmin.checkPartyExists(partyId);
-          if (existsCheck.exists) {
-            registrationResult = { success: true, method: 'already-exists' };
-          } else {
-            throw new Error(`Failed to register party: ${registrationResult?.error}`);
-          }
+          throw new Error(`Failed to register party: ${registrationResult?.error}`);
         }
       } catch (regError) {
         registrationResult = { success: false, error: regError.message };
       }
 
+      if (!registrationResult?.success) {
+        throw new Error(`Party allocation failed: ${registrationResult?.error || 'unknown error'}`);
+      }
+
       // Step 4: Assign party to validator-operator user (optional - may not be available via JSON API)
       try {
-        await this.assignPartyToValidatorOperator(partyId);
+        // Ensure we grant rights for the allocated party identifier returned by the API (source of truth)
+        const allocatedPartyId = registrationResult.partyId;
+        await this.assignPartyToValidatorOperator(allocatedPartyId);
       } catch (assignError) {
-        // If endpoint doesn't exist (404) or other errors, skip assignment
-        // Party will be assigned automatically when first used, or validator-operator may already have permissions
-        if (assignError.message.includes('404') || assignError.message.includes('not found')) {
-          // Endpoint not available - skip assignment
-        } else if (assignError.message.includes('already') || assignError.message.includes('409')) {
-          // Already assigned - continue
-        } else {
-          // Other errors - log but continue (assignment is optional)
-        }
+        // At this point, assignment is REQUIRED for Canton JSON API access.
+        throw assignError;
       }
 
       // Step 5: Generate JWT token for validator-operator
-      const tokenString = await this.generateTokenForValidatorOperator(partyId);
+      const tokenString = await this.generateTokenForValidatorOperator(registrationResult.partyId);
       
       if (!tokenString || typeof tokenString !== 'string' || tokenString.trim() === '') {
         throw new Error('Token generation failed - invalid token returned');
       }
 
       // Step 6: Verify party registration
-      const verification = await cantonAdmin.verifyPartyRegistration(partyId, tokenString);
+      const verification = await cantonAdmin.verifyPartyRegistration(registrationResult.partyId, tokenString);
 
       // Step 7: Increment quota
       this.incrementQuota();
 
       const result = {
-        partyId: String(partyId),
+        partyId: String(registrationResult.partyId),
         token: String(tokenString),
         quotaStatus: {
         dailyUsed: quotaStatus.dailyCount + 1,

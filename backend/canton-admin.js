@@ -79,6 +79,27 @@ class CantonAdminService {
   async registerParty(partyId, displayName = null) {
     try {
       const adminToken = await this.getAdminToken();
+      const grpc = new (require('./canton-grpc-client'))();
+      // Prefer gRPC allocation via PartyManagementService v2
+      try {
+        const resp = await grpc.allocateParty(partyId, displayName || `User-${partyId.slice(0, 8)}`, adminToken);
+        const allocated =
+          resp?.party_details?.party ||
+          resp?.party ||
+          resp?.party_id ||
+          partyId;
+        return {
+          success: true,
+          partyId: allocated,
+          method: 'grpc-v2',
+          requestedPartyId: partyId
+        };
+      } catch (e) {
+        // JSON API allocate endpoints are not exposed on this devnet (we get HttpMethod 404),
+        // so gRPC allocation failing is a hard stop.
+        console.error('[CantonAdmin] gRPC AllocateParty failed:', e.message);
+        throw e;
+      }
       
       // Extract party identifier (the part after ::)
       const partyIdentifier = partyId.includes('::') ? partyId.split('::')[1] : partyId;
@@ -91,7 +112,9 @@ class CantonAdminService {
         `${CANTON_JSON_API_BASE}/parties/allocate`
       ];
       
-      // JSON API expects identifierHint (not partyId) and displayName (camelCase)
+      // JSON API party allocation MUST succeed before we grant rights.
+      // If allocation endpoints are not available, we must fail fast (no lazy registration),
+      // otherwise GrantUserRights will return NOT_FOUND for a non-existing party.
       const requestBody = {
         identifierHint: partyId,
         displayName: displayName || `User-${partyIdentifier.substring(0, 8)}`
@@ -149,22 +172,8 @@ class CantonAdminService {
           continue;
         }
       }
-      
-      // JSON API party allocation endpoints don't exist - party will be registered on first use
-      const checkResult = await this.checkPartyExists(partyId);
-      if (checkResult.exists) {
-        return {
-          success: true,
-          partyId: partyId,
-          method: 'already-registered'
-        };
-      }
-      return {
-        success: true,
-        partyId: partyId,
-        method: 'lazy-registration',
-        note: 'Party will be registered automatically when first used in a transaction'
-      };
+
+      throw new Error(lastError || 'Party allocation failed: neither gRPC nor JSON API allocate endpoint succeeded');
       
     } catch (error) {
       throw error;

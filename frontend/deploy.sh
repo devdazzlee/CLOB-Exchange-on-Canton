@@ -57,3 +57,4 @@ echo "2. Test API endpoint: curl https://your-project.vercel.app/api/test"
 echo "3. Check function logs in Vercel Dashboard → Functions"
 
 
+

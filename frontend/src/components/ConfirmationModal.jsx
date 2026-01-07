@@ -120,7 +120,7 @@ export default function ConfirmationModal({
 
         {/* Body */}
         <div className="px-6 py-5">
-          <div className="text-[#EAECEF] text-sm leading-relaxed whitespace-pre-line">
+          <div className="text-[#EAECEF] text-sm leading-relaxed whitespace-pre-wrap break-all max-h-[60vh] overflow-auto">
             {message}
           </div>
         </div>
@@ -224,5 +224,6 @@ export function useConfirmationModal() {
 
   return { showModal, ModalComponent };
 }
+
 
 

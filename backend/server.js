@@ -209,7 +209,7 @@ app.get('/api/test-service-account', async (req, res) => {
     if (testResponse.ok) {
       res.json({ 
         status: 'success', 
-        message: 'Service Account is properly configured and has permissions',
+        message: 'Keycloak Admin API is reachable with the configured service account token',
         canCreateUsers: true,
         tokenInfo: tokenInfo,
         testResponse: responseData
@@ -222,9 +222,7 @@ app.get('/api/test-service-account', async (req, res) => {
         tokenInfo: tokenInfo,
         errorResponse: responseData,
         hasManageUsersRole: tokenInfo.realm_management_roles?.includes('manage-users') || false,
-        fix: testResponse.status === 403 
-          ? 'Assign "manage-users" role from "realm-management" client to the service account'
-          : `Unexpected error: ${testResponse.status}`
+        note: 'This endpoint only checks Keycloak admin permissions. Canton authorization is handled via Ledger API user rights (GrantUserRights) and does not require Keycloak mappers.'
       });
     }
   } catch (error) {

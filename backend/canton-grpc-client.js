@@ -14,6 +14,7 @@ const CANTON_LEDGER_API_URL = `${CANTON_LEDGER_API_HOST}:${CANTON_LEDGER_API_POR
 class CantonGrpcClient {
   constructor() {
     this.client = null;
+    this.partyClient = null;
     this.metadata = null;
   }
 
@@ -25,15 +26,30 @@ class CantonGrpcClient {
     this.metadata = new grpc.Metadata();
     this.metadata.add('authorization', `Bearer ${token}`);
 
-    if (this.client) {
-      return; // Client already initialized
-    }
+    // Always re-check clients; we may need both services
+    if (this.client && this.partyClient) return;
 
     try {
-      const protoPath = path.join(__dirname, 'user_management_service.proto');
-      console.log('[gRPC] Loading proto file from:', protoPath);
+      const protoV2Path = path.join(__dirname, 'user_management_service_v2.proto');
+      const protoV1Path = path.join(__dirname, 'user_management_service.proto');
+      const partyV2Path = path.join(__dirname, 'party_management_service_v2.proto');
+      console.log('[gRPC] Loading proto files:', { v2: protoV2Path, v1: protoV1Path });
       
-      const packageDefinition = protoLoader.loadSync(protoPath, {
+      const pkgDefV2 = protoLoader.loadSync(protoV2Path, {
+        keepCase: true,
+        longs: String,
+        enums: String,
+        defaults: true,
+        oneofs: true
+      });
+      const pkgDefV1 = protoLoader.loadSync(protoV1Path, {
+        keepCase: true,
+        longs: String,
+        enums: String,
+        defaults: true,
+        oneofs: true
+      });
+      const pkgDefPartyV2 = protoLoader.loadSync(partyV2Path, {
         keepCase: true,
         longs: String,
         enums: String,
@@ -41,13 +57,32 @@ class CantonGrpcClient {
         oneofs: true
       });
 
-      const proto = grpc.loadPackageDefinition(packageDefinition);
+      const protoV2 = grpc.loadPackageDefinition(pkgDefV2);
+      const protoV1 = grpc.loadPackageDefinition(pkgDefV1);
+      const protoPartyV2 = grpc.loadPackageDefinition(pkgDefPartyV2);
+
       console.log('[gRPC] Connecting to:', CANTON_LEDGER_API_URL);
       
-      this.client = new proto.com.daml.ledger.api.v1.admin.UserManagementService(
-        CANTON_LEDGER_API_URL,
-        grpc.credentials.createInsecure()
-      );
+      // Prefer v2 if available, else fallback to v1
+      const ServiceV2 = protoV2?.com?.daml?.ledger?.api?.v2?.admin?.UserManagementService;
+      const ServiceV1 = protoV1?.com?.daml?.ledger?.api?.v1?.admin?.UserManagementService;
+      if (ServiceV2) {
+        this.client = new ServiceV2(CANTON_LEDGER_API_URL, grpc.credentials.createInsecure());
+        console.log('[gRPC] Using UserManagementService v2');
+      } else if (ServiceV1) {
+        this.client = new ServiceV1(CANTON_LEDGER_API_URL, grpc.credentials.createInsecure());
+        console.log('[gRPC] Using UserManagementService v1');
+      } else {
+        throw new Error('Neither v2 nor v1 UserManagementService could be loaded from proto definitions.');
+      }
+
+      const PartyServiceV2 = protoPartyV2?.com?.daml?.ledger?.api?.v2?.admin?.PartyManagementService;
+      if (PartyServiceV2) {
+        this.partyClient = new PartyServiceV2(CANTON_LEDGER_API_URL, grpc.credentials.createInsecure());
+        console.log('[gRPC] Using PartyManagementService v2');
+      } else {
+        console.warn('[gRPC] PartyManagementService v2 not found in proto; party allocation via gRPC will be unavailable');
+      }
       
       console.log('[gRPC] Client initialized successfully');
     } catch (error) {
@@ -70,6 +105,11 @@ class CantonGrpcClient {
         rights: [
           {
             can_act_as: {
+              party: partyId
+            }
+          },
+          {
+            can_read_as: {
               party: partyId
             }
           }
@@ -120,6 +160,40 @@ class CantonGrpcClient {
           if (error) {
             reject(new Error(`gRPC call failed: ${error.message}`));
           } else {
+            resolve(response);
+          }
+        });
+      });
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  /**
+   * Allocate a party via gRPC v2 PartyManagementService
+   */
+  async allocateParty(partyIdHint, displayName, token) {
+    try {
+      await this.initialize(token);
+      if (!this.partyClient) {
+        throw new Error('PartyManagementService v2 client not initialized');
+      }
+
+      const request = {
+        party_id_hint: partyIdHint,
+        display_name: displayName || partyIdHint,
+        identity_provider_id: ''
+      };
+
+      return new Promise((resolve, reject) => {
+        const deadline = new Date();
+        deadline.setSeconds(deadline.getSeconds() + 10);
+        this.partyClient.AllocateParty(request, this.metadata, { deadline }, (error, response) => {
+          if (error) {
+            console.error('[gRPC] AllocateParty failed:', { code: error.code, message: error.message, details: error.details });
+            reject(new Error(`gRPC AllocateParty failed (${error.code}): ${error.message}`));
+          } else {
+            console.log('[gRPC] AllocateParty succeeded:', response);
             resolve(response);
           }
         });

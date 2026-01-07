@@ -26,8 +26,14 @@ export default function WalletSetup({ onWalletReady }) {
     const existingWallet = loadWallet();
     if (existingWallet) {
       setStep('ready');
-      const derivedPartyId = publicKeyToPartyId(existingWallet.publicKey);
-      setPartyId(derivedPartyId);
+      const storedPartyId = localStorage.getItem('canton_party_id');
+      if (storedPartyId) {
+        setPartyId(storedPartyId);
+      } else {
+        // Fallback display only (may not match allocated party)
+        const derivedPartyId = publicKeyToPartyId(existingWallet.publicKey);
+        setPartyId(derivedPartyId);
+      }
     }
   }, []);
 
@@ -95,6 +101,7 @@ export default function WalletSetup({ onWalletReady }) {
       // 3. Store the party ID
       const derivedPartyId = partyResult.partyId;
       setPartyId(derivedPartyId);
+      localStorage.setItem('canton_party_id', derivedPartyId);
       
       // 4. If backend provided a token, store it
       if (partyResult.token) {
@@ -167,6 +174,7 @@ export default function WalletSetup({ onWalletReady }) {
       // 3. Store the party ID
       const derivedPartyId = partyResult.partyId;
       setPartyId(derivedPartyId);
+      localStorage.setItem('canton_party_id', derivedPartyId);
       
       // 4. If backend provided a token, store it
       if (partyResult.token) {
