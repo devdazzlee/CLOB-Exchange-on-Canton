@@ -246,8 +246,30 @@ export async function queryContractsAtOffset(templateId, party = null, offset = 
     const result = await response.json();
     const allContracts = parseContractResponse(result);
     
-    console.log(`[API] Retrieved ${allContracts.length} contracts at offset ${offsetStr}`);
-    return allContracts;
+    // Filter contracts by templateId to ensure we only return contracts of the requested type
+    // This prevents OrderBook contracts from being returned when querying for Order:Order
+    // Note: qualifiedTemplateId is already declared above at line 189
+    const templateName = templateId.split(':')[1] || templateId.split(':')[0]; // e.g., "Order" from "Order:Order" or "OrderBook" from "OrderBook:OrderBook"
+    const filteredContracts = allContracts.filter(contract => {
+      const contractTemplateId = contract.templateId;
+      if (!contractTemplateId) {
+        console.warn(`[API] Contract missing templateId, filtering out:`, contract.contractId?.substring(0, 30));
+        return false;
+      }
+      // Match if templateId ends with the requested template name (e.g., ":Order:Order" or ":OrderBook:OrderBook")
+      // This handles both qualified and unqualified templateIds
+      const matches = contractTemplateId === qualifiedTemplateId || 
+                      contractTemplateId.endsWith(`:${templateId}`) ||
+                      contractTemplateId.includes(`:${templateName}:${templateName}`);
+      if (!matches) {
+        console.warn(`[API] Filtered out contract with wrong templateId: ${contractTemplateId} (expected ${templateId} or ${qualifiedTemplateId})`);
+      }
+      return matches;
+    });
+    
+    console.log(`[API] Retrieved ${allContracts.length} contracts at offset ${offsetStr}, filtered to ${filteredContracts.length} matching ${templateId}`);
+    
+    return filteredContracts;
   } catch (error) {
     console.error('Error querying contracts at offset:', error);
     throw error;
@@ -637,8 +659,18 @@ export async function exerciseChoice(contractId, choice, argument, party, templa
         }
       }
     } else {
-      // Qualify the template ID if it's not already fully qualified
-      qualifiedTemplateId = await qualifyTemplateId(qualifiedTemplateId);
+      // Check if templateId is already fully qualified (contains package ID)
+      // Fully qualified format: <package-id>:<module>:<template>
+      // e.g., "51522c778cf057ce80b3aa38d272a2fb72ae60ae871bca67940aaccf59567ac9:OrderBook:OrderBook"
+      const isAlreadyQualified = qualifiedTemplateId && qualifiedTemplateId.includes(':') && qualifiedTemplateId.split(':').length >= 3;
+      
+      if (isAlreadyQualified) {
+        console.log('[Exercise Choice] TemplateId already fully qualified:', qualifiedTemplateId);
+        // Use as-is, don't qualify again
+      } else {
+        // Qualify the template ID if it's not already fully qualified
+        qualifiedTemplateId = await qualifyTemplateId(qualifiedTemplateId);
+      }
     }
     
     if (!qualifiedTemplateId) {
@@ -678,8 +710,28 @@ export async function exerciseChoice(contractId, choice, argument, party, templa
       } catch {
         error = { message: errorText || `Failed to exercise choice: ${response.statusText}` };
       }
-      console.error('[Exercise Choice] Error:', error);
-      throw new Error(error.message || error.errors?.join(', ') || `Failed to exercise choice: ${response.statusText}`);
+      console.error('[Exercise Choice] Error response:', {
+        status: response.status,
+        statusText: response.statusText,
+        error: error,
+        errorText: errorText
+      });
+      
+      // Build detailed error message
+      let errorMessage = error.message || error.errors?.join(', ') || errorText || `Failed to exercise choice: ${response.statusText}`;
+      
+      // Add more context if available
+      if (error.cause) {
+        errorMessage += ` (Cause: ${error.cause})`;
+      }
+      if (error.code) {
+        errorMessage += ` (Code: ${error.code})`;
+      }
+      
+      const detailedError = new Error(errorMessage);
+      detailedError.response = { status: response.status, data: error };
+      detailedError.errors = error.errors;
+      throw detailedError;
     }
 
     const result = await response.json();

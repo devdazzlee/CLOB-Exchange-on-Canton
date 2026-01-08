@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { isAuthenticated, getValidAccessToken } from '../services/keycloakAuth';
+import { loadWallet } from '../wallet/keyManager';
 
 export default function AuthGuard({ children }) {
   const [isChecking, setIsChecking] = useState(true);
@@ -25,7 +26,29 @@ export default function AuthGuard({ children }) {
         return;
       }
       
-      // Check if user is authenticated
+      // Check if wallet exists and party ID is stored
+      const wallet = loadWallet();
+      const partyId = localStorage.getItem('canton_party_id');
+      
+      // If wallet and party ID exist, allow access even if token is expired
+      // (The party ID is what matters for trading, not the token)
+      if (wallet && partyId) {
+        console.log('[AuthGuard] Wallet and party ID found, allowing access');
+        // Try to get a valid token, but don't block if it fails
+        try {
+          const token = await getValidAccessToken();
+          console.log('[AuthGuard] Token is valid');
+        } catch (error) {
+          console.log('[AuthGuard] Token expired or invalid, but wallet exists - allowing access');
+          // Token is expired, but we have wallet and party ID, so allow access
+          // The API calls will need to handle token refresh or re-authentication
+        }
+        setIsAuth(true);
+        setIsChecking(false);
+        return;
+      }
+      
+      // Check if user is authenticated (for users who logged in via Keycloak)
       const authStatus = isAuthenticated();
       console.log('[AuthGuard] isAuthenticated result:', authStatus);
       
@@ -39,7 +62,7 @@ export default function AuthGuard({ children }) {
           setIsChecking(false);
           return;
         } catch (error) {
-          // Token refresh failed - don't auto-authenticate, redirect to home
+          // Token refresh failed - redirect to home
           console.log('[AuthGuard] Token refresh failed, redirecting to home:', error.message);
           navigate('/');
           setIsChecking(false);
@@ -47,9 +70,8 @@ export default function AuthGuard({ children }) {
         }
       }
 
-      // Not authenticated and no valid token - redirect to home
-      // Don't auto-authenticate even if wallet exists
-      console.log('[AuthGuard] User not authenticated, redirecting to home...');
+      // Not authenticated and no wallet - redirect to home
+      console.log('[AuthGuard] No wallet or authentication found, redirecting to home...');
       navigate('/');
       setIsChecking(false);
       return;

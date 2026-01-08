@@ -1,15 +1,17 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, memo, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 
 /**
- * Beautiful confirmation modal component
- * Replaces browser alert() with a styled modal
+ * Professional Portal-based Modal Component
+ * Renders outside component tree to prevent re-render issues
+ * Used by major trading platforms (Binance, Coinbase, etc.)
  */
-export default function ConfirmationModal({ 
+const ConfirmationModal = memo(function ConfirmationModal({ 
   isOpen, 
   onClose, 
   title, 
   message, 
-  type = 'info', // 'info', 'success', 'warning', 'error'
+  type = 'info',
   confirmText = 'OK',
   showCancel = false,
   cancelText = 'Cancel',
@@ -17,19 +19,56 @@ export default function ConfirmationModal({
   onCancel
 }) {
   const [isVisible, setIsVisible] = useState(false);
+  const [mounted, setMounted] = useState(false);
+  const modalRef = useRef(null);
 
+  // Handle mounting for portal
+  useEffect(() => {
+    setMounted(true);
+    return () => setMounted(false);
+  }, []);
+
+  // Handle visibility animation
   useEffect(() => {
     if (isOpen) {
-      // Small delay for animation
-      setTimeout(() => setIsVisible(true), 10);
+      // Use requestAnimationFrame for smooth animation
+      requestAnimationFrame(() => {
+        setIsVisible(true);
+      });
     } else {
       setIsVisible(false);
     }
   }, [isOpen]);
 
-  if (!isOpen) return null;
+  // Prevent body scroll when modal is open
+  useEffect(() => {
+    if (isOpen) {
+      const originalStyle = window.getComputedStyle(document.body).overflow;
+      document.body.style.overflow = 'hidden';
+      return () => {
+        document.body.style.overflow = originalStyle;
+      };
+    }
+  }, [isOpen]);
+
+  // Handle ESC key
+  useEffect(() => {
+    if (!isOpen) return;
+    
+    const handleEscape = (e) => {
+      if (e.key === 'Escape') {
+        handleClose();
+      }
+    };
+    
+    document.addEventListener('keydown', handleEscape);
+    return () => document.removeEventListener('keydown', handleEscape);
+  }, [isOpen]);
+
+  if (!isOpen || !mounted) return null;
 
   const handleBackdropClick = (e) => {
+    // Only close if clicking the backdrop itself, not children
     if (e.target === e.currentTarget) {
       handleClose();
     }
@@ -37,28 +76,35 @@ export default function ConfirmationModal({
 
   const handleClose = () => {
     setIsVisible(false);
-    setTimeout(() => {
-      onClose?.();
-    }, 200);
+    // Use requestAnimationFrame for smooth close animation
+    requestAnimationFrame(() => {
+      setTimeout(() => {
+        onClose?.();
+      }, 200);
+    });
   };
 
   const handleConfirm = () => {
     setIsVisible(false);
-    setTimeout(() => {
-      onConfirm?.();
-      onClose?.();
-    }, 200);
+    requestAnimationFrame(() => {
+      setTimeout(() => {
+        onConfirm?.();
+        onClose?.();
+      }, 200);
+    });
   };
 
   const handleCancel = () => {
     setIsVisible(false);
-    setTimeout(() => {
-      onCancel?.();
-      onClose?.();
-    }, 200);
+    requestAnimationFrame(() => {
+      setTimeout(() => {
+        onCancel?.();
+        onClose?.();
+      }, 200);
+    });
   };
 
-  // Icon and color configuration based on type
+  // Icon and color configuration
   const typeConfig = {
     success: {
       icon: '✓',
@@ -92,13 +138,17 @@ export default function ConfirmationModal({
 
   const config = typeConfig[type] || typeConfig.info;
 
-  return (
+  const modalContent = (
     <div
-      className={`fixed inset-0 z-50 flex items-center justify-center p-4 transition-opacity duration-200 ${
-        isVisible ? 'opacity-100' : 'opacity-0'
+      ref={modalRef}
+      className={`fixed inset-0 z-[9999] flex items-center justify-center p-4 transition-opacity duration-200 ${
+        isVisible ? 'opacity-100' : 'opacity-0 pointer-events-none'
       }`}
       onClick={handleBackdropClick}
       style={{ backgroundColor: 'rgba(0, 0, 0, 0.75)' }}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="modal-title"
     >
       <div
         className={`bg-[#181A20] border-2 ${config.borderColor} rounded-xl shadow-2xl max-w-md w-full transform transition-all duration-200 ${
@@ -112,7 +162,7 @@ export default function ConfirmationModal({
             <div className={`w-10 h-10 rounded-full ${config.bgColor} border-2 ${config.borderColor} flex items-center justify-center text-xl font-bold ${config.iconColor}`}>
               {config.icon}
             </div>
-            <h3 className={`text-xl font-bold ${config.titleColor}`}>
+            <h3 id="modal-title" className={`text-xl font-bold ${config.titleColor}`}>
               {title}
             </h3>
           </div>
@@ -153,11 +203,16 @@ export default function ConfirmationModal({
       </div>
     </div>
   );
-}
+
+  // Render modal in portal (outside component tree)
+  return createPortal(modalContent, document.body);
+});
+
+ConfirmationModal.displayName = 'ConfirmationModal';
 
 /**
- * Hook for using confirmation modal
- * Returns { showModal, ModalComponent }
+ * Professional Modal Hook with Stable References
+ * Uses useRef and useCallback to prevent re-renders
  */
 export function useConfirmationModal() {
   const [modalState, setModalState] = useState({
@@ -171,8 +226,12 @@ export function useConfirmationModal() {
     onConfirm: null,
     onCancel: null,
   });
+  
+  // Use ref to track open state (doesn't cause re-renders)
+  const isOpenRef = useRef(false);
+  const resolveRef = useRef(null);
 
-  const showModal = ({
+  const showModal = useCallback(({
     title,
     message,
     type = 'info',
@@ -183,6 +242,9 @@ export function useConfirmationModal() {
     onCancel,
   }) => {
     return new Promise((resolve) => {
+      resolveRef.current = resolve;
+      isOpenRef.current = true;
+      
       setModalState({
         isOpen: true,
         title,
@@ -192,22 +254,30 @@ export function useConfirmationModal() {
         showCancel,
         cancelText,
         onConfirm: () => {
+          isOpenRef.current = false;
           resolve(true);
           onConfirm?.();
         },
         onCancel: () => {
+          isOpenRef.current = false;
           resolve(false);
           onCancel?.();
         },
       });
     });
-  };
+  }, []);
 
-  const closeModal = () => {
+  const closeModal = useCallback(() => {
+    isOpenRef.current = false;
+    if (resolveRef.current) {
+      resolveRef.current(false);
+      resolveRef.current = null;
+    }
     setModalState((prev) => ({ ...prev, isOpen: false }));
-  };
+  }, []);
 
-  const ModalComponent = () => (
+  // Memoize ModalComponent to prevent re-renders
+  const ModalComponent = useCallback(() => (
     <ConfirmationModal
       isOpen={modalState.isOpen}
       onClose={closeModal}
@@ -220,10 +290,7 @@ export function useConfirmationModal() {
       onConfirm={modalState.onConfirm}
       onCancel={modalState.onCancel}
     />
-  );
-
-  return { showModal, ModalComponent };
+  ), [modalState, closeModal]);
+  
+  return { showModal, ModalComponent, isOpenRef };
 }
-
-
-

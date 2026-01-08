@@ -61,6 +61,8 @@ function App() {
   const handleWalletReady = (newPartyId) => {
     setPartyId(newPartyId);
     setWalletReady(true);
+    // Note: Navigation will happen automatically via React Router
+    // when walletReady and authenticated are both true
   };
 
   const handleCopyPartyId = async () => {

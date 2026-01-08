@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   generateMnemonic,
   mnemonicToKeyPair,
@@ -11,6 +12,7 @@ import { storeTokens } from '../services/keycloakAuth';
 import PasswordInput from './PasswordInput';
 
 export default function WalletSetup({ onWalletReady }) {
+  const navigate = useNavigate();
   const [step, setStep] = useState('select');
   const [mnemonic, setMnemonic] = useState('');
   const [importMnemonic, setImportMnemonic] = useState('');
@@ -258,6 +260,15 @@ export default function WalletSetup({ onWalletReady }) {
               {partyId}
             </code>
           </div>
+          <button
+            onClick={() => {
+              // Navigate to trading interface using React Router
+              navigate('/trading');
+            }}
+            className="btn btn-primary w-full py-3 text-base font-semibold"
+          >
+            Go to Trading Interface
+          </button>
         </div>
       </div>
     );
