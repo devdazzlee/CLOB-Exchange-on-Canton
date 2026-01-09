@@ -2,12 +2,99 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const http = require('http');
+const WebSocket = require('ws');
 const TokenExchangeService = require('./token-exchange');
 const PartyService = require('./party-service');
 
 const app = express();
+const server = http.createServer(app);
 const tokenExchange = new TokenExchangeService();
 const partyService = new PartyService();
+
+// WebSocket Server
+const wss = new WebSocket.Server({ 
+  server,
+  path: '/ws',
+  perMessageDeflate: false
+});
+
+// WebSocket connection management
+const clients = new Map(); // clientId -> { ws, subscriptions: Set }
+
+wss.on('connection', (ws, req) => {
+  const clientId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  clients.set(clientId, { ws, subscriptions: new Set() });
+  
+  console.log(`[WebSocket] Client connected: ${clientId} (Total: ${clients.size})`);
+
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message);
+      
+      if (data.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong' }));
+        return;
+      }
+      
+      if (data.type === 'subscribe') {
+        const { channel } = data;
+        if (channel) {
+          clients.get(clientId).subscriptions.add(channel);
+          console.log(`[WebSocket] Client ${clientId} subscribed to ${channel}`);
+          ws.send(JSON.stringify({ type: 'subscribed', channel }));
+        }
+      }
+      
+      if (data.type === 'unsubscribe') {
+        const { channel } = data;
+        if (channel) {
+          clients.get(clientId).subscriptions.delete(channel);
+          console.log(`[WebSocket] Client ${clientId} unsubscribed from ${channel}`);
+          ws.send(JSON.stringify({ type: 'unsubscribed', channel }));
+        }
+      }
+    } catch (error) {
+      console.error('[WebSocket] Error handling message:', error);
+    }
+  });
+
+  ws.on('close', () => {
+    clients.delete(clientId);
+    console.log(`[WebSocket] Client disconnected: ${clientId} (Total: ${clients.size})`);
+  });
+
+  ws.on('error', (error) => {
+    console.error(`[WebSocket] Error for client ${clientId}:`, error);
+  });
+
+  // Send welcome message
+  ws.send(JSON.stringify({ type: 'connected', clientId }));
+});
+
+// Broadcast function to send messages to subscribed clients
+function broadcast(channel, data) {
+  const message = JSON.stringify({ channel, data, timestamp: new Date().toISOString() });
+  let sentCount = 0;
+  
+  clients.forEach((client, clientId) => {
+    if (client.subscriptions.has(channel) && client.ws.readyState === WebSocket.OPEN) {
+      try {
+        client.ws.send(message);
+        sentCount++;
+      } catch (error) {
+        console.error(`[WebSocket] Error sending to client ${clientId}:`, error);
+      }
+    }
+  });
+  
+  if (sentCount > 0) {
+    console.log(`[WebSocket] Broadcasted to ${sentCount} clients on channel ${channel}`);
+  }
+}
+
+// Export broadcast function for use in other modules
+global.broadcastWebSocket = broadcast;
 
 // CORS configuration
 const corsOptions = {
@@ -227,16 +314,357 @@ app.get('/api/test-service-account', async (req, res) => {
     }
   } catch (error) {
     res.status(500).json({ 
-      status: 'error',
+        status: 'error',
       message: error.message,
-      canCreateUsers: false,
+        canCreateUsers: false,
       stack: error.stack
     });
   }
 });
 
+/**
+ * Query global OrderBooks using operator token
+ * This endpoint allows users to discover OrderBooks that were created by the operator
+ * Users can't see OrderBooks directly because they're only signed by the operator
+ */
+app.get('/api/orderbooks', async (req, res) => {
+  try {
+    const cantonAdmin = new (require('./canton-admin'))();
+    const adminToken = await cantonAdmin.getAdminToken();
+    
+    // Get operator party ID from environment or use validator-operator
+    // The operator party is the one that creates OrderBooks
+    const operatorPartyId = process.env.OPERATOR_PARTY_ID || 
+      '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
+    
+    const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://95.216.34.215:31539';
+    
+    // Query OrderBooks using operator's token (they can see OrderBooks they created)
+    const queryUrl = `${CANTON_JSON_API_BASE}/v2/state/active-contracts`;
+    
+    // Get package ID first (we need it to qualify the template ID)
+    let packageId = null;
+    try {
+      const packagesUrl = `${CANTON_JSON_API_BASE}/v2/packages`;
+      const packagesResponse = await fetch(packagesUrl, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${adminToken}`,
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      if (packagesResponse.ok) {
+        const packagesData = await packagesResponse.json();
+        if (packagesData.result && packagesData.result.length > 0) {
+          // Find the package that contains OrderBook template
+          const orderBookPackage = packagesData.result.find(pkg => 
+            pkg.packageId && (pkg.name === 'clob-exchange' || pkg.name?.includes('clob'))
+          );
+          if (orderBookPackage) {
+            packageId = orderBookPackage.packageId;
+          } else if (packagesData.result[0]) {
+            packageId = packagesData.result[0].packageId;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[OrderBooks API] Could not get package ID:', e.message);
+    }
+    
+    // Query for OrderBook contracts
+    const qualifiedTemplateId = packageId ? `${packageId}:OrderBook:OrderBook` : 'OrderBook:OrderBook';
+    
+    const requestBody = {
+      readAs: [operatorPartyId],
+      activeAtOffset: "0",
+      verbose: true,
+      filter: {
+        filtersByParty: {
+          [operatorPartyId]: {
+            inclusive: {
+              templateIds: [qualifiedTemplateId]
+            }
+          }
+        }
+      }
+    };
+    
+    const response = await fetch(queryUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${adminToken}`
+      },
+      body: JSON.stringify(requestBody)
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      let error;
+      try {
+        error = JSON.parse(errorText);
+      } catch {
+        error = { message: errorText };
+      }
+      console.error('[OrderBooks API] Query failed:', error);
+      return res.status(response.status).json({ 
+        error: 'Failed to query OrderBooks',
+        details: error.message || error.cause || error.errors?.join(', ')
+      });
+    }
+    
+    const result = await response.json();
+    
+    // Parse response to extract OrderBook contracts
+    let orderBooks = [];
+    if (Array.isArray(result)) {
+      orderBooks = result;
+    } else if (result.activeContracts) {
+      orderBooks = result.activeContracts;
+    } else if (result.contractEntry) {
+      orderBooks = [result];
+    }
+    
+    // Extract OrderBook data
+    const orderBooksList = orderBooks
+      .map(entry => {
+        const contractData = entry.contractEntry?.JsActiveContract?.createdEvent || 
+                           entry.createdEvent || 
+                           entry;
+        
+        if (!contractData.contractId || !contractData.templateId?.includes('OrderBook')) {
+          return null;
+        }
+        
+        return {
+          contractId: contractData.contractId,
+          templateId: contractData.templateId,
+          tradingPair: contractData.createArgument?.tradingPair || contractData.argument?.tradingPair,
+          operator: contractData.createArgument?.operator || contractData.argument?.operator,
+          buyOrdersCount: contractData.createArgument?.buyOrders?.length || contractData.argument?.buyOrders?.length || 0,
+          sellOrdersCount: contractData.createArgument?.sellOrders?.length || contractData.argument?.sellOrders?.length || 0,
+          lastPrice: contractData.createArgument?.lastPrice || contractData.argument?.lastPrice,
+          offset: contractData.offset
+        };
+      })
+      .filter(ob => ob !== null);
+    
+    console.log(`[OrderBooks API] Found ${orderBooksList.length} OrderBooks`);
+    
+    res.json({
+      success: true,
+      orderBooks: orderBooksList,
+      count: orderBooksList.length
+    });
+    
+  } catch (error) {
+    console.error('[OrderBooks API] Error:', error);
+      res.status(500).json({ 
+      error: 'Failed to query OrderBooks',
+      message: error.message 
+    });
+  }
+});
+
+/**
+ * Get OrderBook for a specific trading pair
+ */
+app.get('/api/orderbooks/:tradingPair', async (req, res) => {
+  try {
+    const { tradingPair } = req.params;
+    const encodedPair = encodeURIComponent(tradingPair);
+    
+    // First get all OrderBooks
+    const allOrderBooksResponse = await fetch(`${req.protocol}://${req.get('host')}/api/orderbooks`, {
+      method: 'GET',
+      headers: {
+        'Authorization': req.headers.authorization || ''
+      }
+    });
+    
+    if (!allOrderBooksResponse.ok) {
+      return res.status(allOrderBooksResponse.status).json({
+        error: 'Failed to query OrderBooks',
+        details: await allOrderBooksResponse.text()
+      });
+    }
+    
+    const data = await allOrderBooksResponse.json();
+    const orderBook = data.orderBooks?.find(ob => ob.tradingPair === tradingPair);
+    
+    if (!orderBook) {
+      return res.status(404).json({
+        error: 'OrderBook not found',
+        tradingPair: tradingPair,
+        message: `No OrderBook found for trading pair ${tradingPair}. Please contact the operator to create it.`
+      });
+    }
+    
+    res.json({
+      success: true,
+      orderBook: orderBook
+    });
+    
+  } catch (error) {
+    console.error('[OrderBooks API] Error:', error);
+    res.status(500).json({ 
+      error: 'Failed to get OrderBook',
+      message: error.message 
+    });
+  }
+});
+
+/**
+ * Update OrderBook's userAccounts map when a UserAccount is created
+ * This allows the matching engine to update balances after trades
+ */
+app.post('/api/orderbooks/:tradingPair/update-user-account', async (req, res) => {
+  try {
+    const { tradingPair } = req.params;
+    const { partyId, userAccountContractId } = req.body;
+    
+    if (!partyId || !userAccountContractId) {
+      return res.status(400).json({ 
+        error: 'Missing required fields',
+        required: ['partyId', 'userAccountContractId']
+      });
+    }
+    
+    const cantonAdmin = new (require('./canton-admin'))();
+    const adminToken = await cantonAdmin.getAdminToken();
+    const operatorPartyId = process.env.OPERATOR_PARTY_ID || 
+      '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
+    
+    const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://95.216.34.215:31539';
+    
+    // Get the OrderBook contract ID for this trading pair
+    const { getOrderBookContractId } = require('./canton-api-helpers');
+    const orderBookContractId = await getOrderBookContractId(tradingPair, adminToken, CANTON_JSON_API_BASE);
+    
+    if (!orderBookContractId) {
+      return res.status(404).json({ 
+        error: 'OrderBook not found',
+        tradingPair 
+      });
+    }
+    
+    // Fetch current OrderBook to get userAccounts map
+    const orderBookResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${adminToken}`
+      },
+      body: JSON.stringify({
+        readAs: [operatorPartyId],
+        activeAtOffset: "0",
+        filter: {
+          filtersByParty: {
+            [operatorPartyId]: {
+              inclusive: {
+                contractIds: [orderBookContractId]
+              }
+            }
+          }
+        }
+      })
+    });
+    
+    if (!orderBookResponse.ok) {
+      throw new Error('Failed to fetch OrderBook');
+    }
+    
+    const orderBookData = await orderBookResponse.json();
+    const orderBook = orderBookData.activeContracts?.[0]?.contractEntry?.JsActiveContract?.createdEvent;
+    
+    if (!orderBook) {
+      throw new Error('OrderBook contract not found');
+    }
+    
+    // Exercise UpdateUserAccount choice on OrderBook
+    const commandId = `update-user-account-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    
+    const exerciseResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/commands/submit-and-wait`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${adminToken}`
+      },
+      body: JSON.stringify({
+        commandId: commandId,
+        commands: [
+          {
+            exercise: {
+              templateId: 'OrderBook:OrderBook',
+              contractId: orderBookContractId,
+              choice: 'UpdateUserAccount',
+              argument: {
+                party: partyId,
+                userAccountCid: userAccountContractId
+              }
+            }
+          }
+        ],
+        actAs: [operatorPartyId]
+      })
+    });
+    
+    if (!exerciseResponse.ok) {
+      const errorText = await exerciseResponse.text();
+      let error;
+      try {
+        error = JSON.parse(errorText);
+      } catch {
+        error = { message: errorText };
+      }
+      throw new Error(error.message || error.cause || `Failed to exercise UpdateUserAccount: ${exerciseResponse.statusText}`);
+    }
+    
+    const exerciseResult = await exerciseResponse.json();
+    
+    // Broadcast order book update via WebSocket
+    const { broadcastOrderBookUpdate } = require('./canton-api-helpers');
+    broadcastOrderBookUpdate(tradingPair, {
+      buyOrders: orderBook.createArgument?.buyOrders || [],
+      sellOrders: orderBook.createArgument?.sellOrders || [],
+      lastPrice: orderBook.createArgument?.lastPrice
+    });
+    
+    res.json({
+      success: true,
+      message: 'UserAccount added to OrderBook map',
+      tradingPair,
+      partyId,
+      userAccountContractId,
+      result: exerciseResult
+    });
+    
+  } catch (error) {
+    console.error('[UpdateUserAccount] Error:', error);
+    res.status(500).json({ 
+      error: 'Failed to update OrderBook userAccounts map',
+      message: error.message 
+    });
+  }
+});
+
+/**
+ * WebSocket health check endpoint
+ */
+app.get('/api/ws/status', (req, res) => {
+  res.json({
+    connected: clients.size,
+    channels: Array.from(new Set(
+      Array.from(clients.values())
+        .flatMap(client => Array.from(client.subscriptions))
+    ))
+  });
+});
+
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
+  console.log(`WebSocket server available at ws://localhost:${PORT}/ws`);
   console.log(`Party creation quota: ${process.env.DAILY_PARTY_QUOTA || '5000'} daily, ${process.env.WEEKLY_PARTY_QUOTA || '35000'} weekly`);
 });

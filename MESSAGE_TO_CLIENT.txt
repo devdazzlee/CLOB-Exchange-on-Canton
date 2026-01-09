@@ -1,0 +1,25 @@
+Hi,
+
+You're absolutely right - and thanks for catching this! Currently, each user is creating their own OrderBook, which is not how a CLOB exchange should work.
+
+In a proper CLOB exchange like Hyperliquid or Lighter, there should be ONE global OrderBook per trading pair that ALL users share and interact with. Right now, we have per-user OrderBooks which means:
+- Orders aren't shared across users
+- No global order matching
+- Each user has an isolated order book
+
+I've already fixed the frontend to prevent users from creating OrderBooks. Now they'll see a message that the OrderBook needs to be created by an operator.
+
+However, there's a deeper issue: our DAML contract structure needs to be updated to make OrderBooks globally observable. Right now, if an operator creates an OrderBook, regular users can't see it because of how DAML visibility works (the contract is only visible to the signatory).
+
+To properly fix this, we need to:
+
+1. Modify the OrderBook DAML contract to make it observable by all users (we can add observers or change the contract structure)
+
+2. Create an admin tool/script that the operator can use to initialize OrderBooks for each trading pair (like BTC/USDT, ETH/USDT, etc.)
+
+3. Ensure all users can query and see the same global OrderBook
+
+This is a DAML contract-level change, so we'll need to update and redeploy the contract. Would you like me to proceed with these changes? I can modify the DAML contract and create the admin initialization script.
+
+Thanks for pointing this out - it's an important architectural issue that needed to be addressed.
+

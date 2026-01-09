@@ -2,6 +2,14 @@ sdk-version: 3.4.9
 name: clob-exchange
 version: 1.0.0
 source: daml
+exposed-modules:
+  - OrderBook
+  - Order
+  - UserAccount
+  - Trade
+  - OrderBookTest
+  - OrderTest
+  - UserAccountTest
 dependencies:
   - daml-prim
   - daml-stdlib

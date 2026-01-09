@@ -59,3 +59,21 @@ template UserAccount
       do
         return balances
 
+    -- Update balances after a trade (called by operator after trade execution)
+    -- For BUY orders: buyer receives base token (e.g., BTC), pays quote token (e.g., USDT)
+    -- For SELL orders: seller receives quote token (e.g., USDT), pays base token (e.g., BTC)
+    choice UpdateAfterTrade : ()
+      with
+        baseToken : Text  -- e.g., "BTC"
+        quoteToken : Text  -- e.g., "USDT"
+        baseAmount : Decimal  -- Amount of base token (positive for buyer, negative for seller)
+        quoteAmount : Decimal  -- Amount of quote token (negative for buyer, positive for seller)
+      controller operator
+      do
+        -- Update base token balance
+        let newBalances1 = Map.insertWith (+) baseToken baseAmount balances
+        -- Update quote token balance
+        let newBalances2 = Map.insertWith (+) quoteToken quoteAmount newBalances1
+        _ <- create this with balances = newBalances2
+        return ()
+

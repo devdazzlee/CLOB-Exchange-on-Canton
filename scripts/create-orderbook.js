@@ -98,7 +98,9 @@ async function createOrderBook(pair, operatorPartyId) {
       buyOrders: [],
       sellOrders: [],
       lastPrice: null,  // Optional in createArguments uses null, not { None: null }
-      operator: operatorPartyId
+      operator: operatorPartyId,
+      activeUsers: [],  // Initially empty - will be populated as users place orders (they become observers)
+      userAccounts: {}  // Map of party to UserAccount contract ID for balance updates (initially empty)
     };
     
     console.log(`   Payload:`, JSON.stringify(payload, null, 2));

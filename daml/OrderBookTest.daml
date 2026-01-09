@@ -4,6 +4,7 @@ import Daml.Script
 import OrderBook
 import Order
 import DA.Time
+import qualified DA.Map as Map
 
 -- Test: Create order book
 testCreateOrderBook : Script ()
@@ -17,6 +18,8 @@ testCreateOrderBook = script do
       sellOrders = []
       lastPrice = None
       operator = operator
+      activeUsers = []
+      userAccounts = Map.empty
   
   ob <- query @OrderBook operator
   assert (length ob == 1)
@@ -52,6 +55,8 @@ testAddBuyOrder = script do
       sellOrders = []
       lastPrice = None
       operator = operator
+      activeUsers = []
+      userAccounts = Map.empty
   
   -- Add order to book
   _ <- submit alice do
@@ -82,6 +87,8 @@ testAddSellOrder = script do
       sellOrders = []
       lastPrice = None
       operator = operator
+      activeUsers = []
+      userAccounts = Map.empty
   
   -- Add sell order
   _ <- submit alice do
@@ -127,6 +134,8 @@ testRemoveOrder = script do
       sellOrders = [orderCid]
       lastPrice = None
       operator = operator
+      activeUsers = []
+      userAccounts = Map.empty
   
   -- Remove order
   _ <- submit operator do

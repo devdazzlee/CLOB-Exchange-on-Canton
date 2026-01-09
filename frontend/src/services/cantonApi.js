@@ -1194,24 +1194,77 @@ export async function qualifyTemplateId(templateId, packageId = null) {
 
 /**
  * Query all available OrderBooks to get list of trading pairs
- * This is useful for populating dropdowns with only pairs that have OrderBooks
- * @param {string} party - Party ID (optional, extracted from token if not provided)
+ * Uses backend endpoint that queries using operator token (since OrderBooks are global)
  * @returns {Promise<Array<string>>} Array of trading pair strings (e.g., ["BTC/USDT", "ETH/USDT"])
  */
 export async function getAvailableTradingPairs(party = null) {
   try {
-    const orderBooks = await queryContracts('OrderBook:OrderBook', party);
-    const tradingPairs = orderBooks
-      .map(ob => ob.payload?.tradingPair)
-      .filter(pair => pair && typeof pair === 'string')
-      .filter((pair, index, self) => self.indexOf(pair) === index); // Remove duplicates
+    // Use backend endpoint to get global OrderBooks (queried using operator token)
+    const backendBase = process.env.VITE_BACKEND_URL || 'http://localhost:3001';
+    const response = await fetch(`${backendBase}/api/orderbooks`, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
     
-    console.log('[API] Available trading pairs:', tradingPairs);
-    return tradingPairs;
+    if (response.ok) {
+      const data = await response.json();
+      const tradingPairs = (data.orderBooks || [])
+        .map(ob => ob.tradingPair)
+        .filter(pair => pair && typeof pair === 'string')
+        .filter((pair, index, self) => self.indexOf(pair) === index); // Remove duplicates
+      
+      console.log('[API] Available trading pairs from backend:', tradingPairs);
+      return tradingPairs.length > 0 ? tradingPairs : ['BTC/USDT'];
+    } else {
+      console.warn('[API] Backend OrderBooks endpoint failed, falling back to direct query');
+      // Fallback to direct query (may not work if user can't see OrderBooks)
+      const orderBooks = await queryContracts('OrderBook:OrderBook', party);
+      const tradingPairs = orderBooks
+        .map(ob => ob.payload?.tradingPair)
+        .filter(pair => pair && typeof pair === 'string')
+        .filter((pair, index, self) => self.indexOf(pair) === index);
+      return tradingPairs.length > 0 ? tradingPairs : ['BTC/USDT'];
+    }
   } catch (error) {
     console.error('[API] Error getting available trading pairs:', error);
     // Return default pairs if query fails
     return ['BTC/USDT'];
+  }
+}
+
+/**
+ * Get OrderBook contract ID for a specific trading pair
+ * Uses backend endpoint to query using operator token
+ * @param {string} tradingPair - Trading pair (e.g., "BTC/USDT")
+ * @returns {Promise<string|null>} OrderBook contract ID or null if not found
+ */
+export async function getOrderBookContractId(tradingPair) {
+  try {
+    const backendBase = process.env.VITE_BACKEND_URL || 'http://localhost:3001';
+    const response = await fetch(`${backendBase}/api/orderbooks/${encodeURIComponent(tradingPair)}`, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    if (response.ok) {
+      const data = await response.json();
+      if (data.orderBook && data.orderBook.contractId) {
+        console.log('[API] Found OrderBook contract ID for', tradingPair, ':', data.orderBook.contractId.substring(0, 30) + '...');
+        return data.orderBook.contractId;
+      }
+    } else if (response.status === 404) {
+      console.log('[API] OrderBook not found for', tradingPair);
+      return null;
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('[API] Error getting OrderBook contract ID:', error);
+    return null;
   }
 }
 
