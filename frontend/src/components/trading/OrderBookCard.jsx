@@ -52,7 +52,7 @@ export default function OrderBookCard({
                 variant="default"
                 size="sm"
               >
-                {creatingOrderBook ? 'Creating...' : 'Create OrderBook'}
+                {creatingOrderBook ? 'Creating Automatically...' : 'Create OrderBook Automatically'}
               </Button>
             )}
             <Button

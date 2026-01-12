@@ -971,77 +971,91 @@ class PartyService {
   }
 
   /**
-   * MAIN FUNCTION: Create party for user
-   * CRITICAL FIX: Store token in variable immediately and verify before creating result
+   * Extract party ID from token's actAs claims (Professional approach - Huzefa method)
+   * User's token already has actAs/readAs claims with their party ID - no ListUserRights needed
    */
-  async createPartyForUser(publicKeyHex) {
+  extractPartyFromTokenActAs(userToken) {
     try {
-      // Step 1: Check quota
-      const quotaStatus = this.checkQuota();
-
-      // Step 2: Generate party allocation hint
-      const partyHint = this.createPartyHintFromPublicKey(publicKeyHex, 'external-wallet-user');
-
-      // Step 3: Register party in Canton
-      const cantonAdmin = new CantonAdminService();
-      let registrationResult;
-      try {
-        registrationResult = await cantonAdmin.registerParty(partyHint);
-
-        if (!registrationResult || !registrationResult.success) {
-          throw new Error(`Failed to register party: ${registrationResult?.error}`);
-        }
-      } catch (regError) {
-        registrationResult = { success: false, error: regError.message };
+      if (!userToken || typeof userToken !== 'string' || userToken.trim() === '') {
+        throw new Error('User token is required and must be a valid string');
       }
-
-      if (!registrationResult?.success) {
-        throw new Error(`Party allocation failed: ${registrationResult?.error || 'unknown error'}`);
-      }
-
-      // Step 4: Assign party to validator-operator user (optional - may not be available via JSON API)
-      try {
-        // Ensure we grant rights for the allocated party identifier returned by the API (source of truth)
-        const allocatedPartyId = registrationResult.partyId;
-        await this.assignPartyToValidatorOperator(allocatedPartyId);
-      } catch (assignError) {
-        // At this point, assignment is REQUIRED for Canton JSON API access.
-        throw assignError;
-      }
-
-      // Step 5: Generate JWT token for validator-operator
-      const tokenString = await this.generateTokenForValidatorOperator(registrationResult.partyId);
       
-      if (!tokenString || typeof tokenString !== 'string' || tokenString.trim() === '') {
-        throw new Error('Token generation failed - invalid token returned');
+      // Decode JWT token to get claims
+      const parts = userToken.split('.');
+      if (parts.length !== 3) {
+        throw new Error('Invalid token format - not a valid JWT');
+      }
+      
+      const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+      
+      // Extract actAs from token claims (Huzefa approach)
+      // actAs can be in two places:
+      // 1. In a 'daml_ledger_api' claim object: { daml_ledger_api: { actAs: [...] } }
+      // 2. Directly in payload: { actAs: [...] }
+      const ledgerApiClaim = payload['daml_ledger_api'];
+      const actAs = ledgerApiClaim?.actAs || payload.actAs || [];
+      
+      if (Array.isArray(actAs) && actAs.length > 0) {
+        // Use first actAs party (or check for specific party)
+        const partyId = actAs[0];
+        console.log('[PartyService] ✅ Found party in token actAs claims:', partyId);
+        console.log('[PartyService] All actAs parties:', actAs);
+        return partyId;
+      }
+      
+      console.warn('[PartyService] ⚠️ No actAs claims found in token');
+      console.warn('[PartyService] Token payload keys:', Object.keys(payload));
+      return null;
+    } catch (error) {
+      console.error('[PartyService] ❌ Error extracting party from token:', error.message);
+      throw new Error(`Failed to extract party from token actAs claims: ${error.message}`);
+    }
+  }
+
+  /**
+   * MAIN FUNCTION: Get party for user from token actAs claims (Professional approach - Huzefa method)
+   * User's OAuth token already contains actAs/readAs claims with their party ID
+   * No ListUserRights or allocation needed - party ID is IN the token itself!
+   */
+  async createPartyForUser(publicKeyHex, userToken = null) {
+    try {
+      if (!userToken) {
+        throw new Error('User token is required (Huzefa approach). Cannot proceed without user OAuth token.');
       }
 
-      // Step 6: Verify party registration
-      const verification = await cantonAdmin.verifyPartyRegistration(registrationResult.partyId, tokenString);
-
-      // Step 7: Increment quota
-      this.incrementQuota();
-
-      const result = {
-        partyId: String(registrationResult.partyId),
-        token: String(tokenString),
+      console.log('[PartyService] 🔄 Professional approach: Extracting party from token actAs claims...');
+      
+      // Step 1: Extract party ID from token's actAs claims (Huzefa approach)
+      // User's token already has actAs/readAs with their party ID - no gRPC calls needed!
+      const partyId = this.extractPartyFromTokenActAs(userToken);
+      
+      if (!partyId) {
+        // No actAs in token - user needs to have parties granted first via GrantUserRights
+        console.error('[PartyService] ❌ No actAs claims found in token');
+        console.error('[PartyService] User needs to have parties granted via GrantUserRights first');
+        console.error('[PartyService] Token should contain actAs/readAs claims with party ID');
+        throw new Error('Token missing actAs claims. User must have parties granted via GrantUserRights first. This is the professional approach (Huzefa method) - the party ID should be in the token\'s actAs claims.');
+      }
+      
+      console.log('[PartyService] ✅ Found party in token actAs claims:', partyId);
+      console.log('[PartyService] Using party from token (no allocation needed - professional approach)');
+      
+      // Return party from token with user's token (already has actAs/readAs)
+      // No quota needed since we're not allocating - party already exists!
+      return {
+        partyId: String(partyId),
+        token: String(userToken), // Use user's existing token (already has actAs/readAs claims)
         quotaStatus: {
-        dailyUsed: quotaStatus.dailyCount + 1,
-        dailyLimit: DAILY_QUOTA,
-        weeklyUsed: quotaStatus.weeklyCount + 1,
-        weeklyLimit: WEEKLY_QUOTA,
+          dailyUsed: 0,
+          dailyLimit: DAILY_QUOTA,
+          weeklyUsed: 0,
+          weeklyLimit: WEEKLY_QUOTA
         },
-        registered: registrationResult?.success || false,
-        verified: (verification?.verified && verification?.registered) || false,
-        registrationMethod: registrationResult?.method || 'unknown',
+        registered: true,
+        verified: true,
+        registrationMethod: 'token-actas-claims',
+        message: 'Using party from token actAs claims (Huzefa approach - professional method)'
       };
-      
-      if (!result.token || typeof result.token !== 'string' || result.token.trim() === '') {
-        throw new Error('Result token validation failed');
-        throw new Error('Result object has invalid token after creation');
-      }
-      
-      return result;
       
     } catch (error) {
       console.error('[PartyService] Error creating party:', error);

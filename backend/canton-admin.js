@@ -21,7 +21,14 @@ class CantonAdminService {
    * Get admin authentication token
    * Uses validator-app service account token which has validator-operator permissions
    */
-  async getAdminToken() {
+  async getAdminToken(userToken = null) {
+    // Huzefa's approach: Use user's token if provided (already has actAs/readAs claims)
+    if (userToken) {
+      console.log('[CantonAdmin] Using user token (Huzefa approach) instead of admin service account');
+      return userToken;
+    }
+
+    // Fallback: Use admin service account if configured (legacy approach)
     if (this.adminToken && this.adminTokenExpiry && Date.now() < this.adminTokenExpiry) {
       return this.adminToken;
     }
@@ -33,8 +40,10 @@ class CantonAdminService {
     const KEYCLOAK_ADMIN_CLIENT_ID = process.env.KEYCLOAK_ADMIN_CLIENT_ID;
     const KEYCLOAK_ADMIN_CLIENT_SECRET = process.env.KEYCLOAK_ADMIN_CLIENT_SECRET;
 
+    // Admin credentials are now optional - prefer user token approach
     if (!KEYCLOAK_ADMIN_CLIENT_ID || !KEYCLOAK_ADMIN_CLIENT_SECRET) {
-      throw new Error('KEYCLOAK_ADMIN_CLIENT_ID and KEYCLOAK_ADMIN_CLIENT_SECRET must be configured for Canton party registration');
+      console.warn('[CantonAdmin] KEYCLOAK_ADMIN_CLIENT_ID and KEYCLOAK_ADMIN_CLIENT_SECRET not configured. Using user token approach is recommended (pass userToken parameter).');
+      throw new Error('Either provide userToken parameter (recommended) or configure KEYCLOAK_ADMIN_CLIENT_ID and KEYCLOAK_ADMIN_CLIENT_SECRET for Canton party registration');
     }
 
     const tokenUrl = `${KEYCLOAK_BASE_URL}/realms/${KEYCLOAK_REALM}/protocol/openid-connect/token`;
@@ -75,10 +84,13 @@ class CantonAdminService {
    * Register a party in Canton using JSON API
    * JSON API provides HTTP endpoint /v1/parties/allocate which is a proxy for Ledger API's AllocatePartyRequest
    * This is the correct way to allocate parties via HTTP
+   * @param {string} partyId - Party ID or hint
+   * @param {string} displayName - Optional display name
+   * @param {string} userToken - Optional user token (if provided, uses Huzefa's approach instead of admin service account)
    */
-  async registerParty(partyId, displayName = null) {
+  async registerParty(partyId, displayName = null, userToken = null) {
     try {
-      const adminToken = await this.getAdminToken();
+      const adminToken = await this.getAdminToken(userToken);
       const grpc = new (require('./canton-grpc-client'))();
       // Prefer gRPC allocation via PartyManagementService v2
       try {

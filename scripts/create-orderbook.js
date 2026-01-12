@@ -14,12 +14,22 @@ const TRADING_PAIRS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'];
 
 /**
  * Get JWT token from environment or prompt user
+ * Can use user's OAuth token with actAs claims (Huzefa's approach) or admin token
  */
 function getAuthToken() {
   const token = process.env.CANTON_JWT_TOKEN;
   if (!token) {
     console.error('❌ Error: CANTON_JWT_TOKEN environment variable not set!');
-    console.error('   Set it with: export CANTON_JWT_TOKEN="your_token_here"');
+    console.error('');
+    console.error('   Option 1: Use user OAuth token (recommended - Huzefa approach):');
+    console.error('     - Get token from Keycloak OAuth (user token with actAs/readAs claims)');
+    console.error('     - Set: export CANTON_JWT_TOKEN="your_user_token"');
+    console.error('');
+    console.error('   Option 2: Use admin/operator token:');
+    console.error('     - Get token from Keycloak for operator account');
+    console.error('     - Set: export CANTON_JWT_TOKEN="your_operator_token"');
+    console.error('');
+    console.error('   Then run: node scripts/create-orderbook.js');
     process.exit(1);
   }
   return token;

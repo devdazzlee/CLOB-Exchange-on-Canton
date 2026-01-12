@@ -62,6 +62,63 @@ export default function TradingInterface({ partyId }) {
   useEffect(() => {
     if (!partyId) return;
 
+    // Professional approach: Automatically ensure OrderBooks exist on app startup
+    // Like professional trading platforms (Hyperliquid, Lighter) - no manual setup needed
+    const initializeOrderBooks = async () => {
+      try {
+        console.log('[TradingInterface] 🌱 Professional initialization: Ensuring OrderBooks exist automatically...');
+        
+        // Get user's OAuth token (Huzefa approach - already has actAs/readAs claims)
+        const { getValidAccessToken } = await import('../services/keycloakAuth');
+        const userToken = await getValidAccessToken();
+        
+        // Default trading pairs that should always exist
+        const defaultPairs = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'];
+        
+        // Ensure all default OrderBooks exist (creates automatically if not)
+        const backendBase = process.env.VITE_BACKEND_URL || 'http://localhost:3001';
+        for (const pair of defaultPairs) {
+          try {
+            const ensureResponse = await fetch(`${backendBase}/api/orderbooks/${encodeURIComponent(pair)}/ensure`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${userToken}`
+              },
+              body: JSON.stringify({
+                userToken: userToken,
+                userPartyId: partyId
+              })
+            });
+            
+            if (ensureResponse.ok) {
+              const result = await ensureResponse.json();
+              if (result.created) {
+                console.log(`[TradingInterface] ✅ Automatically created OrderBook for ${pair}`);
+              } else if (result.exists) {
+                console.log(`[TradingInterface] ✅ OrderBook for ${pair} already exists`);
+              }
+            } else {
+              console.warn(`[TradingInterface] Could not ensure OrderBook for ${pair} (may require permissions)`);
+            }
+            
+            // Small delay to avoid rate limiting
+            await new Promise(resolve => setTimeout(resolve, 300));
+          } catch (pairError) {
+            console.warn(`[TradingInterface] Error ensuring OrderBook for ${pair}:`, pairError.message);
+          }
+        }
+        
+        console.log('[TradingInterface] ✅ Professional initialization complete - OrderBooks ready');
+      } catch (initError) {
+        console.warn('[TradingInterface] OrderBook auto-initialization failed (non-critical):', initError.message);
+        // Non-critical - OrderBooks will be created on first order placement instead
+      }
+    };
+
+    // Run initialization in background (don't block UI)
+    initializeOrderBooks();
+
     // Load available trading pairs on mount
     const loadAvailablePairs = async () => {
       try {
@@ -97,10 +154,15 @@ export default function TradingInterface({ partyId }) {
           }
         }
         
-        setAvailablePairs(pairs.length > 0 ? pairs : ['BTC/USDT']);
+        // Always include default pairs (Professional approach - like Hyperliquid, Lighter)
+        // Default pairs are always available for trading
+        const defaultPairs = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'];
+        const allPairs = [...new Set([...defaultPairs, ...pairs])];
+        
+        setAvailablePairs(allPairs.length > 0 ? allPairs : defaultPairs);
         // If current trading pair is not available, switch to first available
-        if (pairs.length > 0 && !pairs.includes(tradingPair)) {
-          setTradingPair(pairs[0]);
+        if (allPairs.length > 0 && !allPairs.includes(tradingPair)) {
+          setTradingPair(allPairs[0]);
         }
       } catch (err) {
         console.error('[TradingInterface] Error loading available pairs:', err);
@@ -412,18 +474,95 @@ export default function TradingInterface({ partyId }) {
       
       if (!book) {
         console.log('[OrderBook] ❌ OrderBook not found for', tradingPair);
-        // Only set orderBookExists to false if we don't have a stored offset
-        // (If we have a stored offset, the OrderBook was recently created and might just need time to propagate)
+        
+        // Only try auto-creation if we don't have a stored offset (to avoid infinite loops)
+        // If we have a stored offset, the OrderBook was recently created and might just need time to propagate
         const hasStoredOffset = localStorage.getItem(`orderBook_${tradingPair}_${partyId}_offset`);
         if (!hasStoredOffset) {
-          setOrderBookExists(false);
+          console.log('[OrderBook] 🔄 Professional approach: Automatically creating OrderBook...');
+          
+          // Professional approach: Automatically create OrderBook if not found
+          // Like professional trading platforms - no manual setup needed
+          try {
+            const { getValidAccessToken } = await import('../services/keycloakAuth');
+            const userToken = await getValidAccessToken();
+            
+            const backendBase = process.env.VITE_BACKEND_URL || 'http://localhost:3001';
+            const ensureResponse = await fetch(`${backendBase}/api/orderbooks/${encodeURIComponent(tradingPair)}/ensure`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${userToken}`
+              },
+              body: JSON.stringify({
+                userToken: userToken,
+                userPartyId: partyId
+              })
+            });
+            
+            if (ensureResponse.ok) {
+              const result = await ensureResponse.json();
+              if (result.exists && result.contractId) {
+                console.log('[OrderBook] ✅ OrderBook created automatically:', result.contractId);
+                
+                // Store for future use
+                localStorage.setItem(`orderBook_${tradingPair}_${partyId}`, result.contractId);
+                
+                // Wait a moment for OrderBook to be visible, then retry query
+                await new Promise(resolve => setTimeout(resolve, 1500));
+                
+                // Retry loading OrderBook by fetching using contract ID
+                try {
+                  const createdBook = await fetchContract(result.contractId, partyId);
+                  if (createdBook && createdBook.payload?.tradingPair === tradingPair) {
+                    console.log('[OrderBook] ✅ Successfully fetched auto-created OrderBook');
+                    book = createdBook;
+                    setOrderBookExists(true);
+                    // Continue with normal flow below instead of returning
+                  } else {
+                    // Even if we can't fetch it, use the contract ID (user can still exercise AddOrder)
+                    book = {
+                      contractId: result.contractId,
+                      payload: { tradingPair: tradingPair, operator: result.operator || null },
+                      templateId: 'OrderBook:OrderBook'
+                    };
+                    setOrderBookExists(true);
+                  }
+                } catch (fetchErr) {
+                  console.warn('[OrderBook] Could not fetch auto-created OrderBook, using contract ID:', fetchErr.message);
+                  // Use contract ID anyway - user can still exercise AddOrder
+                  book = {
+                    contractId: result.contractId,
+                    payload: { tradingPair: tradingPair, operator: result.operator || null },
+                    templateId: 'OrderBook:OrderBook'
+                  };
+                  setOrderBookExists(true);
+                }
+              } else {
+                console.warn('[OrderBook] OrderBook auto-creation returned but contract ID missing');
+                setOrderBookExists(false);
+              }
+            } else {
+              console.warn('[OrderBook] OrderBook auto-creation failed (may require permissions)');
+              setOrderBookExists(false);
+            }
+          } catch (autoCreateError) {
+            console.warn('[OrderBook] Error during automatic OrderBook creation:', autoCreateError.message);
+            setOrderBookExists(false);
+          }
         } else {
           console.log('[OrderBook] Stored offset exists, keeping orderBookExists=true (OrderBook may need time to propagate)');
+          setOrderBookExists(true);
         }
-        setOrderBook({ buys: [], sells: [] });
-        setOrderBookLoading(false);
-        isLoadingRef.current = false;
-        return;
+        
+        // If still no book after auto-creation attempt, set empty state
+        if (!book) {
+          setOrderBook({ buys: [], sells: [] });
+          setOrderBookLoading(false);
+          isLoadingRef.current = false;
+          return;
+        }
+        // If book was created, continue with normal flow below
       }
       
       setOrderBookExists(true);
@@ -558,17 +697,77 @@ export default function TradingInterface({ partyId }) {
     }
   }, [partyId, tradingPair]);
 
-  // Order book creation - DISABLED: Users cannot create OrderBooks
-  // OrderBooks must be created by an operator/admin and are global (shared across all users)
+  // Professional approach: Automatically create OrderBook if not exists
+  // Uses user's OAuth token with actAs claims (Huzefa approach)
   const handleCreateOrderBook = async () => {
-    await showModal({
-      title: '⚠ Cannot Create OrderBook',
-      message: `OrderBooks are global and shared across all users.\n\nThey must be created by an exchange operator, not individual users.\n\nPlease contact the operator to create the OrderBook for ${tradingPair}.`,
-      type: 'warning',
-      confirmText: 'OK',
-    });
-    setCreatingOrderBook(false);
-    return { success: false, error: 'Users cannot create OrderBooks' };
+    setCreatingOrderBook(true);
+    setError('');
+    
+    try {
+      console.log(`[Create OrderBook] 🔄 Professional approach: Automatically creating OrderBook for ${tradingPair}...`);
+      
+      // Get user's OAuth token (Huzefa approach - already has actAs/readAs claims)
+      const { getValidAccessToken } = await import('../services/keycloakAuth');
+      const userToken = await getValidAccessToken();
+      
+      const backendBase = process.env.VITE_BACKEND_URL || 'http://localhost:3001';
+      const ensureResponse = await fetch(`${backendBase}/api/orderbooks/${encodeURIComponent(tradingPair)}/ensure`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${userToken}`
+        },
+        body: JSON.stringify({
+          userToken: userToken,
+          userPartyId: partyId
+        })
+      });
+      
+      if (ensureResponse.ok) {
+        const result = await ensureResponse.json();
+        if (result.exists && result.created) {
+          console.log('[Create OrderBook] ✅ OrderBook created automatically:', result.contractId);
+          await showModal({
+            title: '✅ OrderBook Created',
+            message: `OrderBook for ${tradingPair} has been created automatically!\n\nYou can now place orders.`,
+            type: 'success',
+            confirmText: 'OK',
+          });
+          
+          // Store for future use
+          if (result.contractId) {
+            localStorage.setItem(`orderBook_${tradingPair}_${partyId}`, result.contractId);
+          }
+          
+          // Reload OrderBook
+          await loadOrderBook(true);
+          return { success: true, contractId: result.contractId };
+        } else if (result.exists && !result.created) {
+          await showModal({
+            title: '✅ OrderBook Exists',
+            message: `OrderBook for ${tradingPair} already exists!\n\nReloading...`,
+            type: 'success',
+            confirmText: 'OK',
+          });
+          await loadOrderBook(true);
+          return { success: true, exists: true };
+        }
+      } else {
+        const errorData = await ensureResponse.json().catch(() => ({ error: 'Unknown error' }));
+        throw new Error(errorData.error || 'Failed to create OrderBook automatically');
+      }
+    } catch (err) {
+      console.error('[Create OrderBook] Error:', err);
+      await showModal({
+        title: '❌ OrderBook Creation Failed',
+        message: `Could not create OrderBook for ${tradingPair} automatically.\n\nError: ${err.message}\n\nThis may be a permissions issue. Check that your token has actAs claims for the operator party.`,
+        type: 'error',
+        confirmText: 'OK',
+      });
+      return { success: false, error: err.message };
+    } finally {
+      setCreatingOrderBook(false);
+    }
   };
 
   // Order placement
@@ -627,11 +826,12 @@ export default function TradingInterface({ partyId }) {
       }
       
       // Fallback: Query OrderBooks directly (may not work if user can't see them)
+      let allOrderBooks = [];
       if (!orderBookContract) {
         console.log('[Place Order] Querying OrderBooks directly for party:', partyId);
-        let orderBooks = await queryContracts('OrderBook:OrderBook', partyId);
-        console.log('[Place Order] Found', orderBooks.length, 'OrderBooks at current ledger end');
-        orderBookContract = orderBooks.find(ob => ob.payload?.tradingPair === tradingPair);
+        allOrderBooks = await queryContracts('OrderBook:OrderBook', partyId);
+        console.log('[Place Order] Found', allOrderBooks.length, 'OrderBooks at current ledger end');
+        orderBookContract = allOrderBooks.find(ob => ob.payload?.tradingPair === tradingPair);
         
         // If not found, try stored completion offset
         if (!orderBookContract) {
@@ -644,6 +844,10 @@ export default function TradingInterface({ partyId }) {
             orderBookContract = orderBooksAtOffset.find(ob => ob.payload?.tradingPair === tradingPair);
             if (orderBookContract) {
               console.log('[Place Order] ✅ Found OrderBook at stored offset:', orderBookContract.contractId);
+            }
+            // Merge with allOrderBooks for logging
+            if (orderBooksAtOffset.length > 0) {
+              allOrderBooks = [...allOrderBooks, ...orderBooksAtOffset];
             }
           }
         }
@@ -661,22 +865,92 @@ export default function TradingInterface({ partyId }) {
       }
       
       if (orderBookContract) {
-        console.log('[Place Order] Using OrderBook for', tradingPair, ':', orderBookContract.contractId, 'at offset', orderBookContract.offset);
+        console.log('[Place Order] Using OrderBook for', tradingPair, ':', orderBookContract.contractId);
       } else {
         console.warn('[Place Order] No OrderBook found for', tradingPair);
-        console.warn('[Place Order] Available pairs:', orderBooks.map(ob => ob.payload?.tradingPair));
+        if (allOrderBooks.length > 0) {
+          console.warn('[Place Order] Available pairs:', allOrderBooks.map(ob => ob.payload?.tradingPair));
+        } else {
+          console.warn('[Place Order] No OrderBooks found on the ledger');
+        }
       }
 
       if (!orderBookContract) {
-        console.log('[Place Order] OrderBook not found. Showing message to user...');
-        await showModal({
-          title: '⚠ OrderBook Not Available',
-          message: `The OrderBook for ${tradingPair} has not been created yet.\n\nPlease contact the exchange operator to create the OrderBook for this trading pair.\n\nNote: OrderBooks are global and shared across all users - they must be created by an operator, not individual users.`,
-          type: 'warning',
-          confirmText: 'OK',
-        });
-        setLoading(false);
-        return;
+        // Professional approach: Automatically create OrderBook if not exists (like Hyperliquid, Lighter)
+        console.log('[Place Order] 🔄 OrderBook not found - automatically creating (Professional approach)...');
+        
+        try {
+          // Get user's OAuth token (Huzefa approach - already has actAs/readAs claims)
+          const { getValidAccessToken } = await import('../services/keycloakAuth');
+          const userToken = await getValidAccessToken();
+          
+          // Call backend to ensure OrderBook exists (will create automatically if not)
+          const backendBase = process.env.VITE_BACKEND_URL || 'http://localhost:3001';
+          const ensureResponse = await fetch(`${backendBase}/api/orderbooks/${encodeURIComponent(tradingPair)}/ensure`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${userToken}`
+            },
+            body: JSON.stringify({
+              userToken: userToken,
+              userPartyId: partyId
+            })
+          });
+          
+          if (ensureResponse.ok) {
+            const ensureResult = await ensureResponse.json();
+            if (ensureResult.exists && ensureResult.contractId) {
+              console.log('[Place Order] ✅ OrderBook created automatically:', ensureResult.contractId);
+              
+              // Use the created OrderBook contract ID
+              orderBookContract = {
+                contractId: ensureResult.contractId,
+                payload: { 
+                  tradingPair: tradingPair, 
+                  operator: ensureResult.operator || null 
+                },
+                templateId: 'OrderBook:OrderBook'
+              };
+              
+              // Store for future use
+              localStorage.setItem(`orderBook_${tradingPair}_${partyId}`, ensureResult.contractId);
+              
+              // Wait a moment for OrderBook to be visible
+              await new Promise(resolve => setTimeout(resolve, 1000));
+            } else {
+              // OrderBook creation might have failed - try direct query
+              console.warn('[Place Order] OrderBook creation returned but contract ID missing, trying direct query...');
+              const { getOrderBookContractId } = await import('../services/cantonApi');
+              const globalOrderBookId = await getOrderBookContractId(tradingPair);
+              if (globalOrderBookId) {
+                orderBookContract = {
+                  contractId: globalOrderBookId,
+                  payload: { tradingPair: tradingPair, operator: null },
+                  templateId: 'OrderBook:OrderBook'
+                };
+              }
+            }
+          } else {
+            console.warn('[Place Order] OrderBook auto-creation via backend failed');
+            // Will show error message below if still no OrderBook
+          }
+        } catch (autoCreateError) {
+          console.error('[Place Order] Error during automatic OrderBook creation:', autoCreateError);
+        }
+        
+        // If still no OrderBook after auto-creation attempt, show error
+        if (!orderBookContract) {
+          console.error('[Place Order] OrderBook still not available after auto-creation attempt');
+          await showModal({
+            title: '⚠ OrderBook Not Available',
+            message: `The OrderBook for ${tradingPair} could not be created automatically.\n\nThis may be a permissions issue. Please check that your token has actAs claims for the operator party.\n\nNote: Following Huzefa's approach, we use your OAuth token with actAs/readAs claims to create OrderBooks automatically.`,
+            type: 'warning',
+            confirmText: 'OK',
+          });
+          setLoading(false);
+          return;
+        }
       }
 
       const operator = orderBookContract.payload?.operator;

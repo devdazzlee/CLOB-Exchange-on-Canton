@@ -17,6 +17,7 @@ function bytesToHex(bytes) {
 
 /**
  * Create a party ID on behalf of the user
+ * Uses Huzefa's approach: passes user's OAuth token with actAs/readAs claims
  * @param {Uint8Array} publicKey - User's public key
  * @returns {Promise<{partyId: string, token?: string, quotaStatus: object}>}
  */
@@ -24,6 +25,18 @@ export async function createPartyForUser(publicKey) {
   try {
     // Convert public key to hex string
     const publicKeyHex = bytesToHex(publicKey);
+    
+    // Get user's OAuth token (already has actAs/readAs claims)
+    // Huzefa's approach: Use user's token instead of admin service account
+    const { getValidAccessToken } = await import('./keycloakAuth');
+    let userToken = null;
+    try {
+      userToken = await getValidAccessToken();
+      console.log('[PartyService] Using user OAuth token (Huzefa approach) with actAs/readAs claims');
+    } catch (tokenError) {
+      console.warn('[PartyService] Could not get user token, will use admin approach if configured:', tokenError.message);
+      // Continue without user token - backend will use admin approach if configured
+    }
     
     console.log('[PartyService] Creating party for public key:', publicKeyHex.substring(0, 20) + '...');
     
@@ -34,6 +47,7 @@ export async function createPartyForUser(publicKey) {
       },
       body: JSON.stringify({
         publicKeyHex: publicKeyHex,
+        userToken: userToken, // Pass user's token (Huzefa's approach)
       }),
     });
 

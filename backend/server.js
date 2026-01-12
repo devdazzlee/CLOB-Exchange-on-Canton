@@ -6,11 +6,13 @@ const http = require('http');
 const WebSocket = require('ws');
 const TokenExchangeService = require('./token-exchange');
 const PartyService = require('./party-service');
+const OrderBookService = require('./orderbook-service');
 
 const app = express();
 const server = http.createServer(app);
 const tokenExchange = new TokenExchangeService();
 const partyService = new PartyService();
+const orderBookService = new OrderBookService();
 
 // WebSocket Server
 const wss = new WebSocket.Server({ 
@@ -129,9 +131,10 @@ app.use(cors(corsOptions));
 app.use(express.json());
 
 // Party creation endpoint - creates party ID on behalf of user
+// Uses Huzefa's approach: user's OAuth token with actAs/readAs claims instead of admin service account
 app.post('/api/create-party', async (req, res) => {
   try {
-    const { publicKeyHex } = req.body;
+    const { publicKeyHex, userToken } = req.body;
     
     if (!publicKeyHex) {
       return res.status(400).json({ error: 'Missing publicKeyHex' });
@@ -143,11 +146,12 @@ app.post('/api/create-party', async (req, res) => {
     }
 
     console.log('[API] POST /api/create-party');
+    console.log('[API] Using user token approach (Huzefa method)');
     
-    // Create party for user
+    // Create party for user using their own token (which already has actAs/readAs claims)
     let result;
     try {
-      result = await partyService.createPartyForUser(publicKeyHex);
+      result = await partyService.createPartyForUser(publicKeyHex, userToken);
     } catch (serviceError) {
       console.error('[API] Error:', serviceError.message);
       throw serviceError;
@@ -213,6 +217,66 @@ app.post('/api/token-exchange', async (req, res) => {
 // Ledger API proxy endpoints
 app.all('/api/ledger/*', async (req, res) => {
   await tokenExchange.proxyLedgerApiCall(req, res);
+});
+
+/**
+ * Automatic OrderBook creation endpoint (Professional approach)
+ * Creates OrderBook if not exists - called automatically by frontend
+ * Uses user's token with actAs claims (Huzefa approach)
+ */
+app.post('/api/orderbooks/:tradingPair/ensure', async (req, res) => {
+  try {
+    const { tradingPair } = req.params;
+    let { userToken, userPartyId } = req.body;
+    
+    if (!userToken) {
+      // Try to get from Authorization header
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({
+          error: 'Missing user token',
+          message: 'User token with actAs/readAs claims is required (Huzefa approach)'
+        });
+      }
+      userToken = authHeader.substring(7);
+    }
+    
+    console.log(`[OrderBooks API] Ensuring OrderBook exists for ${tradingPair}...`);
+    
+    const result = await orderBookService.ensureOrderBookExists(
+      tradingPair, 
+      userToken, 
+      userPartyId || ''
+    );
+    
+    if (result.exists) {
+      res.json({
+        success: true,
+        exists: true,
+        created: result.created || false,
+        contractId: result.contractId || null,
+        tradingPair: tradingPair,
+        message: result.created 
+          ? `OrderBook for ${tradingPair} created automatically` 
+          : `OrderBook for ${tradingPair} already exists`
+      });
+    } else {
+      res.status(500).json({
+        success: false,
+        exists: false,
+        created: false,
+        tradingPair: tradingPair,
+        error: result.error || 'Failed to create OrderBook',
+        message: `Could not create OrderBook for ${tradingPair}. Please check permissions.`
+      });
+    }
+  } catch (error) {
+    console.error('[OrderBooks API] Error ensuring OrderBook:', error);
+    res.status(500).json({
+      error: 'Failed to ensure OrderBook exists',
+      message: error.message
+    });
+  }
 });
 
 // Health check
@@ -469,47 +533,116 @@ app.get('/api/orderbooks', async (req, res) => {
 
 /**
  * Get OrderBook for a specific trading pair
+ * Professional approach: Automatically creates if not exists (like professional trading platforms)
  */
 app.get('/api/orderbooks/:tradingPair', async (req, res) => {
   try {
     const { tradingPair } = req.params;
-    const encodedPair = encodeURIComponent(tradingPair);
     
-    // First get all OrderBooks
-    const allOrderBooksResponse = await fetch(`${req.protocol}://${req.get('host')}/api/orderbooks`, {
-      method: 'GET',
-      headers: {
-        'Authorization': req.headers.authorization || ''
+    // Get user token from Authorization header (Huzefa approach)
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({
+        error: 'Missing authorization token',
+        message: 'User token is required (Huzefa approach - token with actAs/readAs claims)'
+      });
+    }
+    
+    const userToken = authHeader.substring(7); // Remove "Bearer " prefix
+    
+    // Extract user party ID from token
+    let userPartyId;
+    try {
+      const parts = userToken.split('.');
+      if (parts.length === 3) {
+        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+        // Try to get party ID from token claims or use sub
+        userPartyId = payload.partyId || payload.sub || null;
       }
-    });
-    
-    if (!allOrderBooksResponse.ok) {
-      return res.status(allOrderBooksResponse.status).json({
-        error: 'Failed to query OrderBooks',
-        details: await allOrderBooksResponse.text()
-      });
+    } catch (e) {
+      console.warn('[OrderBooks API] Could not extract party ID from token');
     }
     
-    const data = await allOrderBooksResponse.json();
-    const orderBook = data.orderBooks?.find(ob => ob.tradingPair === tradingPair);
+    // First, check if OrderBook exists
+    const exists = await orderBookService.checkOrderBookExists(tradingPair, userToken, userPartyId || '');
     
-    if (!orderBook) {
-      return res.status(404).json({
-        error: 'OrderBook not found',
-        tradingPair: tradingPair,
-        message: `No OrderBook found for trading pair ${tradingPair}. Please contact the operator to create it.`
+    if (exists) {
+      // OrderBook exists - return it
+      const allOrderBooksResponse = await fetch(`${req.protocol}://${req.get('host')}/api/orderbooks`, {
+        method: 'GET',
+        headers: {
+          'Authorization': req.headers.authorization || ''
+        }
       });
+      
+      if (allOrderBooksResponse.ok) {
+        const data = await allOrderBooksResponse.json();
+        const orderBook = data.orderBooks?.find(ob => ob.tradingPair === tradingPair);
+        
+        if (orderBook) {
+          return res.json({
+            success: true,
+            orderBook: orderBook,
+            autoCreated: false
+          });
+        }
+      }
     }
     
-    res.json({
-      success: true,
-      orderBook: orderBook
+    // OrderBook doesn't exist - create it automatically (Professional approach)
+    console.log(`[OrderBooks API] 🔄 OrderBook for ${tradingPair} not found - creating automatically...`);
+    const createResult = await orderBookService.ensureOrderBookExists(tradingPair, userToken, userPartyId || '');
+    
+    if (createResult.exists && createResult.created) {
+      // Successfully created - return the created OrderBook
+      return res.json({
+        success: true,
+        orderBook: {
+          contractId: createResult.contractId,
+          tradingPair: tradingPair,
+          operator: createResult.operator || null,
+          buyOrders: [],
+          sellOrders: [],
+          autoCreated: true
+        },
+        message: `OrderBook for ${tradingPair} created automatically`
+      });
+    } else if (createResult.exists && !createResult.created) {
+      // OrderBook exists but wasn't created by us (race condition or visibility issue)
+      // Try to fetch it again
+      const allOrderBooksResponse = await fetch(`${req.protocol}://${req.get('host')}/api/orderbooks`, {
+        method: 'GET',
+        headers: {
+          'Authorization': req.headers.authorization || ''
+        }
+      });
+      
+      if (allOrderBooksResponse.ok) {
+        const data = await allOrderBooksResponse.json();
+        const orderBook = data.orderBooks?.find(ob => ob.tradingPair === tradingPair);
+        
+        if (orderBook) {
+          return res.json({
+            success: true,
+            orderBook: orderBook,
+            autoCreated: false
+          });
+        }
+      }
+    }
+    
+    // If we get here, creation failed or OrderBook not found after creation
+    return res.status(404).json({
+      error: 'OrderBook not found and could not be created automatically',
+      tradingPair: tradingPair,
+      message: `OrderBook for ${tradingPair} was not found and automatic creation failed. Please try placing an order - it will be created automatically.`,
+      error: createResult.error
     });
     
   } catch (error) {
     console.error('[OrderBooks API] Error:', error);
     res.status(500).json({ 
-      error: 'Failed to get OrderBook',
+      error: 'Failed to get or create OrderBook',
       message: error.message 
     });
   }
