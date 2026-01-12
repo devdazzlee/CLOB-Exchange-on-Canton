@@ -1268,3 +1268,37 @@ export async function getOrderBookContractId(tradingPair) {
   }
 }
 
+/**
+ * Get full OrderBook object (including operator) for a specific trading pair
+ * Uses backend endpoint to query using operator token
+ * @param {string} tradingPair - Trading pair (e.g., "BTC/USDT")
+ * @returns {Promise<object|null>} OrderBook object with contractId and operator, or null if not found
+ */
+export async function getOrderBook(tradingPair) {
+  try {
+    const backendBase = process.env.VITE_BACKEND_URL || 'http://localhost:3001';
+    const response = await fetch(`${backendBase}/api/orderbooks/${encodeURIComponent(tradingPair)}`, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    if (response.ok) {
+      const data = await response.json();
+      if (data.orderBook && data.orderBook.contractId) {
+        console.log('[API] Found OrderBook for', tradingPair, ':', data.orderBook.contractId.substring(0, 30) + '...');
+        return data.orderBook;
+      }
+    } else if (response.status === 404) {
+      console.log('[API] OrderBook not found for', tradingPair);
+      return null;
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('[API] Error getting OrderBook:', error);
+    return null;
+  }
+}
+

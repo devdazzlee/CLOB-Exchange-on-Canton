@@ -101,35 +101,6 @@ export default function WalletSetup({ onWalletReady }) {
     setError('');
 
     try {
-      // Clear old localStorage data before creating new wallet (as per client feedback)
-      // This fixes the issue where old tokens prevent proper navigation after wallet creation
-      console.log('[WalletSetup] Clearing old localStorage data before creating new wallet...');
-      const keysToClear = [
-        'canton_jwt_token',
-        'canton_jwt_token_expires',
-        'canton_party_id',
-        'keycloak_access_token',
-        'keycloak_refresh_token',
-        'keycloak_token_expires_at'
-      ];
-      
-      keysToClear.forEach(key => {
-        if (localStorage.getItem(key)) {
-          console.log(`[WalletSetup] Clearing old ${key}`);
-          localStorage.removeItem(key);
-        }
-      });
-      
-      // Also clear any order book offsets that might be stale
-      Object.keys(localStorage).forEach(key => {
-        if (key.startsWith('orderBook_') || key.startsWith('latestOrder_')) {
-          console.log(`[WalletSetup] Clearing stale ${key}`);
-          localStorage.removeItem(key);
-        }
-      });
-      
-      console.log('[WalletSetup] ✅ Old localStorage data cleared');
-
       // 1. Create wallet locally
       const { publicKey, privateKey } = await mnemonicToKeyPair(mnemonic);
       const encryptedPrivateKey = await encryptPrivateKey(privateKey, password);
@@ -203,34 +174,6 @@ export default function WalletSetup({ onWalletReady }) {
     setError('');
 
     try {
-      // Clear old localStorage data before importing wallet (as per client feedback)
-      console.log('[WalletSetup] Clearing old localStorage data before importing wallet...');
-      const keysToClear = [
-        'canton_jwt_token',
-        'canton_jwt_token_expires',
-        'canton_party_id',
-        'keycloak_access_token',
-        'keycloak_refresh_token',
-        'keycloak_token_expires_at'
-      ];
-      
-      keysToClear.forEach(key => {
-        if (localStorage.getItem(key)) {
-          console.log(`[WalletSetup] Clearing old ${key}`);
-          localStorage.removeItem(key);
-        }
-      });
-      
-      // Also clear any order book offsets that might be stale
-      Object.keys(localStorage).forEach(key => {
-        if (key.startsWith('orderBook_') || key.startsWith('latestOrder_')) {
-          console.log(`[WalletSetup] Clearing stale ${key}`);
-          localStorage.removeItem(key);
-        }
-      });
-      
-      console.log('[WalletSetup] ✅ Old localStorage data cleared');
-
       // 1. Import wallet locally
       const { publicKey, privateKey } = await mnemonicToKeyPair(importMnemonic.trim());
       const encryptedPrivateKey = await encryptPrivateKey(privateKey, password);

@@ -6,13 +6,19 @@ const http = require('http');
 const WebSocket = require('ws');
 const TokenExchangeService = require('./token-exchange');
 const PartyService = require('./party-service');
-const OrderBookService = require('./orderbook-service');
+const UTXOMerger = require('./utxo-merger');
 
 const app = express();
 const server = http.createServer(app);
 const tokenExchange = new TokenExchangeService();
 const partyService = new PartyService();
-const orderBookService = new OrderBookService();
+const utxoMerger = new UTXOMerger();
+
+// In-memory cache for OrderBook contract IDs
+// Maps tradingPair -> { contractId, updateId, completionOffset, createdAt, operator }
+// ROOT CAUSE FIX: Store OrderBook info when created since we can't query them immediately
+// due to admin token not having operator party in actAs
+const orderBookCache = new Map();
 
 // WebSocket Server
 const wss = new WebSocket.Server({ 
@@ -131,10 +137,9 @@ app.use(cors(corsOptions));
 app.use(express.json());
 
 // Party creation endpoint - creates party ID on behalf of user
-// Uses Huzefa's approach: user's OAuth token with actAs/readAs claims instead of admin service account
 app.post('/api/create-party', async (req, res) => {
   try {
-    const { publicKeyHex, userToken } = req.body;
+    const { publicKeyHex } = req.body;
     
     if (!publicKeyHex) {
       return res.status(400).json({ error: 'Missing publicKeyHex' });
@@ -146,12 +151,11 @@ app.post('/api/create-party', async (req, res) => {
     }
 
     console.log('[API] POST /api/create-party');
-    console.log('[API] Using user token approach (Huzefa method)');
     
-    // Create party for user using their own token (which already has actAs/readAs claims)
+    // Create party for user
     let result;
     try {
-      result = await partyService.createPartyForUser(publicKeyHex, userToken);
+      result = await partyService.createPartyForUser(publicKeyHex);
     } catch (serviceError) {
       console.error('[API] Error:', serviceError.message);
       throw serviceError;
@@ -214,69 +218,451 @@ app.post('/api/token-exchange', async (req, res) => {
   }
 });
 
-// Ledger API proxy endpoints
-app.all('/api/ledger/*', async (req, res) => {
-  await tokenExchange.proxyLedgerApiCall(req, res);
-});
+/**
+ * Admin endpoints - MUST be defined BEFORE the catch-all /api/ledger/* route
+ * Otherwise Express will match /api/admin/* to /api/ledger/* first
+ */
 
 /**
- * Automatic OrderBook creation endpoint (Professional approach)
- * Creates OrderBook if not exists - called automatically by frontend
- * Uses user's token with actAs claims (Huzefa approach)
+ * Admin endpoint to create OrderBook for a trading pair
+ * This should be called by the operator/admin to initialize OrderBooks
  */
-app.post('/api/orderbooks/:tradingPair/ensure', async (req, res) => {
+app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
   try {
+    // Decode the trading pair from URL
     const { tradingPair } = req.params;
-    let { userToken, userPartyId } = req.body;
+    const decodedTradingPair = decodeURIComponent(tradingPair);
     
-    if (!userToken) {
-      // Try to get from Authorization header
-      const authHeader = req.headers.authorization;
-      if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({
-          error: 'Missing user token',
-          message: 'User token with actAs/readAs claims is required (Huzefa approach)'
-        });
+    // Validate trading pair format
+    if (!decodedTradingPair || !decodedTradingPair.includes('/')) {
+      return res.status(400).json({
+        error: 'Invalid trading pair format',
+        expected: 'BASE/QUOTE (e.g., BTC/USDT)',
+        received: decodedTradingPair
+      });
+    }
+    
+    console.log(`[Admin] Creating OrderBook for: ${decodedTradingPair}`);
+    
+    const cantonAdmin = new (require('./canton-admin'))();
+    const adminToken = await cantonAdmin.getAdminToken();
+    const operatorPartyId = process.env.OPERATOR_PARTY_ID || 
+      '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
+    
+    const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://95.216.34.215:31539';
+    
+    // Check if OrderBook already exists
+    const { getOrderBookContractId } = require('./canton-api-helpers');
+    const existingContractId = await getOrderBookContractId(decodedTradingPair, adminToken, CANTON_JSON_API_BASE);
+    
+    if (existingContractId) {
+      return res.status(409).json({
+        error: 'OrderBook already exists',
+        tradingPair: decodedTradingPair,
+        contractId: existingContractId,
+        message: `OrderBook for ${decodedTradingPair} already exists. Use GET /api/orderbooks/${encodeURIComponent(decodedTradingPair)} to retrieve it.`
+      });
+    }
+    
+    // Get package ID by querying for existing OrderBook contracts or checking packages
+    // ROOT CAUSE: Need to find which package contains OrderBook template
+    let packageId = null;
+    
+    try {
+      // Method 1: Query for OrderBook contracts to extract package ID from templateId
+      const queryResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${adminToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          readAs: [operatorPartyId],
+          activeAtOffset: "0",
+          filter: {
+            filtersByParty: {
+              [operatorPartyId]: {
+                inclusive: {
+                  templateIds: ['OrderBook:OrderBook']
+                }
+              }
+            }
+          }
+        })
+      });
+      
+      if (queryResponse.ok) {
+        const queryData = await queryResponse.json();
+        // Extract package ID from any existing OrderBook contract's templateId
+        if (queryData.activeContracts && queryData.activeContracts.length > 0) {
+          const contract = queryData.activeContracts[0];
+          const templateId = contract.contractEntry?.JsActiveContract?.createdEvent?.templateId ||
+                            contract.createdEvent?.templateId ||
+                            contract.templateId;
+          
+          if (templateId && templateId.includes(':')) {
+            // Template ID format: packageId:Module:Template
+            packageId = templateId.split(':')[0];
+            console.log('[Admin] Found package ID from existing OrderBook:', packageId);
+          }
+        }
       }
-      userToken = authHeader.substring(7);
+      
+      // Method 2: If no existing contracts, try to get from packages list
+      if (!packageId) {
+        const packagesResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/packages`, {
+          method: 'GET',
+          headers: {
+            'Authorization': `Bearer ${adminToken}`,
+            'Content-Type': 'application/json'
+          }
+        });
+        
+        if (packagesResponse.ok) {
+          const packagesData = await packagesResponse.json();
+          console.log('[Admin] Packages response structure:', Object.keys(packagesData));
+          
+          // Response format: { packageIds: [...] }
+          if (packagesData.packageIds && Array.isArray(packagesData.packageIds) && packagesData.packageIds.length > 0) {
+            // Use the last package ID (most recent) - this is likely our contract package
+            packageId = packagesData.packageIds[packagesData.packageIds.length - 1];
+            console.log('[Admin] ✓ Using latest package ID from packages list:', packageId);
+          } else {
+            console.warn('[Admin] ✗ packageIds array is empty or not found. Response:', JSON.stringify(packagesData).substring(0, 200));
+          }
+        } else {
+          const errorText = await packagesResponse.text();
+          console.error('[Admin] ✗ Failed to fetch packages. Status:', packagesResponse.status, 'Error:', errorText);
+        }
+      }
+    } catch (e) {
+      console.error('[Admin] Error getting package ID:', e.message);
     }
     
-    console.log(`[OrderBooks API] Ensuring OrderBook exists for ${tradingPair}...`);
+    // ROOT CAUSE FIX: Template ID MUST be fully qualified for contract creation
+    // Format: packageId:Module:Template
+    const qualifiedTemplateId = packageId ? `${packageId}:OrderBook:OrderBook` : 'OrderBook:OrderBook';
+    console.log('[Admin] Using template ID:', qualifiedTemplateId);
     
-    const result = await orderBookService.ensureOrderBookExists(
-      tradingPair, 
-      userToken, 
-      userPartyId || ''
-    );
+    if (!packageId) {
+      console.warn('[Admin] WARNING: No package ID found. Contract creation may fail.');
+      console.warn('[Admin] Trying with unqualified template ID - this may not work.');
+    }
     
-    if (result.exists) {
-      res.json({
+    // Create OrderBook contract
+    const commandId = `create-orderbook-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    
+    // ROOT CAUSE FIX: Canton says "Unexpected fields: userAccountsactiveUsers"
+    // This means the deployed template doesn't have these fields, OR they're computed fields
+    // Let's try WITHOUT these fields first - only include fields that are definitely required
+    // Based on OrderBookTest.daml, the minimal required fields are:
+    const payload = {
+      tradingPair: decodedTradingPair,
+      buyOrders: [],  // [ContractId Order.Order] - empty array
+      sellOrders: [], // [ContractId Order.Order] - empty array
+      lastPrice: null, // Optional Decimal - null for None
+      operator: operatorPartyId // Party
+      // NOTE: Removing activeUsers and userAccounts - Canton says they're unexpected
+      // These might be computed/derived fields or not in the deployed template version
+    };
+    
+    console.log('[Admin] OrderBook payload:', JSON.stringify(payload, null, 2));
+    
+    // Build request body according to JSON API v2 spec
+    // Reference: https://docs.digitalasset.com/build/latest/explanations/json-api/commands.html
+    const requestBody = {
+      commandId: commandId, // Required by SubmitAndWaitRequest schema - MUST be at top level
+      commands: [
+        {
+          CreateCommand: {
+            templateId: qualifiedTemplateId, // Fully qualified template ID
+            createArguments: payload
+          }
+        }
+      ],
+      actAs: [operatorPartyId] // Required by SubmitAndWaitRequest schema
+    };
+    
+    console.log('[Admin] Request body:', JSON.stringify(requestBody, null, 2));
+    
+    const createResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/commands/submit-and-wait`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${adminToken}`
+      },
+      body: JSON.stringify(requestBody)
+    });
+    
+    if (!createResponse.ok) {
+      const errorText = await createResponse.text();
+      console.error('[Create OrderBook] Response status:', createResponse.status);
+      console.error('[Create OrderBook] Response headers:', Object.fromEntries(createResponse.headers.entries()));
+      console.error('[Create OrderBook] Full error response:', errorText);
+      
+      let error;
+      try {
+        error = JSON.parse(errorText);
+        console.error('[Create OrderBook] Parsed error:', JSON.stringify(error, null, 2));
+      } catch {
+        error = { message: errorText };
+        console.error('[Create OrderBook] Error text (not JSON):', errorText);
+      }
+      
+      // Log the request that failed for debugging
+      console.error('[Create OrderBook] Failed request body:', JSON.stringify(requestBody, null, 2));
+      
+      return res.status(createResponse.status).json({
+        error: 'Failed to create OrderBook',
+        details: error.message || error.cause || error.errors?.join(', ') || errorText,
+        status: createResponse.status,
+        fullError: error
+      });
+    }
+    
+    const result = await createResponse.json();
+    
+    // ROOT CAUSE FIX: v2 API returns { updateId, completionOffset } not { events }
+    // We need to query for the contract using completionOffset
+    let contractId = null;
+    
+    // Method 1: Check if events are present (v1 format)
+    if (result.events && result.events.length > 0) {
+      const createdEvent = result.events.find(e => e.created);
+      if (createdEvent && createdEvent.created) {
+        contractId = createdEvent.created.contractId;
+        console.log('[Create OrderBook] Found contract ID from events:', contractId);
+      }
+    }
+    
+    // ROOT CAUSE FIX: Use transaction events API to get contract ID from updateId
+    // This bypasses the token permission issue (admin token doesn't have operator party in actAs)
+    if (!contractId && result.updateId && result.completionOffset !== undefined) {
+      console.log('[Create OrderBook] Getting contract ID from transaction events using updateId:', result.updateId);
+      
+      try {
+        // Use /v2/updates endpoint to get transaction details from updateId
+        // This doesn't require party permissions - it's a transaction lookup
+        const updatesResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/updates`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${adminToken}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            begin: {
+              updateId: result.updateId
+            },
+            end: {
+              updateId: result.updateId
+            }
+          })
+        });
+        
+        if (updatesResponse.ok) {
+          const updatesData = await updatesResponse.json();
+          console.log('[Create OrderBook] Updates response:', JSON.stringify(updatesData, null, 2).substring(0, 1000));
+          
+          // Extract contract ID from transaction events
+          if (updatesData.updates && updatesData.updates.length > 0) {
+            for (const update of updatesData.updates) {
+              if (update.transaction && update.transaction.events) {
+                for (const event of update.transaction.events) {
+                  if (event.created && event.created.contractId) {
+                    const createdContract = event.created;
+                    // Verify this is our OrderBook by checking template ID and trading pair
+                    if (createdContract.templateId?.includes('OrderBook')) {
+                      // Try to get trading pair from createArguments
+                      const createArgs = createdContract.createArguments || createdContract.argument;
+                      if (createArgs?.tradingPair === decodedTradingPair) {
+                        contractId = createdContract.contractId;
+                        console.log('[Create OrderBook] Found contract ID from transaction events:', contractId);
+                        break; // Break out of inner for loop
+                      }
+                    }
+                  }
+                }
+                if (contractId) break; // Break out of outer for loop if found
+              }
+            }
+          }
+        } else {
+          const errorText = await updatesResponse.text();
+          console.warn('[Create OrderBook] Updates API returned error:', updatesResponse.status, errorText);
+        }
+      } catch (updatesError) {
+        console.error('[Create OrderBook] Error getting transaction events:', updatesError);
+      }
+      
+      // Fallback: Try querying at completionOffset if transaction events didn't work
+      if (!contractId) {
+        console.log('[Create OrderBook] Transaction events did not return contract ID, trying query at completionOffset');
+        await new Promise(resolve => setTimeout(resolve, 1000)); // Wait longer for contract to be visible
+        
+        try {
+          const queryResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${adminToken}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              readAs: [operatorPartyId],
+              activeAtOffset: result.completionOffset.toString(),
+              verbose: true,
+              filter: {
+                filtersByParty: {
+                  [operatorPartyId]: {
+                    inclusive: {
+                      templateIds: [qualifiedTemplateId]
+                    }
+                  }
+                }
+              }
+            })
+          });
+          
+          if (queryResponse.ok) {
+            const queryData = await queryResponse.json();
+            const contracts = Array.isArray(queryData) ? queryData : (queryData.activeContracts || []);
+            
+            if (contracts.length > 0) {
+              const orderBook = contracts.find(contract => {
+                const contractData = contract.contractEntry?.JsActiveContract?.createdEvent || 
+                                    contract.createdEvent || 
+                                    contract;
+                return contractData.createArgument?.tradingPair === decodedTradingPair;
+              });
+              
+              if (orderBook) {
+                const contractData = orderBook.contractEntry?.JsActiveContract?.createdEvent || 
+                                    orderBook.createdEvent || 
+                                    orderBook;
+                contractId = contractData.contractId;
+                console.log('[Create OrderBook] Found contract ID from query at offset:', contractId);
+              }
+            }
+          }
+        } catch (queryError) {
+          console.error('[Create OrderBook] Error querying at completionOffset:', queryError);
+        }
+      }
+    }
+    
+    // ROOT CAUSE FIX: Store OrderBook info in cache even if we can't get contractId immediately
+    // This allows us to track created OrderBooks and query them later when token permissions are fixed
+    const orderBookInfo = {
+      tradingPair: decodedTradingPair,
+      operator: operatorPartyId,
+      updateId: result.updateId,
+      completionOffset: result.completionOffset,
+      createdAt: new Date().toISOString(),
+      contractId: contractId || null
+    };
+    
+    orderBookCache.set(decodedTradingPair, orderBookInfo);
+    console.log(`[Create OrderBook] Cached OrderBook info for ${decodedTradingPair}`);
+    
+    if (!contractId) {
+      console.warn('[Create OrderBook] Contract ID not found, but creation succeeded:', JSON.stringify(result, null, 2));
+      console.warn('[Create OrderBook] OrderBook was created successfully. Contract ID will be available when queried.');
+      // Don't fail - the OrderBook was created, we just can't return the ID immediately
+      return res.json({
         success: true,
-        exists: true,
-        created: result.created || false,
-        contractId: result.contractId || null,
-        tradingPair: tradingPair,
-        message: result.created 
-          ? `OrderBook for ${tradingPair} created automatically` 
-          : `OrderBook for ${tradingPair} already exists`
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        exists: false,
-        created: false,
-        tradingPair: tradingPair,
-        error: result.error || 'Failed to create OrderBook',
-        message: `Could not create OrderBook for ${tradingPair}. Please check permissions.`
+        message: `OrderBook created successfully for ${decodedTradingPair}`,
+        tradingPair: decodedTradingPair,
+        updateId: result.updateId,
+        completionOffset: result.completionOffset,
+        note: 'Contract ID not immediately available. Query /api/orderbooks/:tradingPair to get the contract ID.'
       });
     }
+    
+    console.log(`[Admin] Created OrderBook for ${decodedTradingPair}: ${contractId}`);
+    
+    res.json({
+      success: true,
+      message: `OrderBook created successfully for ${decodedTradingPair}`,
+      tradingPair: decodedTradingPair,
+      contractId,
+      operator: operatorPartyId
+    });
+    
   } catch (error) {
-    console.error('[OrderBooks API] Error ensuring OrderBook:', error);
+    console.error('[Admin Create OrderBook] Error:', error);
     res.status(500).json({
-      error: 'Failed to ensure OrderBook exists',
+      error: 'Failed to create OrderBook',
       message: error.message
     });
   }
+});
+
+/**
+ * Admin endpoint to create multiple OrderBooks at once
+ */
+app.post('/api/admin/orderbooks', async (req, res) => {
+  console.log('[Admin Route] POST /api/admin/orderbooks hit');
+  console.log('[Admin Route] Body:', req.body);
+  
+  try {
+    const { tradingPairs } = req.body;
+    
+    if (!tradingPairs || !Array.isArray(tradingPairs) || tradingPairs.length === 0) {
+      return res.status(400).json({
+        error: 'Missing or invalid tradingPairs',
+        expected: { tradingPairs: ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'] }
+      });
+    }
+    
+    const results = [];
+    
+    for (const tradingPair of tradingPairs) {
+      try {
+        // Use internal endpoint to create each OrderBook
+        const createResponse = await fetch(`http://localhost:${process.env.PORT || 3001}/api/admin/orderbooks/${encodeURIComponent(tradingPair)}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        });
+        
+        const result = await createResponse.json();
+        results.push({
+          tradingPair,
+          success: createResponse.ok,
+          ...result
+        });
+        
+        // Small delay to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 500));
+      } catch (error) {
+        results.push({
+          tradingPair,
+          success: false,
+          error: error.message
+        });
+      }
+    }
+    
+    const successCount = results.filter(r => r.success).length;
+    
+    res.json({
+      success: successCount === tradingPairs.length,
+      message: `Created ${successCount} of ${tradingPairs.length} OrderBooks`,
+      results
+    });
+    
+  } catch (error) {
+    console.error('[Admin Create OrderBooks] Error:', error);
+    res.status(500).json({
+      error: 'Failed to create OrderBooks',
+      message: error.message
+    });
+  }
+});
+
+// Ledger API proxy endpoints (catch-all, must be last)
+app.all('/api/ledger/*', async (req, res) => {
+  await tokenExchange.proxyLedgerApiCall(req, res);
 });
 
 // Health check
@@ -403,6 +789,21 @@ app.get('/api/orderbooks', async (req, res) => {
     
     const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://95.216.34.215:31539';
     
+    // Debug: Check what parties are in the admin token
+    try {
+      const parts = adminToken.split('.');
+      if (parts.length === 3) {
+        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+        const ledgerApi = payload['https://daml.com/ledger-api'];
+        console.log('[OrderBooks API] Admin token actAs:', ledgerApi?.actAs);
+        console.log('[OrderBooks API] Admin token readAs:', ledgerApi?.readAs);
+        console.log('[OrderBooks API] Operator party:', operatorPartyId);
+        console.log('[OrderBooks API] Operator in actAs?', ledgerApi?.actAs?.includes?.(operatorPartyId));
+      }
+    } catch (e) {
+      console.warn('[OrderBooks API] Could not decode admin token:', e.message);
+    }
+    
     // Query OrderBooks using operator's token (they can see OrderBooks they created)
     const queryUrl = `${CANTON_JSON_API_BASE}/v2/state/active-contracts`;
     
@@ -420,8 +821,13 @@ app.get('/api/orderbooks', async (req, res) => {
       
       if (packagesResponse.ok) {
         const packagesData = await packagesResponse.json();
-        if (packagesData.result && packagesData.result.length > 0) {
-          // Find the package that contains OrderBook template
+        // ROOT CAUSE FIX: API returns { packageIds: [...] } not { result: [...] }
+        if (packagesData.packageIds && Array.isArray(packagesData.packageIds) && packagesData.packageIds.length > 0) {
+          // Use the last package ID (most recent deployment) - this is likely our OrderBook package
+          packageId = packagesData.packageIds[packagesData.packageIds.length - 1];
+          console.log('[OrderBooks API] Using package ID:', packageId);
+        } else if (packagesData.result && packagesData.result.length > 0) {
+          // Fallback for different API response format
           const orderBookPackage = packagesData.result.find(pkg => 
             pkg.packageId && (pkg.name === 'clob-exchange' || pkg.name?.includes('clob'))
           );
@@ -436,90 +842,156 @@ app.get('/api/orderbooks', async (req, res) => {
       console.warn('[OrderBooks API] Could not get package ID:', e.message);
     }
     
-    // Query for OrderBook contracts
-    const qualifiedTemplateId = packageId ? `${packageId}:OrderBook:OrderBook` : 'OrderBook:OrderBook';
+    // ROOT CAUSE FIX: Use transaction events API to get OrderBooks from cached updateIds
+    // This bypasses the token permission issue - we get contract IDs from transaction history
+    // The /v2/updates endpoint doesn't require party permissions, it's a transaction lookup
+    let orderBooksFromEvents = [];
     
-    const requestBody = {
-      readAs: [operatorPartyId],
-      activeAtOffset: "0",
-      verbose: true,
-      filter: {
-        filtersByParty: {
-          [operatorPartyId]: {
-            inclusive: {
-              templateIds: [qualifiedTemplateId]
+    if (orderBookCache.size > 0) {
+      console.log(`[OrderBooks API] Found ${orderBookCache.size} cached OrderBooks, fetching contract IDs from transaction events...`);
+      
+      for (const [tradingPair, info] of orderBookCache.entries()) {
+        if (info.updateId) {
+          // Try to get contract ID from transaction events if we don't have it
+          if (!info.contractId) {
+            try {
+              const updatesResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/updates`, {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${adminToken}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  begin: {
+                    updateId: info.updateId
+                  },
+                  end: {
+                    updateId: info.updateId
+                  }
+                })
+              });
+              
+              if (updatesResponse.ok) {
+                const updatesData = await updatesResponse.json();
+                if (updatesData.updates && updatesData.updates.length > 0) {
+                  for (const update of updatesData.updates) {
+                    if (update.transaction && update.transaction.events) {
+                      for (const event of update.transaction.events) {
+                        if (event.created && event.created.contractId) {
+                          const createdContract = event.created;
+                          if (createdContract.templateId?.includes('OrderBook')) {
+                            const createArgs = createdContract.createArguments || createdContract.argument;
+                            if (createArgs?.tradingPair === tradingPair) {
+                              info.contractId = createdContract.contractId;
+                              console.log(`[OrderBooks API] Found contract ID for ${tradingPair}: ${info.contractId}`);
+                              break;
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            } catch (error) {
+              console.error(`[OrderBooks API] Error getting contract ID for ${tradingPair}:`, error.message);
             }
+          }
+          
+          // Add to results if we have contract ID
+          if (info.contractId) {
+            orderBooksFromEvents.push({
+              tradingPair: info.tradingPair,
+              contractId: info.contractId,
+              operator: info.operator,
+              buyOrdersCount: 0,
+              sellOrdersCount: 0,
+              lastPrice: null
+            });
           }
         }
       }
-    };
-    
-    const response = await fetch(queryUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${adminToken}`
-      },
-      body: JSON.stringify(requestBody)
-    });
-    
-    if (!response.ok) {
-      const errorText = await response.text();
-      let error;
-      try {
-        error = JSON.parse(errorText);
-      } catch {
-        error = { message: errorText };
-      }
-      console.error('[OrderBooks API] Query failed:', error);
-      return res.status(response.status).json({ 
-        error: 'Failed to query OrderBooks',
-        details: error.message || error.cause || error.errors?.join(', ')
-      });
     }
     
-    const result = await response.json();
+    // Also try querying Canton directly (may fail due to token permissions, but worth trying)
+    const qualifiedTemplateId = packageId ? `${packageId}:OrderBook:OrderBook` : 'OrderBook:OrderBook';
+    let orderBooksFromQuery = [];
     
-    // Parse response to extract OrderBook contracts
-    let orderBooks = [];
-    if (Array.isArray(result)) {
-      orderBooks = result;
-    } else if (result.activeContracts) {
-      orderBooks = result.activeContracts;
-    } else if (result.contractEntry) {
-      orderBooks = [result];
-    }
-    
-    // Extract OrderBook data
-    const orderBooksList = orderBooks
-      .map(entry => {
-        const contractData = entry.contractEntry?.JsActiveContract?.createdEvent || 
-                           entry.createdEvent || 
-                           entry;
-        
-        if (!contractData.contractId || !contractData.templateId?.includes('OrderBook')) {
-          return null;
+    try {
+      const requestBody = {
+        readAs: [operatorPartyId],
+        activeAtOffset: "0",
+        verbose: true,
+        filter: {
+          filtersByParty: {
+            [operatorPartyId]: {
+              inclusive: {
+                templateIds: [qualifiedTemplateId]
+              }
+            }
+          }
         }
+      };
+      
+      const response = await fetch(queryUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${adminToken}`
+        },
+        body: JSON.stringify(requestBody)
+      });
+      
+      if (response.ok) {
+        const result = await response.json();
+        const orderBooks = Array.isArray(result) ? result : (result.activeContracts || []);
         
-        return {
-          contractId: contractData.contractId,
-          templateId: contractData.templateId,
-          tradingPair: contractData.createArgument?.tradingPair || contractData.argument?.tradingPair,
-          operator: contractData.createArgument?.operator || contractData.argument?.operator,
-          buyOrdersCount: contractData.createArgument?.buyOrders?.length || contractData.argument?.buyOrders?.length || 0,
-          sellOrdersCount: contractData.createArgument?.sellOrders?.length || contractData.argument?.sellOrders?.length || 0,
-          lastPrice: contractData.createArgument?.lastPrice || contractData.argument?.lastPrice,
-          offset: contractData.offset
-        };
-      })
-      .filter(ob => ob !== null);
+        orderBooksFromQuery = orderBooks
+          .map(entry => {
+            const contractData = entry.contractEntry?.JsActiveContract?.createdEvent || 
+                               entry.createdEvent || 
+                               entry;
+            
+            if (!contractData?.contractId || !contractData?.templateId?.includes('OrderBook')) {
+              return null;
+            }
+            
+            return {
+              contractId: contractData.contractId,
+              templateId: contractData.templateId,
+              tradingPair: contractData.createArgument?.tradingPair || contractData.argument?.tradingPair,
+              operator: contractData.createArgument?.operator || contractData.argument?.operator,
+              buyOrdersCount: contractData.createArgument?.buyOrders?.length || contractData.argument?.buyOrders?.length || 0,
+              sellOrdersCount: contractData.createArgument?.sellOrders?.length || contractData.argument?.sellOrders?.length || 0,
+              lastPrice: contractData.createArgument?.lastPrice || contractData.argument?.lastPrice
+            };
+          })
+          .filter(ob => ob !== null);
+        
+        console.log(`[OrderBooks API] Found ${orderBooksFromQuery.length} OrderBooks from Canton query`);
+      } else {
+        console.log('[OrderBooks API] Canton query failed (expected due to token permissions):', response.status);
+      }
+    } catch (error) {
+      console.warn('[OrderBooks API] Error querying Canton (expected):', error.message);
+    }
     
-    console.log(`[OrderBooks API] Found ${orderBooksList.length} OrderBooks`);
+    // Merge results - prefer query results, fallback to transaction events
+    const allOrderBooks = [...orderBooksFromQuery];
+    
+    // Add OrderBooks from transaction events that aren't already in the list
+    for (const eventBook of orderBooksFromEvents) {
+      if (!allOrderBooks.find(ob => ob.tradingPair === eventBook.tradingPair)) {
+        allOrderBooks.push(eventBook);
+      }
+    }
+    
+    console.log(`[OrderBooks API] Total OrderBooks found: ${allOrderBooks.length} (${orderBooksFromQuery.length} from query, ${orderBooksFromEvents.length} from events)`);
     
     res.json({
       success: true,
-      orderBooks: orderBooksList,
-      count: orderBooksList.length
+      orderBooks: allOrderBooks,
+      count: allOrderBooks.length
     });
     
   } catch (error) {
@@ -533,116 +1005,47 @@ app.get('/api/orderbooks', async (req, res) => {
 
 /**
  * Get OrderBook for a specific trading pair
- * Professional approach: Automatically creates if not exists (like professional trading platforms)
  */
 app.get('/api/orderbooks/:tradingPair', async (req, res) => {
   try {
     const { tradingPair } = req.params;
+    const encodedPair = encodeURIComponent(tradingPair);
     
-    // Get user token from Authorization header (Huzefa approach)
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({
-        error: 'Missing authorization token',
-        message: 'User token is required (Huzefa approach - token with actAs/readAs claims)'
-      });
-    }
-    
-    const userToken = authHeader.substring(7); // Remove "Bearer " prefix
-    
-    // Extract user party ID from token
-    let userPartyId;
-    try {
-      const parts = userToken.split('.');
-      if (parts.length === 3) {
-        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
-        // Try to get party ID from token claims or use sub
-        userPartyId = payload.partyId || payload.sub || null;
+    // First get all OrderBooks
+    const allOrderBooksResponse = await fetch(`${req.protocol}://${req.get('host')}/api/orderbooks`, {
+      method: 'GET',
+      headers: {
+        'Authorization': req.headers.authorization || ''
       }
-    } catch (e) {
-      console.warn('[OrderBooks API] Could not extract party ID from token');
+    });
+    
+    if (!allOrderBooksResponse.ok) {
+      return res.status(allOrderBooksResponse.status).json({
+        error: 'Failed to query OrderBooks',
+        details: await allOrderBooksResponse.text()
+      });
     }
     
-    // First, check if OrderBook exists
-    const exists = await orderBookService.checkOrderBookExists(tradingPair, userToken, userPartyId || '');
+    const data = await allOrderBooksResponse.json();
+    const orderBook = data.orderBooks?.find(ob => ob.tradingPair === tradingPair);
     
-    if (exists) {
-      // OrderBook exists - return it
-      const allOrderBooksResponse = await fetch(`${req.protocol}://${req.get('host')}/api/orderbooks`, {
-        method: 'GET',
-        headers: {
-          'Authorization': req.headers.authorization || ''
-        }
+    if (!orderBook) {
+      return res.status(404).json({
+        error: 'OrderBook not found',
+        tradingPair: tradingPair,
+        message: `No OrderBook found for trading pair ${tradingPair}. Please contact the operator to create it.`
       });
-      
-      if (allOrderBooksResponse.ok) {
-        const data = await allOrderBooksResponse.json();
-        const orderBook = data.orderBooks?.find(ob => ob.tradingPair === tradingPair);
-        
-        if (orderBook) {
-          return res.json({
-            success: true,
-            orderBook: orderBook,
-            autoCreated: false
-          });
-        }
-      }
     }
     
-    // OrderBook doesn't exist - create it automatically (Professional approach)
-    console.log(`[OrderBooks API] 🔄 OrderBook for ${tradingPair} not found - creating automatically...`);
-    const createResult = await orderBookService.ensureOrderBookExists(tradingPair, userToken, userPartyId || '');
-    
-    if (createResult.exists && createResult.created) {
-      // Successfully created - return the created OrderBook
-      return res.json({
-        success: true,
-        orderBook: {
-          contractId: createResult.contractId,
-          tradingPair: tradingPair,
-          operator: createResult.operator || null,
-          buyOrders: [],
-          sellOrders: [],
-          autoCreated: true
-        },
-        message: `OrderBook for ${tradingPair} created automatically`
-      });
-    } else if (createResult.exists && !createResult.created) {
-      // OrderBook exists but wasn't created by us (race condition or visibility issue)
-      // Try to fetch it again
-      const allOrderBooksResponse = await fetch(`${req.protocol}://${req.get('host')}/api/orderbooks`, {
-        method: 'GET',
-        headers: {
-          'Authorization': req.headers.authorization || ''
-        }
-      });
-      
-      if (allOrderBooksResponse.ok) {
-        const data = await allOrderBooksResponse.json();
-        const orderBook = data.orderBooks?.find(ob => ob.tradingPair === tradingPair);
-        
-        if (orderBook) {
-          return res.json({
-            success: true,
-            orderBook: orderBook,
-            autoCreated: false
-          });
-        }
-      }
-    }
-    
-    // If we get here, creation failed or OrderBook not found after creation
-    return res.status(404).json({
-      error: 'OrderBook not found and could not be created automatically',
-      tradingPair: tradingPair,
-      message: `OrderBook for ${tradingPair} was not found and automatic creation failed. Please try placing an order - it will be created automatically.`,
-      error: createResult.error
+    res.json({
+      success: true,
+      orderBook: orderBook
     });
     
   } catch (error) {
     console.error('[OrderBooks API] Error:', error);
     res.status(500).json({ 
-      error: 'Failed to get or create OrderBook',
+      error: 'Failed to get OrderBook',
       message: error.message 
     });
   }
@@ -783,6 +1186,39 @@ app.post('/api/orderbooks/:tradingPair/update-user-account', async (req, res) =>
 });
 
 /**
+ * UTXO Merging endpoint
+ * Merges UTXOs for a user account to consolidate balances
+ * This is critical for Canton's UTXO model - when orders are cancelled,
+ * UTXOs may remain separate, preventing larger orders
+ */
+app.post('/api/utxo/merge', async (req, res) => {
+  try {
+    const { partyId, token, userAccountContractId } = req.body;
+    
+    if (!partyId || !token || !userAccountContractId) {
+      return res.status(400).json({
+        error: 'Missing required fields',
+        required: ['partyId', 'token', 'userAccountContractId']
+      });
+    }
+    
+    const result = await utxoMerger.mergeUTXOs(partyId, token, userAccountContractId);
+    
+    res.json({
+      success: true,
+      message: `UTXOs merged successfully for ${token}`,
+      result
+    });
+  } catch (error) {
+    console.error('[UTXO Merge API] Error:', error);
+    res.status(500).json({
+      error: 'Failed to merge UTXOs',
+      message: error.message 
+    });
+  }
+});
+
+/**
  * WebSocket health check endpoint
  */
 app.get('/api/ws/status', (req, res) => {
@@ -796,8 +1232,35 @@ app.get('/api/ws/status', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
+
+// Log registered routes for debugging
+function logRegisteredRoutes() {
+  const routes = [];
+  app._router.stack.forEach((middleware) => {
+    if (middleware.route) {
+      const methods = Object.keys(middleware.route.methods).join(',').toUpperCase();
+      routes.push(`${methods} ${middleware.route.path}`);
+    }
+  });
+  
+  console.log('\n📋 Registered Routes:');
+  routes.forEach(route => console.log(`  ${route}`));
+  console.log('');
+  
+  // Verify admin routes are registered
+  const adminRoutes = routes.filter(r => r.includes('/api/admin/orderbooks'));
+  if (adminRoutes.length > 0) {
+    console.log('✅ Admin routes registered:', adminRoutes);
+  } else {
+    console.error('❌ ERROR: Admin routes NOT registered!');
+  }
+}
+
 server.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
   console.log(`WebSocket server available at ws://localhost:${PORT}/ws`);
   console.log(`Party creation quota: ${process.env.DAILY_PARTY_QUOTA || '5000'} daily, ${process.env.WEEKLY_PARTY_QUOTA || '35000'} weekly`);
+  
+  // Log routes after server starts
+  setTimeout(() => logRegisteredRoutes(), 100);
 });

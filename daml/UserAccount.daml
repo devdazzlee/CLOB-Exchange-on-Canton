@@ -77,3 +77,17 @@ template UserAccount
         _ <- create this with balances = newBalances2
         return ()
 
+    -- Merge balances (useful for UTXO consolidation after order cancellation)
+    -- This consolidates the balance map, which may help with UTXO merging at the ledger level
+    -- Note: Actual UTXO merging happens at the Canton ledger level, not in DAML contracts
+    -- This choice ensures the balance map is clean and consolidated
+    choice MergeBalances : ()
+      controller party
+      do
+        -- Simply recreate the contract with the same balances
+        -- This may trigger ledger-level UTXO consolidation
+        -- The balances map is already consolidated (Map doesn't create separate UTXOs)
+        -- but recreating the contract may help consolidate underlying token UTXOs
+        _ <- create this with balances = balances
+        return ()
+

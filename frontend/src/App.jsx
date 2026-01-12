@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
 import WalletSetup from './components/WalletSetup';
 import TradingInterface from './components/TradingInterface';
+import AdminPanel from './components/AdminPanel';
 import AuthGuard from './components/AuthGuard';
 import AuthCallback from './components/AuthCallback';
 import { loadWallet, clearWallet } from './wallet/keyManager';
@@ -183,6 +184,14 @@ function App() {
               element={
                 <AuthGuard>
                   <TradingInterface partyId={partyId} />
+                </AuthGuard>
+              }
+            />
+            <Route
+              path="/admin"
+              element={
+                <AuthGuard>
+                  <AdminPanel partyId={partyId} />
                 </AuthGuard>
               }
             />
