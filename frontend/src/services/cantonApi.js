@@ -1302,3 +1302,47 @@ export async function getOrderBook(tradingPair) {
   }
 }
 
+/**
+ * ROOT CAUSE FIX: Get global OrderBook with all orders (shared across all users)
+ * This uses the backend endpoint which queries with operator token, so ALL users see the SAME orders
+ * Like Hyperliquid, Lighter, etc. - truly global order book
+ * @param {string} tradingPair - Trading pair (e.g., "BTC/USDT")
+ * @returns {Promise<object|null>} OrderBook with buyOrders and sellOrders arrays, or null if not found
+ */
+export async function getGlobalOrderBook(tradingPair) {
+  try {
+    const backendBase = process.env.VITE_BACKEND_URL || 'http://localhost:3001';
+    const response = await fetch(`${backendBase}/api/orderbooks/${encodeURIComponent(tradingPair)}/orders`, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    if (response.ok) {
+      const data = await response.json();
+      if (data.success && data.contractId) {
+        console.log('[API] Found global OrderBook for', tradingPair, ':', data.buyOrdersCount, 'buys,', data.sellOrdersCount, 'sells');
+        return {
+          contractId: data.contractId,
+          operator: data.operator,
+          tradingPair: data.tradingPair,
+          buyOrders: data.buyOrders || [],
+          sellOrders: data.sellOrders || [],
+          buyOrdersCount: data.buyOrdersCount || 0,
+          sellOrdersCount: data.sellOrdersCount || 0,
+          lastPrice: data.lastPrice
+        };
+      }
+    } else if (response.status === 404) {
+      console.log('[API] Global OrderBook not found for', tradingPair);
+      return null;
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('[API] Error getting global OrderBook:', error);
+    return null;
+  }
+}
+

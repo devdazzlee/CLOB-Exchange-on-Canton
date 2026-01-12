@@ -14,11 +14,7 @@ const tokenExchange = new TokenExchangeService();
 const partyService = new PartyService();
 const utxoMerger = new UTXOMerger();
 
-// In-memory cache for OrderBook contract IDs
-// Maps tradingPair -> { contractId, updateId, completionOffset, createdAt, operator }
-// ROOT CAUSE FIX: Store OrderBook info when created since we can't query them immediately
-// due to admin token not having operator party in actAs
-const orderBookCache = new Map();
+// No cache - query ledger directly like professional trading platforms
 
 // WebSocket Server
 const wss = new WebSocket.Server({ 
@@ -449,14 +445,20 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
             'Authorization': `Bearer ${adminToken}`,
             'Content-Type': 'application/json'
           },
-          body: JSON.stringify({
-            begin: {
-              updateId: result.updateId
-            },
-            end: {
-              updateId: result.updateId
+            body: JSON.stringify({
+              beginExclusive: result.completionOffset || 0, // Use completion offset as integer
+              endInclusive: result.completionOffset || 0, // Same offset for single transaction
+          filter: {
+            filtersByParty: {
+              [operatorPartyId]: {
+                inclusive: {
+                  templateIds: [] // Empty array means match all templates for this party
+                }
+              }
             }
-          })
+          },
+          verbose: true // Get full transaction details
+            })
         });
         
         if (updatesResponse.ok) {
@@ -549,19 +551,8 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
       }
     }
     
-    // ROOT CAUSE FIX: Store OrderBook info in cache even if we can't get contractId immediately
-    // This allows us to track created OrderBooks and query them later when token permissions are fixed
-    const orderBookInfo = {
-      tradingPair: decodedTradingPair,
-      operator: operatorPartyId,
-      updateId: result.updateId,
-      completionOffset: result.completionOffset,
-      createdAt: new Date().toISOString(),
-      contractId: contractId || null
-    };
-    
-    orderBookCache.set(decodedTradingPair, orderBookInfo);
-    console.log(`[Create OrderBook] Cached OrderBook info for ${decodedTradingPair}`);
+    // OrderBook created - no cache needed, query ledger directly when needed
+    console.log(`[Create OrderBook] OrderBook created successfully for ${decodedTradingPair}`);
     
     if (!contractId) {
       console.warn('[Create OrderBook] Contract ID not found, but creation succeeded:', JSON.stringify(result, null, 2));
@@ -842,75 +833,70 @@ app.get('/api/orderbooks', async (req, res) => {
       console.warn('[OrderBooks API] Could not get package ID:', e.message);
     }
     
-    // ROOT CAUSE FIX: Use transaction events API to get OrderBooks from cached updateIds
-    // This bypasses the token permission issue - we get contract IDs from transaction history
-    // The /v2/updates endpoint doesn't require party permissions, it's a transaction lookup
+    // PROFESSIONAL APPROACH: Query ledger directly for all OrderBooks (no cache)
+    // Scan transaction events to find all OrderBook creation events
     let orderBooksFromEvents = [];
     
-    if (orderBookCache.size > 0) {
-      console.log(`[OrderBooks API] Found ${orderBookCache.size} cached OrderBooks, fetching contract IDs from transaction events...`);
+    try {
+      console.log('[OrderBooks API] Querying ledger transaction events for all OrderBooks...');
+      const updatesResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/updates`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${adminToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          beginExclusive: 0, // Start from beginning (integer offset)
+          endInclusive: null, // null = latest
+          filter: {
+            filtersByParty: {
+              [operatorPartyId]: {
+                inclusive: {
+                  templateIds: [] // Empty array means match all templates for this party
+                }
+              }
+            }
+          },
+          verbose: true // Get full transaction details
+        })
+      });
       
-      for (const [tradingPair, info] of orderBookCache.entries()) {
-        if (info.updateId) {
-          // Try to get contract ID from transaction events if we don't have it
-          if (!info.contractId) {
-            try {
-              const updatesResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/updates`, {
-                method: 'POST',
-                headers: {
-                  'Authorization': `Bearer ${adminToken}`,
-                  'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                  begin: {
-                    updateId: info.updateId
-                  },
-                  end: {
-                    updateId: info.updateId
-                  }
-                })
-              });
-              
-              if (updatesResponse.ok) {
-                const updatesData = await updatesResponse.json();
-                if (updatesData.updates && updatesData.updates.length > 0) {
-                  for (const update of updatesData.updates) {
-                    if (update.transaction && update.transaction.events) {
-                      for (const event of update.transaction.events) {
-                        if (event.created && event.created.contractId) {
-                          const createdContract = event.created;
-                          if (createdContract.templateId?.includes('OrderBook')) {
-                            const createArgs = createdContract.createArguments || createdContract.argument;
-                            if (createArgs?.tradingPair === tradingPair) {
-                              info.contractId = createdContract.contractId;
-                              console.log(`[OrderBooks API] Found contract ID for ${tradingPair}: ${info.contractId}`);
-                              break;
-                            }
-                          }
-                        }
-                      }
-                    }
+      if (updatesResponse.ok) {
+        const updatesData = await updatesResponse.json();
+        const updates = updatesData.updates || [];
+        
+        // Find all OrderBook creation events
+        const orderBookMap = new Map(); // tradingPair -> most recent OrderBook
+        
+        for (const update of updates) {
+          if (update.transaction && update.transaction.events) {
+            for (const event of update.transaction.events) {
+              if (event.created && event.created.contractId && event.created.templateId?.includes('OrderBook')) {
+                const createArgs = event.created.createArguments || event.created.argument;
+                const tradingPair = createArgs?.tradingPair;
+                if (tradingPair) {
+                  // Keep the most recent OrderBook for each trading pair
+                  if (!orderBookMap.has(tradingPair)) {
+                    orderBookMap.set(tradingPair, {
+                      tradingPair: tradingPair,
+                      contractId: event.created.contractId,
+                      operator: createArgs?.operator || operatorPartyId,
+                      buyOrdersCount: createArgs?.buyOrders?.length || 0,
+                      sellOrdersCount: createArgs?.sellOrders?.length || 0,
+                      lastPrice: createArgs?.lastPrice || null
+                    });
                   }
                 }
               }
-            } catch (error) {
-              console.error(`[OrderBooks API] Error getting contract ID for ${tradingPair}:`, error.message);
             }
           }
-          
-          // Add to results if we have contract ID
-          if (info.contractId) {
-            orderBooksFromEvents.push({
-              tradingPair: info.tradingPair,
-              contractId: info.contractId,
-              operator: info.operator,
-              buyOrdersCount: 0,
-              sellOrdersCount: 0,
-              lastPrice: null
-            });
-          }
         }
+        
+        orderBooksFromEvents = Array.from(orderBookMap.values());
+        console.log(`[OrderBooks API] Found ${orderBooksFromEvents.length} OrderBooks in ledger`);
       }
+    } catch (error) {
+      console.error('[OrderBooks API] Error querying ledger for OrderBooks:', error.message);
     }
     
     // Also try querying Canton directly (may fail due to token permissions, but worth trying)
@@ -918,56 +904,56 @@ app.get('/api/orderbooks', async (req, res) => {
     let orderBooksFromQuery = [];
     
     try {
-      const requestBody = {
-        readAs: [operatorPartyId],
-        activeAtOffset: "0",
-        verbose: true,
-        filter: {
-          filtersByParty: {
-            [operatorPartyId]: {
-              inclusive: {
-                templateIds: [qualifiedTemplateId]
-              }
+    const requestBody = {
+      readAs: [operatorPartyId],
+      activeAtOffset: "0",
+      verbose: true,
+      filter: {
+        filtersByParty: {
+          [operatorPartyId]: {
+            inclusive: {
+              templateIds: [qualifiedTemplateId]
             }
           }
         }
-      };
-      
-      const response = await fetch(queryUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`
-        },
-        body: JSON.stringify(requestBody)
-      });
-      
+      }
+    };
+    
+    const response = await fetch(queryUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${adminToken}`
+      },
+      body: JSON.stringify(requestBody)
+    });
+    
       if (response.ok) {
-        const result = await response.json();
+    const result = await response.json();
         const orderBooks = Array.isArray(result) ? result : (result.activeContracts || []);
         
         orderBooksFromQuery = orderBooks
-          .map(entry => {
-            const contractData = entry.contractEntry?.JsActiveContract?.createdEvent || 
-                               entry.createdEvent || 
-                               entry;
-            
-            if (!contractData?.contractId || !contractData?.templateId?.includes('OrderBook')) {
-              return null;
-            }
-            
-            return {
-              contractId: contractData.contractId,
-              templateId: contractData.templateId,
-              tradingPair: contractData.createArgument?.tradingPair || contractData.argument?.tradingPair,
-              operator: contractData.createArgument?.operator || contractData.argument?.operator,
-              buyOrdersCount: contractData.createArgument?.buyOrders?.length || contractData.argument?.buyOrders?.length || 0,
-              sellOrdersCount: contractData.createArgument?.sellOrders?.length || contractData.argument?.sellOrders?.length || 0,
-              lastPrice: contractData.createArgument?.lastPrice || contractData.argument?.lastPrice
-            };
-          })
-          .filter(ob => ob !== null);
+      .map(entry => {
+        const contractData = entry.contractEntry?.JsActiveContract?.createdEvent || 
+                           entry.createdEvent || 
+                           entry;
         
+            if (!contractData?.contractId || !contractData?.templateId?.includes('OrderBook')) {
+          return null;
+        }
+        
+        return {
+          contractId: contractData.contractId,
+          templateId: contractData.templateId,
+          tradingPair: contractData.createArgument?.tradingPair || contractData.argument?.tradingPair,
+          operator: contractData.createArgument?.operator || contractData.argument?.operator,
+          buyOrdersCount: contractData.createArgument?.buyOrders?.length || contractData.argument?.buyOrders?.length || 0,
+          sellOrdersCount: contractData.createArgument?.sellOrders?.length || contractData.argument?.sellOrders?.length || 0,
+              lastPrice: contractData.createArgument?.lastPrice || contractData.argument?.lastPrice
+        };
+      })
+      .filter(ob => ob !== null);
+    
         console.log(`[OrderBooks API] Found ${orderBooksFromQuery.length} OrderBooks from Canton query`);
       } else {
         console.log('[OrderBooks API] Canton query failed (expected due to token permissions):', response.status);
@@ -1046,6 +1032,510 @@ app.get('/api/orderbooks/:tradingPair', async (req, res) => {
     console.error('[OrderBooks API] Error:', error);
     res.status(500).json({ 
       error: 'Failed to get OrderBook',
+      message: error.message 
+    });
+  }
+});
+
+/**
+ * PROFESSIONAL APPROACH: Query ledger directly for global OrderBook
+ * No cache - query blockchain/ledger directly like Hyperliquid, Lighter, etc.
+ * Uses Canton's transaction events API to find OrderBooks, then queries contracts directly
+ */
+app.get('/api/orderbooks/:tradingPair/orders', async (req, res) => {
+  try {
+    const { tradingPair } = req.params;
+    const decodedTradingPair = decodeURIComponent(tradingPair);
+    
+    console.log(`[Global OrderBook] Querying ledger directly for ${decodedTradingPair}`);
+    
+    const cantonAdmin = new (require('./canton-admin'))();
+    const adminToken = await cantonAdmin.getAdminToken();
+    const operatorPartyId = process.env.OPERATOR_PARTY_ID || 
+      '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
+    
+    const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://95.216.34.215:31539';
+    
+    // STEP 1: Query ledger directly using transaction events API to find OrderBook
+    // This is how professional trading platforms work - query blockchain/ledger directly
+    let orderBookContractId = null;
+    let orderBookOperator = null;
+    
+    console.log(`[Global OrderBook] Scanning ledger transaction events for OrderBook creation...`);
+    
+    try {
+      // Query transaction events from the beginning to find all OrderBook creations
+      // Professional platforms scan the ledger to find contracts
+      // PROFESSIONAL APPROACH: Use backwards compatible filter/verbose format
+      // According to Canton docs: Either filter/verbose OR update_format is required
+      // Using filter with filtersByParty using operator party to get all transactions
+      const requestBody = {
+        beginExclusive: 0, // Start from beginning (integer offset)
+        endInclusive: null, // null = latest
+        filter: {
+          filtersByParty: {
+            [operatorPartyId]: {
+              inclusive: {
+                // Empty templateIds array means match all templates for this party
+                templateIds: []
+              }
+            }
+          }
+        },
+        verbose: true // Get full transaction details
+      };
+      
+      console.log('[Global OrderBook] Request body:', JSON.stringify(requestBody));
+      
+      const updatesResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/updates`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${adminToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(requestBody)
+      });
+      
+      if (!updatesResponse.ok) {
+        const errorText = await updatesResponse.text();
+        console.error('[Global OrderBook] Updates API error:', errorText);
+        console.error('[Global OrderBook] Request body sent:', JSON.stringify(requestBody));
+        throw new Error(`Failed to query ledger: ${updatesResponse.status} - ${errorText}`);
+      }
+      
+      const updatesData = await updatesResponse.json();
+      const updates = updatesData.updates || [];
+      console.log(`[Global OrderBook] Scanned ${updates.length} transaction events from ledger`);
+      
+      // Search backwards through all transactions to find the most recent OrderBook for this trading pair
+      for (let i = updates.length - 1; i >= 0; i--) {
+        const update = updates[i];
+        if (update.transaction && update.transaction.events) {
+          for (const event of update.transaction.events) {
+            if (event.created && event.created.contractId && event.created.templateId?.includes('OrderBook')) {
+              const createArgs = event.created.createArguments || event.created.argument;
+              if (createArgs?.tradingPair === decodedTradingPair) {
+                orderBookContractId = event.created.contractId;
+                orderBookOperator = createArgs?.operator || operatorPartyId;
+                console.log(`[Global OrderBook] ✅ Found OrderBook in ledger: ${orderBookContractId.substring(0, 30)}...`);
+                break;
+              }
+            }
+          }
+          if (orderBookContractId) break;
+        }
+      }
+    } catch (err) {
+      console.error('[Global OrderBook] Error querying ledger:', err.message);
+      return res.status(500).json({
+        error: 'Failed to query ledger',
+        message: err.message
+      });
+    }
+    
+    if (!orderBookContractId) {
+      return res.status(404).json({
+        error: 'OrderBook not found',
+        tradingPair: decodedTradingPair,
+        message: `No OrderBook found for trading pair ${decodedTradingPair} in the ledger. Please contact the operator to create it.`
+      });
+    }
+    
+    console.log(`[Global OrderBook] Found OrderBook contract: ${orderBookContractId.substring(0, 30)}...`);
+    
+    // Fetch the OrderBook contract using operator token
+    // ROOT CAUSE FIX: Try multiple query methods since party permissions may fail
+    let orderBookResponse = null;
+    let orderBookData = null;
+    
+    // Method 1: Try filtersForAnyParty (doesn't require specific party permissions)
+    try {
+      console.log('[Global OrderBook] Trying filtersForAnyParty to fetch OrderBook contract...');
+      orderBookResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${adminToken}`
+        },
+        body: JSON.stringify({
+          activeAtOffset: "0",
+          filter: {
+            filtersForAnyParty: {
+              inclusive: {
+                contractIds: [orderBookContractId]
+              }
+            }
+          }
+        })
+      });
+      
+      if (orderBookResponse.ok) {
+        orderBookData = await orderBookResponse.json();
+        console.log('[Global OrderBook] Successfully fetched using filtersForAnyParty');
+      } else {
+        console.warn(`[Global OrderBook] filtersForAnyParty failed: ${orderBookResponse.status}`);
+      }
+    } catch (err) {
+      console.warn('[Global OrderBook] filtersForAnyParty error:', err.message);
+    }
+    
+    // Method 2: Try filtersByParty with readAs (fallback)
+    if (!orderBookData || !orderBookResponse?.ok) {
+      try {
+        console.log('[Global OrderBook] Trying filtersByParty with readAs...');
+        orderBookResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${adminToken}`
+          },
+          body: JSON.stringify({
+            readAs: [operatorPartyId],
+            activeAtOffset: "0",
+            filter: {
+              filtersByParty: {
+                [operatorPartyId]: {
+                  inclusive: {
+                    contractIds: [orderBookContractId]
+                  }
+                }
+              }
+            }
+          })
+        });
+        
+        if (orderBookResponse.ok) {
+          orderBookData = await orderBookResponse.json();
+          console.log('[Global OrderBook] Successfully fetched using filtersByParty');
+        } else {
+          const errorText = await orderBookResponse.text();
+          console.error('[Global OrderBook] Failed to fetch OrderBook:', orderBookResponse.status, errorText);
+          return res.status(orderBookResponse.status).json({
+            error: 'Failed to fetch OrderBook',
+            details: errorText,
+            contractId: orderBookContractId,
+            note: 'OrderBook contract ID found but cannot be fetched. This may be a permission issue.'
+          });
+        }
+      } catch (err) {
+        console.error('[Global OrderBook] filtersByParty error:', err.message);
+        return res.status(500).json({
+          error: 'Failed to fetch OrderBook',
+          details: err.message,
+          contractId: orderBookContractId
+        });
+      }
+    }
+    
+    if (!orderBookData) {
+      return res.status(500).json({
+        error: 'Failed to fetch OrderBook',
+        contractId: orderBookContractId
+      });
+    }
+    
+    const orderBookContract = orderBookData.activeContracts?.[0]?.contractEntry?.JsActiveContract?.createdEvent ||
+                             orderBookData.activeContracts?.[0]?.createdEvent ||
+                             orderBookData.activeContracts?.[0];
+    
+    if (!orderBookContract) {
+      console.error('[Global OrderBook] Contract fetch returned empty. Response:', JSON.stringify(orderBookData).substring(0, 500));
+      console.error('[Global OrderBook] activeContracts length:', orderBookData.activeContracts?.length || 0);
+      
+      // PROFESSIONAL APPROACH: Get OrderBook data from transaction events (no cache, query ledger directly)
+      console.log('[Global OrderBook] Contract query failed, getting OrderBook data from transaction events...');
+      
+      // Query transaction events to get OrderBook creation event with order IDs
+      const orderBookEventsResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/updates`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${adminToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          beginExclusive: 0, // Start from beginning (integer offset)
+          endInclusive: null, // null = latest
+          filter: {
+            filtersByParty: {
+              [operatorPartyId]: {
+                inclusive: {
+                  templateIds: [] // Empty array means match all templates for this party
+                }
+              }
+            }
+          },
+          verbose: true // Get full transaction details
+        })
+      });
+      
+      if (orderBookEventsResponse.ok) {
+        const orderBookEventsData = await orderBookEventsResponse.json();
+        const orderBookEvents = orderBookEventsData.updates || [];
+        
+        // Find the OrderBook creation event
+        for (let i = orderBookEvents.length - 1; i >= 0; i--) {
+          const update = orderBookEvents[i];
+          if (update.transaction && update.transaction.events) {
+            for (const event of update.transaction.events) {
+              if (event.created && event.created.contractId === orderBookContractId) {
+                const createArgs = event.created.createArguments || event.created.argument;
+                const buyOrderCids = createArgs?.buyOrders || [];
+                const sellOrderCids = createArgs?.sellOrders || [];
+                const lastPrice = createArgs?.lastPrice || null;
+                
+                console.log(`[Global OrderBook] Found OrderBook data in ledger: ${buyOrderCids.length} buy orders, ${sellOrderCids.length} sell orders`);
+                
+                // Query all order contracts directly from ledger
+                const allOrderCids = [...buyOrderCids, ...sellOrderCids];
+                let orderContracts = [];
+                
+                if (allOrderCids.length > 0) {
+                  const batchSize = 50;
+                  for (let i = 0; i < allOrderCids.length; i += batchSize) {
+                    const batch = allOrderCids.slice(i, i + batchSize);
+                    
+                    try {
+                      const ordersResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+                        method: 'POST',
+                        headers: {
+                          'Content-Type': 'application/json',
+                          'Authorization': `Bearer ${adminToken}`
+                        },
+                        body: JSON.stringify({
+                          activeAtOffset: "0",
+                          filter: {
+                            filtersForAnyParty: {
+                              inclusive: {
+                                contractIds: batch
+                              }
+                            }
+                          }
+                        })
+                      });
+                      
+                      if (ordersResponse.ok) {
+                        const ordersData = await ordersResponse.json();
+                        const batchContracts = ordersData.activeContracts || [];
+                        orderContracts.push(...batchContracts.map(entry => 
+                          entry.contractEntry?.JsActiveContract?.createdEvent ||
+                          entry.createdEvent ||
+                          entry
+                        ));
+                      }
+                    } catch (err) {
+                      console.warn(`[Global OrderBook] Error fetching order batch:`, err.message);
+                    }
+                  }
+                }
+                
+                // Process and return orders
+                const buyOrders = orderContracts
+                  .filter(contract => buyOrderCids.includes(contract.contractId))
+                  .map(contract => {
+                    const payload = contract.argument || contract.createArgument || {};
+                    return {
+                      contractId: contract.contractId,
+                      price: payload.price || null,
+                      quantity: parseFloat(payload.quantity || 0),
+                      filled: parseFloat(payload.filled || 0),
+                      remaining: parseFloat(payload.quantity || 0) - parseFloat(payload.filled || 0),
+                      timestamp: payload.timestamp || 0,
+                      owner: payload.owner || null,
+                      orderType: payload.orderType || null,
+                      status: payload.status || 'OPEN'
+                    };
+                  })
+                  .filter(order => order.remaining > 0 && order.status === 'OPEN')
+                  .sort((a, b) => {
+                    if (a.price === null && b.price === null) return a.timestamp - b.timestamp;
+                    if (a.price === null) return 1;
+                    if (b.price === null) return -1;
+                    return b.price - a.price; // Buy orders: highest price first
+                  });
+                
+                const sellOrders = orderContracts
+                  .filter(contract => sellOrderCids.includes(contract.contractId))
+                  .map(contract => {
+                    const payload = contract.argument || contract.createArgument || {};
+                    return {
+                      contractId: contract.contractId,
+                      price: payload.price || null,
+                      quantity: parseFloat(payload.quantity || 0),
+                      filled: parseFloat(payload.filled || 0),
+                      remaining: parseFloat(payload.quantity || 0) - parseFloat(payload.filled || 0),
+                      timestamp: payload.timestamp || 0,
+                      owner: payload.owner || null,
+                      orderType: payload.orderType || null,
+                      status: payload.status || 'OPEN'
+                    };
+                  })
+                  .filter(order => order.remaining > 0 && order.status === 'OPEN')
+                  .sort((a, b) => {
+                    if (a.price === null && b.price === null) return a.timestamp - b.timestamp;
+                    if (a.price === null) return 1;
+                    if (b.price === null) return -1;
+                    return a.price - b.price; // Sell orders: lowest price first
+                  });
+                
+                return res.json({
+                  success: true,
+                  tradingPair: decodedTradingPair,
+                  contractId: orderBookContractId,
+                  operator: createArgs?.operator || orderBookOperator || operatorPartyId,
+                  buyOrders: buyOrders,
+                  sellOrders: sellOrders,
+                  buyOrdersCount: buyOrders.length,
+                  sellOrdersCount: sellOrders.length,
+                  lastPrice: lastPrice
+                });
+              }
+            }
+          }
+        }
+      }
+      
+      // If we can't get OrderBook data, return empty order book
+      console.log('[Global OrderBook] Could not fetch OrderBook data, returning empty order book');
+      return res.json({
+        success: true,
+        tradingPair: decodedTradingPair,
+        contractId: orderBookContractId,
+        operator: orderBookOperator || operatorPartyId,
+        buyOrders: [],
+        sellOrders: [],
+        buyOrdersCount: 0,
+        sellOrdersCount: 0,
+        lastPrice: null
+      });
+    }
+    
+    const buyOrderCids = orderBookContract.createArgument?.buyOrders || orderBookContract.argument?.buyOrders || [];
+    const sellOrderCids = orderBookContract.createArgument?.sellOrders || orderBookContract.argument?.sellOrders || [];
+    
+    console.log(`[Global OrderBook] OrderBook contains ${buyOrderCids.length} buy orders and ${sellOrderCids.length} sell orders`);
+    
+    // Fetch all order contracts using operator token (so we can see ALL orders, not just user's orders)
+    const allOrderCids = [...buyOrderCids, ...sellOrderCids];
+    let orderContracts = [];
+    
+    if (allOrderCids.length > 0) {
+      // Fetch orders in batches to avoid URL length limits
+      const batchSize = 50;
+      for (let i = 0; i < allOrderCids.length; i += batchSize) {
+        const batch = allOrderCids.slice(i, i + batchSize);
+        
+        const ordersResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${adminToken}`
+          },
+          body: JSON.stringify({
+            readAs: [operatorPartyId],
+            activeAtOffset: "0",
+            filter: {
+              filtersByParty: {
+                [operatorPartyId]: {
+                  inclusive: {
+                    contractIds: batch
+                  }
+                }
+              }
+            }
+          })
+        });
+        
+        if (ordersResponse.ok) {
+          const ordersData = await ordersResponse.json();
+          const batchContracts = ordersData.activeContracts || [];
+          orderContracts.push(...batchContracts.map(entry => 
+            entry.contractEntry?.JsActiveContract?.createdEvent ||
+            entry.createdEvent ||
+            entry
+          ));
+        } else {
+          console.warn(`[Global OrderBook] Failed to fetch order batch ${i}-${i + batch.length}:`, ordersResponse.status);
+        }
+      }
+    }
+    
+    console.log(`[Global OrderBook] Fetched ${orderContracts.length} order contracts`);
+    
+    // Process orders into buy/sell arrays
+    const buyOrders = orderContracts
+      .filter(contract => {
+        const cid = contract.contractId;
+        return buyOrderCids.includes(cid) && contract.argument?.status === 'OPEN';
+      })
+      .map(contract => {
+        const payload = contract.argument || contract.createArgument || {};
+        return {
+          contractId: contract.contractId,
+          price: payload.price || null,
+          quantity: parseFloat(payload.quantity || 0),
+          filled: parseFloat(payload.filled || 0),
+          remaining: parseFloat(payload.quantity || 0) - parseFloat(payload.filled || 0),
+          timestamp: payload.timestamp || 0,
+          owner: payload.owner || null,
+          orderType: payload.orderType || null,
+          status: payload.status || 'OPEN'
+        };
+      })
+      .filter(order => order.remaining > 0)
+      .sort((a, b) => {
+        if (a.price === null && b.price === null) return a.timestamp - b.timestamp;
+        if (a.price === null) return 1;
+        if (b.price === null) return -1;
+        if (b.price !== a.price) return b.price - a.price;
+        return a.timestamp - b.timestamp;
+      });
+    
+    const sellOrders = orderContracts
+      .filter(contract => {
+        const cid = contract.contractId;
+        return sellOrderCids.includes(cid) && contract.argument?.status === 'OPEN';
+      })
+      .map(contract => {
+        const payload = contract.argument || contract.createArgument || {};
+        return {
+          contractId: contract.contractId,
+          price: payload.price || null,
+          quantity: parseFloat(payload.quantity || 0),
+          filled: parseFloat(payload.filled || 0),
+          remaining: parseFloat(payload.quantity || 0) - parseFloat(payload.filled || 0),
+          timestamp: payload.timestamp || 0,
+          owner: payload.owner || null,
+          orderType: payload.orderType || null,
+          status: payload.status || 'OPEN'
+        };
+      })
+      .filter(order => order.remaining > 0)
+      .sort((a, b) => {
+        if (a.price === null && b.price === null) return a.timestamp - b.timestamp;
+        if (a.price === null) return 1;
+        if (b.price === null) return -1;
+        if (a.price !== b.price) return a.price - b.price;
+        return a.timestamp - b.timestamp;
+      });
+    
+    console.log(`[Global OrderBook] Returning ${buyOrders.length} buy orders and ${sellOrders.length} sell orders`);
+    
+    res.json({
+      success: true,
+      tradingPair: decodedTradingPair,
+      contractId: orderBookContractId,
+      operator: orderBookContract.createArgument?.operator || orderBookContract.argument?.operator,
+      buyOrders: buyOrders,
+      sellOrders: sellOrders,
+      buyOrdersCount: buyOrders.length,
+      sellOrdersCount: sellOrders.length,
+      lastPrice: orderBookContract.createArgument?.lastPrice || orderBookContract.argument?.lastPrice
+    });
+    
+  } catch (error) {
+    console.error('[Global OrderBook] Error:', error);
+    res.status(500).json({ 
+      error: 'Failed to get global OrderBook',
       message: error.message 
     });
   }

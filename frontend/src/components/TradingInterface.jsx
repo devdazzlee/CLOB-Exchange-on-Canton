@@ -323,207 +323,56 @@ export default function TradingInterface({ partyId }) {
     }
     
     try {
-      // Check for stored offset first (prioritize stored offset over current ledger end)
-      const storedOffset = localStorage.getItem(`orderBook_${tradingPair}_${partyId}_offset`);
-      const storedOrderBookId = localStorage.getItem(`orderBook_${tradingPair}_${partyId}`);
-      let book = null;
+      // ROOT CAUSE FIX: Use global OrderBook endpoint that queries with operator token
+      // This ensures ALL users see the SAME orders (truly global, like Hyperliquid, Lighter, etc.)
+      console.log('[OrderBook] Loading global OrderBook for', tradingPair);
       
-      // If we have a stored offset, try that first (most reliable after creation)
-      if (storedOffset) {
-        console.log('[OrderBook] Checking stored offset first:', storedOffset);
-        try {
-          const { queryContractsAtOffset } = await import('../services/cantonApi');
-          const orderBooksAtOffset = await queryContractsAtOffset('OrderBook:OrderBook', partyId, storedOffset);
-          console.log('[OrderBook] Found', orderBooksAtOffset.length, 'OrderBooks at stored offset', storedOffset);
-          book = orderBooksAtOffset.find(ob => ob.payload?.tradingPair === tradingPair);
-          if (book) {
-            console.log('[OrderBook] ✅ Found OrderBook at stored offset:', book.contractId);
-          }
-        } catch (err) {
-          console.warn('[OrderBook] Error querying at stored offset:', err);
-        }
-      }
+      const { getGlobalOrderBook } = await import('../services/cantonApi');
+      const globalOrderBook = await getGlobalOrderBook(tradingPair);
       
-      // If not found at stored offset, try backend endpoint (queries using operator token for global OrderBooks)
-      if (!book) {
-        console.log('[OrderBook] Not found at stored offset, trying backend endpoint for global OrderBook...');
-        try {
-          const { getOrderBookContractId } = await import('../services/cantonApi');
-          const globalOrderBookId = await getOrderBookContractId(tradingPair);
-          if (globalOrderBookId) {
-            console.log('[OrderBook] Found global OrderBook contract ID from backend:', globalOrderBookId.substring(0, 30) + '...');
-            // Try to fetch it using the contract ID
-            try {
-              const fetchedBook = await fetchContract(globalOrderBookId, partyId);
-              if (fetchedBook && fetchedBook.payload?.tradingPair === tradingPair) {
-                console.log('[OrderBook] ✅ Successfully fetched global OrderBook by contract ID');
-                book = fetchedBook;
-                // Store the contract ID for future use
-                localStorage.setItem(`orderBook_${tradingPair}_${partyId}`, globalOrderBookId);
-              } else {
-                console.warn('[OrderBook] Contract ID found but fetch failed (visibility issue)');
-              }
-            } catch (fetchErr) {
-              console.warn('[OrderBook] Could not fetch OrderBook by contract ID (may not be visible to user):', fetchErr.message);
-              // Even if we can't fetch it, we can still try to use the contract ID for exercising choices
-              // Store it so we can use it later
-              localStorage.setItem(`orderBook_${tradingPair}_${partyId}`, globalOrderBookId);
-              // Create a minimal book object with just the contract ID
-              // Users can still exercise AddOrder if they have the contract ID, even if they can't query it
-              book = {
-                contractId: globalOrderBookId,
-                payload: { tradingPair: tradingPair, operator: null }, // We don't know operator yet
-                templateId: 'OrderBook:OrderBook'
-              };
-            }
-          }
-        } catch (backendErr) {
-          console.warn('[OrderBook] Backend endpoint failed, trying direct query:', backendErr.message);
-          // Fallback to direct query (may not work if user can't see OrderBooks)
-          let orderBooks = await queryContracts('OrderBook:OrderBook', partyId);
-          console.log('[OrderBook] Found', orderBooks.length, 'OrderBooks at current ledger end');
-          book = orderBooks.find(ob => ob.payload?.tradingPair === tradingPair);
-          if (book) {
-            console.log('[OrderBook] ✅ Found OrderBook at current ledger end');
-            // Found at current ledger end - clear stored offset (no longer needed)
-            localStorage.removeItem(`orderBook_${tradingPair}_${partyId}_offset`);
-          }
-        }
-      }
-      
-      // If still not found, try fetching by stored contract ID
-      if (!book && storedOrderBookId) {
-        console.log('[OrderBook] Trying to fetch stored OrderBook by ID:', storedOrderBookId);
-        try {
-          const storedBook = await fetchContract(storedOrderBookId, partyId);
-          if (storedBook && storedBook.payload?.tradingPair === tradingPair) {
-            console.log('[OrderBook] ✅ Found stored OrderBook by ID');
-            book = storedBook;
-          }
-        } catch (err) {
-          console.warn('[OrderBook] Could not fetch stored OrderBook:', err);
-          // Even if fetch fails, we can still use the contract ID for exercising choices
-          book = {
-            contractId: storedOrderBookId,
-            payload: { tradingPair: tradingPair, operator: null },
-            templateId: 'OrderBook:OrderBook'
-          };
-        }
-      }
-      
-      if (!book) {
-        console.log('[OrderBook] ❌ OrderBook not found for', tradingPair);
-        // Only set orderBookExists to false if we don't have a stored offset
-        // (If we have a stored offset, the OrderBook was recently created and might just need time to propagate)
-        const hasStoredOffset = localStorage.getItem(`orderBook_${tradingPair}_${partyId}_offset`);
-        if (!hasStoredOffset) {
-          setOrderBookExists(false);
-        } else {
-          console.log('[OrderBook] Stored offset exists, keeping orderBookExists=true (OrderBook may need time to propagate)');
-        }
+      if (!globalOrderBook) {
+        console.log('[OrderBook] ❌ Global OrderBook not found for', tradingPair);
+        setOrderBookExists(false);
         setOrderBook({ buys: [], sells: [] });
         setOrderBookLoading(false);
         isLoadingRef.current = false;
         return;
       }
+      
+      console.log('[OrderBook] ✅ Found global OrderBook:', globalOrderBook.buyOrdersCount, 'buys,', globalOrderBook.sellOrdersCount, 'sells');
       
       setOrderBookExists(true);
-      localStorage.setItem(`orderBook_${tradingPair}_${partyId}`, book.contractId);
-
-      const buyCids = book.payload?.buyOrders || [];
-      const sellCids = book.payload?.sellOrders || [];
+      localStorage.setItem(`orderBook_${tradingPair}_${partyId}`, globalOrderBook.contractId);
       
-      console.log('[OrderBook] OrderBook contains:', {
-        buyOrders: buyCids.length,
-        sellOrders: sellCids.length,
-        buyOrderIds: buyCids.map(cid => cid.substring(0, 20) + '...'),
-        sellOrderIds: sellCids.map(cid => cid.substring(0, 20) + '...')
-      });
+      // Convert backend order format to frontend format
+      const buyOrders = (globalOrderBook.buyOrders || []).map(order => ({
+        price: order.price,
+        quantity: order.quantity,
+        filled: order.filled,
+        remaining: order.remaining,
+        timestamp: order.timestamp,
+        contractId: order.contractId,
+        owner: order.owner
+      }));
       
-      if (buyCids.length === 0 && sellCids.length === 0) {
-        setOrderBook({ buys: [], sells: [] });
-        setOrderBookExists(true);
-        setOrderBookLoading(false);
-        isLoadingRef.current = false;
-        return;
-      }
+      const sellOrders = (globalOrderBook.sellOrders || []).map(order => ({
+        price: order.price,
+        quantity: order.quantity,
+        filled: order.filled,
+        remaining: order.remaining,
+        timestamp: order.timestamp,
+        contractId: order.contractId,
+        owner: order.owner
+      }));
       
-      const allCids = [...buyCids, ...sellCids];
-      
-      // Try fetching contracts - first try current ledger end
-      let orderContracts = await fetchContracts(allCids, partyId);
-      console.log('[OrderBook] Fetched', orderContracts.length, 'order contracts at current ledger end');
-      
-      // If some contracts are missing, try fetching at stored offset
-      if (orderContracts.length < allCids.length) {
-        const storedOffset = localStorage.getItem(`orderBook_${tradingPair}_${partyId}_offset`);
-        if (storedOffset) {
-          console.log('[OrderBook] Some orders missing, trying to fetch at stored offset:', storedOffset);
-          try {
-            const { queryContractsAtOffset } = await import('../services/cantonApi');
-            const ordersAtOffset = await queryContractsAtOffset('Order:Order', partyId, storedOffset);
-            console.log('[OrderBook] Found', ordersAtOffset.length, 'Order contracts at stored offset');
-            
-            // Merge results - use contracts from offset if they're not already fetched
-            const fetchedIds = new Set(orderContracts.map(c => c.contractId));
-            const missingOrders = ordersAtOffset.filter(o => allCids.includes(o.contractId) && !fetchedIds.has(o.contractId));
-            
-            if (missingOrders.length > 0) {
-              console.log('[OrderBook] Adding', missingOrders.length, 'missing orders from stored offset');
-              orderContracts = [...orderContracts, ...missingOrders];
-          }
-        } catch (err) {
-            console.warn('[OrderBook] Error fetching orders at stored offset:', err);
-          }
-        }
-      }
-      
-      const buyOrders = orderContracts
-        .filter(contract => buyCids.includes(contract.contractId) && contract?.payload?.status === 'OPEN')
-        .map(contract => ({
-          price: contract.payload?.price || null,
-          quantity: parseFloat(contract.payload?.quantity || 0),
-          filled: parseFloat(contract.payload?.filled || 0),
-          remaining: parseFloat(contract.payload?.quantity || 0) - parseFloat(contract.payload?.filled || 0),
-          timestamp: contract.payload?.timestamp || 0
-        }))
-        .filter(order => order.remaining > 0)
-        .sort((a, b) => {
-          if (a.price === null && b.price === null) return a.timestamp - b.timestamp;
-          if (a.price === null) return 1;
-          if (b.price === null) return -1;
-          if (b.price !== a.price) return b.price - a.price;
-          return a.timestamp - b.timestamp;
-        });
-
-      const sellOrders = orderContracts
-        .filter(contract => sellCids.includes(contract.contractId) && contract?.payload?.status === 'OPEN')
-        .map(contract => {
-          const price = contract.payload?.price || null;
-          const quantity = parseFloat(contract.payload?.quantity || 0);
-          const filled = parseFloat(contract.payload?.filled || 0);
-          return {
-            price: price,
-            quantity: quantity,
-            filled: filled,
-            remaining: quantity - filled,
-            timestamp: contract.payload?.timestamp || 0
-          };
-        })
-        .filter(order => order.remaining > 0)
-        .sort((a, b) => {
-          if (a.price === null && b.price === null) return a.timestamp - b.timestamp;
-          if (a.price === null) return 1;
-          if (b.price === null) return -1;
-          if (a.price !== b.price) return a.price - b.price;
-          return a.timestamp - b.timestamp;
-        });
-
       setOrderBook({ buys: buyOrders, sells: sellOrders });
+      
+      console.log('[OrderBook] ✅ Loaded global OrderBook:', buyOrders.length, 'buys,', sellOrders.length, 'sells');
+      
     } catch (err) {
-      console.error('Error loading order book:', err);
+      console.error('[OrderBook] Error loading global OrderBook:', err);
       setOrderBook({ buys: [], sells: [] });
-      setOrderBookExists(false);
+      // Don't set orderBookExists to false on error - might be temporary
     } finally {
       setOrderBookLoading(false);
       isLoadingRef.current = false;
