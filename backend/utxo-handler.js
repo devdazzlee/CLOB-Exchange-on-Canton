@@ -18,6 +18,37 @@
 const UTXOMerger = require('./utxo-merger');
 const CantonAdmin = require('./canton-admin');
 
+async function getLedgerEndOffset(adminToken) {
+  const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
+  try {
+    const response = await fetch(`${CANTON_JSON_API_BASE}/v2/state/ledger-end`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${adminToken}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    if (response.ok) {
+      const data = await response.json();
+      return data.offset || null;
+    }
+  } catch (e) {
+    console.warn('[Ledger End] Failed to get ledger end:', e.message);
+  }
+  return null;
+}
+
+async function getActiveAtOffset(adminToken, completionOffset = null) {
+  if (completionOffset) {
+    return completionOffset.toString();
+  }
+  const ledgerEnd = await getLedgerEndOffset(adminToken);
+  if (ledgerEnd) {
+    return ledgerEnd.toString();
+  }
+  throw new Error('Could not determine activeAtOffset');
+}
+
 class UTXOHandler {
   constructor() {
     this.utxoMerger = new UTXOMerger();
@@ -34,6 +65,7 @@ class UTXOHandler {
     try {
       const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
       
+      const activeAtOffset = await getActiveAtOffset(adminToken);
       const response = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
         method: 'POST',
         headers: {
@@ -41,7 +73,7 @@ class UTXOHandler {
           'Authorization': `Bearer ${adminToken}`
         },
         body: JSON.stringify({
-          activeAtOffset: "0",
+          activeAtOffset: activeAtOffset,
           verbose: true,
           filter: {
             filtersByParty: {
@@ -95,6 +127,7 @@ class UTXOHandler {
     try {
       const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
       
+      const activeAtOffset = await getActiveAtOffset(adminToken);
       const response = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
         method: 'POST',
         headers: {
@@ -102,7 +135,7 @@ class UTXOHandler {
           'Authorization': `Bearer ${adminToken}`
         },
         body: JSON.stringify({
-          activeAtOffset: "0",
+          activeAtOffset: activeAtOffset,
           verbose: true,
           filter: {
             filtersForAnyParty: {

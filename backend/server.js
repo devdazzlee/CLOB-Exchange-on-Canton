@@ -81,6 +81,37 @@ wss.on('connection', (ws, req) => {
 });
 
 // Broadcast function to send messages to subscribed clients
+async function getLedgerEndOffset(adminToken) {
+  const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
+  try {
+    const response = await fetch(`${CANTON_JSON_API_BASE}/v2/state/ledger-end`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${adminToken}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    if (response.ok) {
+      const data = await response.json();
+      return data.offset || null;
+    }
+  } catch (e) {
+    console.warn('[Ledger End] Failed to get ledger end:', e.message);
+  }
+  return null;
+}
+
+async function getActiveAtOffset(adminToken, completionOffset = null) {
+  if (completionOffset) {
+    return completionOffset.toString();
+  }
+  const ledgerEnd = await getLedgerEndOffset(adminToken);
+  if (ledgerEnd) {
+    return ledgerEnd.toString();
+  }
+  throw new Error('Could not determine activeAtOffset');
+}
+
 function broadcast(channel, data) {
   const message = JSON.stringify({ channel, data, timestamp: new Date().toISOString() });
   let sentCount = 0;
@@ -270,6 +301,7 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
     
     try {
       // Method 1: Query for OrderBook contracts to extract package ID from templateId
+      const activeAtOffset1 = await getActiveAtOffset(adminToken);
       const queryResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
         method: 'POST',
         headers: {
@@ -278,7 +310,7 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
         },
         body: JSON.stringify({
           readAs: [operatorPartyId],
-          activeAtOffset: "0",
+          activeAtOffset: activeAtOffset1,
           filter: {
             filtersByParty: {
               [operatorPartyId]: {
@@ -311,6 +343,7 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
       // Method 2: Query for OrderBook template using filtersForAnyParty to get package ID
       if (!packageId) {
         try {
+          const activeAtOffset2 = await getActiveAtOffset(adminToken);
           const templateQueryResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
             method: 'POST',
             headers: {
@@ -318,7 +351,7 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
               'Content-Type': 'application/json'
             },
             body: JSON.stringify({
-              activeAtOffset: "0",
+              activeAtOffset: activeAtOffset2,
               filter: {
                 filtersForAnyParty: {
                   inclusive: {
@@ -372,6 +405,7 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
             // Try each recent package to see if it has OrderBook
             for (const pkgId of recentPackages) {
               try {
+                const activeAtOffset3 = await getActiveAtOffset(adminToken);
                 const testQuery = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
                   method: 'POST',
                   headers: {
@@ -379,7 +413,7 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
                     'Content-Type': 'application/json'
                   },
                   body: JSON.stringify({
-                    activeAtOffset: "0",
+                    activeAtOffset: activeAtOffset3,
                     filter: {
                       filtersForAnyParty: {
                         inclusive: {
@@ -425,6 +459,7 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
     
     // Method 1: Query for existing OrderBook contracts to extract package ID
     try {
+      const activeAtOffset4 = await getActiveAtOffset(adminToken);
       const existingQuery = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
         method: 'POST',
         headers: {
@@ -432,7 +467,7 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          activeAtOffset: "0",
+          activeAtOffset: activeAtOffset4,
           verbose: true,
           filter: {
             filtersForAnyParty: {
@@ -555,12 +590,12 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
     if (!contractId && result.transactionEvents && Array.isArray(result.transactionEvents)) {
       for (const event of result.transactionEvents) {
         if (event.created?.contractId) {
-          contractId = event.created.contractId;
+                    contractId = event.created.contractId;
           console.log(`[Create OrderBook] ✅ Contract ID from transactionEvents: ${contractId.substring(0, 50)}...`);
-          break;
-        }
-      }
-    }
+                    break;
+                  }
+                }
+              }
     
     // Method 3: Check root level
     if (!contractId && result.contractId) {
@@ -575,29 +610,32 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
       try {
         // Extract packageId from templateIdToUse (format: packageId:Module:Template)
         const packageIdFromTemplate = templateIdToUse.split(':')[0];
-        const queryResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${adminToken}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            activeAtOffset: "0",
-            filter: {
+        
+        const activeAtOffset = await getActiveAtOffset(adminToken, result.completionOffset);
+      
+      const queryResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${adminToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            activeAtOffset: activeAtOffset,
+          filter: {
               filtersByParty: {
                 [operatorPartyId]: {
-                  inclusive: {
+              inclusive: {
                     templateIds: [`${packageIdFromTemplate}:OrderBook:OrderBook`]
-                  }
-                }
               }
+            }
+          }
             },
             verbose: true
-          })
-        });
-        
-        if (queryResponse.ok) {
-          const queryData = await queryResponse.json();
+        })
+      });
+      
+      if (queryResponse.ok) {
+        const queryData = await queryResponse.json();
           const contracts = queryData.activeContracts || queryData.result || queryData || [];
           const contractsArray = Array.isArray(contracts) ? contracts : [];
           console.log(`[Create OrderBook] Found ${contractsArray.length} active OrderBook contracts`);
@@ -609,7 +647,7 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
               const createArgs = contract.createArguments || contract.argument || {};
               if (createArgs.tradingPair === payload.tradingPair) {
                 contractId = contract.contractId;
-                console.log(`[Create OrderBook] ✅ Contract ID from active contracts: ${contractId.substring(0, 50)}...`);
+          console.log(`[Create OrderBook] ✅ Contract ID from active contracts: ${contractId.substring(0, 50)}...`);
                 break;
               }
             }
@@ -998,8 +1036,9 @@ app.get('/api/orderbooks', async (req, res) => {
         const qualifiedTemplateId = `${pkgId}:OrderBook:OrderBook`;
         console.log(`[OrderBooks API] Trying to query with package ID: ${pkgId.substring(0, 16)}...`);
         
+        const activeAtOffset = await getActiveAtOffset(adminToken);
         const requestBody = {
-          activeAtOffset: "0",
+          activeAtOffset: activeAtOffset,
           verbose: true,
           filter: {
             filtersForAnyParty: {
@@ -1207,6 +1246,7 @@ app.get('/api/orderbooks/:tradingPair/orders', async (req, res) => {
       
       try {
         // Use filtersByParty with operator party - this works with admin token
+        const activeAtOffset = await getActiveAtOffset(adminToken);
         const directQueryResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
           method: 'POST',
           headers: {
@@ -1214,7 +1254,7 @@ app.get('/api/orderbooks/:tradingPair/orders', async (req, res) => {
             'Authorization': `Bearer ${adminToken}`
           },
           body: JSON.stringify({
-            activeAtOffset: "0",
+            activeAtOffset: activeAtOffset,
             verbose: true,
             filter: {
               filtersByParty: {
@@ -1299,6 +1339,7 @@ app.get('/api/orderbooks/:tradingPair/orders', async (req, res) => {
     // Method 1: Try filtersForAnyParty (doesn't require specific party permissions)
     try {
       console.log('[Global OrderBook] Trying filtersForAnyParty to fetch OrderBook contract...');
+      const activeAtOffset5 = await getActiveAtOffset(adminToken);
       orderBookResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
         method: 'POST',
         headers: {
@@ -1306,7 +1347,7 @@ app.get('/api/orderbooks/:tradingPair/orders', async (req, res) => {
           'Authorization': `Bearer ${adminToken}`
         },
         body: JSON.stringify({
-          activeAtOffset: "0",
+          activeAtOffset: activeAtOffset5,
           filter: {
             filtersForAnyParty: {
               inclusive: {
@@ -1331,6 +1372,7 @@ app.get('/api/orderbooks/:tradingPair/orders', async (req, res) => {
     if (!orderBookData || !orderBookResponse?.ok) {
       try {
         console.log('[Global OrderBook] Trying filtersByParty with readAs...');
+        const activeAtOffset6 = await getActiveAtOffset(adminToken);
         orderBookResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
           method: 'POST',
           headers: {
@@ -1339,7 +1381,7 @@ app.get('/api/orderbooks/:tradingPair/orders', async (req, res) => {
           },
           body: JSON.stringify({
             readAs: [operatorPartyId],
-            activeAtOffset: "0",
+            activeAtOffset: activeAtOffset6,
             filter: {
               filtersByParty: {
                 [operatorPartyId]: {
@@ -1443,6 +1485,7 @@ app.get('/api/orderbooks/:tradingPair/orders', async (req, res) => {
                     const batch = allOrderCids.slice(i, i + batchSize);
                     
                     try {
+                      const activeAtOffset7 = await getActiveAtOffset(adminToken);
                       const ordersResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
                         method: 'POST',
                         headers: {
@@ -1450,7 +1493,7 @@ app.get('/api/orderbooks/:tradingPair/orders', async (req, res) => {
                           'Authorization': `Bearer ${adminToken}`
                         },
                         body: JSON.stringify({
-                          activeAtOffset: "0",
+                          activeAtOffset: activeAtOffset7,
                           filter: {
                             filtersForAnyParty: {
                               inclusive: {
@@ -1572,6 +1615,7 @@ app.get('/api/orderbooks/:tradingPair/orders', async (req, res) => {
       for (let i = 0; i < allOrderCids.length; i += batchSize) {
         const batch = allOrderCids.slice(i, i + batchSize);
         
+        const activeAtOffset8 = await getActiveAtOffset(adminToken);
         const ordersResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
           method: 'POST',
           headers: {
@@ -1580,7 +1624,7 @@ app.get('/api/orderbooks/:tradingPair/orders', async (req, res) => {
           },
           body: JSON.stringify({
             readAs: [operatorPartyId],
-            activeAtOffset: "0",
+            activeAtOffset: activeAtOffset8,
             filter: {
               filtersByParty: {
                 [operatorPartyId]: {
@@ -1726,6 +1770,7 @@ app.post('/api/orderbooks/:tradingPair/update-user-account', async (req, res) =>
     }
     
     // Fetch current OrderBook to get userAccounts map
+    const activeAtOffset9 = await getActiveAtOffset(adminToken);
     const orderBookResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
       method: 'POST',
       headers: {
@@ -1734,7 +1779,7 @@ app.post('/api/orderbooks/:tradingPair/update-user-account', async (req, res) =>
       },
       body: JSON.stringify({
         readAs: [operatorPartyId],
-        activeAtOffset: "0",
+        activeAtOffset: activeAtOffset9,
         filter: {
           filtersByParty: {
             [operatorPartyId]: {
@@ -1874,6 +1919,7 @@ app.post('/api/testnet/mint-tokens', async (req, res) => {
       // Discover template ID
       let templateIdToUse = null;
       try {
+        const activeAtOffset = await getActiveAtOffset(adminToken);
         const existingQuery = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
           method: 'POST',
           headers: {
@@ -1881,7 +1927,7 @@ app.post('/api/testnet/mint-tokens', async (req, res) => {
             'Content-Type': 'application/json'
           },
           body: JSON.stringify({
-            activeAtOffset: "0",
+            activeAtOffset: activeAtOffset,
             verbose: true,
             filter: {
               filtersForAnyParty: {
@@ -1966,6 +2012,7 @@ app.post('/api/testnet/mint-tokens', async (req, res) => {
         
         // Query using party filter - more reliable than filtersForAnyParty
         try {
+          const activeAtOffset = await getActiveAtOffset(adminToken, createResult.completionOffset);
           const queryResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
             method: 'POST',
             headers: {
@@ -1973,7 +2020,7 @@ app.post('/api/testnet/mint-tokens', async (req, res) => {
               'Content-Type': 'application/json'
             },
             body: JSON.stringify({
-              activeAtOffset: "0",
+              activeAtOffset: activeAtOffset,
               verbose: true,
               filter: {
                 filtersByParty: {
@@ -2221,6 +2268,7 @@ app.post('/api/orders/place', async (req, res) => {
         // Discover template ID
         let templateIdToUse = null;
         try {
+          const activeAtOffset = await getActiveAtOffset(adminToken);
           const existingQuery = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
             method: 'POST',
             headers: {
@@ -2228,7 +2276,7 @@ app.post('/api/orders/place', async (req, res) => {
               'Content-Type': 'application/json'
             },
             body: JSON.stringify({
-              activeAtOffset: "0",
+              activeAtOffset: activeAtOffset,
               verbose: true,
               filter: {
                 filtersForAnyParty: {
@@ -2349,6 +2397,9 @@ app.post('/api/orders/place', async (req, res) => {
             try {
               // Extract packageId from templateIdToUse (format: packageId:Module:Template)
               const packageIdFromTemplate = templateIdToUse.split(':')[0];
+              
+              const activeAtOffset = await getActiveAtOffset(adminToken, createResult.completionOffset);
+              
               const queryResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
                 method: 'POST',
                 headers: {
@@ -2356,7 +2407,7 @@ app.post('/api/orders/place', async (req, res) => {
                   'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({
-                  activeAtOffset: "0",
+                  activeAtOffset: activeAtOffset,
                   filter: {
                     filtersByParty: {
                       [partyId]: {
@@ -2393,7 +2444,7 @@ app.post('/api/orders/place', async (req, res) => {
                     }
                   }
                 }
-              } else {
+          } else {
                 const errorText = await queryResponse.text();
                 console.warn(`[Order Place] Active contracts query failed: ${queryResponse.status}`, errorText.substring(0, 200));
               }
@@ -2436,6 +2487,7 @@ app.post('/api/orders/place', async (req, res) => {
       
       // Check if OrderBook exists
       try {
+        const activeAtOffset = await getActiveAtOffset(adminToken);
         const queryResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
           method: 'POST',
           headers: {
@@ -2443,7 +2495,7 @@ app.post('/api/orders/place', async (req, res) => {
             'Content-Type': 'application/json'
           },
           body: JSON.stringify({
-            activeAtOffset: "0",
+            activeAtOffset: activeAtOffset,
             verbose: true,
             filter: {
               filtersByParty: {
@@ -2561,26 +2613,28 @@ app.post('/api/orders/place', async (req, res) => {
             if (!finalOrderBookContractId) {
               console.log(`[Order Place] Querying active contracts for OrderBook: ${tradingPair}`);
               try {
-                const queryResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
-                  method: 'POST',
-                  headers: {
-                    'Authorization': `Bearer ${adminToken}`,
-                    'Content-Type': 'application/json'
-                  },
-                  body: JSON.stringify({
-                    activeAtOffset: "0",
-                    filter: {
-                      filtersByParty: {
-                        [operatorPartyId]: {
-                          inclusive: {
+                const activeAtOffset = await getActiveAtOffset(adminToken, createResult.completionOffset);
+                
+              const queryResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${adminToken}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    activeAtOffset: activeAtOffset,
+                  filter: {
+                    filtersByParty: {
+                      [operatorPartyId]: {
+                        inclusive: {
                             templateIds: [`${WORKING_PACKAGE_ID}:OrderBook:OrderBook`]
-                          }
                         }
                       }
+                    }
                     },
                     verbose: true
-                  })
-                });
+                })
+              });
               
               if (queryResponse.ok) {
                 const queryData = await queryResponse.json();
@@ -2593,13 +2647,13 @@ app.post('/api/orders/place', async (req, res) => {
                   const contract = entry.activeContract || entry.contract || entry;
                   if (contract?.contractId && contract?.templateId?.includes('OrderBook')) {
                     const createArgs = contract.createArguments || contract.argument || {};
-                    if (createArgs.tradingPair === tradingPair) {
+                  if (createArgs.tradingPair === tradingPair) {
                       finalOrderBookContractId = contract.contractId;
                       console.log(`[Order Place] ✅ OrderBook contract ID from active contracts: ${finalOrderBookContractId.substring(0, 50)}...`);
-                      break;
-                    }
+                    break;
                   }
                 }
+              }
               } else {
                 const errorText = await queryResponse.text();
                 console.warn(`[Order Place] Active contracts query failed: ${queryResponse.status}`, errorText.substring(0, 200));
@@ -3002,6 +3056,7 @@ app.get('/api/orderbooks/:tradingPair', async (req, res) => {
     // PRIORITIZE direct query (most reliable, no 413 limit)
     // Use filtersByParty with operator party (works with admin token)
     try {
+      const activeAtOffset10 = await getActiveAtOffset(adminToken);
       const queryResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
         method: 'POST',
         headers: {
@@ -3009,7 +3064,7 @@ app.get('/api/orderbooks/:tradingPair', async (req, res) => {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          activeAtOffset: "0",
+          activeAtOffset: activeAtOffset10,
           verbose: true,
           filter: {
             filtersByParty: {

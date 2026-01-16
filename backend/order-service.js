@@ -6,6 +6,37 @@
 const UTXOHandler = require('./utxo-handler');
 const CantonAdmin = require('./canton-admin');
 
+async function getLedgerEndOffset(adminToken) {
+  const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
+  try {
+    const response = await fetch(`${CANTON_JSON_API_BASE}/v2/state/ledger-end`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${adminToken}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    if (response.ok) {
+      const data = await response.json();
+      return data.offset || null;
+    }
+  } catch (e) {
+    console.warn('[Ledger End] Failed to get ledger end:', e.message);
+  }
+  return null;
+}
+
+async function getActiveAtOffset(adminToken, completionOffset = null) {
+  if (completionOffset) {
+    return completionOffset.toString();
+  }
+  const ledgerEnd = await getLedgerEndOffset(adminToken);
+  if (ledgerEnd) {
+    return ledgerEnd.toString();
+  }
+  throw new Error('Could not determine activeAtOffset');
+}
+
 class OrderService {
   constructor() {
     this.utxoHandler = new UTXOHandler();
@@ -43,6 +74,7 @@ class OrderService {
       const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
 
       // Step 3: Get OrderBook to find operator
+      const activeAtOffset = await getActiveAtOffset(adminToken);
       const orderBookResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
         method: 'POST',
         headers: {
@@ -50,7 +82,7 @@ class OrderService {
           'Authorization': `Bearer ${adminToken}`
         },
         body: JSON.stringify({
-          activeAtOffset: "0",
+          activeAtOffset: activeAtOffset,
           filter: {
             filtersForAnyParty: {
               inclusive: {
@@ -128,14 +160,39 @@ class OrderService {
       const result = await exerciseResponse.json();
 
       console.log(`[Order Service] ✅ Order placed successfully. Update ID: ${result.updateId}`);
+      console.log(`[Order Service] Matchmaking should have executed automatically (MatchOrders called in AddOrder)`);
+
+      // Extract order contract ID if available in response
+      let orderContractId = null;
+      if (result.events && Array.isArray(result.events)) {
+        for (const event of result.events) {
+          if (event.created?.contractId && event.created?.templateId?.includes('Order')) {
+            orderContractId = event.created.contractId;
+            console.log(`[Order Service] ✅ Order contract ID from response: ${orderContractId.substring(0, 50)}...`);
+            break;
+          }
+        }
+      }
+
+      // Check if trades were created (matchmaking executed)
+      let tradesCreated = 0;
+      if (result.events && Array.isArray(result.events)) {
+        tradesCreated = result.events.filter(e => e.created?.templateId?.includes('Trade')).length;
+        if (tradesCreated > 0) {
+          console.log(`[Order Service] ✅ Matchmaking executed! ${tradesCreated} trade(s) created`);
+        }
+      }
 
       return {
         success: true,
         orderId: orderId,
+        orderContractId: orderContractId,
         updateId: result.updateId,
         completionOffset: result.completionOffset,
         utxoHandled: preOrderResult.merged,
-        userAccount: preOrderResult.userAccount
+        userAccount: preOrderResult.userAccount,
+        tradesCreated: tradesCreated,
+        matchmakingExecuted: tradesCreated > 0
       };
     } catch (error) {
       console.error('[Order Service] Error placing order:', error);
@@ -164,7 +221,7 @@ class OrderService {
           'Authorization': `Bearer ${adminToken}`
         },
         body: JSON.stringify({
-          activeAtOffset: "0",
+          activeAtOffset: await getActiveAtOffset(adminToken),
           filter: {
             filtersForAnyParty: {
               inclusive: {
