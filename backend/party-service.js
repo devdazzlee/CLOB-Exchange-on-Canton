@@ -19,9 +19,9 @@ const KEYCLOAK_ADMIN_CLIENT_ID = process.env.KEYCLOAK_ADMIN_CLIENT_ID || null;
 const KEYCLOAK_ADMIN_CLIENT_SECRET = process.env.KEYCLOAK_ADMIN_CLIENT_SECRET || null;
 
 const CANTON_ADMIN_BASE = process.env.CANTON_ADMIN_BASE || 'https://participant.dev.canton.wolfedgelabs.com';
-const CANTON_ADMIN_HOST = process.env.CANTON_ADMIN_HOST || '95.216.34.215';
+const CANTON_ADMIN_HOST = process.env.CANTON_ADMIN_HOST || '65.108.40.104';
 const CANTON_ADMIN_PORT = process.env.CANTON_ADMIN_PORT || '30100';
-const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://95.216.34.215:31539';
+const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
 
 // Quota configuration
 const DAILY_QUOTA = parseInt(process.env.DAILY_PARTY_QUOTA || '5000');

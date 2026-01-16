@@ -19,7 +19,7 @@ testCreateOrderBook = script do
       lastPrice = None
       operator = operator
       activeUsers = []
-      userAccounts = Map.empty
+      userAccounts = Some Map.empty
   
   ob <- query @OrderBook operator
   assert (length ob == 1)
@@ -56,7 +56,7 @@ testAddBuyOrder = script do
       lastPrice = None
       operator = operator
       activeUsers = []
-      userAccounts = Map.empty
+      userAccounts = Some Map.empty
   
   -- Add order to book
   _ <- submit alice do
@@ -88,7 +88,7 @@ testAddSellOrder = script do
       lastPrice = None
       operator = operator
       activeUsers = []
-      userAccounts = Map.empty
+      userAccounts = Some Map.empty
   
   -- Add sell order
   _ <- submit alice do
@@ -135,7 +135,7 @@ testRemoveOrder = script do
       lastPrice = None
       operator = operator
       activeUsers = []
-      userAccounts = Map.empty
+      userAccounts = Some Map.empty
   
   -- Remove order
   _ <- submit operator do

@@ -5,7 +5,9 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "init-orderbooks": "node scripts/initialize-orderbooks.js",
+    "check-orderbooks": "node scripts/check-orderbooks.js"
   },
   "keywords": [
     "canton",

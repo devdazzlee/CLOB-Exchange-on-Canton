@@ -1346,3 +1346,66 @@ export async function getGlobalOrderBook(tradingPair) {
   }
 }
 
+/**
+ * Get all trades (global view) - shows ALL trades across ALL users
+ * @param {string|null} tradingPair - Optional trading pair filter (e.g., "BTC/USDT")
+ * @param {number} limit - Maximum number of trades to return (default: 50)
+ * @returns {Promise<object>} Object with trades array
+ */
+export async function getTrades(tradingPair = null, limit = 50) {
+  try {
+    const backendBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
+    const params = new URLSearchParams();
+    if (tradingPair) params.append('tradingPair', tradingPair);
+    params.append('limit', limit.toString());
+
+    const response = await fetch(`${backendBase}/api/trades?${params.toString()}`, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch trades: ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    return data;
+  } catch (error) {
+    console.error('[API] Error getting trades:', error);
+    throw error;
+  }
+}
+
+/**
+ * Get trades for a specific trading pair
+ * @param {string} tradingPair - Trading pair (e.g., "BTC/USDT")
+ * @param {number} limit - Maximum number of trades to return (default: 50)
+ * @returns {Promise<object>} Object with trades array
+ */
+export async function getTradesForPair(tradingPair, limit = 50) {
+  try {
+    const backendBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
+    const response = await fetch(
+      `${backendBase}/api/orderbooks/${encodeURIComponent(tradingPair)}/trades?limit=${limit}`,
+      {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch trades for ${tradingPair}: ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    return data;
+  } catch (error) {
+    console.error('[API] Error getting trades for pair:', error);
+    throw error;
+  }
+}
+

@@ -27,7 +27,7 @@ class UTXOMerger {
   async mergeUTXOs(partyId, token, userAccountContractId) {
     try {
       const adminToken = await this.cantonAdmin.getAdminToken();
-      const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://95.216.34.215:31539';
+      const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
 
       // Exercise MergeBalances choice on UserAccount
       // This recreates the contract, which may trigger UTXO consolidation at ledger level

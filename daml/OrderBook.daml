@@ -86,8 +86,8 @@ parseTradingPair pair =
 
 -- Helper function to match first compatible pair
 -- Returns: lastTradePrice (most recent trade price, or None if no trades)
-matchFirstPair : Text -> Map.Map Party (ContractId UserAccount.UserAccount) -> [(ContractId Order.Order, Order.Order)] -> [(ContractId Order.Order, Order.Order)] -> Update (Optional Decimal)
-matchFirstPair tradingPair userAccounts buyList sellList = 
+matchFirstPair : Text -> Optional (Map.Map Party (ContractId UserAccount.UserAccount)) -> [(ContractId Order.Order, Order.Order)] -> [(ContractId Order.Order, Order.Order)] -> Update (Optional Decimal)
+matchFirstPair tradingPair userAccountsOpt buyList sellList = 
   if null buyList || null sellList then
     return None
   else do
@@ -112,24 +112,28 @@ matchFirstPair tradingPair userAccounts buyList sellList =
       -- Update balances if UserAccount contracts exist
       -- Buyer: receives baseToken, pays quoteToken (tradeQuantity * tradePrice)
       -- Seller: receives quoteToken (tradeQuantity * tradePrice), pays baseToken
-      buyerAccountCidOpt <- case Map.lookup buyOrder.owner userAccounts of
-        Some buyerCid -> do
-          _ <- exercise buyerCid UserAccount.UpdateAfterTrade with
-            baseToken = baseToken
-            quoteToken = quoteToken
-            baseAmount = tradeQuantity  -- Buyer receives base token
-            quoteAmount = -(tradeQuantity * tradePrice)  -- Buyer pays quote token
-          return (Some buyerCid)
+      buyerAccountCidOpt <- case userAccountsOpt of
+        Some accounts -> case Map.lookup buyOrder.owner accounts of
+            Some buyerCid -> do
+              _ <- exercise buyerCid UserAccount.UpdateAfterTrade with
+                baseToken = baseToken
+                quoteToken = quoteToken
+                baseAmount = tradeQuantity  -- Buyer receives base token
+                quoteAmount = -(tradeQuantity * tradePrice)  -- Buyer pays quote token
+              return (Some buyerCid)
+            None -> return None
         None -> return None
       
-      sellerAccountCidOpt <- case Map.lookup sellOrder.owner userAccounts of
-        Some sellerCid -> do
-          _ <- exercise sellerCid UserAccount.UpdateAfterTrade with
-            baseToken = baseToken
-            quoteToken = quoteToken
-            baseAmount = -tradeQuantity  -- Seller pays base token
-            quoteAmount = tradeQuantity * tradePrice  -- Seller receives quote token
-          return (Some sellerCid)
+      sellerAccountCidOpt <- case userAccountsOpt of
+        Some accounts -> case Map.lookup sellOrder.owner accounts of
+            Some sellerCid -> do
+              _ <- exercise sellerCid UserAccount.UpdateAfterTrade with
+                baseToken = baseToken
+                quoteToken = quoteToken
+                baseAmount = -tradeQuantity  -- Seller pays base token
+                quoteAmount = tradeQuantity * tradePrice  -- Seller receives quote token
+              return (Some sellerCid)
+            None -> return None
         None -> return None
       
       -- Fill both orders
@@ -154,13 +158,42 @@ matchFirstPair tradingPair userAccounts buyList sellList =
       updatedBuy <- fetch buyCid
       updatedSell <- fetch sellCid
       
+      -- UTXO HANDLING: Merge UTXOs after partial fills to prevent fragmentation
+      -- If orders are partially filled, merge remaining UTXOs for both parties
+      let buyRemaining = updatedBuy.quantity - updatedBuy.filled
+      let sellRemaining = updatedSell.quantity - updatedSell.filled
+      
+      -- Merge UTXOs for buyer if order is partially filled (remaining quantity > 0)
+      _ <- if buyRemaining > 0.0 then
+        case userAccountsOpt of
+          Some accounts -> case Map.lookup buyOrder.owner accounts of
+            Some buyerAccountCid -> do
+              -- Merge quote token UTXOs (for BUY orders, quote token was partially used)
+              _ <- exercise buyerAccountCid UserAccount.MergeBalances
+              return ()
+            None -> return ()
+          None -> return ()
+      else return ()
+      
+      -- Merge UTXOs for seller if order is partially filled (remaining quantity > 0)
+      _ <- if sellRemaining > 0.0 then
+        case userAccountsOpt of
+          Some accounts -> case Map.lookup sellOrder.owner accounts of
+            Some sellerAccountCid -> do
+              -- Merge base token UTXOs (for SELL orders, base token was partially used)
+              _ <- exercise sellerAccountCid UserAccount.MergeBalances
+              return ()
+            None -> return ()
+          None -> return ()
+      else return ()
+      
       -- Continue matching if orders are still open
       let nextBuyPair = (buyCid, updatedBuy)
       let nextSellPair = (sellCid, updatedSell)
       let nextBuys = if updatedBuy.filled >= updatedBuy.quantity then buyRest else ([nextBuyPair] ++ buyRest)
       let nextSells = if updatedSell.filled >= updatedSell.quantity then sellRest else ([nextSellPair] ++ sellRest)
       
-      nextPrice <- matchFirstPair tradingPair userAccounts nextBuys nextSells
+      nextPrice <- matchFirstPair tradingPair userAccountsOpt nextBuys nextSells
       -- Return the most recent trade price (this trade takes precedence over subsequent trades)
       return (Some tradePrice)
     else
@@ -184,7 +217,7 @@ template OrderBook
     lastPrice : Optional Decimal
     operator : Party
     activeUsers : [Party]  -- Track all parties who have placed orders (for querying/filtering)
-    userAccounts : Map.Map Party (ContractId UserAccount.UserAccount)  -- Map of party to UserAccount contract ID for balance updates
+    userAccounts : Optional (Map.Map Party (ContractId UserAccount.UserAccount))  -- Map of party to UserAccount contract ID for balance updates
   where
     signatory operator
     -- Make OrderBook visible to all users who have placed orders
@@ -232,12 +265,32 @@ template OrderBook
         -- All users who place orders become observers and can see the global OrderBook
         let updatedActiveUsers = if owner `elem` activeUsers then activeUsers else activeUsers ++ [owner]
         
+        currentAccounts <- case userAccounts of
+          Some accounts -> return accounts
+          None -> return (Map.empty : Map.Map Party (ContractId UserAccount.UserAccount))
+        
         orderBookCid <- create this with
           buyOrders = updatedBuyOrders
           sellOrders = updatedSellOrders
           lastPrice = None  -- Initialize with None for new order books
           activeUsers = updatedActiveUsers
-          userAccounts = userAccounts  -- Preserve user accounts map
+          userAccounts = Some currentAccounts  -- Preserve user accounts map
+        
+        -- UTXO HANDLING: Merge UTXOs before placing order to ensure sufficient balance
+        -- This prevents UTXO fragmentation issues when placing orders
+        -- Determine which token needs merging based on order type
+        let (baseToken, quoteToken) = parseTradingPair tradingPair
+        let tokenToMerge = if orderType == "BUY" then quoteToken else baseToken
+        
+        -- Merge UTXOs if UserAccount exists
+        _ <- case userAccounts of
+          Some accounts -> case Map.lookup owner accounts of
+            Some userAccountCid -> do
+            -- Exercise MergeBalances to consolidate UTXOs before order placement
+            -- This ensures the user can use their full balance for the order
+            _ <- exercise userAccountCid UserAccount.MergeBalances
+            return ()
+          None -> return ()  -- No UserAccount, skip UTXO merge
         
         -- Try to match orders immediately
         exercise orderBookCid MatchOrders
@@ -279,12 +332,16 @@ template OrderBook
             Some p -> return (Some p)
             None -> return lastPrice
         
+        currentAccounts <- case userAccounts of
+          Some accounts -> return accounts
+          None -> return (Map.empty : Map.Map Party (ContractId UserAccount.UserAccount))
+        
         _ <- create this with
           buyOrders = remainingBuyCids
           sellOrders = remainingSellCids
           lastPrice = newLastPrice
           activeUsers = activeUsers  -- Preserve active users (observers) so OrderBook remains visible
-          userAccounts = userAccounts  -- Preserve user accounts map
+          userAccounts = Some currentAccounts  -- Preserve user accounts map
         return ()
 
     -- Remove a cancelled or filled order from the book
@@ -299,15 +356,20 @@ template OrderBook
         let updatedBuyOrders = filter (\cid -> cid /= orderCid) buyOrders
         let updatedSellOrders = filter (\cid -> cid /= orderCid) sellOrders
         
+        currentAccounts <- case userAccounts of
+          Some accounts -> return accounts
+          None -> return (Map.empty : Map.Map Party (ContractId UserAccount.UserAccount))
+        
         _ <- create this with
           buyOrders = updatedBuyOrders
           sellOrders = updatedSellOrders
           activeUsers = activeUsers  -- Preserve active users (observers) so OrderBook remains visible
-          userAccounts = userAccounts  -- Preserve user accounts map
+          userAccounts = Some currentAccounts  -- Preserve user accounts map
         return ()
 
     -- Cancel an order (called by order owner)
     -- This choice allows users to cancel their own orders and removes them from the OrderBook
+    -- UTXO HANDLING: After cancellation, triggers UTXO merge for the user account
     choice CancelOrderFromBook : ()
       with
         orderCid : ContractId Order.Order
@@ -321,15 +383,35 @@ template OrderBook
         -- Cancel the order
         _ <- exercise orderCid Order.CancelOrder
         
+        -- UTXO HANDLING: Merge UTXOs after cancellation
+        -- Determine which token needs merging based on order type
+        let (baseToken, quoteToken) = parseTradingPair tradingPair
+        let tokenToMerge = if order.orderType == "BUY" then quoteToken else baseToken
+        
+        -- Trigger UTXO merge if UserAccount exists
+        _ <- case userAccounts of
+          Some accounts -> case Map.lookup orderOwner accounts of
+            Some userAccountCid -> do
+            -- Exercise MergeBalances to consolidate UTXOs
+            -- This helps prevent UTXO fragmentation after order cancellation
+            _ <- exercise userAccountCid UserAccount.MergeBalances
+            return ()
+          None -> return ()  -- No UserAccount, skip UTXO merge
+          None -> return ()  -- No userAccounts map, skip UTXO merge
+        
         -- Remove from OrderBook
         let updatedBuyOrders = filter (\cid -> cid /= orderCid) buyOrders
         let updatedSellOrders = filter (\cid -> cid /= orderCid) sellOrders
+        
+        currentAccounts <- case userAccounts of
+          Some accounts -> return accounts
+          None -> return (Map.empty : Map.Map Party (ContractId UserAccount.UserAccount))
         
         _ <- create this with
           buyOrders = updatedBuyOrders
           sellOrders = updatedSellOrders
           activeUsers = activeUsers
-          userAccounts = userAccounts  -- Preserve user accounts map
+          userAccounts = Some currentAccounts  -- Preserve user accounts map
         return ()
 
     -- Update userAccounts map (add a new UserAccount contract ID)
@@ -341,6 +423,9 @@ template OrderBook
       controller operator
       do
         -- Add or update the user account in the map
-        let updatedUserAccounts = Map.insert party userAccountCid userAccounts
-        _ <- create this with userAccounts = updatedUserAccounts
+        currentAccounts <- case userAccounts of
+          Some accounts -> return accounts
+          None -> return (Map.empty : Map.Map Party (ContractId UserAccount.UserAccount))
+        let updatedUserAccounts = Map.insert party userAccountCid currentAccounts
+        _ <- create this with userAccounts = Some updatedUserAccounts
         return ()

@@ -2,7 +2,7 @@ module OrderTest where
 
 import Daml.Script
 import Order
-import DA.Time
+import DA.Time()
 
 -- Test: Create buy order
 testCreateBuyOrder : Script ()

@@ -7,7 +7,7 @@ const grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');
 const path = require('path');
 
-const CANTON_LEDGER_API_HOST = process.env.CANTON_LEDGER_API_HOST || '95.216.34.215';
+const CANTON_LEDGER_API_HOST = process.env.CANTON_LEDGER_API_HOST || '65.108.40.104';
 const CANTON_LEDGER_API_PORT = process.env.CANTON_LEDGER_API_PORT || '31217';
 const CANTON_LEDGER_API_URL = `${CANTON_LEDGER_API_HOST}:${CANTON_LEDGER_API_PORT}`;
 

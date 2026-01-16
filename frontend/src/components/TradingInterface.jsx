@@ -10,6 +10,7 @@ import OrderBookCard from './trading/OrderBookCard';
 import ActiveOrdersTable from './trading/ActiveOrdersTable';
 import DepthChart from './trading/DepthChart';
 import RecentTrades from './trading/RecentTrades';
+import GlobalTrades from './trading/GlobalTrades';
 import TransactionHistory from './trading/TransactionHistory';
 import PortfolioView from './trading/PortfolioView';
 import MarketData from './trading/MarketData';
@@ -550,7 +551,7 @@ export default function TradingInterface({ partyId }) {
         throw new Error('OrderBook operator not found. Cannot place order.');
       }
       
-      console.log('[Place Order] Exercising AddOrder choice on OrderBook:', orderBookContract.contractId);
+      console.log('[Place Order] Using UTXO-aware order placement endpoint');
       console.log('[Place Order] Order details:', {
         orderId,
         owner: partyId,
@@ -560,39 +561,61 @@ export default function TradingInterface({ partyId }) {
         quantity: parseFloat(quantity).toString()
       });
       
-      // Prepare actAs parties - only include unique parties
-      const actAsParties = [partyId];
-      if (operator && operator !== partyId) {
-        actAsParties.push(operator);
+      // Get UserAccount contract ID for UTXO handling
+      let userAccountContractId = null;
+      try {
+        const { queryContracts } = await import('../services/cantonApi');
+        const userAccounts = await queryContracts('UserAccount:UserAccount', partyId);
+        const userAccount = userAccounts.find(ua => ua.payload?.party === partyId);
+        if (userAccount) {
+          userAccountContractId = userAccount.contractId;
+          console.log('[Place Order] Found UserAccount:', userAccountContractId.substring(0, 30) + '...');
+        } else {
+          console.warn('[Place Order] UserAccount not found - UTXO handling may be limited');
+        }
+      } catch (err) {
+        console.warn('[Place Order] Could not fetch UserAccount:', err.message);
       }
       
-      console.log('[Place Order] ActAs parties:', actAsParties);
-      
-      // Ensure we use OrderBook:OrderBook templateId (AddOrder is on OrderBook, not Order)
-      const orderBookTemplateId = orderBookContract.templateId || 'OrderBook:OrderBook';
-      console.log('[Place Order] Using templateId for AddOrder:', orderBookTemplateId);
-      console.log('[Place Order] OrderBook contract details:', {
-        contractId: orderBookContract.contractId?.substring(0, 30) + '...',
-        templateId: orderBookContract.templateId,
-        tradingPair: orderBookContract.payload?.tradingPair
+      // Use new UTXO-aware order placement endpoint
+      const backendBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
+      const placeOrderResponse = await fetch(`${backendBase}/api/orders/place`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          partyId: partyId,
+          tradingPair: tradingPair,
+          orderType: orderType,
+          orderMode: orderMode || 'LIMIT',
+          quantity: parseFloat(quantity).toString(),
+          price: orderMode === 'LIMIT' && price ? parseFloat(price).toString() : null,
+          orderBookContractId: orderBookContract.contractId,
+          userAccountContractId: userAccountContractId
+        })
       });
       
-      const exerciseResult = await exerciseChoice(
-        orderBookContract.contractId,
-        'AddOrder',
-        {
-          orderId: orderId,
-          owner: partyId,
-          orderType: orderType,
-          orderMode: orderMode,
-          price: orderMode === 'LIMIT' 
-            ? parseFloat(price).toString()
-            : null,
-          quantity: parseFloat(quantity).toString()
-        },
-        actAsParties,
-        orderBookTemplateId // Explicitly pass OrderBook templateId
-      );
+      if (!placeOrderResponse.ok) {
+        const errorData = await placeOrderResponse.json();
+        throw new Error(errorData.message || errorData.error || 'Failed to place order');
+      }
+      
+      const result = await placeOrderResponse.json();
+      
+      // Backend returns: { success, updateId, completionOffset, orderId, utxoHandled, ... }
+      const exerciseResult = {
+        updateId: result.updateId,
+        completionOffset: result.completionOffset,
+        orderId: result.orderId || orderId
+      };
+      
+      console.log('[Place Order] Order placed with UTXO handling:', {
+        updateId: result.updateId,
+        completionOffset: result.completionOffset,
+        utxoHandled: result.utxoHandled,
+        orderId: result.orderId
+      });
       
       if (exerciseResult.updateId && exerciseResult.completionOffset !== undefined) {
         console.log('[Place Order] Order placement succeeded:', {
@@ -663,7 +686,7 @@ export default function TradingInterface({ partyId }) {
         console.log('[Place Order] Querying Order at current ledger end...');
         const updatedOrders = await queryContracts('Order:Order', partyId);
         newOrder = updatedOrders.find(o => 
-          o.payload?.orderId === orderId && 
+          (o.payload?.orderId === orderId || o.payload?.orderId === exerciseResult.orderId) && 
           o.payload?.tradingPair === tradingPair
         );
       }
@@ -742,7 +765,7 @@ export default function TradingInterface({ partyId }) {
     }
   };
 
-  // Order cancellation
+  // Order cancellation with UTXO handling
   const handleCancelOrder = async (contractId) => {
     const confirmed = await showModal({
       title: 'Cancel Order',
@@ -759,19 +782,73 @@ export default function TradingInterface({ partyId }) {
     setError('');
 
     try {
+      // Get order details
       const orderContract = await fetchContract(contractId, partyId);
-      await exerciseChoice(
-        contractId, 
-        'CancelOrder', 
-        {}, 
-        partyId,
-        orderContract?.templateId || 'Order:Order'
-      );
+      if (!orderContract) {
+        throw new Error('Order not found');
+      }
+
+      const orderPayload = orderContract.payload || {};
+      const tradingPair = orderPayload.tradingPair || tradingPair;
+      const orderType = orderPayload.orderType || 'BUY';
+
+      // Get OrderBook contract ID
+      let orderBookContractId = null;
+      try {
+        const { getOrderBook } = await import('../services/cantonApi');
+        const orderBook = await getOrderBook(tradingPair);
+        if (orderBook && orderBook.contractId) {
+          orderBookContractId = orderBook.contractId;
+        }
+      } catch (err) {
+        console.warn('[Cancel Order] Could not fetch OrderBook:', err.message);
+      }
+
+      // Get UserAccount contract ID for UTXO handling
+      let userAccountContractId = null;
+      try {
+        const { queryContracts } = await import('../services/cantonApi');
+        const userAccounts = await queryContracts('UserAccount:UserAccount', partyId);
+        const userAccount = userAccounts.find(ua => ua.payload?.party === partyId);
+        if (userAccount) {
+          userAccountContractId = userAccount.contractId;
+        }
+      } catch (err) {
+        console.warn('[Cancel Order] Could not fetch UserAccount:', err.message);
+      }
+
+      // Use new UTXO-aware order cancellation endpoint
+      const backendBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
+      const cancelResponse = await fetch(`${backendBase}/api/orders/cancel`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          partyId: partyId,
+          tradingPair: tradingPair,
+          orderType: orderType,
+          orderContractId: contractId,
+          orderBookContractId: orderBookContractId,
+          userAccountContractId: userAccountContractId
+        })
+      });
+
+      if (!cancelResponse.ok) {
+        const errorData = await cancelResponse.json();
+        throw new Error(errorData.message || errorData.error || 'Failed to cancel order');
+      }
+
+      const result = await cancelResponse.json();
+      console.log('[Cancel Order] Order cancelled with UTXO handling:', result);
+
       await loadOrders();
       await loadOrderBook(true);
+      await loadBalance(false); // Reload balance after UTXO merge
+      
       await showModal({
         title: 'Order Cancelled',
-        message: 'Order cancelled successfully!',
+        message: 'Order cancelled successfully! UTXOs have been merged.',
         type: 'success',
         confirmText: 'OK',
       });
@@ -880,29 +957,41 @@ export default function TradingInterface({ partyId }) {
               trades={trades}
             />
             
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              <OrderBookCard
-                tradingPair={tradingPair}
-                orderBook={orderBook}
-                loading={orderBookLoading}
-                onRefresh={() => loadOrderBook(true)}
-                onCreateOrderBook={handleCreateOrderBook}
-                creatingOrderBook={creatingOrderBook}
-              />
-              
-              <div className="space-y-6">
-                <DepthChart
-                  buyOrders={orderBook.buys}
-                  sellOrders={orderBook.sells}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              {/* OrderBook - Left Column (2/3 width) */}
+              <div className="lg:col-span-2">
+                <OrderBookCard
                   tradingPair={tradingPair}
-                />
-                
-                <RecentTrades
-                  trades={trades}
-                  tradingPair={tradingPair}
-                  loading={false}
+                  orderBook={orderBook}
+                  loading={orderBookLoading}
+                  onRefresh={() => loadOrderBook(true)}
+                  onCreateOrderBook={handleCreateOrderBook}
+                  creatingOrderBook={creatingOrderBook}
                 />
               </div>
+              
+              {/* Right Column (1/3 width) - Global Trades */}
+              <div className="space-y-6">
+                <GlobalTrades
+                  tradingPair={tradingPair}
+                  limit={50}
+                />
+              </div>
+            </div>
+            
+            {/* Depth Chart and Recent Trades Row */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              <DepthChart
+                buyOrders={orderBook.buys}
+                sellOrders={orderBook.sells}
+                tradingPair={tradingPair}
+              />
+              
+              <RecentTrades
+                trades={trades}
+                tradingPair={tradingPair}
+                loading={false}
+              />
             </div>
 
             <ActiveOrdersTable
