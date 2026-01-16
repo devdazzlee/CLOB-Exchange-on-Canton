@@ -1408,4 +1408,3 @@ export async function getTradesForPair(tradingPair, limit = 50) {
     throw error;
   }
 }
-

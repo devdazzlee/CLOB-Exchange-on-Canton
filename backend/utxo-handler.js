@@ -42,10 +42,13 @@ class UTXOHandler {
         },
         body: JSON.stringify({
           activeAtOffset: "0",
+          verbose: true,
           filter: {
-            filtersForAnyParty: {
-              inclusive: {
-                templateIds: ['UserAccount:UserAccount']
+            filtersByParty: {
+              [partyId]: {
+                inclusive: {
+                  templateIds: ['UserAccount:UserAccount']
+                }
               }
             }
           }
@@ -78,6 +81,62 @@ class UTXOHandler {
       return null;
     } catch (error) {
       console.error('[UTXO Handler] Error getting UserAccount:', error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Get UserAccount by contract ID
+   * @param {string} contractId - Contract ID
+   * @param {string} adminToken - Admin token
+   * @returns {Promise<object|null>} UserAccount contract or null
+   */
+  async getUserAccountByContractId(contractId, adminToken) {
+    try {
+      const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
+      
+      const response = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${adminToken}`
+        },
+        body: JSON.stringify({
+          activeAtOffset: "0",
+          verbose: true,
+          filter: {
+            filtersForAnyParty: {
+              inclusive: {
+                contractIds: [contractId]
+              }
+            }
+          }
+        })
+      });
+
+      if (!response.ok) {
+        return null;
+      }
+
+      const data = await response.json();
+      const contracts = Array.isArray(data) ? data : (data.activeContracts || []);
+      
+      if (contracts.length > 0) {
+        const contract = contracts[0];
+        const contractData = contract.contractEntry?.JsActiveContract?.createdEvent || 
+                           contract.createdEvent || 
+                           contract;
+        
+        return {
+          contractId: contractData.contractId,
+          balances: contractData.createArgument?.balances || contractData.argument?.balances || {},
+          party: contractData.createArgument?.party || contractData.argument?.party
+        };
+      }
+
+      return null;
+    } catch (error) {
+      console.error('[UTXO Handler] Error getting UserAccount by contract ID:', error.message);
       return null;
     }
   }
@@ -190,9 +249,10 @@ class UTXOHandler {
    * @param {string} orderType - 'BUY' or 'SELL'
    * @param {number} quantity - Order quantity
    * @param {number} price - Order price (for limit orders)
+   * @param {string} userAccountContractId - Optional contract ID if UserAccount was just created
    * @returns {Promise<{success: boolean, merged: boolean, userAccount: object|null}>}
    */
-  async handlePreOrderPlacement(partyId, tradingPair, orderType, quantity, price = null) {
+  async handlePreOrderPlacement(partyId, tradingPair, orderType, quantity, price = null, userAccountContractId = null) {
     try {
       const [baseToken, quoteToken] = tradingPair.split('/');
       
@@ -207,23 +267,64 @@ class UTXOHandler {
       console.log(`[UTXO Handler] Pre-order placement check for ${partyId}`);
       console.log(`[UTXO Handler] Order type: ${orderType}, Token: ${requiredToken}, Amount: ${requiredAmount}`);
 
-      const result = await this.checkAndMergeBalance(partyId, requiredToken, requiredAmount);
+      // If contract ID provided, query by contract ID (most direct)
+      let userAccount = null;
+      const adminToken = await this.cantonAdmin.getAdminToken();
+      
+      if (userAccountContractId) {
+        userAccount = await this.getUserAccountByContractId(userAccountContractId, adminToken);
+      }
+      
+      // If not found by contract ID or not provided, query by party
+      if (!userAccount) {
+        userAccount = await this.getUserAccount(partyId, adminToken);
+      }
 
-      if (!result.sufficient) {
+      if (!userAccount) {
         return {
           success: false,
-          merged: result.merged,
-          error: result.reason,
-          userAccount: result.userAccount
+          merged: false,
+          error: 'UserAccount not found',
+          userAccount: null
         };
       }
 
-      return {
-        success: true,
-        merged: result.merged,
-        userAccount: result.userAccount,
-        totalBalance: result.totalBalance
-      };
+      const totalBalance = this.getTotalBalance(userAccount, requiredToken);
+
+      if (totalBalance < requiredAmount) {
+        return {
+          success: false,
+          merged: false,
+          error: `Insufficient balance: have ${totalBalance}, need ${requiredAmount}`,
+          userAccount: userAccount,
+          totalBalance: totalBalance
+        };
+      }
+
+      // Merge UTXOs if needed
+      try {
+        await this.utxoMerger.mergeUTXOs(partyId, requiredToken, userAccount.contractId);
+        console.log(`[UTXO Handler] Merged UTXOs for ${partyId}, token: ${requiredToken}`);
+        
+        // Re-fetch UserAccount after merge
+        const updatedAccount = await this.getUserAccountByContractId(userAccount.contractId, adminToken);
+        
+        return {
+          success: true,
+          merged: true,
+          userAccount: updatedAccount || userAccount,
+          totalBalance: updatedAccount ? this.getTotalBalance(updatedAccount, requiredToken) : totalBalance
+        };
+      } catch (mergeError) {
+        // Merge failed, but balance might still be sufficient
+        console.warn(`[UTXO Handler] UTXO merge failed:`, mergeError.message);
+        return {
+          success: true,
+          merged: false,
+          userAccount: userAccount,
+          totalBalance: totalBalance
+        };
+      }
     } catch (error) {
       console.error('[UTXO Handler] Error in pre-order placement:', error);
       return {

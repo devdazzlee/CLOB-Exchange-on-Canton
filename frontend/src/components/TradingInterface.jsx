@@ -4,7 +4,6 @@ import { AlertCircle } from 'lucide-react';
 import { useConfirmationModal } from './ConfirmationModal';
 
 // Import trading components
-import BalanceCard from './trading/BalanceCard';
 import OrderForm from './trading/OrderForm';
 import OrderBookCard from './trading/OrderBookCard';
 import ActiveOrdersTable from './trading/ActiveOrdersTable';
@@ -189,7 +188,71 @@ export default function TradingInterface({ partyId }) {
         
         setBalance({ BTC: btcBalance, USDT: usdtBalance });
       } else {
-        setBalance({ BTC: '0.0', USDT: '0.0' });
+        // TESTNET: Auto-create UserAccount with test tokens if it doesn't exist
+        console.log('[Balance] UserAccount not found, auto-creating with test tokens...');
+        try {
+          const backendBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
+          const response = await fetch(`${backendBase}/api/testnet/mint-tokens`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${localStorage.getItem('access_token')}`
+            },
+            body: JSON.stringify({ partyId })
+          });
+          
+          if (response.ok) {
+            const result = await response.json();
+            console.log('[Balance] ✅ UserAccount created with test tokens:', result.balances);
+            
+            // IMMEDIATELY set balances from mint response (even if UserAccount not queryable yet)
+            if (result.balances && typeof result.balances === 'object') {
+              const btcBalance = result.balances?.BTC?.toString() || '0.0';
+              const usdtBalance = result.balances?.USDT?.toString() || '0.0';
+              setBalance({ BTC: btcBalance, USDT: usdtBalance });
+              console.log('[Balance] ✅ Set balances immediately from mint response:', { BTC: btcBalance, USDT: usdtBalance });
+            }
+            
+            // Then try to reload from UserAccount after a delay (for accuracy)
+            setTimeout(async () => {
+              try {
+                const newAccounts = await queryContracts('UserAccount:UserAccount', partyId);
+                
+                if (newAccounts.length > 0) {
+                  const account = newAccounts[0];
+                  const balances = account.payload?.balances || {};
+                  
+                  let btcBalance = '0.0';
+                  let usdtBalance = '0.0';
+                  
+                  if (Array.isArray(balances)) {
+                    balances.forEach(([key, value]) => {
+                      if (key === 'BTC') btcBalance = value?.toString() || '0.0';
+                      if (key === 'USDT') usdtBalance = value?.toString() || '0.0';
+                    });
+                  } else if (balances && typeof balances === 'object') {
+                    btcBalance = balances?.BTC?.toString() || '0.0';
+                    usdtBalance = balances?.USDT?.toString() || '0.0';
+                  }
+                  
+                  setBalance({ BTC: btcBalance, USDT: usdtBalance });
+                  console.log('[Balance] ✅ Updated balances from UserAccount query:', { BTC: btcBalance, USDT: usdtBalance });
+                } else {
+                  console.log('[Balance] UserAccount not yet queryable, using mint response balances');
+                }
+              } catch (retryErr) {
+                console.warn('[Balance] Retry query failed (non-critical):', retryErr.message);
+                // Keep using balances from mint response
+              }
+            }, 2000); // Wait 2 seconds then retry
+          } else {
+            console.warn('[Balance] Failed to auto-create UserAccount:', response.status);
+            setBalance({ BTC: '0.0', USDT: '0.0' });
+          }
+        } catch (mintErr) {
+          console.error('[Balance] Error auto-creating UserAccount:', mintErr);
+          setBalance({ BTC: '0.0', USDT: '0.0' });
+        }
       }
     } catch (err) {
       console.error('[Balance] Error:', err);
@@ -529,27 +592,11 @@ export default function TradingInterface({ partyId }) {
       if (orderBookContract) {
         console.log('[Place Order] Using OrderBook for', tradingPair, ':', orderBookContract.contractId, 'at offset', orderBookContract.offset);
       } else {
-        console.warn('[Place Order] No OrderBook found for', tradingPair);
-        console.warn('[Place Order] Available pairs:', orderBooks.map(ob => ob.payload?.tradingPair));
+        console.log('[Place Order] OrderBook not found for', tradingPair, '- backend will auto-create it on first order');
       }
 
-      if (!orderBookContract) {
-        console.log('[Place Order] OrderBook not found. Showing message to user...');
-        await showModal({
-          title: '⚠ OrderBook Not Available',
-          message: `The OrderBook for ${tradingPair} has not been created yet.\n\nPlease contact the exchange operator to create the OrderBook for this trading pair.\n\nNote: OrderBooks are global and shared across all users - they must be created by an operator, not individual users.`,
-          type: 'warning',
-          confirmText: 'OK',
-        });
-        setLoading(false);
-        return;
-      }
-
-      const operator = orderBookContract.payload?.operator;
-      if (!operator) {
-        console.error('[Place Order] OrderBook has no operator!');
-        throw new Error('OrderBook operator not found. Cannot place order.');
-      }
+      // OrderBook can be null - backend will auto-create it if needed
+      // No need to block order placement
       
       console.log('[Place Order] Using UTXO-aware order placement endpoint');
       console.log('[Place Order] Order details:', {
@@ -591,7 +638,7 @@ export default function TradingInterface({ partyId }) {
           orderMode: orderMode || 'LIMIT',
           quantity: parseFloat(quantity).toString(),
           price: orderMode === 'LIMIT' && price ? parseFloat(price).toString() : null,
-          orderBookContractId: orderBookContract.contractId,
+          orderBookContractId: orderBookContract?.contractId || null, // Can be null - backend will auto-create
           userAccountContractId: userAccountContractId
         })
       });
@@ -884,13 +931,7 @@ export default function TradingInterface({ partyId }) {
           </motion.div>
         )}
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <BalanceCard
-            balance={balance}
-            loading={balanceLoading}
-            onRefresh={() => loadBalance(true)}
-          />
-          
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <OrderForm
             tradingPair={tradingPair}
             availablePairs={availablePairs}

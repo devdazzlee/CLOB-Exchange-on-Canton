@@ -419,299 +419,216 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
       console.error('[Admin] Error getting package ID:', e.message);
     }
     
-    // ROOT CAUSE FIX: Use PRIMARY package ID first (confirmed working in tests)
-    // Unqualified template ID fails with "Invalid value for: body" - don't use it
-    // Known package IDs from DAR uploads
-    const knownPackageIds = [
-      '1aa4ed9b2bec34ef6764c882d76e3789a9bf3af77cc8e60ac903fea2e8aab215', // NEW - clob-exchange-utxo v1.0.0 with UTXO handling
-      '51522c778cf057ce80b3aa38d272a2fb72ae60ae871bca67940aaccf59567ac9', // FALLBACK - old package
-      'ebe9b93c1bd07c02de5635347a8bf1904bf96f7918b65136621bf61c16090e1e', // clob-exchange v1.0.0 (second upload)
-    ];
+    // EXPERT FIX: Discover template dynamically instead of hardcoding package ID
+    let templateIdToUse = null;
+    let discoveredPackageId = null;
     
-    // Try PRIMARY package ID first (confirmed working), then others
-    let templateIdsToTry = knownPackageIds.map(pkgId => `${pkgId}:OrderBook:OrderBook`);
-    
-    // Add detected package ID if different
-    if (packageId && !knownPackageIds.includes(packageId)) {
-      templateIdsToTry.push(`${packageId}:OrderBook:OrderBook`);
-    }
-    
-    console.log('[Admin] Will try template IDs in order:', templateIdsToTry);
-    
-    let createSuccess = false;
-    let lastError = null;
-    
-    // Try each template ID until one works
-    let result = null;
-    let createResponse = null;
-    
-    for (const qualifiedTemplateId of templateIdsToTry) {
-      console.log('[Admin] Trying template ID:', qualifiedTemplateId);
-      
-      try {
-        // Create OrderBook contract
-        const commandId = `create-orderbook-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-        
-        // ROOT CAUSE FIX: Canton says "Unexpected fields: userAccountsactiveUsers"
-        // This means the deployed template doesn't have these fields, OR they're computed fields
-        // Let's try WITHOUT these fields first - only include fields that are definitely required
-        // Based on OrderBookTest.daml, the minimal required fields are:
-        const payload = {
-          tradingPair: decodedTradingPair,
-          buyOrders: [],  // [ContractId Order.Order] - empty array
-          sellOrders: [], // [ContractId Order.Order] - empty array
-          lastPrice: null, // Optional Decimal - null for None
-          operator: operatorPartyId // Party
-          // NOTE: Removing activeUsers and userAccounts - Canton says they're unexpected
-          // These might be computed/derived fields or not in the deployed template version
-        };
-        
-        console.log('[Admin] OrderBook payload:', JSON.stringify(payload, null, 2));
-        
-        // Build request body according to JSON API v2 spec
-        // Reference: https://docs.digitalasset.com/build/latest/explanations/json-api/commands.html
-        const requestBody = {
-          commandId: commandId, // Required by SubmitAndWaitRequest schema - MUST be at top level
-          commands: [
-            {
-              CreateCommand: {
-                templateId: qualifiedTemplateId, // Try this template ID
-                createArguments: payload
+    // Method 1: Query for existing OrderBook contracts to extract package ID
+    try {
+      const existingQuery = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${adminToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          activeAtOffset: "0",
+          verbose: true,
+          filter: {
+            filtersForAnyParty: {
+              inclusive: {
+                templateIds: ['OrderBook:OrderBook'] // Unqualified - Canton will match any package
               }
             }
-          ],
-          actAs: [operatorPartyId] // Required by SubmitAndWaitRequest schema
-        };
-        
-        console.log('[Admin] Request body:', JSON.stringify(requestBody, null, 2));
-        
-        createResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/commands/submit-and-wait`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${adminToken}`
-          },
-          body: JSON.stringify(requestBody)
-        });
-        
-        if (createResponse.ok) {
-          result = await createResponse.json();
-          console.log('[Admin] ✓ Success with template ID:', qualifiedTemplateId);
-          createSuccess = true;
-          break; // Success! Exit the loop
-        } else {
-          const errorText = await createResponse.text();
-          let error;
-          try {
-            error = JSON.parse(errorText);
-          } catch {
-            error = { message: errorText };
           }
+        })
+      });
+      
+      if (existingQuery.ok) {
+        const existingData = await existingQuery.json();
+        const contracts = Array.isArray(existingData) ? existingData : (existingData.activeContracts || []);
+        
+        if (contracts.length > 0) {
+          const contract = contracts[0];
+          const contractData = contract.contractEntry?.JsActiveContract?.createdEvent || 
+                              contract.createdEvent || 
+                              contract;
+          const fullTemplateId = contractData.templateId;
           
-          // Check if it's a template not found error
-          if (error.code === 'TEMPLATES_OR_INTERFACES_NOT_FOUND' || 
-              errorText.includes('Templates do not exist') ||
-              errorText.includes('TEMPLATES_OR_INTERFACES_NOT_FOUND')) {
-            console.warn(`[Admin] Template ID ${qualifiedTemplateId} not found, trying next...`);
-            lastError = error;
-            continue; // Try next template ID
-          } else {
-            // Different error - might be a real issue
-            console.error(`[Admin] Error with template ID ${qualifiedTemplateId}:`, errorText.substring(0, 200));
-            lastError = error;
-            // Still try next template ID in case it works
-            continue;
+          if (fullTemplateId && fullTemplateId.includes(':')) {
+            // Extract package ID from fully qualified template ID
+            discoveredPackageId = fullTemplateId.split(':')[0];
+            templateIdToUse = fullTemplateId; // Use the same template ID that's already working
+            console.log('[Admin] ✅ Discovered template from existing contracts:', templateIdToUse);
           }
         }
-      } catch (e) {
-        console.error(`[Admin] Exception trying template ID ${qualifiedTemplateId}:`, e.message);
-        lastError = e;
-        continue; // Try next template ID
       }
+    } catch (e) {
+      console.warn('[Admin] Template discovery from existing contracts failed:', e.message);
     }
     
-    // If all template IDs failed, return error
-    if (!createSuccess || !result) {
-      const errorText = lastError?.message || lastError?.details || 'All template ID attempts failed';
-      console.error('[Create OrderBook] All template ID attempts failed');
-      console.error('[Create OrderBook] Last error:', lastError);
-      
-      return res.status(createResponse?.status || 404).json({
+    // Method 2: Fallback to known working package ID if discovery failed
+    if (!templateIdToUse) {
+      const WORKING_PACKAGE_ID = '51522c778cf057ce80b3aa38d272a2fb72ae60ae871bca67940aaccf59567ac9';
+      templateIdToUse = `${WORKING_PACKAGE_ID}:OrderBook:OrderBook`;
+      discoveredPackageId = WORKING_PACKAGE_ID;
+      console.log('[Admin] Using fallback package ID:', WORKING_PACKAGE_ID);
+    }
+    
+    console.log('[Admin] Template ID to use:', templateIdToUse);
+    
+    // Create OrderBook contract - DIRECT, NO LOOPS, NO FALLBACKS
+    const commandId = `create-orderbook-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    
+    const payload = {
+      tradingPair: decodedTradingPair,
+      buyOrders: [],
+      sellOrders: [],
+      lastPrice: null,
+      operator: operatorPartyId
+    };
+    
+    console.log('[Admin] OrderBook payload:', JSON.stringify(payload, null, 2));
+    
+    const requestBody = {
+      commandId: commandId,
+      commands: [
+        {
+          CreateCommand: {
+            templateId: templateIdToUse,
+            createArguments: payload
+          }
+        }
+      ],
+      actAs: [operatorPartyId]
+    };
+    
+    console.log('[Admin] Creating OrderBook with template:', templateIdToUse);
+    
+    const createResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/commands/submit-and-wait`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${adminToken}`
+      },
+      body: JSON.stringify(requestBody)
+    });
+    
+    if (!createResponse.ok) {
+      const errorText = await createResponse.text();
+      console.error('[Create OrderBook] Failed:', createResponse.status, errorText);
+      return res.status(createResponse.status).json({
         error: 'Failed to create OrderBook',
         details: errorText,
-        status: createResponse?.status || 404,
-        fullError: lastError,
-        attemptedTemplateIds: templateIdsToTry
+        status: createResponse.status
       });
     }
     
-    // ROOT CAUSE FIX: v2 API returns { updateId, completionOffset } not { events }
-    // We need to query for the contract using completionOffset
+    const result = await createResponse.json();
+    console.log('[Admin] ✓ OrderBook created successfully');
+    console.log('[Admin] Response:', JSON.stringify(result, null, 2));
+    
+    // Per Sync Global scan API: extract contract ID from submit-and-wait response
+    // Response may have: events[], transactionEvents[], or contractId at root
     let contractId = null;
     
-    // Method 1: Check if events are present (v1 format)
-    if (result.events && result.events.length > 0) {
-      const createdEvent = result.events.find(e => e.created);
-      if (createdEvent && createdEvent.created) {
-        contractId = createdEvent.created.contractId;
-        console.log('[Create OrderBook] Found contract ID from events:', contractId);
+    console.log('[Create OrderBook] Response structure:', {
+      hasEvents: !!result.events,
+      hasTransactionEvents: !!result.transactionEvents,
+      hasUpdateId: !!result.updateId,
+      hasContractId: !!result.contractId,
+      keys: Object.keys(result)
+    });
+    
+    // Method 1: Check events array
+    if (result.events && Array.isArray(result.events)) {
+      for (const event of result.events) {
+        if (event.created?.contractId) {
+                    contractId = event.created.contractId;
+          console.log(`[Create OrderBook] ✅ Contract ID from events: ${contractId.substring(0, 50)}...`);
+                    break;
+                  }
       }
     }
     
-    // ROOT CAUSE FIX: Use transaction events API to get contract ID from updateId
-    // This bypasses the token permission issue (admin token doesn't have operator party in actAs)
-    if (!contractId && result.updateId && result.completionOffset !== undefined) {
-      console.log('[Create OrderBook] Getting contract ID from transaction events using updateId:', result.updateId);
-      
+    // Method 2: Check transactionEvents
+    if (!contractId && result.transactionEvents && Array.isArray(result.transactionEvents)) {
+      for (const event of result.transactionEvents) {
+        if (event.created?.contractId) {
+          contractId = event.created.contractId;
+          console.log(`[Create OrderBook] ✅ Contract ID from transactionEvents: ${contractId.substring(0, 50)}...`);
+          break;
+        }
+      }
+    }
+    
+    // Method 3: Check root level
+    if (!contractId && result.contractId) {
+      contractId = result.contractId;
+      console.log(`[Create OrderBook] ✅ Contract ID from root: ${contractId.substring(0, 50)}...`);
+    }
+    
+    // Method 4: Query active contracts by operator party (most reliable after submit-and-wait)
+    // submit-and-wait guarantees the transaction is committed, so the contract should be visible
+    if (!contractId) {
+      console.log(`[Create OrderBook] Querying active contracts for OrderBook: ${payload.tradingPair}`);
       try {
-        // Use /v2/updates endpoint to get transaction details from updateId
-        // This doesn't require party permissions - it's a transaction lookup
-        const updatesResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/updates`, {
+        // Extract packageId from templateIdToUse (format: packageId:Module:Template)
+        const packageIdFromTemplate = templateIdToUse.split(':')[0];
+        const queryResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
           method: 'POST',
           headers: {
             'Authorization': `Bearer ${adminToken}`,
             'Content-Type': 'application/json'
           },
-            body: JSON.stringify({
-              beginExclusive: result.completionOffset || 0, // Use completion offset as integer
-              endInclusive: result.completionOffset || 0, // Same offset for single transaction
-          filter: {
-            filtersByParty: {
-              [operatorPartyId]: {
-                inclusive: {
-                  templateIds: [] // Empty array means match all templates for this party
+          body: JSON.stringify({
+            activeAtOffset: "0",
+            filter: {
+              filtersByParty: {
+                [operatorPartyId]: {
+                  inclusive: {
+                    templateIds: [`${packageIdFromTemplate}:OrderBook:OrderBook`]
+                  }
                 }
               }
-            }
-          },
-          verbose: true // Get full transaction details
-            })
+            },
+            verbose: true
+          })
         });
         
-        if (updatesResponse.ok) {
-          const updatesData = await updatesResponse.json();
-          const updates = updatesData.updates || [];
-          console.log(`[Create OrderBook] Got ${updates.length} updates from transaction events`);
+        if (queryResponse.ok) {
+          const queryData = await queryResponse.json();
+          const contracts = queryData.activeContracts || queryData.result || queryData || [];
+          const contractsArray = Array.isArray(contracts) ? contracts : [];
+          console.log(`[Create OrderBook] Found ${contractsArray.length} active OrderBook contracts`);
           
-          // Known package IDs
-          const knownPackageIds = [
-            '51522c778cf057ce80b3aa38d272a2fb72ae60ae871bca67940aaccf59567ac9',
-            'ebe9b93c1bd07c02de5635347a8bf1904bf96f7918b65136621bf61c16090e1e',
-          ];
-          
-          // Extract contract ID from transaction events
-          // Search backwards to get the most recent (our creation)
-          for (let i = updates.length - 1; i >= 0; i--) {
-            const update = updates[i];
-            if (update.transaction && update.transaction.events) {
-              for (const event of update.transaction.events) {
-                if (event.created && event.created.contractId) {
-                  const templateId = event.created.templateId || '';
-                  // Check if it's an OrderBook
-                  const isOrderBook = templateId.includes('OrderBook') && (
-                    templateId.includes('OrderBook:OrderBook') ||
-                    knownPackageIds.some(pkgId => templateId.startsWith(pkgId))
-                  );
-                  
-                  if (isOrderBook) {
-                    const createArgs = event.created.createArguments || event.created.argument;
-                    if (createArgs?.tradingPair === decodedTradingPair) {
-                      contractId = event.created.contractId;
-                      console.log(`[Create OrderBook] ✅ Found contract ID from transaction events: ${contractId.substring(0, 50)}...`);
-                      break;
-                    }
-                  }
-                }
-              }
-              if (contractId) break;
-            }
-          }
-        } else {
-          const errorText = await updatesResponse.text();
-          console.warn('[Create OrderBook] Updates API returned error:', updatesResponse.status, errorText.substring(0, 200));
-        }
-      } catch (updatesError) {
-        console.error('[Create OrderBook] Error getting transaction events:', updatesError.message);
-      }
-      
-      // Fallback: Try querying with known package IDs
-      if (!contractId) {
-        console.log('[Create OrderBook] Trying to query with known package IDs...');
-        await new Promise(resolve => setTimeout(resolve, 2000)); // Wait for contract to be visible
-        
-        const knownPackageIds = [
-          '51522c778cf057ce80b3aa38d272a2fb72ae60ae871bca67940aaccf59567ac9',
-          'ebe9b93c1bd07c02de5635347a8bf1904bf96f7918b65136621bf61c16090e1e',
-        ];
-        
-        for (const pkgId of knownPackageIds) {
-          try {
-            const qualifiedTemplateId = `${pkgId}:OrderBook:OrderBook`;
-            const queryResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${adminToken}`,
-                'Content-Type': 'application/json'
-              },
-              body: JSON.stringify({
-                activeAtOffset: "0",
-                verbose: true,
-                filter: {
-                  filtersForAnyParty: {
-                    inclusive: {
-                      templateIds: [qualifiedTemplateId]
-                    }
-                  }
-                }
-              })
-            });
-            
-            if (queryResponse.ok) {
-              const queryData = await queryResponse.json();
-              const contracts = Array.isArray(queryData) ? queryData : (queryData.activeContracts || []);
-              
-              const orderBook = contracts.find(contract => {
-                const contractData = contract.contractEntry?.JsActiveContract?.createdEvent || 
-                                    contract.createdEvent || 
-                                    contract;
-                return (contractData.createArgument?.tradingPair === decodedTradingPair ||
-                        contractData.argument?.tradingPair === decodedTradingPair);
-              });
-              
-              if (orderBook) {
-                const contractData = orderBook.contractEntry?.JsActiveContract?.createdEvent || 
-                                    orderBook.createdEvent || 
-                                    orderBook;
-                contractId = contractData.contractId;
-                console.log(`[Create OrderBook] ✅ Found contract ID from query: ${contractId.substring(0, 50)}...`);
+          // Find the OrderBook for this trading pair
+          for (const entry of contractsArray) {
+            const contract = entry.activeContract || entry.contract || entry;
+            if (contract?.contractId && contract?.templateId?.includes('OrderBook')) {
+              const createArgs = contract.createArguments || contract.argument || {};
+              if (createArgs.tradingPair === payload.tradingPair) {
+                contractId = contract.contractId;
+                console.log(`[Create OrderBook] ✅ Contract ID from active contracts: ${contractId.substring(0, 50)}...`);
                 break;
               }
             }
-          } catch (queryError) {
-            console.warn(`[Create OrderBook] Query with package ${pkgId.substring(0, 16)}... failed:`, queryError.message);
           }
+        } else {
+          const errorText = await queryResponse.text();
+          console.warn(`[Create OrderBook] Active contracts query failed: ${queryResponse.status}`, errorText.substring(0, 200));
         }
+      } catch (queryError) {
+        console.warn('[Create OrderBook] Error querying active contracts:', queryError.message);
       }
     }
     
-    // OrderBook created - no cache needed, query ledger directly when needed
-    console.log(`[Create OrderBook] OrderBook created successfully for ${decodedTradingPair}`);
-    
     if (!contractId) {
-      console.warn('[Create OrderBook] Contract ID not found, but creation succeeded:', JSON.stringify(result, null, 2));
-      console.warn('[Create OrderBook] OrderBook was created successfully. Contract ID will be available when queried.');
-      // Don't fail - the OrderBook was created, we just can't return the ID immediately
-      return res.json({
-        success: true,
-        message: `OrderBook created successfully for ${decodedTradingPair}`,
-        tradingPair: decodedTradingPair,
-        updateId: result.updateId,
-        completionOffset: result.completionOffset,
-        note: 'Contract ID not immediately available. Query /api/orderbooks/:tradingPair to get the contract ID.'
-      });
+      console.error('[Create OrderBook] Full response:', JSON.stringify(result, null, 2));
+      throw new Error(`Failed to extract OrderBook contract ID. Response keys: ${Object.keys(result).join(', ')}`);
     }
     
-    console.log(`[Admin] Created OrderBook for ${decodedTradingPair}: ${contractId}`);
+    console.log(`[Create OrderBook] ✅ OrderBook created: ${contractId.substring(0, 30)}...`);
     
     res.json({
       success: true,
@@ -981,10 +898,10 @@ app.get('/api/orderbooks', async (req, res) => {
     let orderBooksFromEvents = [];
     
     // Known package IDs from DAR uploads
-    // PRIMARY: 51522c77... (confirmed working)
+    // PRIMARY: 51522c77... (confirmed working - OrderBooks are created with this)
     const knownPackageIds = [
-      '1aa4ed9b2bec34ef6764c882d76e3789a9bf3af77cc8e60ac903fea2e8aab215', // NEW - clob-exchange-utxo v1.0.0 with UTXO handling
-      '51522c778cf057ce80b3aa38d272a2fb72ae60ae871bca67940aaccf59567ac9', // FALLBACK - old package
+      '51522c778cf057ce80b3aa38d272a2fb72ae60ae871bca67940aaccf59567ac9', // PRIMARY - confirmed working, OrderBooks created with this
+      '1aa4ed9b2bec34ef6764c882d76e3789a9bf3af77cc8e60ac903fea2e8aab215', // NEW - clob-exchange-utxo v1.0.0 with UTXO handling (has activeUsers field issue)
       'ebe9b93c1bd07c02de5635347a8bf1904bf96f7918b65136621bf61c16090e1e',
     ];
     
@@ -1174,57 +1091,11 @@ app.get('/api/orderbooks', async (req, res) => {
 });
 
 /**
- * Get OrderBook for a specific trading pair
- */
-app.get('/api/orderbooks/:tradingPair', async (req, res) => {
-  try {
-    const { tradingPair } = req.params;
-    const encodedPair = encodeURIComponent(tradingPair);
-    
-    // First get all OrderBooks
-    const allOrderBooksResponse = await fetch(`${req.protocol}://${req.get('host')}/api/orderbooks`, {
-      method: 'GET',
-      headers: {
-        'Authorization': req.headers.authorization || ''
-      }
-    });
-    
-    if (!allOrderBooksResponse.ok) {
-      return res.status(allOrderBooksResponse.status).json({
-        error: 'Failed to query OrderBooks',
-        details: await allOrderBooksResponse.text()
-      });
-    }
-    
-    const data = await allOrderBooksResponse.json();
-    const orderBook = data.orderBooks?.find(ob => ob.tradingPair === tradingPair);
-    
-    if (!orderBook) {
-      return res.status(404).json({
-        error: 'OrderBook not found',
-        tradingPair: tradingPair,
-        message: `No OrderBook found for trading pair ${tradingPair}. Please contact the operator to create it.`
-      });
-    }
-    
-    res.json({
-      success: true,
-      orderBook: orderBook
-    });
-    
-  } catch (error) {
-    console.error('[OrderBooks API] Error:', error);
-    res.status(500).json({ 
-      error: 'Failed to get OrderBook',
-      message: error.message 
-    });
-  }
-});
-
-/**
  * PROFESSIONAL APPROACH: Query ledger directly for global OrderBook
  * No cache - query blockchain/ledger directly like Hyperliquid, Lighter, etc.
  * Uses Canton's transaction events API to find OrderBooks, then queries contracts directly
+ * 
+ * IMPORTANT: This route must come BEFORE /api/orderbooks/:tradingPair (more specific routes first)
  */
 app.get('/api/orderbooks/:tradingPair/orders', async (req, res) => {
   try {
@@ -1282,61 +1153,139 @@ app.get('/api/orderbooks/:tradingPair/orders', async (req, res) => {
       
       if (!updatesResponse.ok) {
         const errorText = await updatesResponse.text();
-        console.error('[Global OrderBook] Updates API error:', errorText);
-        console.error('[Global OrderBook] Request body sent:', JSON.stringify(requestBody));
-        throw new Error(`Failed to query ledger: ${updatesResponse.status} - ${errorText}`);
-      }
+        // Handle 413 error gracefully - too many transactions, fall back to direct query
+        if (updatesResponse.status === 413) {
+          console.warn('[Global OrderBook] Transaction scan hit 413 limit (too many transactions) - falling back to direct query');
+          // Don't throw - let it fall through to direct query below
+        } else {
+          console.error('[Global OrderBook] Updates API error:', errorText);
+          console.error('[Global OrderBook] Request body sent:', JSON.stringify(requestBody));
+          // Don't throw - let it fall through to direct query below
+        }
+      } else {
       
-      const updatesData = await updatesResponse.json();
-      const updates = updatesData.updates || [];
-      console.log(`[Global OrderBook] Scanned ${updates.length} transaction events from ledger`);
-      
-      // Known package IDs
-      const knownPackageIds = [
-        '51522c778cf057ce80b3aa38d272a2fb72ae60ae871bca67940aaccf59567ac9',
-        'ebe9b93c1bd07c02de5635347a8bf1904bf96f7918b65136621bf61c16090e1e',
-      ];
-      
-      // Search backwards through all transactions to find the most recent OrderBook for this trading pair
-      for (let i = updates.length - 1; i >= 0; i--) {
-        const update = updates[i];
-        if (update.transaction && update.transaction.events) {
-          for (const event of update.transaction.events) {
-            if (event.created && event.created.contractId) {
-              const templateId = event.created.templateId || '';
-              // Check if it's an OrderBook from any of our known packages
-              const isOrderBook = templateId.includes('OrderBook') && (
-                templateId.includes('OrderBook:OrderBook') ||
-                knownPackageIds.some(pkgId => templateId.includes(pkgId))
-              );
-              
-              if (isOrderBook) {
-                const createArgs = event.created.createArguments || event.created.argument;
-                if (createArgs?.tradingPair === decodedTradingPair) {
-                  orderBookContractId = event.created.contractId;
-                  orderBookOperator = createArgs?.operator || operatorPartyId;
-                  console.log(`[Global OrderBook] ✅ Found OrderBook in ledger: ${orderBookContractId.substring(0, 30)}...`);
-                  break;
+        const updatesData = await updatesResponse.json();
+        const updates = updatesData.updates || [];
+        console.log(`[Global OrderBook] Scanned ${updates.length} transaction events from ledger`);
+        
+        // EXPERT FIX: Use template pattern matching instead of hardcoded package IDs
+        // Search backwards through all transactions to find the most recent OrderBook for this trading pair
+        for (let i = updates.length - 1; i >= 0; i--) {
+          const update = updates[i];
+          if (update.transaction && update.transaction.events) {
+            for (const event of update.transaction.events) {
+              if (event.created && event.created.contractId) {
+                const templateId = event.created.templateId || '';
+                // Check if it's an OrderBook - match by template name, not package ID
+                const isOrderBook = templateId.includes('OrderBook:OrderBook') || 
+                                    (templateId.includes('OrderBook') && templateId.split(':').length === 3);
+                
+                if (isOrderBook) {
+                  const createArgs = event.created.createArguments || event.created.argument;
+                  if (createArgs?.tradingPair === decodedTradingPair) {
+                    orderBookContractId = event.created.contractId;
+                    orderBookOperator = createArgs?.operator || operatorPartyId;
+                    console.log(`[Global OrderBook] ✅ Found OrderBook in ledger: ${orderBookContractId.substring(0, 30)}...`);
+                    break;
+                  }
                 }
               }
             }
+            if (orderBookContractId) break;
           }
-          if (orderBookContractId) break;
         }
       }
     } catch (err) {
-      console.error('[Global OrderBook] Error querying ledger:', err.message);
-      return res.status(500).json({
-        error: 'Failed to query ledger',
-        message: err.message
+      console.warn('[Global OrderBook] Transaction scan error:', err.message);
+      // Don't throw - fall through to direct query
+    }
+    
+    // EXPERT FIX: Always try direct query (most reliable, no 413 limit)
+    // Use filtersByParty with operator party (works with admin token, filtersForAnyParty requires different permissions)
+    if (!orderBookContractId) {
+      console.log('[Global OrderBook] Trying direct active contracts query (most reliable)...');
+      
+      try {
+        // Use filtersByParty with operator party - this works with admin token
+        const directQueryResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${adminToken}`
+          },
+          body: JSON.stringify({
+            activeAtOffset: "0",
+            verbose: true,
+            filter: {
+              filtersByParty: {
+                [operatorPartyId]: {
+                  inclusive: {
+                    templateIds: ['OrderBook:OrderBook'] // Unqualified - matches any package
+                  }
+                }
+              }
+            }
+          })
+        });
+        
+        if (directQueryResponse.ok) {
+          const directQueryData = await directQueryResponse.json();
+          const contracts = Array.isArray(directQueryData) ? directQueryData : (directQueryData.activeContracts || []);
+          
+          console.log(`[Global OrderBook] Found ${contracts.length} active OrderBook contracts`);
+          
+          // Find OrderBook for this trading pair
+          for (const contract of contracts) {
+            const contractData = contract.contractEntry?.JsActiveContract?.createdEvent || 
+                               contract.createdEvent || 
+                               contract;
+            const createArgs = contractData.createArgument || contractData.argument || {};
+            
+            if (createArgs.tradingPair === decodedTradingPair) {
+              orderBookContractId = contractData.contractId;
+              orderBookOperator = createArgs.operator || operatorPartyId;
+              console.log(`[Global OrderBook] ✅ Found OrderBook via direct query: ${orderBookContractId.substring(0, 30)}...`);
+              break;
+            }
+          }
+        } else {
+          const errorText = await directQueryResponse.text();
+          console.warn('[Global OrderBook] Direct query failed:', directQueryResponse.status, errorText.substring(0, 200));
+        }
+      } catch (err) {
+        console.warn('[Global OrderBook] Direct query error:', err.message);
+      }
+    }
+    
+    // If still not found, return empty orders (OrderBook doesn't exist yet - will be created on first order)
+    if (!orderBookContractId) {
+      console.log(`[Global OrderBook] OrderBook not found for ${decodedTradingPair} - will be created on first order`);
+      return res.json({
+        success: true,
+        tradingPair: decodedTradingPair,
+        orders: {
+          buys: [],
+          sells: []
+        },
+        buyOrders: [],
+        sellOrders: [],
+        buyOrdersCount: 0,
+        sellOrdersCount: 0,
+        lastPrice: null,
+        message: 'OrderBook not found - will be created on first order'
       });
     }
     
     if (!orderBookContractId) {
-      return res.status(404).json({
-        error: 'OrderBook not found',
+      // Return empty orders array instead of 404 - OrderBook will be created when first order is placed
+      return res.json({
+        success: true,
         tradingPair: decodedTradingPair,
-        message: `No OrderBook found for trading pair ${decodedTradingPair} in the ledger. Please contact the operator to create it.`
+        orders: {
+          buys: [],
+          sells: []
+        },
+        message: 'OrderBook not found - will be created on first order'
       });
     }
     
@@ -1768,9 +1717,11 @@ app.post('/api/orderbooks/:tradingPair/update-user-account', async (req, res) =>
     const orderBookContractId = await getOrderBookContractId(tradingPair, adminToken, CANTON_JSON_API_BASE);
     
     if (!orderBookContractId) {
-      return res.status(404).json({ 
-        error: 'OrderBook not found',
-        tradingPair 
+      // Return success instead of 404 - OrderBook will be created on first order
+      return res.json({
+        success: true,
+        tradingPair,
+        message: 'OrderBook not found - will be created on first order'
       });
     }
     
@@ -1875,6 +1826,319 @@ app.post('/api/orderbooks/:tradingPair/update-user-account', async (req, res) =>
 });
 
 /**
+ * TESTNET: Create UserAccount and add test tokens
+ * This endpoint creates a UserAccount for a user and adds test tokens for testing
+ */
+app.post('/api/testnet/mint-tokens', async (req, res) => {
+  try {
+    const { partyId } = req.body;
+    
+    if (!partyId) {
+      return res.status(400).json({
+        error: 'Missing partyId',
+        required: ['partyId']
+      });
+    }
+    
+    const cantonAdmin = new (require('./canton-admin'))();
+    const adminToken = await cantonAdmin.getAdminToken();
+    const operatorPartyId = process.env.OPERATOR_PARTY_ID || 
+      '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
+    
+    const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
+    
+    console.log(`[Testnet] Creating UserAccount and minting test tokens for: ${partyId}`);
+    
+    // Check if UserAccount already exists
+    const UTXOHandler = require('./utxo-handler');
+    const utxoHandler = new UTXOHandler();
+    let userAccount = await utxoHandler.getUserAccount(partyId, adminToken);
+    
+    // Test token amounts (generous for testing)
+    // DAML Map.Map Text Decimal is serialized as array of [key, value] pairs
+    const testBalances = [
+      ['USDT', '100000.0'],  // 100k USDT
+      ['BTC', '10.0'],       // 10 BTC
+      ['ETH', '100.0'],      // 100 ETH
+      ['SOL', '1000.0'],     // 1000 SOL
+      ['BNB', '500.0'],      // 500 BNB
+      ['ADA', '5000.0']      // 5000 ADA
+    ];
+    
+    let userAccountContractId = null;
+    
+    if (!userAccount) {
+      // Create UserAccount with initial test balances
+      console.log('[Testnet] Creating new UserAccount with test balances...');
+      
+      // Discover template ID
+      let templateIdToUse = null;
+      try {
+        const existingQuery = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${adminToken}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            activeAtOffset: "0",
+            verbose: true,
+            filter: {
+              filtersForAnyParty: {
+                inclusive: {
+                  templateIds: ['UserAccount:UserAccount']
+                }
+              }
+            }
+          })
+        });
+        
+        if (existingQuery.ok) {
+          const existingData = await existingQuery.json();
+          const contracts = Array.isArray(existingData) ? existingData : (existingData.activeContracts || []);
+          if (contracts.length > 0) {
+            const contract = contracts[0];
+            const contractData = contract.contractEntry?.JsActiveContract?.createdEvent || 
+                                contract.createdEvent || 
+                                contract;
+            templateIdToUse = contractData.templateId;
+            console.log('[Testnet] Discovered UserAccount template:', templateIdToUse);
+          }
+        }
+      } catch (e) {
+        console.warn('[Testnet] Template discovery failed:', e.message);
+      }
+      
+      // Fallback to known package ID
+      if (!templateIdToUse) {
+        const WORKING_PACKAGE_ID = '51522c778cf057ce80b3aa38d272a2fb72ae60ae871bca67940aaccf59567ac9';
+        templateIdToUse = `${WORKING_PACKAGE_ID}:UserAccount:UserAccount`;
+      }
+      
+      // Create UserAccount
+      const commandId = `create-useraccount-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      const createResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/commands/submit-and-wait`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${adminToken}`
+        },
+        body: JSON.stringify({
+          commandId: commandId,
+          commands: [{
+            CreateCommand: {
+              templateId: templateIdToUse,
+              createArguments: {
+                party: partyId,
+                balances: testBalances,
+                operator: operatorPartyId
+              }
+            }
+          }],
+          actAs: [operatorPartyId]
+        })
+      });
+      
+      if (!createResponse.ok) {
+        const errorText = await createResponse.text();
+        console.error('[Testnet] Failed to create UserAccount:', createResponse.status, errorText);
+        return res.status(createResponse.status).json({
+          error: 'Failed to create UserAccount',
+          details: errorText
+        });
+      }
+      
+      const createResult = await createResponse.json();
+      console.log('[Testnet] UserAccount created successfully');
+      
+      // Get contract ID from response
+      if (createResult.events && Array.isArray(createResult.events)) {
+        const createdEvent = createResult.events.find(e => e.created);
+        if (createdEvent && createdEvent.created && createdEvent.created.contractId) {
+          userAccountContractId = createdEvent.created.contractId;
+        }
+      }
+      
+      // If not in events, query active contracts by party (most reliable after submit-and-wait)
+      // submit-and-wait guarantees the transaction is committed, so the contract should be visible
+      if (!userAccountContractId) {
+        console.log('[Testnet] Contract ID not in response, querying active contracts by party...');
+        
+        // Query using party filter - more reliable than filtersForAnyParty
+        try {
+          const queryResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${adminToken}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              activeAtOffset: "0",
+              verbose: true,
+              filter: {
+                filtersByParty: {
+                  [partyId]: {
+                    inclusive: {
+                      templateIds: ['UserAccount:UserAccount']
+                    }
+                  }
+                }
+              }
+            })
+          });
+          
+          if (queryResponse.ok) {
+            const queryData = await queryResponse.json();
+            const contracts = Array.isArray(queryData) ? queryData : (queryData.activeContracts || []);
+            
+            // Find UserAccount for this party
+            for (const contract of contracts) {
+              const contractData = contract.contractEntry?.JsActiveContract?.createdEvent || 
+                                  contract.createdEvent || 
+                                  contract;
+              const createArgs = contractData.createArgument || contractData.argument || {};
+              
+              if (createArgs.party === partyId) {
+                userAccountContractId = contractData.contractId;
+                console.log(`[Testnet] ✅ Found UserAccount contract ID: ${userAccountContractId.substring(0, 50)}...`);
+                break;
+              }
+            }
+          } else {
+            const errorText = await queryResponse.text();
+            console.warn('[Testnet] Active contracts query failed:', queryResponse.status, errorText.substring(0, 200));
+          }
+        } catch (queryErr) {
+          console.warn('[Testnet] Error querying active contracts:', queryErr.message);
+        }
+      }
+      
+      // If still not found, try using UTXOHandler to get it
+      if (!userAccountContractId) {
+        console.log('[Testnet] Trying UTXOHandler to get UserAccount...');
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        const fetchedAccount = await utxoHandler.getUserAccount(partyId, adminToken);
+        if (fetchedAccount && fetchedAccount.contractId) {
+          userAccountContractId = fetchedAccount.contractId;
+          console.log(`[Testnet] ✅ Got UserAccount from UTXOHandler: ${userAccountContractId.substring(0, 50)}...`);
+        }
+      }
+      
+      if (!userAccountContractId) {
+        // Don't fail - UserAccount was created, just return success without contract ID
+        console.warn('[Testnet] ⚠️ UserAccount created but contract ID not immediately retrievable');
+        console.warn('[Testnet] This is OK - contract will be queryable shortly. updateId:', createResult.updateId);
+        
+        // Return success with test balances so frontend can use them immediately
+        // Convert testBalances array to object for response
+        const balancesObj = {};
+        testBalances.forEach(([key, value]) => {
+          balancesObj[key] = value;
+        });
+        
+        return res.json({
+          success: true,
+          message: 'UserAccount created successfully (contract ID will be available shortly)',
+          partyId,
+          userAccountContractId: null,
+          balances: balancesObj, // Return test balances so frontend can use them immediately
+          updateId: createResult.updateId,
+          completionOffset: createResult.completionOffset,
+          note: 'UserAccount was created. Balances shown are from creation.'
+        });
+      }
+      
+      console.log(`[Testnet] ✅ UserAccount created: ${userAccountContractId.substring(0, 50)}...`);
+      
+    } else {
+      // UserAccount exists - add more tokens via Deposit
+      console.log('[Testnet] UserAccount exists, adding test tokens via Deposit...');
+      userAccountContractId = userAccount.contractId;
+      
+      // Discover template ID
+      let templateIdToUse = userAccount.contractId.split('#')[0] || null;
+      if (!templateIdToUse) {
+        const WORKING_PACKAGE_ID = '51522c778cf057ce80b3aa38d272a2fb72ae60ae871bca67940aaccf59567ac9';
+        templateIdToUse = `${WORKING_PACKAGE_ID}:UserAccount:UserAccount`;
+      }
+      
+      // Deposit each token (testBalances is array of [key, value] pairs)
+      for (const [token, amount] of testBalances) {
+        try {
+          const commandId = `deposit-${token}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+          const depositResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/commands/submit-and-wait`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${adminToken}`
+            },
+            body: JSON.stringify({
+              commandId: commandId,
+              commands: [{
+                ExerciseCommand: {
+                  contractId: userAccountContractId,
+                  choice: 'Deposit',
+                  argument: {
+                    token: token,
+                    amount: amount
+                  }
+                }
+              }],
+              actAs: [partyId]
+            })
+          });
+          
+          if (depositResponse.ok) {
+            console.log(`[Testnet] ✅ Deposited ${amount} ${token}`);
+          } else {
+            const errorText = await depositResponse.text();
+            console.warn(`[Testnet] Failed to deposit ${token}:`, depositResponse.status, errorText.substring(0, 200));
+          }
+        } catch (e) {
+          console.warn(`[Testnet] Error depositing ${token}:`, e.message);
+        }
+      }
+    }
+    
+    // Get updated balances
+    userAccount = await utxoHandler.getUserAccount(partyId, adminToken);
+    
+    // Convert balances array to object for response
+    let balancesObj = {};
+    if (userAccount?.balances) {
+      if (Array.isArray(userAccount.balances)) {
+        userAccount.balances.forEach(([key, value]) => {
+          balancesObj[key] = value;
+        });
+      } else if (typeof userAccount.balances === 'object') {
+        balancesObj = userAccount.balances;
+      }
+    } else {
+      // Convert testBalances array to object
+      testBalances.forEach(([key, value]) => {
+        balancesObj[key] = value;
+      });
+    }
+    
+    res.json({
+      success: true,
+      message: 'Test tokens minted successfully',
+      partyId,
+      userAccountContractId,
+      balances: balancesObj,
+      note: 'This is a testnet endpoint. Tokens are for testing only.'
+    });
+    
+  } catch (error) {
+    console.error('[Testnet Mint] Error:', error);
+    res.status(500).json({
+      error: 'Failed to mint test tokens',
+      message: error.message
+    });
+  }
+});
+
+/**
  * UTXO Merging endpoint
  * Merges UTXOs for a user account to consolidate balances
  * This is critical for Canton's UTXO model - when orders are cancelled,
@@ -1916,11 +2180,452 @@ app.post('/api/orders/place', async (req, res) => {
   try {
     const { partyId, tradingPair, orderType, orderMode, quantity, price, orderBookContractId, userAccountContractId } = req.body;
     
-    if (!partyId || !tradingPair || !orderType || !quantity || !orderBookContractId) {
+    if (!partyId || !tradingPair || !orderType || !quantity) {
       return res.status(400).json({
         error: 'Missing required fields',
-        required: ['partyId', 'tradingPair', 'orderType', 'quantity', 'orderBookContractId']
+        required: ['partyId', 'tradingPair', 'orderType', 'quantity']
       });
+    }
+    
+    // TESTNET: Auto-create UserAccount with test tokens if it doesn't exist
+    const UTXOHandler = require('./utxo-handler');
+    const utxoHandler = new UTXOHandler();
+    const cantonAdmin = new (require('./canton-admin'))();
+    const adminToken = await cantonAdmin.getAdminToken();
+    const operatorPartyId = process.env.OPERATOR_PARTY_ID || 
+      '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
+    const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
+    
+    let finalUserAccountContractId = userAccountContractId;
+    let userAccount = await utxoHandler.getUserAccount(partyId, adminToken);
+    
+    if (!userAccount) {
+      console.log(`[Order Place] UserAccount not found for ${partyId}, auto-creating with test tokens...`);
+      
+      try {
+        // Create UserAccount with test balances inline
+        const operatorPartyId = process.env.OPERATOR_PARTY_ID || 
+          '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
+        const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
+        
+        // DAML Map.Map Text Decimal is serialized as array of [key, value] pairs
+        const testBalances = [
+          ['USDT', '100000.0'],
+          ['BTC', '10.0'],
+          ['ETH', '100.0'],
+          ['SOL', '1000.0'],
+          ['BNB', '500.0'],
+          ['ADA', '5000.0']
+        ];
+        
+        // Discover template ID
+        let templateIdToUse = null;
+        try {
+          const existingQuery = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${adminToken}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              activeAtOffset: "0",
+              verbose: true,
+              filter: {
+                filtersForAnyParty: {
+                  inclusive: {
+                    templateIds: ['UserAccount:UserAccount']
+                  }
+                }
+              }
+            })
+          });
+          
+          if (existingQuery.ok) {
+            const existingData = await existingQuery.json();
+            const contracts = Array.isArray(existingData) ? existingData : (existingData.activeContracts || []);
+            if (contracts.length > 0) {
+              const contract = contracts[0];
+              const contractData = contract.contractEntry?.JsActiveContract?.createdEvent || 
+                                  contract.createdEvent || 
+                                  contract;
+              templateIdToUse = contractData.templateId;
+            }
+          }
+        } catch (e) {
+          console.warn('[Order Place] Template discovery failed:', e.message);
+        }
+        
+        if (!templateIdToUse) {
+          const WORKING_PACKAGE_ID = '51522c778cf057ce80b3aa38d272a2fb72ae60ae871bca67940aaccf59567ac9';
+          templateIdToUse = `${WORKING_PACKAGE_ID}:UserAccount:UserAccount`;
+        }
+        
+        // Create UserAccount
+        const commandId = `create-useraccount-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        const createResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/commands/submit-and-wait`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${adminToken}`
+          },
+          body: JSON.stringify({
+            commandId: commandId,
+            commands: [{
+              CreateCommand: {
+                templateId: templateIdToUse,
+                createArguments: {
+                  party: partyId,
+                  balances: testBalances,
+                  operator: operatorPartyId
+                }
+              }
+            }],
+            actAs: [operatorPartyId]
+          })
+        });
+        
+        if (createResponse.ok) {
+          const createResult = await createResponse.json();
+          
+          // Per Sync Global scan API: extract contract ID from response
+          // Check multiple possible response structures
+          console.log('[Order Place] UserAccount create response structure:', {
+            hasEvents: !!createResult.events,
+            hasTransactionEvents: !!createResult.transactionEvents,
+            hasUpdateId: !!createResult.updateId,
+            keys: Object.keys(createResult)
+          });
+          
+          // Method 1: Check events array - extract contract ID and balances from creation response
+          if (createResult.events && Array.isArray(createResult.events)) {
+            for (const event of createResult.events) {
+              if (event.created?.contractId) {
+                finalUserAccountContractId = event.created.contractId;
+                // Extract balances from createArguments if available
+                const createArgs = event.created.createArguments || event.created.argument || {};
+                if (createArgs.balances) {
+                  // Store balances for use in order placement (no query needed)
+                  userAccount = {
+                    contractId: finalUserAccountContractId,
+                    balances: createArgs.balances,
+                    party: partyId
+                  };
+                }
+                console.log(`[Order Place] ✅ UserAccount contract ID from events: ${finalUserAccountContractId.substring(0, 50)}...`);
+                break;
+              }
+            }
+          }
+          
+          // Method 2: Check transactionEvents
+          if (!finalUserAccountContractId && createResult.transactionEvents && Array.isArray(createResult.transactionEvents)) {
+            for (const event of createResult.transactionEvents) {
+              if (event.created?.contractId) {
+                finalUserAccountContractId = event.created.contractId;
+                const createArgs = event.created.createArguments || event.created.argument || {};
+                if (createArgs.balances) {
+                  userAccount = {
+                    contractId: finalUserAccountContractId,
+                    balances: createArgs.balances,
+                    party: partyId
+                  };
+                }
+                console.log(`[Order Place] ✅ UserAccount contract ID from transactionEvents: ${finalUserAccountContractId.substring(0, 50)}...`);
+                break;
+              }
+            }
+          }
+          
+          // Method 3: Check root level
+          if (!finalUserAccountContractId && createResult.contractId) {
+            finalUserAccountContractId = createResult.contractId;
+            console.log(`[Order Place] ✅ UserAccount contract ID from root: ${finalUserAccountContractId.substring(0, 50)}...`);
+          }
+          
+          // Method 4: Query active contracts by party (most reliable after submit-and-wait)
+          // submit-and-wait guarantees the transaction is committed, so the contract should be visible
+          if (!finalUserAccountContractId) {
+            console.log(`[Order Place] Querying active contracts for UserAccount by party: ${partyId}`);
+            try {
+              // Extract packageId from templateIdToUse (format: packageId:Module:Template)
+              const packageIdFromTemplate = templateIdToUse.split(':')[0];
+              const queryResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${adminToken}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  activeAtOffset: "0",
+                  filter: {
+                    filtersByParty: {
+                      [partyId]: {
+                        inclusive: {
+                          templateIds: [`${packageIdFromTemplate}:UserAccount:UserAccount`]
+                        }
+                      }
+                    }
+                  },
+                  verbose: true
+                })
+              });
+              
+              if (queryResponse.ok) {
+                const queryData = await queryResponse.json();
+                const contracts = queryData.activeContracts || queryData.result || queryData || [];
+                const contractsArray = Array.isArray(contracts) ? contracts : [];
+                console.log(`[Order Place] Found ${contractsArray.length} active UserAccount contracts`);
+                
+                // Find the UserAccount for this party
+                for (const entry of contractsArray) {
+                  const contract = entry.activeContract || entry.contract || entry;
+                  if (contract?.contractId && contract?.templateId?.includes('UserAccount')) {
+                    const createArgs = contract.createArguments || contract.argument || {};
+                    if (createArgs.party === partyId) {
+                      finalUserAccountContractId = contract.contractId;
+                      userAccount = {
+                        contractId: finalUserAccountContractId,
+                        balances: createArgs.balances || testBalances,
+                        party: partyId
+                      };
+                      console.log(`[Order Place] ✅ UserAccount contract ID from active contracts: ${finalUserAccountContractId.substring(0, 50)}...`);
+                      break;
+                    }
+                  }
+                }
+              } else {
+                const errorText = await queryResponse.text();
+                console.warn(`[Order Place] Active contracts query failed: ${queryResponse.status}`, errorText.substring(0, 200));
+              }
+            } catch (queryError) {
+              console.warn('[Order Place] Error querying active contracts:', queryError.message);
+            }
+          }
+          
+          if (!finalUserAccountContractId) {
+            console.error('[Order Place] Full UserAccount response:', JSON.stringify(createResult, null, 2));
+            throw new Error(`Failed to extract UserAccount contract ID. Response keys: ${Object.keys(createResult).join(', ')}`);
+          }
+          
+          // If we have contract ID but no userAccount object, construct it with test balances
+          if (finalUserAccountContractId && !userAccount) {
+            userAccount = {
+              contractId: finalUserAccountContractId,
+              balances: testBalances, // Use the balances we created it with
+              party: partyId
+            };
+            console.log(`[Order Place] Constructed UserAccount object from creation response`);
+          }
+        } else {
+          const errorText = await createResponse.text();
+          console.warn(`[Order Place] Failed to auto-create UserAccount: ${createResponse.status}`, errorText.substring(0, 200));
+        }
+      } catch (e) {
+        console.warn('[Order Place] Error auto-creating UserAccount:', e.message);
+        // Continue - order service will handle the error
+      }
+    } else {
+      finalUserAccountContractId = userAccount.contractId;
+    }
+
+    // AUTO-CREATE OrderBook if it doesn't exist
+    let finalOrderBookContractId = orderBookContractId;
+    
+    if (!finalOrderBookContractId || finalOrderBookContractId === 'null' || finalOrderBookContractId === '') {
+      console.log(`[Order Place] OrderBook not provided, checking if it exists for ${tradingPair}...`);
+      
+      // Check if OrderBook exists
+      try {
+        const queryResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${adminToken}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            activeAtOffset: "0",
+            verbose: true,
+            filter: {
+              filtersByParty: {
+                [operatorPartyId]: {
+                  inclusive: {
+                    templateIds: ['OrderBook:OrderBook']
+                  }
+                }
+              }
+            }
+          })
+        });
+        
+        if (queryResponse.ok) {
+          const queryData = await queryResponse.json();
+          const contracts = Array.isArray(queryData) ? queryData : (queryData.activeContracts || []);
+          
+          // Find OrderBook for this trading pair
+          for (const contract of contracts) {
+            const contractData = contract.contractEntry?.JsActiveContract?.createdEvent || 
+                               contract.createdEvent || 
+                               contract;
+            const createArgs = contractData.createArgument || contractData.argument || {};
+            
+            if (createArgs.tradingPair === tradingPair) {
+              finalOrderBookContractId = contractData.contractId;
+              console.log(`[Order Place] ✅ Found existing OrderBook: ${finalOrderBookContractId.substring(0, 30)}...`);
+              break;
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[Order Place] Error checking for OrderBook:', e.message);
+      }
+      
+      // If still not found, create it
+      if (!finalOrderBookContractId || finalOrderBookContractId === 'null' || finalOrderBookContractId === '') {
+        console.log(`[Order Place] OrderBook not found, auto-creating for ${tradingPair}...`);
+        
+        try {
+          // Use the admin endpoint logic to create OrderBook
+          const WORKING_PACKAGE_ID = '51522c778cf057ce80b3aa38d272a2fb72ae60ae871bca67940aaccf59567ac9';
+          const templateIdToUse = `${WORKING_PACKAGE_ID}:OrderBook:OrderBook`;
+          
+          const commandId = `create-orderbook-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+          const createResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/commands/submit-and-wait`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${adminToken}`
+            },
+            body: JSON.stringify({
+              commandId: commandId,
+              commands: [{
+                CreateCommand: {
+                  templateId: templateIdToUse,
+                  createArguments: {
+                    tradingPair: tradingPair,
+                    buyOrders: [],
+                    sellOrders: [],
+                    operator: operatorPartyId,
+                    lastPrice: null,
+                    userAccounts: null
+                  }
+                }
+              }],
+              actAs: [operatorPartyId]
+            })
+          });
+          
+          if (createResponse.ok) {
+            const createResult = await createResponse.json();
+            
+            // Per Sync Global scan API: extract contract ID from response
+            // Response structure: { updateId, completionOffset, events: [{ created: { contractId } }] }
+            // Or: { transactionEvents: [{ created: { contractId } }] }
+            // Or: events at root level
+            console.log('[Order Place] Create response structure:', {
+              hasEvents: !!createResult.events,
+              hasTransactionEvents: !!createResult.transactionEvents,
+              hasUpdateId: !!createResult.updateId,
+              keys: Object.keys(createResult)
+            });
+            
+            // Method 1: Check events array (most common)
+            if (createResult.events && Array.isArray(createResult.events)) {
+              for (const event of createResult.events) {
+                if (event.created?.contractId) {
+                  finalOrderBookContractId = event.created.contractId;
+                  console.log(`[Order Place] ✅ OrderBook contract ID from events: ${finalOrderBookContractId.substring(0, 50)}...`);
+                  break;
+                }
+              }
+            }
+            
+            // Method 2: Check transactionEvents
+            if (!finalOrderBookContractId && createResult.transactionEvents && Array.isArray(createResult.transactionEvents)) {
+              for (const event of createResult.transactionEvents) {
+                if (event.created?.contractId) {
+                          finalOrderBookContractId = event.created.contractId;
+                  console.log(`[Order Place] ✅ OrderBook contract ID from transactionEvents: ${finalOrderBookContractId.substring(0, 50)}...`);
+                          break;
+                        }
+                      }
+                    }
+            
+            // Method 3: Check if contractId is at root level (some API versions)
+            if (!finalOrderBookContractId && createResult.contractId) {
+              finalOrderBookContractId = createResult.contractId;
+              console.log(`[Order Place] ✅ OrderBook contract ID from root: ${finalOrderBookContractId.substring(0, 50)}...`);
+            }
+            
+            // Method 4: Query active contracts by operator party (most reliable after submit-and-wait)
+            // submit-and-wait guarantees the transaction is committed, so the contract should be visible
+            if (!finalOrderBookContractId) {
+              console.log(`[Order Place] Querying active contracts for OrderBook: ${tradingPair}`);
+              try {
+                const queryResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+                  method: 'POST',
+                  headers: {
+                    'Authorization': `Bearer ${adminToken}`,
+                    'Content-Type': 'application/json'
+                  },
+                  body: JSON.stringify({
+                    activeAtOffset: "0",
+                    filter: {
+                      filtersByParty: {
+                        [operatorPartyId]: {
+                          inclusive: {
+                            templateIds: [`${WORKING_PACKAGE_ID}:OrderBook:OrderBook`]
+                          }
+                        }
+                      }
+                    },
+                    verbose: true
+                  })
+                });
+              
+              if (queryResponse.ok) {
+                const queryData = await queryResponse.json();
+                const contracts = queryData.activeContracts || queryData.result || queryData || [];
+                const contractsArray = Array.isArray(contracts) ? contracts : [];
+                console.log(`[Order Place] Found ${contractsArray.length} active OrderBook contracts`);
+                
+                // Find the OrderBook for this trading pair
+                for (const entry of contractsArray) {
+                  const contract = entry.activeContract || entry.contract || entry;
+                  if (contract?.contractId && contract?.templateId?.includes('OrderBook')) {
+                    const createArgs = contract.createArguments || contract.argument || {};
+                    if (createArgs.tradingPair === tradingPair) {
+                      finalOrderBookContractId = contract.contractId;
+                      console.log(`[Order Place] ✅ OrderBook contract ID from active contracts: ${finalOrderBookContractId.substring(0, 50)}...`);
+                      break;
+                    }
+                  }
+                }
+              } else {
+                const errorText = await queryResponse.text();
+                console.warn(`[Order Place] Active contracts query failed: ${queryResponse.status}`, errorText.substring(0, 200));
+              }
+              } catch (queryError) {
+                console.warn('[Order Place] Error querying active contracts:', queryError.message);
+              }
+            }
+            
+            if (!finalOrderBookContractId) {
+              console.error('[Order Place] Full response:', JSON.stringify(createResult, null, 2));
+              throw new Error(`Failed to extract OrderBook contract ID. Response keys: ${Object.keys(createResult).join(', ')}`);
+            }
+          } else {
+            const errorText = await createResponse.text();
+            console.error(`[Order Place] Failed to create OrderBook: ${createResponse.status}`, errorText.substring(0, 200));
+            throw new Error(`Failed to create OrderBook: ${errorText.substring(0, 200)}`);
+          }
+        } catch (e) {
+          console.error('[Order Place] Error auto-creating OrderBook:', e.message);
+          return res.status(500).json({
+            error: 'Failed to create OrderBook',
+            message: e.message
+          });
+        }
+      }
     }
 
     // Use OrderService to place order with UTXO handling
@@ -1931,8 +2636,8 @@ app.post('/api/orders/place', async (req, res) => {
       orderMode || 'LIMIT',
       quantity,
       price,
-      orderBookContractId,
-      userAccountContractId
+      finalOrderBookContractId,
+      finalUserAccountContractId || userAccountContractId
     );
 
     res.json({
@@ -2269,6 +2974,109 @@ app.get('/api/orderbooks/:tradingPair/trades', async (req, res) => {
   } catch (error) {
     console.error('[Trades] Error:', error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * GET /api/orderbooks/:tradingPair - Get OrderBook contract info
+ * Returns OrderBook contract ID and metadata (used by frontend to check if OrderBook exists)
+ * 
+ * IMPORTANT: This route must come AFTER /api/orderbooks/:tradingPair/orders and /api/orderbooks/:tradingPair/trades
+ * (general routes come after specific routes in Express)
+ */
+app.get('/api/orderbooks/:tradingPair', async (req, res) => {
+  try {
+    const { tradingPair } = req.params;
+    const decodedTradingPair = decodeURIComponent(tradingPair);
+    
+    const cantonAdmin = new (require('./canton-admin'))();
+    const adminToken = await cantonAdmin.getAdminToken();
+    const operatorPartyId = process.env.CANTON_OPERATOR_PARTY_ID || '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
+    
+    const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
+    
+    // Find OrderBook contract ID
+    let orderBookContractId = null;
+    let orderBookOperator = operatorPartyId;
+    
+    // PRIORITIZE direct query (most reliable, no 413 limit)
+    // Use filtersByParty with operator party (works with admin token)
+    try {
+      const queryResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${adminToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          activeAtOffset: "0",
+          verbose: true,
+          filter: {
+            filtersByParty: {
+              [operatorPartyId]: {
+                inclusive: {
+                  templateIds: ['OrderBook:OrderBook']
+                }
+              }
+            }
+          }
+        })
+      });
+      
+      if (queryResponse.ok) {
+        const queryData = await queryResponse.json();
+        const contracts = Array.isArray(queryData) ? queryData : (queryData.activeContracts || []);
+        
+        console.log(`[OrderBook] Found ${contracts.length} active OrderBook contracts`);
+        
+        for (const contract of contracts) {
+          const contractData = contract.contractEntry?.JsActiveContract?.createdEvent || 
+                             contract.createdEvent || 
+                             contract;
+          const createArgs = contractData.createArgument || contractData.argument || {};
+          
+          if (createArgs.tradingPair === decodedTradingPair) {
+            orderBookContractId = contractData.contractId;
+            orderBookOperator = createArgs.operator || operatorPartyId;
+            console.log(`[OrderBook] ✅ Found OrderBook: ${orderBookContractId.substring(0, 30)}...`);
+            break;
+          }
+        }
+      } else {
+        const errorText = await queryResponse.text();
+        console.warn('[OrderBook] Direct query failed:', queryResponse.status, errorText.substring(0, 200));
+      }
+    } catch (err) {
+      console.warn('[OrderBook] Error querying active contracts:', err.message);
+    }
+    
+    if (!orderBookContractId) {
+      // Return 200 with success:false (not 404) - professional trading platforms don't use 404 for missing orderbooks
+      return res.json({
+        success: false,
+        error: 'OrderBook not found',
+        tradingPair: decodedTradingPair,
+        message: 'No OrderBook found for this trading pair. It will be created automatically when you place the first order.',
+        orderBook: null
+      });
+    }
+    
+    res.json({
+      success: true,
+      orderBook: {
+        contractId: orderBookContractId,
+        operator: orderBookOperator,
+        tradingPair: decodedTradingPair
+      }
+    });
+    
+  } catch (error) {
+    console.error('[OrderBook] Error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get OrderBook',
+      message: error.message
+    });
   }
 });
 

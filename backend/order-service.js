@@ -28,11 +28,12 @@ class OrderService {
         tradingPair,
         orderType,
         parseFloat(quantity),
-        price ? parseFloat(price) : null
+        price ? parseFloat(price) : null,
+        userAccountContractId // Pass contract ID if available
       );
 
       if (!preOrderResult.success) {
-        throw new Error(preOrderResult.error || preOrderResult.reason || 'Insufficient balance or UTXO issue');
+        throw new Error(preOrderResult.error || 'Insufficient balance or UTXO issue');
       }
 
       console.log(`[Order Service] ✅ UTXO check passed. Balance: ${preOrderResult.totalBalance}, Merged: ${preOrderResult.merged}`);

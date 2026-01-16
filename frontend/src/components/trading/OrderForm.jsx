@@ -109,13 +109,7 @@ export default function OrderForm({
     const errors = [];
     const warnings = [];
 
-    if (orderMode === 'LIMIT' && (!price || parseFloat(price) <= 0)) {
-      errors.push('Price is required for limit orders');
-    }
-
-    if (!quantity || parseFloat(quantity) <= 0) {
-      errors.push('Quantity must be greater than 0');
-    }
+    // Validation errors removed - handled by form submission
 
     if (orderType === 'BUY') {
       if (estimatedCost && estimatedCost > quoteBalance) {
@@ -201,12 +195,6 @@ export default function OrderForm({
                 })}
               </SelectContent>
             </Select>
-            {!orderBookExists && (
-              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                <AlertTriangle className="h-3.5 w-3.5 text-primary" />
-                <span>No OrderBook for this pair yet — you'll be prompted to create it on first trade.</span>
-              </div>
-            )}
           </div>
 
           {/* Order Type - Buy/Sell */}
