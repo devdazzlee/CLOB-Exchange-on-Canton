@@ -104,20 +104,21 @@ function App() {
                   CLOB Exchange
                 </h1>
               </div>
-              <div className="flex items-center space-x-4">
+              <div className="flex items-center space-x-3">
                 {partyId && (
-                  <div className="hidden md:flex items-center space-x-2 text-sm">
-                    <span className="text-[#848E9C]">Party ID:</span>
-                    <code className="px-3 py-1.5 bg-[#1E2329] border border-[#2B3139] rounded-md text-[#F0B90B] font-mono text-xs">
-                      {partyId.substring(0, 30)}...
+                  <div className="flex items-center space-x-2 text-sm">
+                    <span className="hidden sm:inline text-[#848E9C]">Party ID:</span>
+                    <code className="px-2 sm:px-3 py-1.5 bg-[#1E2329] border border-[#2B3139] rounded-md text-[#F0B90B] font-mono text-xs max-w-[100px] sm:max-w-[200px] md:max-w-none truncate">
+                      <span className="hidden sm:inline">{partyId.substring(0, 30)}...</span>
+                      <span className="sm:hidden">{partyId.substring(0, 12)}...</span>
                     </code>
                     <button
                       onClick={handleCopyPartyId}
-                      className="p-1.5 hover:bg-[#2B3139] rounded-md transition-colors group"
+                      className="p-1.5 sm:p-2 hover:bg-[#2B3139] rounded-md transition-colors group border border-[#2B3139] hover:border-[#F0B90B]"
                       title={copiedPartyId ? "Copied!" : "Copy Party ID"}
                     >
                       {copiedPartyId ? (
-                        <svg className="w-4 h-4 text-success transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <svg className="w-4 h-4 text-green-500 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
                         </svg>
                       ) : (
@@ -131,9 +132,13 @@ function App() {
                 {authenticated && (
                   <button
                     onClick={handleLogout}
-                    className="px-3 py-1.5 rounded-md border border-[#2B3139] text-sm font-medium text-[#EAECEF] hover:bg-[#2B3139] hover:text-white transition-colors"
+                    className="px-3 sm:px-4 py-1.5 sm:py-2 rounded-md border border-red-500/50 text-sm font-medium text-red-400 hover:bg-red-500/10 hover:border-red-500 hover:text-red-300 transition-colors flex items-center space-x-1.5"
+                    title="Logout"
                   >
-                    Logout
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+                    </svg>
+                    <span className="hidden sm:inline">Logout</span>
                   </button>
                 )}
               </div>
