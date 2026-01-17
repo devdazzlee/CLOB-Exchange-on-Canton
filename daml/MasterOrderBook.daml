@@ -1,0 +1,403 @@
+-- | MasterOrderBook - Global Order Book owned by the Venue Operator
+-- | This is the single source of truth for all trading on the exchange.
+-- | Users do NOT create their own order books - they interact with this global one.
+module MasterOrderBook where
+
+import qualified Order
+import Trade
+import UserAccount
+import qualified DA.Map as Map
+import DA.List
+
+-- =============================================================================
+-- OPERATOR CONFIGURATION
+-- =============================================================================
+
+-- | The Operator Party ID - This is the venue owner who controls the order book
+-- | This should be set to the actual operator party ID from Canton
+-- | Example: "8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292"
+
+-- =============================================================================
+-- HELPER FUNCTIONS
+-- =============================================================================
+
+-- Helper function to fetch orders with their contract IDs
+fetchOrderPairs : [ContractId Order.Order] -> Update [(ContractId Order.Order, Order.Order)]
+fetchOrderPairs cids = if null cids then
+  return []
+  else do
+    let cid = head cids
+    let rest = tail cids
+    order <- fetch cid
+    restPairs <- fetchOrderPairs rest
+    let pair = (cid, order)
+    return ([pair] ++ restPairs)
+
+-- Helper function to compare buy orders (PRICE-TIME PRIORITY)
+-- Priority: 1) Market orders first, 2) Highest price, 3) Earliest timestamp (FIFO)
+compareBuyOrders : (ContractId Order.Order, Order.Order) -> (ContractId Order.Order, Order.Order) -> Ordering
+compareBuyOrders (_, a) (_, b) = case (a.price, b.price) of
+  (None, Some _) -> GT  -- Market orders have highest priority
+  (Some _, None) -> LT
+  (None, None) -> 
+    -- Both market orders: earlier timestamp first (FIFO)
+    if a.timestamp < b.timestamp then GT else if a.timestamp > b.timestamp then LT else EQ
+  (Some pa, Some pb) -> 
+    -- Both limit orders: higher price first, then earlier timestamp (FIFO)
+    if pa > pb then GT 
+    else if pa < pb then LT 
+    else if a.timestamp < b.timestamp then GT  -- Same price: earlier timestamp first
+    else if a.timestamp > b.timestamp then LT
+    else EQ
+
+-- Helper function to compare sell orders (PRICE-TIME PRIORITY)
+-- Priority: 1) Market orders first, 2) Lowest price, 3) Earliest timestamp (FIFO)
+compareSellOrders : (ContractId Order.Order, Order.Order) -> (ContractId Order.Order, Order.Order) -> Ordering
+compareSellOrders (_, a) (_, b) = case (a.price, b.price) of
+  (None, Some _) -> GT  -- Market orders have highest priority
+  (Some _, None) -> LT
+  (None, None) -> 
+    -- Both market orders: earlier timestamp first (FIFO)
+    if a.timestamp < b.timestamp then GT else if a.timestamp > b.timestamp then LT else EQ
+  (Some pa, Some pb) -> 
+    -- Both limit orders: lower price first, then earlier timestamp (FIFO)
+    if pa < pb then GT 
+    else if pa > pb then LT 
+    else if a.timestamp < b.timestamp then GT  -- Same price: earlier timestamp first
+    else if a.timestamp > b.timestamp then LT
+    else EQ
+
+-- Helper function to check if two orders can match
+canOrdersMatch : Order.Order -> Order.Order -> Bool
+canOrdersMatch buyOrder sellOrder = case buyOrder.price of
+  Some buyPrice -> case sellOrder.price of
+    Some sellPrice -> buyPrice >= sellPrice
+    None -> True
+  None -> True
+
+-- Helper function to determine trade price
+determineTradePrice : Order.Order -> Order.Order -> Decimal
+determineTradePrice buyOrder sellOrder = case buyOrder.price of
+  Some bp -> case sellOrder.price of
+    Some sp -> (bp + sp) / 2.0
+    None -> bp
+  None -> case sellOrder.price of
+    Some sp -> sp
+    None -> 0.0
+
+-- Helper function to parse trading pair (e.g., "BTC/USDT" -> ("BTC", "USDT"))
+parseTradingPair : Text -> (Text, Text)
+parseTradingPair pair = 
+  if pair == "BTC/USDT" then ("BTC", "USDT")
+  else if pair == "ETH/USDT" then ("ETH", "USDT")
+  else if pair == "SOL/USDT" then ("SOL", "USDT")
+  else if pair == "BTC-USDT" then ("BTC", "USDT")
+  else if pair == "ETH-USDT" then ("ETH", "USDT")
+  else if pair == "SOL-USDT" then ("SOL", "USDT")
+  else ("UNKNOWN", "UNKNOWN")
+
+-- =============================================================================
+-- MASTER ORDER BOOK TEMPLATE
+-- =============================================================================
+
+-- | MasterOrderBook - The GLOBAL order book owned by the venue operator
+-- |
+-- | KEY ARCHITECTURE:
+-- | - Signatory: operator (the venue/exchange owner)
+-- | - Observer: publicObserver (a generic party that all users can "readAs")
+-- | - Key: (operator, tradingPair) - ensures ONE order book per trading pair
+-- |
+-- | IMPORTANT: Users do NOT create MasterOrderBooks.
+-- | Only the operator creates them via the deployment script.
+-- | Users interact with the global order book through choices.
+template MasterOrderBook
+  with
+    operator : Party         -- The venue operator who owns this order book
+    publicObserver : Party   -- Public party that allows all users to read the book
+    tradingPair : Text       -- Trading pair (e.g., "BTC-USDT")
+    buyOrders : [ContractId Order.Order]   -- Active buy orders
+    sellOrders : [ContractId Order.Order]  -- Active sell orders
+    lastPrice : Optional Decimal           -- Last traded price
+    activeUsers : [Party]    -- Users who have placed orders (for observer list)
+    userAccounts : Optional (Map.Map Party (ContractId UserAccount.UserAccount))
+  where
+    signatory operator
+    
+    -- Make the order book visible to:
+    -- 1. Public observer (all users can read)
+    -- 2. Active users who have placed orders
+    observer publicObserver :: activeUsers
+    
+    -- NOTE: Contract keys are not supported in this Canton/DAML version
+    -- Uniqueness of MasterOrderBook per trading pair is enforced by:
+    -- 1. Backend logic (operator creates only one MasterOrderBook per pair)
+    -- 2. deploymentScript.js checks for existing books before creating
+
+    -- =========================================================================
+    -- LOG ORDER - Simple test choice to verify connectivity
+    -- =========================================================================
+    
+    -- | LogOrder - A simple placeholder choice to test connectivity
+    -- | This allows any party to "ping" the order book to verify it exists
+    choice LogOrder : ()
+      with
+        caller : Party
+        message : Text
+      controller caller
+      do
+        -- Just log the message - no state change
+        return ()
+
+    -- =========================================================================
+    -- ADD ORDER - Submit a new order to the global order book
+    -- =========================================================================
+    
+    -- | AddOrder - Users call this to place orders on the global book
+    -- | The user becomes an observer of the order book after placing an order
+    choice AddOrder : ContractId Order.Order
+      with
+        orderId : Text
+        owner : Party          -- The user placing the order
+        orderType : Text       -- "BUY" or "SELL"
+        orderMode : Text       -- "LIMIT" or "MARKET"
+        price : Optional Decimal
+        quantity : Decimal
+      controller owner
+      do
+        now <- getTime
+        orderCid <- create Order.Order with
+            orderId = orderId
+            owner = owner
+            orderType = orderType
+            orderMode = orderMode
+            tradingPair = tradingPair
+            price = price
+            quantity = quantity
+            filled = 0.0 : Decimal
+            status = "OPEN"
+            timestamp = now
+            operator = operator
+        
+        let updatedBuyOrders = if orderType == "BUY" then buyOrders ++ [orderCid] else buyOrders
+        let updatedSellOrders = if orderType == "SELL" then sellOrders ++ [orderCid] else sellOrders
+        
+        -- Add owner to activeUsers list if not already present
+        let updatedActiveUsers = if owner `elem` activeUsers then activeUsers else activeUsers ++ [owner]
+        
+        currentAccounts <- case userAccounts of
+          Some accounts -> return accounts
+          None -> return (Map.empty : Map.Map Party (ContractId UserAccount.UserAccount))
+        
+        orderBookCid <- create this with
+          buyOrders = updatedBuyOrders
+          sellOrders = updatedSellOrders
+          activeUsers = updatedActiveUsers
+          userAccounts = Some currentAccounts
+        
+        -- Try to match orders immediately
+        exercise orderBookCid MatchOrders
+        
+        return orderCid
+
+    -- =========================================================================
+    -- MATCH ORDERS - Internal matching engine
+    -- =========================================================================
+    
+    choice MatchOrders : ()
+      controller operator
+      do
+        -- Get active buy and sell orders with their contract IDs
+        buyOrderPairs <- fetchOrderPairs buyOrders
+        sellOrderPairs <- fetchOrderPairs sellOrders
+        
+        -- Filter only open orders
+        let activeBuys = filter (\(_, o) -> o.status == "OPEN") buyOrderPairs
+        let activeSells = filter (\(_, o) -> o.status == "OPEN") sellOrderPairs
+        
+        -- Sort buy orders by price (highest first) and sell orders by price (lowest first)
+        let sortedBuys = sortBy compareBuyOrders activeBuys
+        let sortedSells = sortBy compareSellOrders activeSells
+        
+        -- Match orders
+        matchedPrice <- matchFirstPair tradingPair userAccounts sortedBuys sortedSells
+        
+        -- Update order book by fetching current status of all orders
+        updatedBuyPairs <- fetchOrderPairs buyOrders
+        updatedSellPairs <- fetchOrderPairs sellOrders
+        
+        -- Keep only open orders
+        let remainingBuys = filter (\(_, o) -> o.status == "OPEN") updatedBuyPairs
+        let remainingSells = filter (\(_, o) -> o.status == "OPEN") updatedSellPairs
+        
+        let remainingBuyCids = map (\(cid, _) -> cid) remainingBuys
+        let remainingSellCids = map (\(cid, _) -> cid) remainingSells
+        
+        -- Update lastPrice if a trade occurred
+        newLastPrice <- case matchedPrice of
+            Some p -> return (Some p)
+            None -> return lastPrice
+        
+        currentAccounts <- case userAccounts of
+          Some accounts -> return accounts
+          None -> return (Map.empty : Map.Map Party (ContractId UserAccount.UserAccount))
+        
+        _ <- create this with
+          buyOrders = remainingBuyCids
+          sellOrders = remainingSellCids
+          lastPrice = newLastPrice
+          userAccounts = Some currentAccounts
+        return ()
+
+    -- =========================================================================
+    -- CANCEL ORDER - User cancels their own order
+    -- =========================================================================
+    
+    choice CancelOrderFromBook : ()
+      with
+        orderCid : ContractId Order.Order
+        orderOwner : Party
+      controller orderOwner
+      do
+        order <- fetch orderCid
+        assertMsg "Only owner can cancel" (order.owner == orderOwner)
+        assertMsg "Only open orders can be cancelled" (order.status == "OPEN")
+        
+        -- Cancel the order
+        _ <- exercise orderCid Order.CancelOrder
+        
+        -- Remove from OrderBook
+        let updatedBuyOrders = filter (\cid -> cid /= orderCid) buyOrders
+        let updatedSellOrders = filter (\cid -> cid /= orderCid) sellOrders
+        
+        currentAccounts <- case userAccounts of
+          Some accounts -> return accounts
+          None -> return (Map.empty : Map.Map Party (ContractId UserAccount.UserAccount))
+        
+        _ <- create this with
+          buyOrders = updatedBuyOrders
+          sellOrders = updatedSellOrders
+          userAccounts = Some currentAccounts
+        return ()
+
+    -- =========================================================================
+    -- REMOVE ORDER - Operator removes a filled/cancelled order
+    -- =========================================================================
+    
+    choice RemoveOrder : ()
+      with
+        orderCid : ContractId Order.Order
+      controller operator
+      do
+        order <- fetch orderCid
+        assertMsg "Order must be filled or cancelled" (order.status == "FILLED" || order.status == "CANCELLED")
+        
+        let updatedBuyOrders = filter (\cid -> cid /= orderCid) buyOrders
+        let updatedSellOrders = filter (\cid -> cid /= orderCid) sellOrders
+        
+        currentAccounts <- case userAccounts of
+          Some accounts -> return accounts
+          None -> return (Map.empty : Map.Map Party (ContractId UserAccount.UserAccount))
+        
+        _ <- create this with
+          buyOrders = updatedBuyOrders
+          sellOrders = updatedSellOrders
+          userAccounts = Some currentAccounts
+        return ()
+
+    -- =========================================================================
+    -- UPDATE USER ACCOUNT - Register a user's account for balance updates
+    -- =========================================================================
+    
+    choice UpdateUserAccount : ()
+      with
+        party : Party
+        userAccountCid : ContractId UserAccount.UserAccount
+      controller operator
+      do
+        currentAccounts <- case userAccounts of
+          Some accounts -> return accounts
+          None -> return (Map.empty : Map.Map Party (ContractId UserAccount.UserAccount))
+        let updatedUserAccounts = Map.insert party userAccountCid currentAccounts
+        _ <- create this with userAccounts = Some updatedUserAccounts
+        return ()
+
+-- =============================================================================
+-- MATCHING ENGINE HELPER
+-- =============================================================================
+
+matchFirstPair : Text -> Optional (Map.Map Party (ContractId UserAccount.UserAccount)) -> [(ContractId Order.Order, Order.Order)] -> [(ContractId Order.Order, Order.Order)] -> Update (Optional Decimal)
+matchFirstPair tradingPair userAccountsOpt buyList sellList = 
+  if null buyList || null sellList then
+    return None
+  else do
+    let (buyCid, buyOrder) = head buyList
+    let buyRest : [(ContractId Order.Order, Order.Order)] = tail buyList
+    let (sellCid, sellOrder) = head sellList
+    let sellRest : [(ContractId Order.Order, Order.Order)] = tail sellList
+    
+    let canMatch = canOrdersMatch buyOrder sellOrder
+    
+    if canMatch then do
+      let buyRemaining = buyOrder.quantity - buyOrder.filled
+      let sellRemaining = sellOrder.quantity - sellOrder.filled
+      let tradeQuantity = min buyRemaining sellRemaining
+      let tradePrice = determineTradePrice buyOrder sellOrder
+      let (baseToken, quoteToken) = parseTradingPair tradingPair
+      
+      -- Update balances if UserAccount contracts exist
+      _ <- case userAccountsOpt of
+        Some accounts -> case Map.lookup buyOrder.owner accounts of
+            Some buyerCid -> do
+              _ <- exercise buyerCid UserAccount.UpdateAfterTrade with
+                baseToken = baseToken
+                quoteToken = quoteToken
+                baseAmount = tradeQuantity
+                quoteAmount = -(tradeQuantity * tradePrice)
+              return ()
+            None -> return ()
+        None -> return ()
+      
+      _ <- case userAccountsOpt of
+        Some accounts -> case Map.lookup sellOrder.owner accounts of
+            Some sellerCid -> do
+              _ <- exercise sellerCid UserAccount.UpdateAfterTrade with
+                baseToken = baseToken
+                quoteToken = quoteToken
+                baseAmount = -tradeQuantity
+                quoteAmount = tradeQuantity * tradePrice
+              return ()
+            None -> return ()
+        None -> return ()
+      
+      -- Fill both orders
+      _ <- exercise buyCid Order.FillOrder with fillQuantity = tradeQuantity
+      _ <- exercise sellCid Order.FillOrder with fillQuantity = tradeQuantity
+      
+      -- Create trade record
+      now <- getTime
+      let tradeIdText = buyOrder.orderId <> "-" <> sellOrder.orderId <> "-" <> show now
+      _ <- create Trade with
+        tradeId = tradeIdText
+        buyer = buyOrder.owner
+        seller = sellOrder.owner
+        tradingPair = tradingPair
+        price = tradePrice
+        quantity = tradeQuantity
+        timestamp = now
+        buyOrderId = buyOrder.orderId
+        sellOrderId = sellOrder.orderId
+      
+      -- Fetch updated orders to check if they're filled
+      updatedBuy <- fetch buyCid
+      updatedSell <- fetch sellCid
+      
+      -- Continue matching if orders are still open
+      let nextBuyPair = (buyCid, updatedBuy)
+      let nextSellPair = (sellCid, updatedSell)
+      let nextBuys = if updatedBuy.filled >= updatedBuy.quantity then buyRest else ([nextBuyPair] ++ buyRest)
+      let nextSells = if updatedSell.filled >= updatedSell.quantity then sellRest else ([nextSellPair] ++ sellRest)
+      
+      _ <- matchFirstPair tradingPair userAccountsOpt nextBuys nextSells
+      return (Some tradePrice)
+    else
+      return None

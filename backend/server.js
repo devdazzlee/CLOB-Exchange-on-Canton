@@ -355,7 +355,7 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
               filter: {
                 filtersForAnyParty: {
                   inclusive: {
-                    templateIds: ['OrderBook:OrderBook']
+                    templateIds: ['MasterOrderBook:MasterOrderBook', 'OrderBook:OrderBook']
                   }
                 }
               }
@@ -505,7 +505,9 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
     // Method 2: Fallback to known working package ID if discovery failed
     if (!templateIdToUse) {
       const WORKING_PACKAGE_ID = '51522c778cf057ce80b3aa38d272a2fb72ae60ae871bca67940aaccf59567ac9';
-      templateIdToUse = `${WORKING_PACKAGE_ID}:OrderBook:OrderBook`;
+      // Try MasterOrderBook first, fallback to OrderBook
+      templateIdToUse = `${WORKING_PACKAGE_ID}:MasterOrderBook:MasterOrderBook`;
+      // Fallback: `${WORKING_PACKAGE_ID}:OrderBook:OrderBook`;
       discoveredPackageId = WORKING_PACKAGE_ID;
       console.log('[Admin] Using fallback package ID:', WORKING_PACKAGE_ID);
     }
@@ -515,12 +517,16 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
     // Create OrderBook contract - DIRECT, NO LOOPS, NO FALLBACKS
     const commandId = `create-orderbook-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     
+    // Use MasterOrderBook template (Global Order Book model)
     const payload = {
+      operator: operatorPartyId,
+      publicObserver: 'public-observer', // Public observer for global visibility
       tradingPair: decodedTradingPair,
       buyOrders: [],
       sellOrders: [],
       lastPrice: null,
-      operator: operatorPartyId
+      activeUsers: [],
+      userAccounts: null
     };
     
     console.log('[Admin] OrderBook payload:', JSON.stringify(payload, null, 2));
@@ -551,6 +557,97 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
     
     if (!createResponse.ok) {
       const errorText = await createResponse.text();
+      let errorData;
+      try {
+        errorData = JSON.parse(errorText);
+      } catch {
+        errorData = { code: 'UNKNOWN', cause: errorText };
+      }
+      
+      // If MasterOrderBook doesn't exist, try OrderBook:OrderBook as fallback
+      if (errorData.code === 'TEMPLATES_OR_INTERFACES_NOT_FOUND' && templateIdToUse.includes('MasterOrderBook')) {
+        console.log('[Admin] MasterOrderBook not found, falling back to OrderBook:OrderBook...');
+        const packageIdFromTemplate = templateIdToUse.split(':')[0];
+        templateIdToUse = `${packageIdFromTemplate}:OrderBook:OrderBook`;
+        
+        // Update payload for OrderBook template (no publicObserver, activeUsers, userAccounts)
+        payload = {
+          tradingPair: decodedTradingPair,
+          buyOrders: [],
+          sellOrders: [],
+          lastPrice: null,
+          operator: operatorPartyId
+        };
+        
+        requestBody.commands[0].CreateCommand.templateId = templateIdToUse;
+        requestBody.commands[0].CreateCommand.createArguments = payload;
+        
+        console.log('[Admin] Retrying with OrderBook:OrderBook template:', templateIdToUse);
+        
+        const fallbackResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/commands/submit-and-wait`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${adminToken}`
+          },
+          body: JSON.stringify(requestBody)
+        });
+        
+        if (!fallbackResponse.ok) {
+          const fallbackErrorText = await fallbackResponse.text();
+          console.error('[Create OrderBook] Fallback also failed:', fallbackResponse.status, fallbackErrorText);
+          return res.status(fallbackResponse.status).json({
+            error: 'Failed to create OrderBook',
+            details: fallbackErrorText,
+            status: fallbackResponse.status,
+            tried: ['MasterOrderBook:MasterOrderBook', 'OrderBook:OrderBook']
+          });
+        }
+        
+        // Use the fallback response
+        const result = await fallbackResponse.json();
+        console.log('[Admin] ✓ OrderBook created successfully (using OrderBook:OrderBook fallback)');
+        console.log('[Admin] Response:', JSON.stringify(result, null, 2));
+        
+        // Continue with contract ID extraction using the fallback result
+        // (The code below will handle extracting the contract ID)
+        // We need to set createResponse to fallbackResponse for the rest of the code
+        const fallbackResult = result;
+        
+        // Extract contract ID from fallback result
+        let contractId = null;
+        if (fallbackResult.events && Array.isArray(fallbackResult.events)) {
+          for (const event of fallbackResult.events) {
+            if (event.created?.contractId) {
+              contractId = event.created.contractId;
+              break;
+            }
+          }
+        }
+        if (!contractId && fallbackResult.transactionEvents && Array.isArray(fallbackResult.transactionEvents)) {
+          for (const event of fallbackResult.transactionEvents) {
+            if (event.created?.contractId) {
+              contractId = event.created.contractId;
+              break;
+            }
+          }
+        }
+        if (!contractId && fallbackResult.contractId) {
+          contractId = fallbackResult.contractId;
+        }
+        
+        if (contractId) {
+          return res.json({
+            success: true,
+            message: `OrderBook created successfully for ${decodedTradingPair} (using OrderBook:OrderBook template)`,
+            tradingPair: decodedTradingPair,
+            contractId,
+            operator: operatorPartyId,
+            template: 'OrderBook:OrderBook'
+          });
+        }
+      }
+      
       console.error('[Create OrderBook] Failed:', createResponse.status, errorText);
       return res.status(createResponse.status).json({
         error: 'Failed to create OrderBook',
@@ -752,6 +849,87 @@ app.post('/api/admin/orderbooks', async (req, res) => {
 // Ledger API proxy endpoints (catch-all, must be last)
 app.all('/api/ledger/*', async (req, res) => {
   await tokenExchange.proxyLedgerApiCall(req, res);
+});
+
+/**
+ * Admin endpoint to upload DAR file
+ * Uses the backend's working authentication to upload the DAR
+ */
+app.post('/api/admin/upload-dar', async (req, res) => {
+  try {
+    const fs = require('fs');
+    const path = require('path');
+    
+    // Find DAR file
+    const darPaths = [
+      path.join(__dirname, '../.daml/dist/clob-exchange-utxo-1.0.0.dar'),
+      path.join(__dirname, '../.daml/dist/clob-exchange-1.0.0.dar'),
+      path.join(__dirname, '../daml/.daml/dist/clob-exchange-utxo-1.0.0.dar'),
+      path.join(__dirname, '../daml/.daml/dist/clob-exchange-1.0.0.dar')
+    ];
+    
+    let darFile = null;
+    for (const darPath of darPaths) {
+      if (fs.existsSync(darPath)) {
+        darFile = darPath;
+        break;
+      }
+    }
+    
+    if (!darFile) {
+      return res.status(404).json({
+        error: 'DAR file not found',
+        searched: darPaths.map(p => path.relative(__dirname, p))
+      });
+    }
+    
+    console.log(`[Admin] Uploading DAR: ${darFile}`);
+    
+    // Get admin token
+    const cantonAdmin = new (require('./canton-admin'))();
+    const adminToken = await cantonAdmin.getAdminToken();
+    
+    // Upload to Canton using gRPC (the working method)
+    // For now, we'll use the JSON API v1 endpoint
+    const CANTON_UPLOAD_URL = 'https://participant.dev.canton.wolfedgelabs.com/v1/packages';
+    
+    const darBuffer = fs.readFileSync(darFile);
+    
+    // Try JSON API first
+    const response = await fetch(CANTON_UPLOAD_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${adminToken}`,
+        'Content-Type': 'application/octet-stream'
+      },
+      body: darBuffer
+    });
+    
+    const responseText = await response.text();
+    
+    if (response.ok || response.status === 409) {
+      console.log('[Admin] ✅ DAR uploaded successfully');
+      return res.json({
+        success: true,
+        message: 'DAR uploaded successfully',
+        status: response.status,
+        response: responseText
+      });
+    } else {
+      console.error('[Admin] ❌ DAR upload failed:', response.status, responseText);
+      return res.status(response.status).json({
+        error: 'DAR upload failed',
+        status: response.status,
+        response: responseText
+      });
+    }
+  } catch (error) {
+    console.error('[Admin] DAR upload error:', error);
+    res.status(500).json({
+      error: 'Failed to upload DAR',
+      message: error.message
+    });
+  }
 });
 
 // Health check
@@ -2501,7 +2679,7 @@ app.post('/api/orders/place', async (req, res) => {
               filtersByParty: {
                 [operatorPartyId]: {
                   inclusive: {
-                    templateIds: ['OrderBook:OrderBook']
+                    templateIds: ['MasterOrderBook:MasterOrderBook', 'OrderBook:OrderBook']
                   }
                 }
               }

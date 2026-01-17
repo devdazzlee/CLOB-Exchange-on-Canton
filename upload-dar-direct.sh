@@ -1,86 +1,137 @@
 #!/bin/bash
 set -e
 
-# Access token
-ACCESS_TOKEN="eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICJDdjhRQVpEa3pYTlVvSXdNTnpZQWxBSmlBWlUtbmlvelV4VG96R0I4eXM0In0.eyJleHAiOjE3Njg1Njc5NDgsImlhdCI6MTc2ODU2NjE0OCwiYXV0aF90aW1lIjoxNzY4NTY2MTM5LCJqdGkiOiJvbnJ0YWM6NzExNTlkOTQtYWExNS0xNDA4LTY3YzEtYmQzMWY3ZDg0YWU2IiwiaXNzIjoiaHR0cHM6Ly9rZXljbG9hay53b2xmZWRnZWxhYnMuY29tOjg0NDMvcmVhbG1zL2NhbnRvbi1kZXZuZXQiLCJhdWQiOiJhY2NvdW50Iiwic3ViIjoiODEwMGIyZGItODZjZi00MGExLTgzNTEtNTU0ODNjMTUxY2RjIiwidHlwIjoiQmVhcmVyIiwiYXpwIjoiYWNjb3VudC1jb25zb2xlIiwic2lkIjoiNDIzOGZiZjMtOTZkOS00Y2FiLWE5NWQtNzM2MDBiNzA5YjliIiwiYWNyIjoiMCIsInJlc291cmNlX2FjY2VzcyI6eyJhY2NvdW50Ijp7InJvbGVzIjpbIm1hbmFnZS1hY2NvdW50IiwibWFuYWdlLWFjY291bnQtbGlua3MiXX19LCJzY29wZSI6Im9wZW5pZCBwcm9maWxlIGVtYWlsIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsIm5hbWUiOiJab3lhIE11aGFtbWFkIiwicHJlZmVycmVkX3VzZXJuYW1lIjoiem95YSIsImdpdmVuX25hbWUiOiJab3lhIiwiZmFtaWx5X25hbWUiOiJNdWhhbW1hZCIsImVtYWlsIjoiem95YW11aGFtbWFkOTlAZ21haWwuY29tIn0.zf2ztblorz8rtTYBXmdtSeCRNBsbIBaClnMv9xQjMvqevYFDab5A-gFvW_G1JcQDfCepgTBFvOvcOL2XCJA_9o5wLIoy1qbUcYzsZqWmMLWprkEw37Wjtg20vssWC1Se2A6jJYkrHJ3hnqL4FjlhytMAPQvaxAt2ohh7ki8yZUN6z36I7Nf07gJVYmQi9QPjBzIn0e6bjMrjVObVHX83ta3yQNuVRdCaaGdaRFXZpXxcAjedwSO4Tg8ecmVvZlJ9lXUaryZK7RXOJnUzp8Zp9HKDdBGem9GxAO1Vv6xmI75Lhmx7c6BnZMFHv8Q8abiOFQuxr3rvu7Ke5dOH_WBBwQ"
+# =============================================================================
+# CLOB Exchange - DAR Upload Script (Fixed with Working Credentials)
+# =============================================================================
+
+# Keycloak Configuration (Operator credentials from image_abcdeb.png)
+CLIENT_ID="snp3u6udkFF983rfprvsBbx3X3mBpw"
+CLIENT_SECRET="l5Td3OUSanQoGeNMWg2nnPxq1VYc"
+KEYCLOAK_URL="https://keycloak.wolfedgelabs.com:8443"
+REALM="canton-devnet"
+
+# Canton API Configuration
+CANTON_UPLOAD_URL="https://participant.dev.canton.wolfedgelabs.com/v1/packages"
 
 # Find DAR file
 DAR_FILE=""
-if [ -f ".daml/dist/clob-exchange-1.0.0.dar" ]; then
+if [ -f ".daml/dist/clob-exchange-utxo-1.0.0.dar" ]; then
+    DAR_FILE=".daml/dist/clob-exchange-utxo-1.0.0.dar"
+elif [ -f ".daml/dist/clob-exchange-1.0.0.dar" ]; then
     DAR_FILE=".daml/dist/clob-exchange-1.0.0.dar"
+elif [ -f "daml/.daml/dist/clob-exchange-utxo-1.0.0.dar" ]; then
+    DAR_FILE="daml/.daml/dist/clob-exchange-utxo-1.0.0.dar"
 elif [ -f "daml/.daml/dist/clob-exchange-1.0.0.dar" ]; then
     DAR_FILE="daml/.daml/dist/clob-exchange-1.0.0.dar"
 else
     echo "❌ DAR file not found"
+    echo "Expected: .daml/dist/clob-exchange-utxo-1.0.0.dar"
+    echo "Run 'daml build' first to create the DAR file"
     exit 1
 fi
 
-echo "📤 Uploading DAR file: $DAR_FILE"
-echo "Size: $(ls -lh "$DAR_FILE" | awk '{print $5}')"
+echo "╔════════════════════════════════════════════════════════════════╗"
+echo "║          CLOB Exchange - DAR Upload (Fixed)                     ║"
+echo "╚════════════════════════════════════════════════════════════════╝"
+echo ""
+echo "📦 DAR file: $DAR_FILE"
+echo "📏 Size: $(ls -lh "$DAR_FILE" | awk '{print $5}')"
 echo ""
 
-# Try JSON API first (simpler)
-echo "Method 1: Trying JSON API endpoint..."
-RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-    "https://participant.dev.canton.wolfedgelabs.com/json-api/v1/packages" \
+# Step 1: Get access token from Keycloak
+echo "🔑 Step 1: Getting access token from Keycloak..."
+TOKEN_URL="${KEYCLOAK_URL}/realms/${REALM}/protocol/openid-connect/token"
+
+TOKEN_RESPONSE=$(curl -s -X POST "$TOKEN_URL" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "grant_type=client_credentials" \
+    -d "client_id=${CLIENT_ID}" \
+    -d "client_secret=${CLIENT_SECRET}" \
+    -d "scope=openid daml_ledger_api")
+
+# Extract access token using jq if available, otherwise use grep/sed
+if command -v jq &> /dev/null; then
+    ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token // empty')
+    ERROR=$(echo "$TOKEN_RESPONSE" | jq -r '.error // empty')
+    ERROR_DESC=$(echo "$TOKEN_RESPONSE" | jq -r '.error_description // empty')
+else
+    # Fallback: use grep/sed
+    ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
+    ERROR=$(echo "$TOKEN_RESPONSE" | grep -o '"error":"[^"]*"' | cut -d'"' -f4)
+    ERROR_DESC=$(echo "$TOKEN_RESPONSE" | grep -o '"error_description":"[^"]*"' | cut -d'"' -f4)
+fi
+
+if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+    echo "❌ Failed to get access token"
+    echo "Response: $TOKEN_RESPONSE"
+    if [ -n "$ERROR" ]; then
+        echo "Error: $ERROR"
+        if [ -n "$ERROR_DESC" ]; then
+            echo "Description: $ERROR_DESC"
+        fi
+    fi
+    exit 1
+fi
+
+echo "✅ Got access token (${#ACCESS_TOKEN} chars)"
+echo ""
+
+# Step 2: Upload DAR to Canton
+echo "📤 Step 2: Uploading DAR to Canton..."
+echo "   URL: $CANTON_UPLOAD_URL"
+echo ""
+
+UPLOAD_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$CANTON_UPLOAD_URL" \
     -H "Authorization: Bearer ${ACCESS_TOKEN}" \
     -H "Content-Type: application/octet-stream" \
-    --data-binary "@${DAR_FILE}")
+    --data-binary "@${DAR_FILE}" \
+    --max-time 120)
 
-HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-BODY=$(echo "$RESPONSE" | sed '$d')
+HTTP_CODE=$(echo "$UPLOAD_RESPONSE" | tail -n1)
+RESPONSE_BODY=$(echo "$UPLOAD_RESPONSE" | sed '$d')
+
+echo "HTTP Status: $HTTP_CODE"
 
 if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
-    echo "✅ DAR uploaded successfully via JSON API (HTTP $HTTP_CODE)"
+    echo "✅ DAR uploaded successfully!"
     echo ""
     echo "Response:"
-    echo "$BODY" | jq '.' 2>/dev/null || echo "$BODY"
+    if command -v jq &> /dev/null; then
+        echo "$RESPONSE_BODY" | jq '.' 2>/dev/null || echo "$RESPONSE_BODY"
+    else
+        echo "$RESPONSE_BODY"
+    fi
+    echo ""
+    echo "════════════════════════════════════════════════════════════════"
+    echo "✅ SUCCESS! MasterOrderBook template is now on the ledger"
+    echo ""
+    echo "Next steps:"
+    echo "1. Restart your backend: cd backend && npm restart"
+    echo "2. Run deployment script: node scripts/deploymentScript.js"
+    echo "════════════════════════════════════════════════════════════════"
     exit 0
-elif echo "$BODY" | grep -q "KNOWN_PACKAGE_VERSION"; then
-    echo "⚠️  DAR already uploaded (KNOWN_PACKAGE_VERSION) - this is OK"
+elif [ "$HTTP_CODE" = "409" ]; then
+    echo "ℹ️  DAR already uploaded (409 Conflict)"
+    echo "This is fine - the package already exists on the ledger"
+    echo ""
+    echo "Response: $RESPONSE_BODY"
+    echo ""
+    echo "════════════════════════════════════════════════════════════════"
+    echo "ℹ️  Package already deployed - you can proceed with deployment"
+    echo "════════════════════════════════════════════════════════════════"
+    exit 0
+elif echo "$RESPONSE_BODY" | grep -qi "KNOWN_PACKAGE_VERSION"; then
+    echo "ℹ️  DAR already uploaded (KNOWN_PACKAGE_VERSION)"
     echo "The package is already deployed and active."
     exit 0
 else
-    echo "⚠️  JSON API upload failed (HTTP $HTTP_CODE)"
-    echo "Response: $BODY"
+    echo "❌ Upload failed"
+    echo "Response: $RESPONSE_BODY"
     echo ""
-    echo "Trying gRPC method..."
-fi
-
-# Try gRPC with TLS
-echo "Method 2: Trying gRPC with TLS..."
-BASE64_DAR=$(base64 -i "$DAR_FILE" | tr -d '\n')
-
-GRPC_REQUEST=$(jq -n \
-    --arg bytes "$BASE64_DAR" \
-    '{
-        "dars": [{
-            "bytes": $bytes
-        }],
-        "vet_all_packages": true,
-        "synchronize_vetting": true
-    }')
-
-# Use -insecure for self-signed certs, or remove for proper TLS
-GRPC_RESPONSE=$(echo "$GRPC_REQUEST" | grpcurl \
-    -insecure \
-    -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-    -d @ \
-    participant.dev.canton.wolfedgelabs.com:443 \
-    com.digitalasset.canton.admin.participant.v30.PackageService.UploadDar 2>&1)
-
-if [ $? -eq 0 ]; then
-    echo "✅ DAR uploaded successfully via gRPC"
-    echo ""
-    echo "Response:"
-    echo "$GRPC_RESPONSE" | jq '.' 2>/dev/null || echo "$GRPC_RESPONSE"
-    exit 0
-elif echo "$GRPC_RESPONSE" | grep -q "KNOWN_PACKAGE_VERSION"; then
-    echo "⚠️  DAR already uploaded (KNOWN_PACKAGE_VERSION) - this is OK"
-    exit 0
-else
-    echo "❌ gRPC upload also failed"
-    echo "Error: $GRPC_RESPONSE"
+    echo "Troubleshooting:"
+    echo "1. Check that the token is valid"
+    echo "2. Verify the DAR file exists: $DAR_FILE"
+    echo "3. Check network connectivity to Canton"
     exit 1
 fi
-

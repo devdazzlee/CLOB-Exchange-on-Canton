@@ -1,17 +1,27 @@
 import { motion, AnimatePresence } from 'framer-motion';
-import { TrendingUp, TrendingDown, RefreshCw, Loader2 } from 'lucide-react';
+import { TrendingUp, TrendingDown, RefreshCw, Loader2, Globe, CheckCircle2 } from 'lucide-react';
 import { Button } from '../ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
+import { OPERATOR_PARTY_ID } from '../../config/authConfig';
 
+/**
+ * OrderBookCard - Displays the GLOBAL order book
+ * 
+ * IMPORTANT: Users do NOT create order books.
+ * The order book is owned by the Operator (venue) and is shared by all users.
+ * This component shows the global market state, like Hyperliquid or other pro exchanges.
+ */
 export default function OrderBookCard({ 
   tradingPair, 
   orderBook, 
   loading, 
-  onRefresh, 
+  onRefresh,
+  // DEPRECATED: These props are no longer used in Global OrderBook model
   onCreateOrderBook, 
   creatingOrderBook 
 }) {
   const isEmpty = orderBook.buys.length === 0 && orderBook.sells.length === 0;
+  const isConnectedToGlobalMarket = true; // Always connected to global market
 
   // Calculate cumulative depth for visualization
   const calculateDepth = (orders) => {
@@ -43,18 +53,22 @@ export default function OrderBookCard({
     <Card>
       <CardHeader>
         <div className="flex items-center justify-between">
-          <CardTitle>Order Book - {tradingPair}</CardTitle>
-          <div className="flex items-center space-x-2">
-            {isEmpty && !loading && (
-              <Button
-                onClick={onCreateOrderBook}
-                disabled={creatingOrderBook}
-                variant="default"
-                size="sm"
-              >
-                {creatingOrderBook ? 'Creating...' : 'Create OrderBook'}
-              </Button>
+          <div className="flex items-center gap-2">
+            <CardTitle>Order Book - {tradingPair}</CardTitle>
+            {/* Global Market Indicator */}
+            {isConnectedToGlobalMarket && (
+              <div className="flex items-center gap-1.5 px-2 py-1 bg-success/10 border border-success/20 rounded-full">
+                <Globe className="w-3 h-3 text-success" />
+                <span className="text-xs font-medium text-success">Global Market</span>
+              </div>
             )}
+          </div>
+          <div className="flex items-center space-x-2">
+            {/* Connected Status */}
+            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <CheckCircle2 className="w-3 h-3 text-success" />
+              <span>Connected</span>
+            </div>
             <Button
               variant="ghost"
               size="icon"

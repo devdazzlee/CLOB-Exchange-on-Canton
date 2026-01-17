@@ -3,6 +3,7 @@ name: clob-exchange-utxo
 version: 1.0.0
 source: daml
 exposed-modules:
+  - MasterOrderBook
   - OrderBook
   - Order
   - UserAccount

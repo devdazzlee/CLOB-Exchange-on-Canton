@@ -472,17 +472,24 @@ export default function TradingInterface({ partyId }) {
     }
   }, [partyId, tradingPair]);
 
-  // Order book creation - DISABLED: Users cannot create OrderBooks
-  // OrderBooks must be created by an operator/admin and are global (shared across all users)
+  // ==========================================================================
+  // GLOBAL ORDER BOOK MODEL
+  // ==========================================================================
+  // OrderBooks are GLOBAL and owned by the Operator (Venue).
+  // Users do NOT create order books - they interact with the global market.
+  // This is similar to how Hyperliquid, Lighter, and other pro exchanges work.
+  //
+  // The order book is initialized by the operator using:
+  //   node backend/scripts/deploymentScript.js
+  //
+  // Users simply trade against the global order book.
+  // ==========================================================================
+
+  // DEPRECATED: handleCreateOrderBook is no longer used
+  // Kept for backward compatibility but does nothing
   const handleCreateOrderBook = async () => {
-    await showModal({
-      title: '⚠ Cannot Create OrderBook',
-      message: `OrderBooks are global and shared across all users.\n\nThey must be created by an exchange operator, not individual users.\n\nPlease contact the operator to create the OrderBook for ${tradingPair}.`,
-      type: 'warning',
-      confirmText: 'OK',
-    });
-    setCreatingOrderBook(false);
-    return { success: false, error: 'Users cannot create OrderBooks' };
+    console.warn('[TradingInterface] Create OrderBook is disabled - using Global OrderBook model');
+    return { success: false, error: 'Global OrderBook model - users cannot create order books' };
   };
 
   // Order placement
@@ -1006,8 +1013,8 @@ export default function TradingInterface({ partyId }) {
                   orderBook={orderBook}
                   loading={orderBookLoading}
                   onRefresh={() => loadOrderBook(true)}
-                  onCreateOrderBook={handleCreateOrderBook}
-                  creatingOrderBook={creatingOrderBook}
+                  // Global OrderBook model - these props are deprecated
+                  // onCreateOrderBook and creatingOrderBook are no longer used
                 />
               </div>
               

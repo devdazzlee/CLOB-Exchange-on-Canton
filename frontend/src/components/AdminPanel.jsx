@@ -1,11 +1,26 @@
 import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { Plus, CheckCircle, XCircle, Loader2, RefreshCw, Settings } from 'lucide-react';
+import { Plus, CheckCircle, XCircle, Loader2, RefreshCw, Settings, ShieldAlert, Globe } from 'lucide-react';
 import { Button } from './ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card';
 import { Input } from './ui/input';
 import { Label } from './ui/label';
+import { OPERATOR_PARTY_ID } from '../config/authConfig';
 
+/**
+ * AdminPanel - Operator-only interface for managing Global OrderBooks
+ * 
+ * ⚠️ IMPORTANT: This panel is for the OPERATOR (venue owner) only.
+ * Regular users should NOT have access to this panel.
+ * 
+ * The CLOB Exchange uses a Global OrderBook model where:
+ * - The Operator creates and owns all OrderBooks
+ * - Users trade against the global order books
+ * - Users cannot create their own order books
+ * 
+ * Alternatively, use the deployment script for initial setup:
+ *   node backend/scripts/deploymentScript.js
+ */
 export default function AdminPanel({ partyId }) {
   const [orderBooks, setOrderBooks] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -116,13 +131,33 @@ export default function AdminPanel({ partyId }) {
 
   return (
     <div className="space-y-6">
+      {/* Operator Warning Banner */}
+      <div className="p-4 bg-amber-500/10 border border-amber-500/30 rounded-lg">
+        <div className="flex items-start gap-3">
+          <ShieldAlert className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
+          <div>
+            <h3 className="font-semibold text-amber-500">Operator Access Only</h3>
+            <p className="text-sm text-muted-foreground mt-1">
+              This panel is for the <strong>Venue Operator</strong> only. Regular users should trade via the Trading Interface.
+              OrderBooks created here are global and shared by all users.
+            </p>
+            <p className="text-xs text-muted-foreground mt-2 font-mono">
+              Operator: {OPERATOR_PARTY_ID.substring(0, 40)}...
+            </p>
+          </div>
+        </div>
+      </div>
+
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-3xl font-bold text-foreground flex items-center gap-2">
             <Settings className="w-8 h-8" />
-            Admin Panel
+            Operator Admin Panel
           </h2>
-          <p className="text-muted-foreground mt-1">Manage OrderBooks and Exchange Configuration</p>
+          <p className="text-muted-foreground mt-1 flex items-center gap-2">
+            <Globe className="w-4 h-4" />
+            Manage Global OrderBooks for the Exchange
+          </p>
         </div>
         <Button
           onClick={loadOrderBooks}
