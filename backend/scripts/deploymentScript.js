@@ -92,13 +92,25 @@ async function createOrderBook(tradingPair) {
     
     if (response.ok) {
       console.log(`[Deployment] ✅ OrderBook for ${tradingPair} created successfully!`);
+      if (data.contractId) {
+        console.log(`[Deployment]    Contract ID: ${data.contractId.substring(0, 50)}...`);
+      }
       return { success: true, tradingPair, data };
     } else if (response.status === 409) {
       console.log(`[Deployment] ℹ️  OrderBook for ${tradingPair} already exists`);
       return { success: true, tradingPair, alreadyExists: true, data };
     } else {
-      console.error(`[Deployment] ❌ Failed to create OrderBook for ${tradingPair}:`, data.error || data.message);
-      return { success: false, tradingPair, error: data.error || data.message };
+      // Show full error details
+      console.error(`[Deployment] ❌ Failed to create OrderBook for ${tradingPair}`);
+      console.error(`[Deployment]    Status: ${response.status}`);
+      console.error(`[Deployment]    Error: ${data.error || data.message || 'Unknown error'}`);
+      if (data.details) {
+        console.error(`[Deployment]    Details: ${typeof data.details === 'string' ? data.details.substring(0, 500) : JSON.stringify(data.details).substring(0, 500)}`);
+      }
+      if (data.tried) {
+        console.error(`[Deployment]    Templates tried: ${data.tried.join(', ')}`);
+      }
+      return { success: false, tradingPair, error: data.error || data.message || `HTTP ${response.status}` };
     }
   } catch (error) {
     console.error(`[Deployment] ❌ Error creating OrderBook for ${tradingPair}:`, error.message);

@@ -564,8 +564,20 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
         errorData = { code: 'UNKNOWN', cause: errorText };
       }
       
-      // If MasterOrderBook doesn't exist, try OrderBook:OrderBook as fallback
-      if (errorData.code === 'TEMPLATES_OR_INTERFACES_NOT_FOUND' && templateIdToUse.includes('MasterOrderBook')) {
+      console.error('[Create OrderBook] Error response:', {
+        status: createResponse.status,
+        code: errorData.code,
+        cause: errorData.cause,
+        templateId: templateIdToUse
+      });
+      
+      // If MasterOrderBook doesn't exist (404 or TEMPLATES_OR_INTERFACES_NOT_FOUND), try OrderBook:OrderBook as fallback
+      const isTemplateNotFound = 
+        errorData.code === 'TEMPLATES_OR_INTERFACES_NOT_FOUND' ||
+        (createResponse.status === 404 && errorText.includes('TEMPLATE')) ||
+        (errorText.includes('MasterOrderBook') && errorText.includes('not found'));
+      
+      if (isTemplateNotFound && templateIdToUse.includes('MasterOrderBook')) {
         console.log('[Admin] MasterOrderBook not found, falling back to OrderBook:OrderBook...');
         const packageIdFromTemplate = templateIdToUse.split(':')[0];
         templateIdToUse = `${packageIdFromTemplate}:OrderBook:OrderBook`;
@@ -595,12 +607,27 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
         
         if (!fallbackResponse.ok) {
           const fallbackErrorText = await fallbackResponse.text();
-          console.error('[Create OrderBook] Fallback also failed:', fallbackResponse.status, fallbackErrorText);
+          let fallbackErrorData;
+          try {
+            fallbackErrorData = JSON.parse(fallbackErrorText);
+          } catch {
+            fallbackErrorData = { code: 'UNKNOWN', cause: fallbackErrorText };
+          }
+          
+          console.error('[Create OrderBook] Fallback also failed:', {
+            status: fallbackResponse.status,
+            code: fallbackErrorData.code,
+            cause: fallbackErrorData.cause,
+            templateId: templateIdToUse
+          });
+          
           return res.status(fallbackResponse.status).json({
             error: 'Failed to create OrderBook',
+            message: fallbackErrorData.cause || fallbackErrorData.message || fallbackErrorText,
             details: fallbackErrorText,
             status: fallbackResponse.status,
-            tried: ['MasterOrderBook:MasterOrderBook', 'OrderBook:OrderBook']
+            tried: ['MasterOrderBook:MasterOrderBook', 'OrderBook:OrderBook'],
+            errorCode: fallbackErrorData.code
           });
         }
         
