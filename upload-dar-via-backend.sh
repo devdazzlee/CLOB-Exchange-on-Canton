@@ -1,37 +1,41 @@
 #!/bin/bash
 
-# DEBUG VERSION - PRINTS ERROR DETAILS
-CLIENT_ID="snp3u6udkFF983rfprvsBbx3X3mBpw"
-CLIENT_SECRET="l5Td3OUSanQoGeNMWg2nnPxq1VYc"
-TOKEN_URL="https://keycloak.wolfedgelabs.com:8443/realms/canton-devnet/protocol/openid-connect/token"
+# DAR Upload Script - Uses Backend Admin Service
+# This script leverages the backend's working CantonAdmin service to get the token
+# This avoids authentication issues by using the same method the backend uses
 
-echo "🔐 Fetching Admin Token..."
+echo "🔐 Getting Admin Token via Backend Service..."
 
-# 1. Capture the full response
-response=$(curl -k -s -X POST $TOKEN_URL \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "grant_type=client_credentials" \
-  -d "client_id=$CLIENT_ID" \
-  -d "client_secret=$CLIENT_SECRET" \
-  -d "scope=daml_ledger_api")
+# Change to backend directory to use the admin service
+cd "$(dirname "$0")/backend" || exit 1
 
-# 2. Print the response for debugging
-echo "🔍 Debug - Keycloak Response:"
-echo "$response"
+# Use Node.js to get the admin token from the backend's CantonAdmin service
+ADMIN_TOKEN=$(node -e "
+const CantonAdmin = require('./canton-admin');
+const admin = new CantonAdmin();
+admin.getAdminToken()
+  .then(token => {
+    console.log(token);
+    process.exit(0);
+  })
+  .catch(err => {
+    console.error('ERROR:', err.message);
+    process.exit(1);
+  });
+")
 
-# 3. Extract Token
-jwt_token=$(echo $response | jq -r .access_token)
-
-if [ "$jwt_token" == "null" ] || [ -z "$jwt_token" ]; then
-  echo "❌ Failed to get token."
+if [ $? -ne 0 ] || [ -z "$ADMIN_TOKEN" ]; then
+  echo "❌ Failed to get admin token from backend service"
+  echo "💡 Make sure backend/.env has KEYCLOAK_ADMIN_CLIENT_ID and KEYCLOAK_ADMIN_CLIENT_SECRET set"
   exit 1
 fi
 
-echo "✅ Token received!"
-# ... rest of the script is fine ...
+echo "✅ Token received from backend service"
 
-# 2. CONFIGURATION
-# Point directly to where 'daml build' creates the file
+# Go back to project root
+cd "$(dirname "$0")" || exit 1
+
+# Configuration
 DAR_DIRECTORY=".daml/dist" 
 PARTICIPANT_HOST="participant.dev.canton.wolfedgelabs.com"
 CANTON_ADMIN_GRPC_PORT=443
@@ -62,7 +66,7 @@ upload_dar() {
   # Execute gRPC call
   echo "🚀 Executing gRPC upload..."
   grpcurl \
-    -H "Authorization: Bearer ${jwt_token}" \
+    -H "Authorization: Bearer ${ADMIN_TOKEN}" \
     -d @ \
     ${canton_admin_api_url} ${canton_admin_api_grpc_package_service}.UploadDar \
     < <(echo ${grpc_upload_dar_request} | json)
@@ -75,13 +79,13 @@ upload_dar() {
   fi
 }
 
-# 3. EXECUTION
+# Find and upload DAR file
 if [ -d ${DAR_DIRECTORY} ]; then
-  # Find the .dar file automatically
-  dar_file=$(find ${DAR_DIRECTORY} -name "*.dar" | head -n 1)
+  dar_file=$(find ${DAR_DIRECTORY} -name "clob-exchange-splice*.dar" | head -n 1)
   
   if [ -z "$dar_file" ]; then
-    echo "❌ No .dar file found in ${DAR_DIRECTORY}. Did you run 'daml build'?"
+    echo "❌ No clob-exchange-splice DAR file found in ${DAR_DIRECTORY}"
+    echo "💡 Run 'daml build' first"
     exit 1
   fi
 

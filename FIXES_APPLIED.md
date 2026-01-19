@@ -1,124 +1,125 @@
-# Fixes Applied
+# Fixes Applied to Resolve Build and Runtime Issues
 
 ## Issues Fixed
 
-### 1. ✅ Admin Routes 404 Error
+### 1. ✅ DAML Build Error - Splice Packages Not Found
 
-**Problem**: `Cannot POST /api/admin/orderbooks/:tradingPair` - 404 errors
+**Error:**
+```
+damlc: /Users/mac/.daml/sdk/3.4.9/daml-libs/splice-token-standard-2.2.dar: openBinaryFile: does not exist
+```
 
-**Root Cause**: 
-- Admin routes were defined AFTER the catch-all `/api/ledger/*` route
-- Express matches routes in order, so the catch-all was intercepting admin requests
-- Duplicate route definitions
+**Fix Applied:**
+- Commented out Splice dependencies in `daml.yaml`
+- Added instructions for installing Splice packages
 
-**Fix Applied**:
-- Moved admin routes BEFORE the catch-all route (around line 224)
-- Removed duplicate route definitions
-- Added proper URL decoding for trading pair parameter
-- Routes now properly defined:
-  - `POST /api/admin/orderbooks/:tradingPair` (line 224)
-  - `POST /api/admin/orderbooks` (line 350)
+**Next Steps:**
+1. Install Splice Token Standard packages in your DAML SDK
+2. Add DAR files to `~/.daml/sdk/3.4.9/daml-libs/`
+3. Uncomment the Splice dependencies in `daml.yaml`
 
-**Result**: Admin endpoints now work correctly
+**To Build Without Splice (for now):**
+```bash
+cd CLOB-Exchange-on-Canton
+daml build
+```
 
-### 2. ✅ Order Mode Checkbox Not Working
+**Note:** The contracts will compile but won't have Splice Allocation functionality until packages are installed.
 
-**Problem**: RadioGroup for Order Mode (Limit/Market) not responding to clicks
+---
 
-**Root Cause**: 
-- RadioGroup was using `onValueChange` (Radix UI pattern) but component uses custom `onChange`
-- Mismatch between component API and usage
+### 2. ✅ Matchmaker TypeScript Error
 
-**Fix Applied**:
-- Changed to use RadioGroupItem's `onChange` prop directly
-- Each RadioGroupItem now has explicit `checked` and `onChange` handlers
-- Added console logging for debugging
+**Error:**
+```
+Error: Cannot find module 'ts-node/register'
+```
 
-**Result**: Order mode selection now works correctly
+**Fix Applied:**
+- Converted `backend/matchmaker.ts` to `backend/matchmaker.js`
+- Removed TypeScript dependencies
+- Uses global `fetch` (available in Node.js 18+)
 
-### 3. ✅ Percentage Buttons Not Working
+**To Run Matchmaker:**
+```bash
+cd backend
+node matchmaker.js
+```
 
-**Problem**: 25%, 50%, 75%, 100% buttons not calculating/setting quantity
+---
 
-**Root Cause**:
-- `calculatePercentage` function had issues with:
-  - Market price handling
-  - Balance checks
-  - Price calculation logic
+### 3. ⚠️ Upload Script Authentication Error
 
-**Fix Applied**:
-- Enhanced `calculatePercentage` function with:
-  - Better error handling and logging
-  - Proper market price vs limit price handling
-  - Improved balance calculations
-  - Console logging for debugging
+**Error:**
+```
+{"error":"invalid_client","error_description":"Invalid client or Invalid client credentials"}
+```
 
-**Result**: Percentage buttons now correctly calculate and set quantities
+**Status:** 
+- Debug output added to script (already done by user)
+- This indicates the client credentials may be incorrect or the client is not configured for `client_credentials` flow in Keycloak
 
-## Testing Instructions
+**Possible Causes:**
+1. Client ID or Secret is incorrect
+2. Client is not enabled for `client_credentials` grant type
+3. Client doesn't have `daml_ledger_api` scope
 
-### Test Admin Routes
+**Troubleshooting Steps:**
+1. Verify client credentials in Keycloak admin console
+2. Check that the client has `client_credentials` grant type enabled
+3. Verify the client has `daml_ledger_api` scope assigned
+4. Try using the backend's admin token instead (see below)
 
-1. **Restart backend server** (important - routes were reordered):
-   ```bash
-   cd backend
-   yarn dev
-   ```
+**Alternative: Use Backend Admin Token**
+Instead of using the upload script, you can use the backend's existing admin service:
 
-2. **Test single OrderBook creation**:
-   ```bash
-   curl -X POST http://localhost:3001/api/admin/orderbooks/BTC%2FUSDT
-   ```
+```bash
+# The backend already has CantonAdmin service that gets tokens
+# You can create a script that uses it:
+cd backend
+node -e "
+const CantonAdmin = require('./canton-admin');
+const admin = new CantonAdmin();
+admin.getAdminToken().then(token => {
+  console.log('Admin token:', token.substring(0, 50) + '...');
+  // Use this token for DAR upload
+});
+"
+```
 
-3. **Test multiple OrderBooks**:
-   ```bash
-   curl -X POST http://localhost:3001/api/admin/orderbooks \
-     -H "Content-Type: application/json" \
-     -d '{"tradingPairs": ["BTC/USDT", "ETH/USDT", "SOL/USDT"]}'
-   ```
+---
 
-4. **Access admin panel**:
-   - Navigate to: `http://localhost:3000/admin`
-   - Create OrderBooks via UI
-   - Verify they appear in the list
+## Summary
 
-### Test Order Form
+✅ **Fixed:**
+- DAML build (commented out Splice deps)
+- Matchmaker (converted to JavaScript)
 
-1. **Order Mode Selection**:
-   - Click "Limit" radio button → Should select Limit mode
-   - Click "Market" radio button → Should select Market mode
-   - Price field should enable/disable accordingly
+⚠️ **Needs Attention:**
+- Splice packages installation
+- Upload script authentication (Keycloak client configuration)
 
-2. **Percentage Buttons**:
-   - Enter a price (for limit orders)
-   - Click 25% → Should set quantity to 25% of available balance
-   - Click 50% → Should set quantity to 50% of available balance
-   - Click 75% → Should set quantity to 75% of available balance
-   - Click 100% → Should set quantity to 100% of available balance
-   - Check browser console for calculation logs
-
-## Files Modified
-
-1. `backend/server.js`:
-   - Moved admin routes before catch-all route
-   - Removed duplicate route definitions
-   - Added URL decoding for trading pair
-
-2. `frontend/src/components/trading/OrderForm.jsx`:
-   - Fixed RadioGroup usage for Order Mode
-   - Enhanced percentage button calculation
-   - Added debugging logs
+---
 
 ## Next Steps
 
-1. **Restart backend server** to apply route changes
-2. **Test admin panel** at `/admin` route
-3. **Test order form** functionality
-4. **Verify OrderBooks** are created and visible
+1. **Build DAML Contracts:**
+   ```bash
+   cd CLOB-Exchange-on-Canton
+   daml build
+   ```
 
-## Important Notes
+2. **Install Splice Packages** (when ready):
+   - Follow Splice installation documentation
+   - Add DAR files to DAML SDK libs directory
+   - Uncomment dependencies in `daml.yaml`
 
-- **Server restart required**: Route ordering changes require server restart
-- **Route order matters**: Admin routes MUST come before `/api/ledger/*`
-- **URL encoding**: Trading pairs are URL-encoded (e.g., `BTC%2FUSDT` = `BTC/USDT`)
+3. **Fix Upload Authentication:**
+   - Check Keycloak client configuration
+   - Or use backend's admin token service
 
+4. **Test Matchmaker:**
+   ```bash
+   cd backend
+   node matchmaker.js
+   ```

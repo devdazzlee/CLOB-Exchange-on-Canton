@@ -44,7 +44,156 @@ class OrderService {
   }
 
   /**
-   * Place order with UTXO handling
+   * Place order with Splice Allocation (NEW - replaces UTXO handling)
+   * Uses Allocation CID created by frontend (Step A of two-step process)
+   */
+  async placeOrderWithAllocation(partyId, tradingPair, orderType, orderMode, quantity, price, orderBookContractId, allocationCid) {
+    try {
+      console.log(`[Order Service] Placing order with Splice Allocation for ${partyId}`);
+      console.log(`[Order Service] Allocation CID: ${allocationCid.substring(0, 30)}...`);
+      
+      // Step 1: Get admin token for Ledger API
+      const adminToken = await this.cantonAdmin.getAdminToken();
+      const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
+
+      // Step 2: Get OrderBook to find operator and template
+      const activeAtOffset = await getActiveAtOffset(adminToken);
+      const orderBookResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${adminToken}`
+        },
+        body: JSON.stringify({
+          activeAtOffset: activeAtOffset,
+          filter: {
+            filtersForAnyParty: {
+              inclusive: {
+                contractIds: [orderBookContractId]
+              }
+            }
+          }
+        })
+      });
+
+      if (!orderBookResponse.ok) {
+        throw new Error('Failed to fetch OrderBook');
+      }
+
+      const orderBookData = await orderBookResponse.json();
+      const orderBook = orderBookData.activeContracts?.[0]?.contractEntry?.JsActiveContract?.createdEvent || 
+                       orderBookData.activeContracts?.[0]?.createdEvent ||
+                       orderBookData.activeContracts?.[0];
+      
+      const operator = orderBook?.createArgument?.operator || orderBook?.argument?.operator;
+      if (!operator) {
+        throw new Error('OrderBook operator not found');
+      }
+
+      // Step 3: Place order via AddOrder choice with Allocation CID
+      const orderId = `ORDER-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      const commandId = `place-order-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+      const orderBookTemplateId = orderBook?.templateId || 'MasterOrderBook:MasterOrderBook';
+      
+      // Determine actAs parties
+      const actAsParties = [partyId];
+      if (operator && operator !== partyId) {
+        actAsParties.push(operator);
+      }
+
+      // Build AddOrder argument with Allocation CID
+      const addOrderArgument = {
+        orderId: orderId,
+        owner: partyId,
+        orderType: orderType,
+        orderMode: orderMode,
+        price: orderMode === 'LIMIT' && price ? price.toString() : null,
+        quantity: quantity.toString(),
+        allocationCid: allocationCid // CRITICAL: Pass Allocation CID for Splice model
+      };
+
+      console.log('[Order Service] Exercising AddOrder with Allocation:', {
+        orderId,
+        allocationCid: allocationCid.substring(0, 30) + '...',
+        orderType,
+        quantity
+      });
+
+      const exerciseResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/commands/submit-and-wait`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${adminToken}`
+        },
+        body: JSON.stringify({
+          commandId: commandId,
+          commands: [{
+            ExerciseCommand: {
+              templateId: orderBookTemplateId,
+              contractId: orderBookContractId,
+              choice: 'AddOrder',
+              choiceArgument: addOrderArgument
+            }
+          }],
+          actAs: actAsParties
+        })
+      });
+
+      if (!exerciseResponse.ok) {
+        const errorText = await exerciseResponse.text();
+        let error;
+        try {
+          error = JSON.parse(errorText);
+        } catch {
+          error = { message: errorText };
+        }
+        throw new Error(error.message || error.cause || `Failed to place order: ${exerciseResponse.statusText}`);
+      }
+
+      const result = await exerciseResponse.json();
+
+      console.log(`[Order Service] ✅ Order placed successfully with Allocation. Update ID: ${result.updateId}`);
+
+      // Extract order contract ID if available in response
+      let orderContractId = null;
+      if (result.events && Array.isArray(result.events)) {
+        for (const event of result.events) {
+          if (event.created?.contractId && event.created?.templateId?.includes('Order')) {
+            orderContractId = event.created.contractId;
+            console.log(`[Order Service] ✅ Order contract ID from response: ${orderContractId.substring(0, 50)}...`);
+            break;
+          }
+        }
+      }
+
+      // Check if trades were created (matchmaking executed)
+      let tradesCreated = 0;
+      if (result.events && Array.isArray(result.events)) {
+        tradesCreated = result.events.filter(e => e.created?.templateId?.includes('Trade')).length;
+        if (tradesCreated > 0) {
+          console.log(`[Order Service] ✅ Matchmaking executed! ${tradesCreated} trade(s) created`);
+        }
+      }
+
+      return {
+        success: true,
+        orderId: orderId,
+        orderContractId: orderContractId,
+        updateId: result.updateId,
+        completionOffset: result.completionOffset,
+        allocationUsed: allocationCid,
+        tradesCreated: tradesCreated,
+        matchmakingExecuted: tradesCreated > 0
+      };
+    } catch (error) {
+      console.error('[Order Service] Error placing order with Allocation:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Place order with UTXO handling (DEPRECATED - kept for backward compatibility)
    * 1. Check balance and merge UTXOs if needed
    * 2. Place order via Ledger API
    * 3. Return result

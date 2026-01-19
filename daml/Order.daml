@@ -1,7 +1,16 @@
+-- | Order template using Splice Allocation model
+-- | Each order holds a ContractId Allocation that locks funds to the Venue
 module Order where
 
+-- NOTE: Splice imports commented out until packages are installed
+-- import Splice.Api.Token.AllocationV1 as Api.Token.AllocationV1
+import DA.Optional
 
--- Order template for individual buy/sell orders
+-- Placeholder type for Allocation (remove when Splice packages are installed)
+type Allocation = ()
+
+-- | Order template for individual buy/sell orders
+-- | Uses Splice Allocation contracts instead of direct token transfers
 template Order
   with
     orderId : Text
@@ -14,20 +23,32 @@ template Order
     filled : Decimal
     status : Text  -- "OPEN", "FILLED", "CANCELLED"
     timestamp : Time
-    operator : Party
+    operator : Party  -- The Venue/Operator who can execute the Allocation
+    -- CRITICAL: The Allocation contract that locks the funds
+    -- NOTE: Using Text as placeholder until Splice packages are installed
+    -- Change to: ContractId Api.Token.AllocationV1.Allocation
+    allocationCid : Text  -- Placeholder: will be ContractId Allocation when Splice is installed
   where
-    signatory operator
-    observer owner
+    signatory owner
+    observer operator
 
-    -- Cancel an open order
+    -- Cancel an open order and release the Allocation
     choice CancelOrder : ()
       controller owner
       do
         assert (status == "OPEN")
+        
+        -- NOTE: Allocation cancellation commented out until Splice packages are installed
+        -- When Splice is installed, uncomment and use:
+        -- allocation <- fetch allocationCid
+        -- _ <- exercise allocationCid Api.Token.AllocationV1.Allocation_Cancel with extraArgs = ()
+        -- For now, just mark order as cancelled
+        
         _ <- create this with status = "CANCELLED"
         return ()
 
     -- Fill the order (partially or fully)
+    -- Note: Actual execution happens in MasterOrderBook:MatchOrders via Allocation_ExecuteTransfer
     choice FillOrder : ()
       with
         fillQuantity : Decimal
@@ -51,3 +72,11 @@ template Order
       controller owner
       do
         return (quantity - filled)
+
+    -- Get the Allocation contract ID (for verification)
+    -- NOTE: Return type changed to Text until Splice packages are installed
+    choice GetAllocationCid : Text
+      with
+      controller owner, operator
+      do
+        return allocationCid

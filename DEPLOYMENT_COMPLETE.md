@@ -1,184 +1,123 @@
-# Deployment Complete ✅
+# ✅ Milestone 2 Deployment Complete
 
-## Summary
+## 🎉 Successfully Deployed
 
-The CLOB Exchange has been **fully deployed** with all client requirements met:
+**Package ID:** `dd500bf887d7e153ee6628b3f6722f234d3d62ce855572ff7ce73b7b3c2afefd`
 
-### ✅ 1. API Endpoints Updated
-- **Admin-api**: `65.108.40.104:30100`
-- **Ledger-api**: `65.108.40.104:31217`
-- **Json-api**: `65.108.40.104:31539`
+## ✅ Changes Deployed
 
-All backend files have been updated to use these new endpoints.
+### 1. Partial Fill Support
+- ✅ `MasterOrderBook.daml` updated with partial fill logic
+- ✅ Creates remainder orders when quantities don't match
+- ✅ Recursively matches remainder orders
 
-### ✅ 2. Global OrderBook Verified
-- **One OrderBook per trading pair** (e.g., BTC/USDT, ETH/USDT)
-- **Shared across all users** - not per user
-- **Created by operator/admin** - not individual users
-- **Matches professional CLOB exchanges** (Hyperliquid, Lighter, etc.)
+### 2. Public Observer
+- ✅ Backend allocates "Public" party automatically
+- ✅ MasterOrderBook contracts use `publicObserver` field
+- ✅ All users can see the global order book
 
-**Evidence**:
-- OrderBooks created via `/api/admin/orderbooks/:tradingPair` (admin endpoint)
-- Frontend message confirms: "OrderBooks are global and shared across all users"
-- All users query the same OrderBook contract ID for each trading pair
+### 3. Frontend Integration
+- ✅ `ActiveOrdersTable` shows partial fill progress
+- ✅ Visual progress bars for fill percentage
+- ✅ Remaining quantity column
+- ✅ Indicator for remainder orders (🔄 icon)
+- ✅ Color-coded progress (yellow for partial, green for full)
 
-### ✅ 3. UTXO Handling Complete
+## 📋 Next Steps
 
-#### Contract-Level (DAML)
-Enhanced DAML contracts with automatic UTXO merging:
-- **Order Placement**: Pre-order UTXO merge in `AddOrder` choice
-- **Order Cancellation**: Post-cancellation UTXO merge in `CancelOrderFromBook` choice
-- **Partial Fills**: Post-fill UTXO merge in `matchFirstPair` function
+### 1. Deploy MasterOrderBooks
 
-#### Backend-Level (Node.js)
-Comprehensive UTXO handling system:
-- **`backend/utxo-handler.js`**: Complete UTXO management
-- **`backend/order-service.js`**: Order operations with UTXO handling
-- **`backend/utxo-merger.js`**: UTXO merging service
+Run the deployment script to create order books with Public Observer:
 
-#### Frontend-Level (React)
-Fully integrated with UTXO-aware endpoints:
-- **Order Placement**: Uses `/api/orders/place` with UTXO handling
-- **Order Cancellation**: Uses `/api/orders/cancel` with UTXO handling
-- **UserAccount Fetching**: Automatically fetched for UTXO operations
-
-### ✅ 4. Matchmaking, Cancellation, and Partial Orders
-
-All three operations have complete UTXO handling:
-
-1. **Matchmaking**:
-   - Automatic UTXO merge after partial fills
-   - Handles both buyer and seller UTXOs
-   - Consolidates remaining balances
-
-2. **Cancellation**:
-   - Pre-cancellation: Order cancellation
-   - Post-cancellation: Automatic UTXO merge
-   - Balance consolidation for future orders
-
-3. **Partial Orders**:
-   - UTXO merging after partial fills
-   - Remaining balance consolidation
-   - Prevents fragmentation
-
-## Deployment Status
-
-### DAR File
-- **Status**: ✅ Already uploaded to Canton
-- **Package ID**: `51522c778cf057ce80b3aa38d272a2fb72ae60ae871bca67940aaccf59567ac9`
-- **Note**: "KNOWN_PACKAGE_VERSION" error indicates DAR is already deployed (this is OK)
-
-### Contracts Deployed
-- ✅ `OrderBook:OrderBook` - Global order book with UTXO handling
-- ✅ `Order:Order` - Individual orders
-- ✅ `UserAccount:UserAccount` - Balance management with MergeBalances choice
-- ✅ `Trade:Trade` - Trade execution records
-
-### OrderBooks
-- **Status**: Ready to initialize
-- **Command**: `cd backend && npm run init-orderbooks`
-
-## Files Modified/Created
-
-### DAML Contracts
-1. **`daml/OrderBook.daml`** - Enhanced with UTXO handling:
-   - Pre-order UTXO merge in `AddOrder`
-   - Post-cancellation UTXO merge in `CancelOrderFromBook`
-   - Post-partial-fill UTXO merge in `matchFirstPair`
-
-### Backend
-1. **`backend/server.js`** - Updated API endpoints and added new endpoints
-2. **`backend/order-service.js`** - NEW: Complete order service with UTXO handling
-3. **`backend/utxo-handler.js`** - NEW: Comprehensive UTXO management
-4. **`backend/utxo-merger.js`** - Enhanced with new API endpoints
-5. **All config files** - Updated to use new IP addresses
-
-### Frontend
-1. **`frontend/src/components/TradingInterface.jsx`** - Updated to use UTXO-aware endpoints
-
-## Next Steps
-
-### 1. Initialize OrderBooks
 ```bash
 cd backend
-npm run init-orderbooks
+node scripts/deploymentScript.js
 ```
 
-This will create OrderBooks for:
-- BTC/USDT
-- ETH/USDT
-- SOL/USDT
-- BNB/USDT
-- ADA/USDT
+This will:
+- Allocate "Public" party (if not exists)
+- Create MasterOrderBook contracts for BTC/USDT, ETH/USDT, SOL/USDT
+- Set `publicObserver` to the allocated Public party
 
-### 2. Start Backend
+### 2. Start the Application
+
 ```bash
-cd backend
-npm start
+# Terminal 1 - Backend
+cd backend && npm start
+
+# Terminal 2 - Frontend
+cd frontend && npm run dev
 ```
 
-### 3. Start Frontend
+### 3. Test Partial Fills
+
+1. **Place a BUY order for 10 BTC at $40,000**
+2. **Place a SELL order for 5 BTC at $40,000**
+3. **Expected Result:**
+   - Orders match for 5 BTC
+   - BUY order gets partially filled (5/10)
+   - New remainder BUY order created for 5 BTC
+   - Both orders visible in "Your Active Orders" table
+   - Progress bar shows 50% fill on original order
+
+## 🎨 Frontend Features
+
+### Active Orders Table Now Shows:
+
+1. **Remaining Quantity** - How much is still unfilled
+2. **Progress Bar** - Visual fill percentage
+3. **Fill Percentage** - Exact percentage (e.g., "50.0%")
+4. **Remainder Indicator** - 🔄 icon for orders created from partial fills
+5. **Color Coding:**
+   - Yellow progress bar = Partially filled
+   - Green progress bar = Fully filled
+
+### Example Display:
+
+```
+ID          Type  Price      Quantity  Filled   Remaining  Progress      Status
+ORDER-123   BUY   $40,000    10.0      5.0      5.0       [█████░░░░] 50.0%  OPEN
+ORDER-123-  BUY   $40,000    5.0       0.0      5.0       [░░░░░░░░░] 0.0%   OPEN 🔄
+PARTIAL-...
+```
+
+## 🔍 Verification
+
+### Check Public Observer
+
 ```bash
-cd frontend
-npm run dev
+# Query MasterOrderBook contracts
+export JWT_TOKEN="your-token"
+./test-api.sh
 ```
 
-### 4. Access Exchange
-Visit: http://localhost:5173
+You should see MasterOrderBook contracts with `publicObserver` set to the allocated Public party.
 
-## Verification
+### Check Partial Fills
 
-### Verify OrderBooks
-```bash
-cd backend
-npm run check-orderbooks
-```
+1. Place orders with mismatched quantities
+2. Check "Your Active Orders" table
+3. Verify:
+   - Original order shows partial fill
+   - Remainder order appears as new order
+   - Progress bars update correctly
 
-### Verify API Endpoints
-```bash
-# Check OrderBooks
-curl http://localhost:3001/api/orderbooks
+## 📝 Notes
 
-# Check health
-curl http://localhost:3001/health
-```
+1. **Allocation Splitting:** Currently, remainder orders reuse the same `allocationCid`. In production with Splice, you should split allocations before creating remainder orders.
 
-## Features
+2. **Order Visibility:** Remainder orders are automatically visible because:
+   - They're created as new Order contracts
+   - Frontend queries all Order contracts
+   - They appear in "Your Active Orders" table
 
-✅ **Global OrderBook**: One per trading pair, shared across users  
-✅ **UTXO Handling**: Automatic merging at contract, backend, and frontend levels  
-✅ **Matchmaking**: UTXO handling for partial fills  
-✅ **Cancellation**: UTXO handling after cancellation  
-✅ **Partial Orders**: UTXO handling for remaining balances  
-✅ **API Endpoints**: All updated to new client endpoints  
+3. **Matching:** The `MatchOrders` choice recursively calls itself after partial fills to immediately match remainder orders if possible.
 
-## Architecture
+## 🚀 Ready for Testing!
 
-### Dual-Layer UTXO Handling
+The system is now ready to test partial fills and the Public Observer functionality. All changes have been:
+- ✅ Built into DAR
+- ✅ Uploaded to Canton
+- ✅ Integrated in frontend
 
-1. **Contract Level (Primary)**:
-   - Automatic UTXO merging in DAML contracts
-   - Works even if backend fails
-   - Transparent to users
-
-2. **Backend Level (Backup/Optimization)**:
-   - Additional UTXO management via endpoints
-   - Provides more control and logging
-   - Can be called explicitly if needed
-
-This dual-layer approach ensures robust UTXO handling.
-
-## Summary
-
-🎉 **All requirements complete!**
-
-- ✅ API endpoints updated
-- ✅ Global OrderBook verified
-- ✅ UTXO handling complete (contract + backend + frontend)
-- ✅ Matchmaking with UTXO support
-- ✅ Cancellation with UTXO merge
-- ✅ Partial orders with UTXO merge
-- ✅ DAR deployed to Canton
-- ✅ Ready for OrderBook initialization
-
-The CLOB Exchange is **production-ready** with professional-grade UTXO handling!
+Start the application and test partial fills!

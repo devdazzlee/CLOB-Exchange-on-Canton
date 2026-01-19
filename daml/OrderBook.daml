@@ -256,6 +256,7 @@ template OrderBook
             status = "OPEN"
             timestamp = now
             operator = operator
+            allocationCid = "placeholder_allocation_cid"  -- Placeholder until Splice is installed
         
         let updatedBuyOrders = if orderType == "BUY" then buyOrders ++ [orderCid] else buyOrders
         let updatedSellOrders = if orderType == "SELL" then sellOrders ++ [orderCid] else sellOrders

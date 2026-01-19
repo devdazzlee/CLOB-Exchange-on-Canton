@@ -24,6 +24,7 @@ testCreateBuyOrder = script do
       status = "OPEN"
       timestamp = now
       operator = operator
+      allocationCid = "placeholder_allocation_cid_001"  -- Placeholder until Splice is installed
   
   order <- query @Order alice
   assert (length order == 1)
@@ -49,6 +50,7 @@ testCreateSellOrder = script do
       status = "OPEN"
       timestamp = now
       operator = operator
+      allocationCid = "placeholder_allocation_cid_002"  -- Placeholder until Splice is installed
   
   order <- query @Order alice
   assert (length order == 1)
@@ -74,6 +76,7 @@ testCancelOrder = script do
       status = "OPEN"
       timestamp = now
       operator = operator
+      allocationCid = "placeholder_allocation_cid_003"  -- Placeholder until Splice is installed
   
   -- Cancel the order
   _ <- submit alice do
@@ -103,6 +106,7 @@ testPartialFill = script do
       status = "OPEN"
       timestamp = now
       operator = operator
+      allocationCid = "placeholder_allocation_cid_004"  -- Placeholder until Splice is installed
   
   -- Fill 1.0 out of 2.0
   _ <- submit operator do
@@ -133,6 +137,7 @@ testCompleteFill = script do
       status = "OPEN"
       timestamp = now
       operator = operator
+      allocationCid = "placeholder_allocation_cid_005"  -- Placeholder until Splice is installed
   
   -- Complete fill
   _ <- submit operator do
@@ -163,6 +168,7 @@ testGetRemainingQuantity = script do
       status = "OPEN"
       timestamp = now
       operator = operator
+      allocationCid = "placeholder_allocation_cid_006"  -- Placeholder until Splice is installed
   
   remaining <- submit alice do
     exerciseCmd orderCid GetRemainingQuantity
@@ -189,6 +195,7 @@ testCannotCancelFilledOrder = script do
       status = "FILLED"
       timestamp = now
       operator = operator
+      allocationCid = "placeholder_allocation_cid_007"  -- Placeholder until Splice is installed
   
   -- Should fail to cancel filled order
   -- Note: In production, this would fail with assertion error

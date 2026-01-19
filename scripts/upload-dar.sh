@@ -71,36 +71,68 @@ else
 fi
 
 # Prepare gRPC request
+# If package already exists, set vet_all_packages to false to skip vetting
+# This allows uploading even if a package with the same name/version exists
 GRPC_UPLOAD_DAR_REQUEST=$(jq -n \
   --arg bytes "$BASE64_ENCODED_DAR" \
   '{
     "dars": [{
       "bytes": $bytes
     }],
-    "vet_all_packages": true,
-    "synchronize_vetting": true
+    "vet_all_packages": false,
+    "synchronize_vetting": false
   }')
 
 echo "Uploading DAR to Canton participant..."
 echo ""
 
 # Upload DAR using gRPC
+# Port 443 requires TLS, so we MUST use -insecure (not -plaintext)
+# -insecure skips certificate verification (OK for devnet)
+echo "Uploading DAR to Canton participant..."
+echo "Using TLS (port 443 requires TLS)..."
+echo ""
+
+# Use a temp file for the request to avoid pipe issues
+TEMP_REQUEST_FILE=$(mktemp)
+echo "$GRPC_UPLOAD_DAR_REQUEST" > "$TEMP_REQUEST_FILE"
+trap "rm -f $TEMP_REQUEST_FILE" EXIT
+
+# Run grpcurl directly with timeout
+# -max-time should handle timeout, but if it hangs we'll see it
+echo "Connecting to ${PARTICIPANT_HOST}:${CANTON_ADMIN_GRPC_PORT}..."
+echo "Uploading DAR file (this may take 30-60 seconds for large files)..."
+echo ""
+
+# Disable exit on error temporarily to capture the response
+set +e
+
 if [ -z "$JWT_TOKEN" ]; then
-  RESPONSE=$(echo "$GRPC_UPLOAD_DAR_REQUEST" | grpcurl \
-    -plaintext \
+  RESPONSE=$(grpcurl \
+    -insecure \
+    -max-time 120 \
     -d @ \
     "${PARTICIPANT_HOST}:${CANTON_ADMIN_GRPC_PORT}" \
-    com.digitalasset.canton.admin.participant.v30.PackageService.UploadDar 2>&1)
+    com.digitalasset.canton.admin.participant.v30.PackageService.UploadDar < "$TEMP_REQUEST_FILE" 2>&1)
 else
-  RESPONSE=$(echo "$GRPC_UPLOAD_DAR_REQUEST" | grpcurl \
+  RESPONSE=$(grpcurl \
+    -insecure \
+    -max-time 120 \
     -H "Authorization: Bearer ${JWT_TOKEN}" \
     -d @ \
     "${PARTICIPANT_HOST}:${CANTON_ADMIN_GRPC_PORT}" \
-    com.digitalasset.canton.admin.participant.v30.PackageService.UploadDar 2>&1)
+    com.digitalasset.canton.admin.participant.v30.PackageService.UploadDar < "$TEMP_REQUEST_FILE" 2>&1)
 fi
 
+GRPC_EXIT_CODE=$?
+set -e
+
+# Cleanup
+rm -f "$TEMP_REQUEST_FILE"
+trap - EXIT
+
 # Check if upload was successful
-if [ $? -eq 0 ]; then
+if [ $GRPC_EXIT_CODE -eq 0 ]; then
   echo -e "${GREEN}✓ DAR file uploaded successfully!${NC}"
   echo ""
   echo "Response:"
@@ -117,13 +149,31 @@ if [ $? -eq 0 ]; then
   echo "2. Create initial OrderBook contracts using the frontend"
   echo "3. Test order placement and matching"
 else
-  echo -e "${RED}✗ Upload failed${NC}"
-  echo "Error:"
+  echo -e "${RED}✗ Upload failed (exit code: $GRPC_EXIT_CODE)${NC}"
+  echo ""
+  echo "Error details:"
   echo "$RESPONSE"
+  echo ""
+  
+  # Provide troubleshooting based on error
+  if [ $GRPC_EXIT_CODE -eq 124 ] || echo "$RESPONSE" | grep -qi "timeout\|timed out"; then
+    echo -e "${YELLOW}Troubleshooting:${NC}"
+    echo "1. Connection timed out - the server may not be responding"
+    echo "2. Check network connectivity: ping ${PARTICIPANT_HOST}"
+    echo "3. Check if port is accessible: nc -zv ${PARTICIPANT_HOST} ${CANTON_ADMIN_GRPC_PORT}"
+    echo "4. The server might be overloaded - try again later"
+  elif echo "$RESPONSE" | grep -qi "unauthorized\|401\|403\|permission\|forbidden"; then
+    echo -e "${YELLOW}Authentication Error:${NC}"
+    echo "1. Your token might be expired or invalid"
+    echo "2. The token might not have permission to upload DAR files"
+    echo "3. Get a fresh token from the Wallet UI"
+  elif echo "$RESPONSE" | grep -qi "connection refused\|refused"; then
+    echo -e "${YELLOW}Connection Error:${NC}"
+    echo "1. The server is not accepting connections"
+    echo "2. Check if the participant host is correct"
+    echo "3. Verify the port (443) is correct"
+  fi
+  
   exit 1
 fi
-
-
-
-
 

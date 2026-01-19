@@ -1,18 +1,23 @@
 sdk-version: 3.4.9
-name: clob-exchange-utxo
+name: clob-exchange-splice
 version: 1.0.0
 source: daml
 exposed-modules:
   - MasterOrderBook
-  - OrderBook
   - Order
-  - UserAccount
   - Trade
-  - OrderBookTest
-  - OrderTest
-  - UserAccountTest
 dependencies:
   - daml-prim
   - daml-stdlib
   - daml-script
-
+  # Splice Token Standard dependencies
+  # NOTE: These are commented out because Splice packages are not installed
+  # To use Splice, you need to:
+  # 1. Install Splice Token Standard packages in your DAML SDK
+  # 2. Add the DAR files to ~/.daml/sdk/3.4.9/daml-libs/
+  # 3. Uncomment the lines below
+  # - splice-token-standard
+  # - splice-wallet-api
+  # Alternative names if above don't work:
+  # - splice-api-token-allocation-v1
+  # - splice-api-token-metadata-v1

@@ -46,6 +46,7 @@ testAddBuyOrder = script do
       status = "OPEN"
       timestamp = now
       operator = operator
+      allocationCid = "placeholder_allocation_cid_008"  -- Placeholder until Splice is installed
   
   -- Create order book
   obCid <- submit operator do
@@ -125,6 +126,7 @@ testRemoveOrder = script do
       status = "FILLED"
       timestamp = now
       operator = operator
+      allocationCid = "placeholder_allocation_cid_010"  -- Placeholder until Splice is installed
   
   -- Create order book with order
   obCid <- submit operator do

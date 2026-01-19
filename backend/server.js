@@ -282,6 +282,28 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
     
     const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
     
+    // Allocate Public Observer party if it doesn't exist
+    let publicObserverPartyId = 'Public';
+    try {
+      // Try to allocate party with hint "Public"
+      const publicPartyResult = await cantonAdmin.registerParty('Public', 'Public Observer');
+      if (publicPartyResult && publicPartyResult.success) {
+        publicObserverPartyId = publicPartyResult.partyId;
+        console.log(`[Admin] ✅ Allocated Public Observer party: ${publicObserverPartyId}`);
+      } else {
+        // Party might already exist, try to use the hint as-is
+        // In Canton, if party exists, we can use it directly
+        publicObserverPartyId = 'Public';
+        console.log(`[Admin] Using Public Observer party: ${publicObserverPartyId}`);
+      }
+    } catch (error) {
+      // If allocation fails (party might already exist), use the hint
+      console.warn(`[Admin] Could not allocate Public party (may already exist): ${error.message}`);
+      console.log(`[Admin] Using Public Observer party hint: ${publicObserverPartyId}`);
+      // Try to construct full party ID if we have the format
+      // For now, use the hint and let Canton resolve it
+    }
+    
     // Check if OrderBook already exists
     const { getOrderBookContractId } = require('./canton-api-helpers');
     const existingContractId = await getOrderBookContractId(decodedTradingPair, adminToken, CANTON_JSON_API_BASE);
@@ -520,13 +542,12 @@ app.post('/api/admin/orderbooks/:tradingPair', async (req, res) => {
     // Use MasterOrderBook template (Global Order Book model)
     const payload = {
       operator: operatorPartyId,
-      publicObserver: 'public-observer', // Public observer for global visibility
+      publicObserver: publicObserverPartyId, // Public observer for global visibility (allocated above)
       tradingPair: decodedTradingPair,
       buyOrders: [],
       sellOrders: [],
       lastPrice: null,
-      activeUsers: [],
-      userAccounts: null
+      activeUsers: []
     };
     
     console.log('[Admin] OrderBook payload:', JSON.stringify(payload, null, 2));
@@ -2430,14 +2451,25 @@ app.post('/api/utxo/merge', async (req, res) => {
  */
 app.post('/api/orders/place', async (req, res) => {
   try {
-    const { partyId, tradingPair, orderType, orderMode, quantity, price, orderBookContractId, userAccountContractId } = req.body;
+    const { partyId, tradingPair, orderType, orderMode, quantity, price, orderBookContractId, userAccountContractId, allocationCid } = req.body;
     
+    // Validate required fields
     if (!partyId || !tradingPair || !orderType || !quantity) {
       return res.status(400).json({
         error: 'Missing required fields',
         required: ['partyId', 'tradingPair', 'orderType', 'quantity']
       });
     }
+    
+    // Validate Allocation CID (required for Splice model)
+    if (!allocationCid) {
+      return res.status(400).json({
+        error: 'Allocation CID required',
+        message: 'Please create an Allocation first using Token_Lock before placing an order. This is required for the Splice Token Standard model.'
+      });
+    }
+    
+    console.log('[Order Place] Splice Allocation model - Allocation CID:', allocationCid.substring(0, 30) + '...');
     
     // TESTNET: Auto-create UserAccount with test tokens if it doesn't exist
     const UTXOHandler = require('./utxo-handler');
@@ -2887,8 +2919,8 @@ app.post('/api/orders/place', async (req, res) => {
       }
     }
 
-    // Use OrderService to place order with UTXO handling
-    const result = await orderService.placeOrderWithUTXOHandling(
+    // Use OrderService to place order with Splice Allocation
+    const result = await orderService.placeOrderWithAllocation(
       partyId,
       tradingPair,
       orderType,
@@ -2896,7 +2928,7 @@ app.post('/api/orders/place', async (req, res) => {
       quantity,
       price,
       finalOrderBookContractId,
-      finalUserAccountContractId || userAccountContractId
+      allocationCid // Pass Allocation CID for Splice model
     );
 
     res.json({

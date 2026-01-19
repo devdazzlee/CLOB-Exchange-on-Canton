@@ -1408,3 +1408,141 @@ export async function getTradesForPair(tradingPair, limit = 50) {
     throw error;
   }
 }
+/**
+ * Create an Allocation by locking funds using Splice Token Standard
+ * This is Step A of the two-step order placement process
+ * @param {string} tokenContractId - Contract ID of the Token to lock
+ * @param {string} partyId - User's party ID
+ * @param {string} operatorPartyId - Operator/Venue party ID (who can execute the Allocation)
+ * @param {string} amount - Amount to lock
+ * @param {string} currency - Currency/token type (e.g., "USDT", "BTC")
+ * @returns {Promise<string>} Allocation contract ID
+ */
+export async function createAllocation(tokenContractId, partyId, operatorPartyId, amount, currency) {
+  try {
+    console.log('[Allocation] Creating Allocation (Step A):', {
+      tokenContractId: tokenContractId.substring(0, 30) + '...',
+      partyId,
+      operatorPartyId,
+      amount,
+      currency
+    });
+
+    // Try to exercise Token_Lock choice on the Token contract
+    // Note: The exact choice name may vary based on Splice version
+    const choiceName = 'Token_Lock'; // Adjust based on actual Splice API
+    
+    // Build the choice argument based on Splice Allocation model
+    const choiceArgument = {
+      receiver: partyId, // User receives the locked allocation
+      provider: operatorPartyId, // Operator can execute
+      amount: amount,
+      currency: currency,
+    };
+
+    console.log('[Allocation] Exercising Token_Lock with argument:', choiceArgument);
+
+    // Exercise the choice to create Allocation
+    const result = await exerciseChoice(
+      tokenContractId,
+      choiceName,
+      choiceArgument,
+      partyId,
+      'Token:Token' // Template ID - adjust based on actual Splice Token template
+    );
+
+    console.log('[Allocation] Token_Lock result:', result);
+
+    // Extract Allocation contract ID from the result
+    if (result.updateId && result.completionOffset !== undefined) {
+      // Wait a bit for the Allocation to be visible
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      // Query for the newly created Allocation contract
+      const allocationTemplates = [
+        'Allocation:Allocation',
+        'Api.Token.AllocationV1:Allocation',
+        'Splice.Api.Token.AllocationV1:Allocation'
+      ];
+      
+      let allocationCid = null;
+      for (const templateId of allocationTemplates) {
+        try {
+          const allocations = await queryContractsAtOffset(
+            templateId,
+            partyId,
+            result.completionOffset
+          );
+
+          if (allocations.length > 0) {
+            allocationCid = allocations[allocations.length - 1].contractId;
+            console.log('[Allocation] ✅ Allocation created:', allocationCid.substring(0, 30) + '...');
+            return allocationCid;
+          }
+        } catch (err) {
+          continue;
+        }
+      }
+
+      // Fallback: Try current ledger end
+      for (const templateId of allocationTemplates) {
+        try {
+          const allocationsCurrent = await queryContracts(templateId, partyId);
+          if (allocationsCurrent.length > 0) {
+            allocationCid = allocationsCurrent[allocationsCurrent.length - 1].contractId;
+            console.log('[Allocation] ✅ Allocation found:', allocationCid.substring(0, 30) + '...');
+            return allocationCid;
+          }
+        } catch (err) {
+          continue;
+        }
+      }
+    }
+
+    throw new Error('Failed to create Allocation: Allocation contract not found after creation');
+  } catch (error) {
+    console.error('[Allocation] Error creating Allocation:', error);
+    throw new Error(`Failed to create Allocation: ${error.message}`);
+  }
+}
+
+/**
+ * Find Token contracts (UTXOs) for a user
+ * @param {string} partyId - User's party ID
+ * @param {string} currency - Currency to find (e.g., "USDT", "BTC")
+ * @param {string} minAmount - Minimum amount required
+ * @returns {Promise<Array>} Array of Token contracts with sufficient balance
+ */
+export async function findTokenContracts(partyId, currency, minAmount) {
+  try {
+    console.log('[Allocation] Finding Token contracts for:', { partyId, currency, minAmount });
+
+    const tokenTemplates = ['Token:Token', 'UTXO:UTXO', 'TokenBalance:TokenBalance'];
+    
+    for (const templateId of tokenTemplates) {
+      try {
+        const tokens = await queryContracts(templateId, partyId);
+        console.log(`[Allocation] Found ${tokens.length} contracts for template ${templateId}`);
+        
+        const matchingTokens = tokens.filter(token => {
+          const tokenCurrency = token.payload?.currency || token.payload?.tokenType || token.payload?.asset;
+          const tokenAmount = parseFloat(token.payload?.amount || token.payload?.quantity || '0');
+          return tokenCurrency === currency && tokenAmount >= parseFloat(minAmount);
+        });
+
+        if (matchingTokens.length > 0) {
+          console.log(`[Allocation] ✅ Found ${matchingTokens.length} matching Token contracts`);
+          return matchingTokens;
+        }
+      } catch (err) {
+        console.warn(`[Allocation] Template ${templateId} not found:`, err.message);
+        continue;
+      }
+    }
+
+    throw new Error(`No Token contracts found for ${currency} with sufficient balance (need ${minAmount})`);
+  } catch (error) {
+    console.error('[Allocation] Error finding Token contracts:', error);
+    throw error;
+  }
+}

@@ -492,7 +492,7 @@ export default function TradingInterface({ partyId }) {
     return { success: false, error: 'Global OrderBook model - users cannot create order books' };
   };
 
-  // Order placement
+  // Order placement with Splice Allocation model (Two-Step Process)
   const handlePlaceOrder = async (e) => {
     e.preventDefault();
     setError('');
@@ -508,9 +508,82 @@ export default function TradingInterface({ partyId }) {
       }
 
       const orderId = `ORDER-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      const OPERATOR_PARTY_ID = '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
+      
+      // Parse trading pair to determine which token to lock
+      const parseTradingPair = (pair) => {
+        if (pair.includes('/')) {
+          const [base, quote] = pair.split('/');
+          return { base, quote };
+        } else if (pair.includes('-')) {
+          const [base, quote] = pair.split('-');
+          return { base, quote };
+        }
+        return { base: 'BTC', quote: 'USDT' }; // Default
+      };
+      
+      const { base, quote } = parseTradingPair(tradingPair);
+      // BUY order: lock quote token (USDT) to buy base token (BTC)
+      // SELL order: lock base token (BTC) to sell for quote token (USDT)
+      const tokenToLock = orderType === 'BUY' ? quote : base;
+      const lockAmount = quantity; // For BUY: amount of USDT, For SELL: amount of BTC
+      
+      console.log('[Place Order] Splice Allocation Flow:', {
+        orderType,
+        tokenToLock,
+        lockAmount,
+        tradingPair: `${base}/${quote}`
+      });
+      
+      // ============================================================================
+      // STEP A: Create Allocation (Lock Funds)
+      // ============================================================================
+      console.log('[Place Order] Step A: Creating Allocation...');
+      setError('Creating Allocation (locking funds)...');
+      
+      const { findTokenContracts, createAllocation } = await import('../services/cantonApi');
+      
+      // Find user's Token contracts with sufficient balance
+      const tokenContracts = await findTokenContracts(partyId, tokenToLock, lockAmount);
+      
+      if (tokenContracts.length === 0) {
+        throw new Error(`Insufficient ${tokenToLock} balance. Need ${lockAmount} ${tokenToLock} to place this order.`);
+      }
+      
+      // Use the first matching token contract
+      const tokenContract = tokenContracts[0];
+      console.log('[Place Order] Using Token contract:', tokenContract.contractId.substring(0, 30) + '...');
+      
+      // Create Allocation by locking the token
+      let allocationCid;
+      try {
+        allocationCid = await createAllocation(
+          tokenContract.contractId,
+          partyId,
+          OPERATOR_PARTY_ID,
+          lockAmount,
+          tokenToLock
+        );
+        console.log('[Place Order] ✅ Step A Complete: Allocation created:', allocationCid.substring(0, 30) + '...');
+      } catch (allocationError) {
+        console.error('[Place Order] ❌ Step A Failed: Allocation creation error:', allocationError);
+        throw new Error(`Failed to create Allocation: ${allocationError.message}. Please ensure you have sufficient ${tokenToLock} balance.`);
+      }
+      
+      // ============================================================================
+      // STEP B: Wait for Allocation to be confirmed
+      // ============================================================================
+      console.log('[Place Order] Step B: Waiting for Allocation confirmation...');
+      setError('Allocation created. Confirming...');
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      // ============================================================================
+      // STEP C: Place Order with Allocation CID
+      // ============================================================================
+      console.log('[Place Order] Step C: Placing order with Allocation CID...');
+      setError('Placing order...');
       
       // Get OrderBook - try backend endpoint first (for global OrderBooks)
-      // ROOT CAUSE FIX: Backend returns full OrderBook with operator field
       console.log('[Place Order] Getting OrderBook for', tradingPair);
       let orderBookContract = null;
       
@@ -631,7 +704,7 @@ export default function TradingInterface({ partyId }) {
         console.warn('[Place Order] Could not fetch UserAccount:', err.message);
       }
       
-      // Use new UTXO-aware order placement endpoint
+      // Use new Splice Allocation-aware order placement endpoint
       const backendBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
       const placeOrderResponse = await fetch(`${backendBase}/api/orders/place`, {
         method: 'POST',
@@ -646,6 +719,7 @@ export default function TradingInterface({ partyId }) {
           quantity: parseFloat(quantity).toString(),
           price: orderMode === 'LIMIT' && price ? parseFloat(price).toString() : null,
           orderBookContractId: orderBookContract?.contractId || null, // Can be null - backend will auto-create
+          allocationCid: allocationCid, // CRITICAL: Pass the Allocation CID from Step A
           userAccountContractId: userAccountContractId
         })
       });
