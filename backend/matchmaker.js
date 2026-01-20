@@ -18,6 +18,10 @@ const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.
 const MATCHING_INTERVAL_MS = 5000; // Check every 5 seconds
 const MAX_MATCHES_PER_CYCLE = 10; // Limit matches per cycle to avoid overload
 
+// CRITICAL: Hardcoded Package ID for MasterOrderBook to prevent 413 errors
+// This package ID was discovered from logs and is used to bypass broken discovery logic
+const MASTER_ORDERBOOK_PACKAGE_ID = "dd500bf887d7e153ee6628b3f6722f234d3d62ce855572ff7ce73b7b3c2afefd";
+
 // Get admin token (assumes you have a way to get it)
 // This should use your existing CantonAdmin service
 async function getAdminToken() {
@@ -66,10 +70,125 @@ async function getActiveAtOffset(adminToken, offset) {
 }
 
 /**
+ * PRODUCTION-GRADE: Dynamic Package Discovery for MasterOrderBook
+ * 
+ * This function dynamically discovers the correct package ID by:
+ * 1. Listing all uploaded packages via /v2/packages
+ * 2. Testing each package for MasterOrderBook module using specific queries
+ * 3. Returning the most recent matching package ID
+ * 
+ * This ensures the system works even after DAR rebuilds and redeployments.
+ * 
+ * @param {string} adminToken - Admin authentication token
+ * @returns {Promise<string|null>} Package ID containing MasterOrderBook, or fallback to hardcoded ID
+ */
+async function getMasterOrderBookPackageId(adminToken) {
+  const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.105:31539';
+  
+  try {
+    // Step 1: List all packages (metadata query - no contract queries)
+    console.log('[Matchmaker Package Discovery] Step 1: Listing all packages...');
+    const packagesUrl = `${CANTON_JSON_API_BASE}/v2/packages`;
+    const packagesResponse = await fetch(packagesUrl, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${adminToken}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    if (!packagesResponse.ok) {
+      console.warn(`[Matchmaker Package Discovery] Failed to list packages: ${packagesResponse.status}`);
+      return MASTER_ORDERBOOK_PACKAGE_ID; // Fallback
+    }
+    
+    const packagesData = await packagesResponse.json();
+    let packageIds = [];
+    
+    // Handle different response formats
+    if (packagesData.packageIds && Array.isArray(packagesData.packageIds)) {
+      packageIds = packagesData.packageIds;
+    } else if (packagesData.result && Array.isArray(packagesData.result)) {
+      packageIds = packagesData.result.map(pkg => pkg.packageId || pkg).filter(Boolean);
+    } else if (Array.isArray(packagesData)) {
+      packageIds = packagesData.map(pkg => pkg.packageId || pkg).filter(Boolean);
+    }
+    
+    if (packageIds.length === 0) {
+      console.warn('[Matchmaker Package Discovery] No packages found');
+      return MASTER_ORDERBOOK_PACKAGE_ID; // Fallback
+    }
+    
+    console.log(`[Matchmaker Package Discovery] Found ${packageIds.length} package(s) to inspect`);
+    
+    // Step 2: Test each package for MasterOrderBook module (most recent first)
+    const packagesToTest = [...packageIds].reverse();
+    
+    for (const pkgId of packagesToTest) {
+      try {
+        // Step 3: Execute specific query with package-qualified template ID
+        // This is precise and won't hit 413 because we filter for a specific template
+        const activeAtOffset = await getActiveAtOffset(adminToken);
+        const testQueryUrl = `${CANTON_JSON_API_BASE}/v2/state/active-contracts`;
+        const testQueryBody = {
+          readAs: [OPERATOR_PARTY_ID],
+          activeAtOffset: activeAtOffset,
+          verbose: false,
+          filter: {
+            filtersByParty: {
+              [OPERATOR_PARTY_ID]: {
+                inclusive: {
+                  templateIds: [`${pkgId}:MasterOrderBook:MasterOrderBook`]
+                }
+              }
+            }
+          }
+        };
+        
+        const testResponse = await fetch(testQueryUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${adminToken}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(testQueryBody)
+        });
+        
+        if (testResponse.ok) {
+          console.log(`[Matchmaker Package Discovery] ✅ Found MasterOrderBook in package ${pkgId.substring(0, 16)}...`);
+          return pkgId;
+        }
+        // Continue to next package if this one doesn't have MasterOrderBook
+      } catch (testError) {
+        console.warn(`[Matchmaker Package Discovery] Error testing package ${pkgId.substring(0, 16)}...:`, testError.message);
+        continue;
+      }
+    }
+    
+    // Fallback to hardcoded ID if no package found
+    console.warn('[Matchmaker Package Discovery] ⚠️  Using fallback hardcoded package ID');
+    return MASTER_ORDERBOOK_PACKAGE_ID;
+    
+  } catch (error) {
+    console.error('[Matchmaker Package Discovery] Error:', error.message);
+    return MASTER_ORDERBOOK_PACKAGE_ID; // Fallback
+  }
+}
+
+/**
  * Query MasterOrderBook contracts
  */
 async function queryMasterOrderBooks(adminToken) {
   try {
+    // CRITICAL FIX: Get package ID and use package-qualified template IDs
+    // MUST get package ID - no fallback to unqualified IDs (would cause 413 error)
+    const packageId = await getMasterOrderBookPackageId(adminToken);
+    
+    // CRITICAL: MUST use package-qualified template ID - no fallback
+    const templateIds = [`${packageId}:MasterOrderBook:MasterOrderBook`];
+    
+    console.log(`[Matchmaker] ✅ Querying with package-qualified template ID: ${templateIds[0]}`);
+    
     const activeAtOffset = await getActiveAtOffset(adminToken);
     
     const response = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
@@ -79,13 +198,15 @@ async function queryMasterOrderBooks(adminToken) {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
+        readAs: [OPERATOR_PARTY_ID], // REQUIRED by Canton JSON API v2
         activeAtOffset: activeAtOffset,
         verbose: true,
         filter: {
           filtersByParty: {
             [OPERATOR_PARTY_ID]: {
               inclusive: {
-                templateIds: ['MasterOrderBook:MasterOrderBook']
+                // CRITICAL: Filter ONLY for MasterOrderBook template to avoid 413 error
+                templateIds: templateIds
               }
             }
           }
