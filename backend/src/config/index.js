@@ -1,0 +1,54 @@
+/**
+ * Application Configuration
+ * Centralized configuration management
+ */
+
+require('dotenv').config();
+
+module.exports = {
+  // Server Configuration
+  server: {
+    port: process.env.PORT || 3001,
+    env: process.env.NODE_ENV || 'development',
+  },
+
+  // Canton Configuration
+  canton: {
+    jsonApiBase: process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539',
+    operatorPartyId: process.env.OPERATOR_PARTY_ID || 
+      '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292',
+    // Package IDs - fallback values
+    packageIds: {
+      masterOrderBook: process.env.MASTER_ORDERBOOK_PACKAGE_ID || 
+        'dd500bf887d7e153ee6628b3f6722f234d3d62ce855572ff7ce73b7b3c2afefd',
+      userAccount: process.env.USER_ACCOUNT_PACKAGE_ID || 
+        '51522c778cf057ce80b3aa38d272a2fb72ae60ae871bca67940aaccf59567ac9',
+    },
+  },
+
+  // Keycloak Configuration
+  keycloak: {
+    baseUrl: process.env.KEYCLOAK_BASE_URL || 'https://keycloak.wolfedgelabs.com:8443',
+    realm: process.env.KEYCLOAK_REALM || 'canton-devnet',
+    clientId: process.env.KEYCLOAK_CLIENT_ID || 'Clob',
+    clientSecret: process.env.KEYCLOAK_CLIENT_SECRET || null,
+  },
+
+  // Party Management
+  party: {
+    dailyQuota: parseInt(process.env.DAILY_PARTY_QUOTA || '5000', 10),
+    weeklyQuota: parseInt(process.env.WEEKLY_PARTY_QUOTA || '35000', 10),
+  },
+
+  // WebSocket Configuration
+  websocket: {
+    path: '/ws',
+    perMessageDeflate: false,
+  },
+
+  // API Configuration
+  api: {
+    timeout: parseInt(process.env.API_TIMEOUT || '30000', 10),
+    batchSize: parseInt(process.env.BATCH_SIZE || '50', 10),
+  },
+};
