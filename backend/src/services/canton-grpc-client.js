@@ -30,9 +30,10 @@ class CantonGrpcClient {
     if (this.client && this.partyClient) return;
 
     try {
-      const protoV2Path = path.join(__dirname, 'user_management_service_v2.proto');
-      const protoV1Path = path.join(__dirname, 'user_management_service.proto');
-      const partyV2Path = path.join(__dirname, 'party_management_service_v2.proto');
+      const protoBasePath = path.join(__dirname, '..', 'proto');
+      const protoV2Path = path.join(protoBasePath, 'user_management_service_v2.proto');
+      const protoV1Path = path.join(protoBasePath, 'user_management_service.proto');
+      const partyV2Path = path.join(protoBasePath, 'party_management_service_v2.proto');
       console.log('[gRPC] Loading proto files:', { v2: protoV2Path, v1: protoV1Path });
       
       const pkgDefV2 = protoLoader.loadSync(protoV2Path, {
@@ -205,4 +206,3 @@ class CantonGrpcClient {
 }
 
 module.exports = CantonGrpcClient;
-

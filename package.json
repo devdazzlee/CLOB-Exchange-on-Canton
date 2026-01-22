@@ -1,0 +1,19 @@
+{
+  "name": "clob-exchange-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "CLOB Exchange on Canton - Monorepo",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently \"yarn workspace @clob-exchange/api dev\" \"yarn workspace @clob-exchange/web dev\" \"yarn workspace @clob-exchange/matcher dev\" \"yarn workspace @clob-exchange/indexer dev\"",
+    "build": "yarn workspaces run build",
+    "test": "yarn workspaces run test",
+    "migrate": "yarn workspace @clob-exchange/indexer migrate"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

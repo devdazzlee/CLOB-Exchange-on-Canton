@@ -134,18 +134,48 @@ let wsServiceInstance = null;
 
 function initializeWebSocketService(server) {
   wsServiceInstance = new WebSocketService(server);
-  
+
   // Make broadcast available globally
   global.broadcastWebSocket = (channel, data) => {
     if (wsServiceInstance) {
       wsServiceInstance.broadcast(channel, data);
     }
   };
-  
+
   return wsServiceInstance;
+}
+
+/**
+ * Broadcast balance update for a specific party
+ * Channel: balance:{partyId}
+ */
+function broadcastBalanceUpdate(partyId, balances, lockedBalances) {
+  if (global.broadcastWebSocket) {
+    global.broadcastWebSocket(`balance:${partyId}`, {
+      type: 'BALANCE_UPDATE',
+      partyId,
+      balances,
+      lockedBalances,
+      timestamp: Date.now()
+    });
+  }
+}
+
+/**
+ * Broadcast balance update to all users (for after trades)
+ * Useful when multiple balances change at once
+ */
+function broadcastMultiBalanceUpdate(updates) {
+  if (global.broadcastWebSocket) {
+    updates.forEach(update => {
+      broadcastBalanceUpdate(update.partyId, update.balances, update.lockedBalances);
+    });
+  }
 }
 
 module.exports = {
   WebSocketService,
   initializeWebSocketService,
+  broadcastBalanceUpdate,
+  broadcastMultiBalanceUpdate,
 };

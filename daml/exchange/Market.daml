@@ -1,0 +1,52 @@
+module Market where
+
+import DA.Assert
+
+-- Market template defines trading pair metadata
+-- References token-standard instrument identifiers
+template Market
+  with
+    marketId : Text  -- e.g., "BTC/USDT"
+    baseTokenInstrumentId : Text  -- Token Standard instrument ID for base token
+    quoteTokenInstrumentId : Text  -- Token Standard instrument ID for quote token
+    tickSize : Decimal  -- Minimum price increment (e.g., 0.01)
+    lotSize : Decimal  -- Minimum order size (e.g., 0.001)
+    operator : Party  -- Market operator
+    isActive : Bool  -- Whether market is active for trading
+  where
+    signatory operator
+    observer operator
+
+    -- Update market configuration
+    choice UpdateConfig : ()
+      with
+        newTickSize : Optional Decimal
+        newLotSize : Optional Decimal
+        newIsActive : Optional Bool
+      controller operator
+      do
+        let updatedTickSize = case newTickSize of
+          Some ts -> ts
+          None -> tickSize
+        let updatedLotSize = case newLotSize of
+          Some ls -> ls
+          None -> lotSize
+        let updatedIsActive = case newIsActive of
+          Some active -> active
+          None -> isActive
+        
+        assert (updatedTickSize > 0.0)
+        assert (updatedLotSize > 0.0)
+        
+        _ <- create this with
+          tickSize = updatedTickSize
+          lotSize = updatedLotSize
+          isActive = updatedIsActive
+        return ()
+
+    -- Get market info
+    choice GetMarketInfo : (Text, Text, Decimal, Decimal, Bool)
+      with
+      controller operator
+      do
+        return (baseTokenInstrumentId, quoteTokenInstrumentId, tickSize, lotSize, isActive)

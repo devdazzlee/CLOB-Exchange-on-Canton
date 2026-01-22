@@ -1,0 +1,20 @@
+{
+  "name": "@clob-exchange/api-clients",
+  "version": "1.0.0",
+  "description": "Generated OpenAPI clients for Canton JSON API and Scan Proxy",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "generate": "openapi-generator-cli generate -i <openapi-url> -g typescript-axios -o ./src/generated",
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "axios": "^1.6.2"
+  },
+  "devDependencies": {
+    "@openapitools/openapi-generator-cli": "^2.7.0",
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.3"
+  }
+}

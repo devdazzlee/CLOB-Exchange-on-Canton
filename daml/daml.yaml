@@ -1,0 +1,8 @@
+sdk-version: 3.4.9
+name: clob-exchange
+source: .
+version: 1.0.0
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script

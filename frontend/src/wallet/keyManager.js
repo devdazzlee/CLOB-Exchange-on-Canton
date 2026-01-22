@@ -259,6 +259,23 @@ export function clearWallet() {
 }
 
 /**
+ * Sign a message with a private key (Ed25519)
+ * @param {Uint8Array} privateKey - Private key
+ * @param {string} messageBase64 - Message to sign (base64 encoded)
+ * @returns {Promise<string>} Signature as base64 string
+ */
+export async function signMessage(privateKey, messageBase64) {
+  // Decode message from base64
+  const messageBytes = Uint8Array.from(atob(messageBase64), c => c.charCodeAt(0));
+
+  // Sign the message
+  const signature = await ed25519.sign(messageBytes, privateKey);
+
+  // Return signature as base64
+  return btoa(String.fromCharCode(...signature));
+}
+
+/**
  * Convert public key to Canton Party ID format
  * @param {Uint8Array} publicKey
  * @returns {string} Party ID in format: prefix::hex
@@ -268,4 +285,13 @@ export function publicKeyToPartyId(publicKey, prefix = '8100b2db-86cf-40a1-8351-
   // The backend will create this party ID on behalf of the user
   const hex = bytesToHex(publicKey);
   return `${prefix}::${hex}`;
+}
+
+/**
+ * Convert bytes to base64
+ * @param {Uint8Array} bytes
+ * @returns {string}
+ */
+export function bytesToBase64(bytes) {
+  return btoa(String.fromCharCode(...bytes));
 }

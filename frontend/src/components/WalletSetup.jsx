@@ -1,13 +1,16 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   generateMnemonic,
   mnemonicToKeyPair,
   encryptPrivateKey,
+  decryptPrivateKey,
   storeWallet,
   loadWallet,
+  bytesToBase64,
+  signMessage,
 } from '../wallet/keyManager';
-import { createPartyForUser } from '../services/partyService';
+import { generateTopology, allocatePartyWithSignature } from '../services/partyService';
 import { storeTokens } from '../services/keycloakAuth';
 import PasswordInput from './PasswordInput';
 
@@ -18,10 +21,19 @@ export default function WalletSetup({ onWalletReady }) {
   const [importMnemonic, setImportMnemonic] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [unlockPassword, setUnlockPassword] = useState('');
   const [partyId, setPartyId] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [copiedPartyId, setCopiedPartyId] = useState(false);
+
+  // 2-step onboarding state
+  const [topologyData, setTopologyData] = useState(null);
+  const [showUnlockModal, setShowUnlockModal] = useState(false);
+
+  // Prevent duplicate API calls
+  const onboardingInProgress = useRef(false);
+  const hasAttemptedOnboarding = useRef(false);
 
   useEffect(() => {
     const existingWallet = loadWallet();
@@ -33,39 +45,57 @@ export default function WalletSetup({ onWalletReady }) {
         return;
       }
 
-      // No fallback: if partyId isn't stored, re-register it via backend using the stored wallet public key.
-      (async () => {
-        try {
-          setLoading(true);
-          setError('');
-          console.log('[WalletSetup] Wallet found but no canton_party_id stored. Re-registering party...');
-          const partyResult = await createPartyForUser(existingWallet.publicKey);
-          const allocatedPartyId = partyResult.partyId;
-          setPartyId(allocatedPartyId);
-          localStorage.setItem('canton_party_id', allocatedPartyId);
-
-          if (partyResult.token) {
-            storeTokens(partyResult.token, null, 1800);
-          }
-
-          setStep('ready');
-          onWalletReady?.(allocatedPartyId);
-        } catch (err) {
-          console.error('[WalletSetup] Failed to re-register party:', err);
-          setError('Wallet found but Party ID is not registered. Please create/register party again: ' + err.message);
-          setStep('select');
-        } finally {
-          setLoading(false);
-        }
-      })();
+      // Wallet exists but no party ID - start onboarding automatically but only once
+      if (!hasAttemptedOnboarding.current) {
+        hasAttemptedOnboarding.current = true;
+        startOnboardingForExistingWallet(existingWallet);
+      }
     }
   }, []);
+
+  /**
+   * Start onboarding for existing wallet (step 1 only, no unlock needed yet)
+   */
+  const startOnboardingForExistingWallet = async (wallet) => {
+    if (onboardingInProgress.current) {
+      return;
+    }
+
+    try {
+      onboardingInProgress.current = true;
+      setLoading(true);
+      setError('');
+
+      console.log('[WalletSetup] Starting onboarding for existing wallet...');
+
+      // Step 1: Generate topology (no unlock needed)
+      const publicKeyBase64 = bytesToBase64(wallet.publicKey);
+      const topology = await generateTopology(publicKeyBase64, null);
+
+      setTopologyData({
+        ...topology,
+        publicKey: wallet.publicKey,
+        encryptedPrivateKey: wallet.encryptedPrivateKey,
+      });
+
+      // Show unlock modal to sign
+      setShowUnlockModal(true);
+      setStep('unlock');
+    } catch (err) {
+      console.error('[WalletSetup] Failed to start onboarding:', err);
+      setError('Failed to start onboarding: ' + err.message);
+      setStep('select');
+    } finally {
+      setLoading(false);
+      onboardingInProgress.current = false;
+    }
+  };
 
   const handleCopyPartyId = async () => {
     try {
       await navigator.clipboard.writeText(partyId);
       setCopiedPartyId(true);
-      setTimeout(() => setCopiedPartyId(false), 2000); // Reset after 2 seconds
+      setTimeout(() => setCopiedPartyId(false), 2000);
     } catch (err) {
       console.error('Failed to copy Party ID:', err);
     }
@@ -74,7 +104,7 @@ export default function WalletSetup({ onWalletReady }) {
   const handleCreateWallet = async () => {
     setLoading(true);
     setError('');
-    
+
     try {
       const newMnemonic = generateMnemonic();
       setMnemonic(newMnemonic);
@@ -97,59 +127,64 @@ export default function WalletSetup({ onWalletReady }) {
       return;
     }
 
+    if (onboardingInProgress.current) {
+      return;
+    }
+
     setLoading(true);
     setError('');
 
     try {
-      // 1. Create wallet locally
+      onboardingInProgress.current = true;
+
+      // 1. Create wallet locally (locked)
       const { publicKey, privateKey } = await mnemonicToKeyPair(mnemonic);
       const encryptedPrivateKey = await encryptPrivateKey(privateKey, password);
       storeWallet(encryptedPrivateKey, publicKey);
-      
-      // 2. Create party ID on backend (on behalf of user)
-      console.log('[WalletSetup] Creating party ID on backend...');
-      const partyResult = await createPartyForUser(publicKey);
-      
-      // ============================================
-      // CRITICAL DEBUG: Check what we received
-      // ============================================
-      console.log('[WalletSetup] ===== PARTY RESULT RECEIVED =====');
-      console.log('[WalletSetup] Full partyResult:', partyResult);
-      console.log('[WalletSetup] partyResult.partyId:', partyResult?.partyId);
-      console.log('[WalletSetup] partyResult.token exists:', !!partyResult?.token);
-      console.log('[WalletSetup] partyResult.token type:', typeof partyResult?.token);
-      console.log('[WalletSetup] partyResult.token value:', partyResult?.token);
-      console.log('[WalletSetup] partyResult.token length:', partyResult?.token?.length);
-      console.log('[WalletSetup] ===================================');
-      
-      // 3. Store the party ID
-      const derivedPartyId = partyResult.partyId;
-      setPartyId(derivedPartyId);
-      localStorage.setItem('canton_party_id', derivedPartyId);
-      
-      // 4. If backend provided a token, store it
-      if (partyResult.token) {
-        console.log('[WalletSetup] ✓ Token found! Storing authentication token...');
-        console.log('[WalletSetup] Token length:', partyResult.token.length);
-        console.log('[WalletSetup] Token preview:', partyResult.token.substring(0, 50) + '...');
-        // Store token with 30 minute expiry (adjust as needed)
-        storeTokens(partyResult.token, null, 1800);
-        console.log('[WalletSetup] ✓ Token stored successfully');
-      } else {
-        console.error('[WalletSetup] ✗ CRITICAL: No token in partyResult!');
-        console.error('[WalletSetup] partyResult object:', JSON.stringify(partyResult, null, 2));
-        console.warn('[WalletSetup] No token provided by backend. User may need to authenticate separately.');
+
+      // 2. Step 1: Generate topology (no signature needed yet)
+      console.log('[WalletSetup] Step 1: Generating topology...');
+      const publicKeyBase64 = bytesToBase64(publicKey);
+      const topology = await generateTopology(publicKeyBase64, null);
+
+      console.log('[WalletSetup] Topology generated:', topology);
+
+      // 3. Sign multiHash with private key (wallet is unlocked, we have it)
+      console.log('[WalletSetup] Signing multiHash...');
+      const signatureBase64 = await signMessage(privateKey, topology.multiHash);
+
+      // 4. Step 2: Allocate party with signature
+      console.log('[WalletSetup] Step 2: Allocating party...');
+      const result = await allocatePartyWithSignature(
+        publicKeyBase64,
+        signatureBase64,
+        topology.topologyTransactions,
+        topology.publicKeyFingerprint
+      );
+
+      console.log('[WalletSetup] Party allocated:', result);
+
+      // 5. Store party ID
+      const allocatedPartyId = result.partyId;
+      setPartyId(allocatedPartyId);
+      localStorage.setItem('canton_party_id', allocatedPartyId);
+
+      // 6. Store token if provided (validator token)
+      if (result.token) {
+        console.log('[WalletSetup] Storing token');
+        storeTokens(result.token, null, 1800);
       }
-      
+
       setStep('ready');
       if (onWalletReady) {
-        onWalletReady(derivedPartyId);
+        onWalletReady(allocatedPartyId);
       }
     } catch (err) {
       console.error('[WalletSetup] Error creating wallet/party:', err);
       setError('Failed to create wallet: ' + err.message);
     } finally {
       setLoading(false);
+      onboardingInProgress.current = false;
     }
   };
 
@@ -170,61 +205,202 @@ export default function WalletSetup({ onWalletReady }) {
       return;
     }
 
+    if (onboardingInProgress.current) {
+      return;
+    }
+
     setLoading(true);
     setError('');
 
     try {
-      // 1. Import wallet locally
+      onboardingInProgress.current = true;
+
+      // 1. Import wallet locally (locked)
       const { publicKey, privateKey } = await mnemonicToKeyPair(importMnemonic.trim());
       const encryptedPrivateKey = await encryptPrivateKey(privateKey, password);
       storeWallet(encryptedPrivateKey, publicKey);
-      
-      // 2. Create party ID on backend (on behalf of user)
-      console.log('[WalletSetup] Creating party ID on backend for imported wallet...');
-      const partyResult = await createPartyForUser(publicKey);
-      
-      // ============================================
-      // CRITICAL DEBUG: Check what we received
-      // ============================================
-      console.log('[WalletSetup] ===== PARTY RESULT RECEIVED (IMPORT) =====');
-      console.log('[WalletSetup] Full partyResult:', partyResult);
-      console.log('[WalletSetup] partyResult.partyId:', partyResult?.partyId);
-      console.log('[WalletSetup] partyResult.token exists:', !!partyResult?.token);
-      console.log('[WalletSetup] partyResult.token type:', typeof partyResult?.token);
-      console.log('[WalletSetup] partyResult.token value:', partyResult?.token);
-      console.log('[WalletSetup] partyResult.token length:', partyResult?.token?.length);
-      console.log('[WalletSetup] ===========================================');
-      
-      // 3. Store the party ID
-      const derivedPartyId = partyResult.partyId;
-      setPartyId(derivedPartyId);
-      localStorage.setItem('canton_party_id', derivedPartyId);
-      
-      // 4. If backend provided a token, store it
-      if (partyResult.token) {
-        console.log('[WalletSetup] ✓ Token found! Storing authentication token...');
-        console.log('[WalletSetup] Token length:', partyResult.token.length);
-        console.log('[WalletSetup] Token preview:', partyResult.token.substring(0, 50) + '...');
-        // Store token with 30 minute expiry (adjust as needed)
-        storeTokens(partyResult.token, null, 1800);
-        console.log('[WalletSetup] ✓ Token stored successfully');
-      } else {
-        console.error('[WalletSetup] ✗ CRITICAL: No token in partyResult!');
-        console.error('[WalletSetup] partyResult object:', JSON.stringify(partyResult, null, 2));
-        console.warn('[WalletSetup] No token provided by backend. User may need to authenticate separately.');
+
+      // 2. Step 1: Generate topology
+      console.log('[WalletSetup] Step 1: Generating topology...');
+      const publicKeyBase64 = bytesToBase64(publicKey);
+      const topology = await generateTopology(publicKeyBase64, null);
+
+      console.log('[WalletSetup] Topology generated:', topology);
+
+      // 3. Sign multiHash with private key
+      console.log('[WalletSetup] Signing multiHash...');
+      const signatureBase64 = await signMessage(privateKey, topology.multiHash);
+
+      // 4. Step 2: Allocate party
+      console.log('[WalletSetup] Step 2: Allocating party...');
+      const result = await allocatePartyWithSignature(
+        publicKeyBase64,
+        signatureBase64,
+        topology.topologyTransactions,
+        topology.publicKeyFingerprint
+      );
+
+      console.log('[WalletSetup] Party allocated:', result);
+
+      // 5. Store party ID
+      const allocatedPartyId = result.partyId;
+      setPartyId(allocatedPartyId);
+      localStorage.setItem('canton_party_id', allocatedPartyId);
+
+      // 6. Store token if provided
+      if (result.token) {
+        console.log('[WalletSetup] Storing token');
+        storeTokens(result.token, null, 1800);
       }
-      
+
       setStep('ready');
       if (onWalletReady) {
-        onWalletReady(derivedPartyId);
+        onWalletReady(allocatedPartyId);
       }
     } catch (err) {
       console.error('[WalletSetup] Error importing wallet/party:', err);
       setError('Failed to import wallet: ' + err.message);
     } finally {
       setLoading(false);
+      onboardingInProgress.current = false;
     }
   };
+
+  /**
+   * Handle unlock and complete onboarding
+   * Called when user provides password to unlock wallet
+   */
+  const handleUnlock = async () => {
+    if (!unlockPassword) {
+      setError('Please enter your wallet password');
+      return;
+    }
+
+    if (!topologyData) {
+      setError('Missing topology data');
+      return;
+    }
+
+    if (onboardingInProgress.current) {
+      return;
+    }
+
+    setLoading(true);
+    setError('');
+
+    try {
+      onboardingInProgress.current = true;
+
+      // 1. Decrypt private key
+      console.log('[WalletSetup] Unlocking wallet...');
+      const privateKey = await decryptPrivateKey(
+        topologyData.encryptedPrivateKey,
+        unlockPassword
+      );
+
+      // 2. Sign multiHash
+      console.log('[WalletSetup] Signing multiHash...');
+      const signatureBase64 = await signMessage(privateKey, topologyData.multiHash);
+
+      // 3. Step 2: Allocate party
+      console.log('[WalletSetup] Step 2: Allocating party...');
+      const publicKeyBase64 = bytesToBase64(topologyData.publicKey);
+      const result = await allocatePartyWithSignature(
+        publicKeyBase64,
+        signatureBase64,
+        topologyData.topologyTransactions,
+        topologyData.publicKeyFingerprint
+      );
+
+      console.log('[WalletSetup] Party allocated:', result);
+
+      // 4. Store party ID
+      const allocatedPartyId = result.partyId;
+      setPartyId(allocatedPartyId);
+      localStorage.setItem('canton_party_id', allocatedPartyId);
+
+      // 5. Store token if provided
+      if (result.token) {
+        console.log('[WalletSetup] Storing token');
+        storeTokens(result.token, null, 1800);
+      }
+
+      setShowUnlockModal(false);
+      setStep('ready');
+      if (onWalletReady) {
+        onWalletReady(allocatedPartyId);
+      }
+    } catch (err) {
+      console.error('[WalletSetup] Error unlocking/allocating:', err);
+      if (err.message.includes('decrypt') || err.message.includes('password')) {
+        setError('Incorrect password');
+      } else {
+        setError('Failed to complete onboarding: ' + err.message);
+      }
+    } finally {
+      setLoading(false);
+      onboardingInProgress.current = false;
+    }
+  };
+
+  // Unlock modal
+  if (showUnlockModal) {
+    return (
+      <div className="card max-w-2xl mx-auto">
+        <h2 className="text-2xl font-bold text-[#EAECEF] mb-2">Unlock Wallet</h2>
+        <p className="text-[#848E9C] mb-6">Please unlock your wallet to complete onboarding.</p>
+
+        <div className="bg-[#F0B90B15] border border-[#F0B90B40] rounded-lg p-4 mb-6">
+          <div className="flex items-start space-x-3">
+            <svg className="w-5 h-5 text-primary mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+            </svg>
+            <div>
+              <p className="text-primary font-semibold mb-1">Signature Required</p>
+              <p className="text-[#848E9C] text-sm">We need your signature to complete party allocation on Canton.</p>
+            </div>
+          </div>
+        </div>
+
+        <div className="space-y-4 mb-6">
+          <div>
+            <label className="block text-sm font-medium text-[#EAECEF] mb-2">
+              Wallet Password
+            </label>
+            <PasswordInput
+              value={unlockPassword}
+              onChange={(e) => setUnlockPassword(e.target.value)}
+              placeholder="Enter your wallet password"
+            />
+          </div>
+        </div>
+
+        {error && (
+          <div className="bg-danger-light border border-danger rounded-lg p-4 mb-4">
+            <p className="text-danger text-sm">{error}</p>
+          </div>
+        )}
+
+        <button
+          onClick={handleUnlock}
+          disabled={loading}
+          className="btn btn-primary w-full"
+        >
+          {loading ? (
+            <span className="flex items-center justify-center">
+              <svg className="animate-spin -ml-1 mr-3 h-5 w-5" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              </svg>
+              Unlocking...
+            </span>
+          ) : (
+            'Unlock & Complete Onboarding'
+          )}
+        </button>
+      </div>
+    );
+  }
 
   if (step === 'ready') {
     return (
@@ -262,7 +438,6 @@ export default function WalletSetup({ onWalletReady }) {
           </div>
           <button
             onClick={() => {
-              // Navigate to trading interface using React Router
               navigate('/trading');
             }}
             className="btn btn-primary w-full py-3 text-base font-semibold"
@@ -278,7 +453,7 @@ export default function WalletSetup({ onWalletReady }) {
     return (
       <div className="card max-w-3xl mx-auto">
         <h2 className="text-2xl font-bold text-[#EAECEF] mb-6">Create New Wallet</h2>
-        
+
         <div className="bg-[#F0B90B15] border border-[#F0B90B40] rounded-lg p-4 mb-6">
           <div className="flex items-start space-x-3">
             <svg className="w-5 h-5 text-primary mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -365,7 +540,7 @@ export default function WalletSetup({ onWalletReady }) {
     <div className="card max-w-2xl mx-auto">
       <h2 className="text-2xl font-bold text-[#EAECEF] mb-2">Wallet Setup</h2>
       <p className="text-[#848E9C] mb-8">Create a new wallet or import an existing one using your mnemonic phrase.</p>
-      
+
       <div className="space-y-6">
         <button
           onClick={handleCreateWallet}
@@ -384,7 +559,7 @@ export default function WalletSetup({ onWalletReady }) {
             'Create New Wallet'
           )}
         </button>
-        
+
         <div className="relative">
           <div className="absolute inset-0 flex items-center">
             <div className="w-full border-t border-[#2B3139]"></div>
@@ -393,7 +568,7 @@ export default function WalletSetup({ onWalletReady }) {
             <span className="px-4 bg-[#181A20] text-[#848E9C]">OR</span>
           </div>
         </div>
-        
+
         <div className="space-y-4">
           <h3 className="text-lg font-semibold text-[#EAECEF]">Import Existing Wallet</h3>
           <textarea
@@ -427,7 +602,7 @@ export default function WalletSetup({ onWalletReady }) {
           </button>
         </div>
       </div>
-      
+
       {error && (
         <div className="mt-6 bg-danger-light border border-danger rounded-lg p-4">
           <p className="text-danger text-sm">{error}</p>

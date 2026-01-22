@@ -1,0 +1,170 @@
+module Asset where
+
+import DA.Optional
+
+-- | Represents a fungible asset (Cash/Token)
+template Asset
+  with
+    issuer : Party        -- Who can mint/issue this asset
+    owner : Party         -- Current owner
+    symbol : Text         -- Asset symbol (BTC, ETH, USDT, etc.)
+    amount : Decimal      -- Quantity owned
+    observers : [Party]   -- Who can observe this asset
+  where
+    signatory issuer, owner
+    observer observers
+
+    ensure amount > 0.0
+
+    -- | Transfer asset to another party
+    choice Transfer : ContractId Asset
+      with
+        newOwner : Party
+      controller owner
+      do
+        create this with owner = newOwner
+
+    -- | Split asset into two parts
+    choice Split : (ContractId Asset, ContractId Asset)
+      with
+        splitAmount : Decimal
+      controller owner
+      do
+        assertMsg "Split amount must be positive" (splitAmount > 0.0)
+        assertMsg "Split amount cannot exceed total" (splitAmount < amount)
+
+        splitAsset <- create this with amount = splitAmount
+        remainderAsset <- create this with amount = amount - splitAmount
+
+        return (splitAsset, remainderAsset)
+
+    -- | Merge with another asset of same type
+    choice Merge : ContractId Asset
+      with
+        otherAssetCid : ContractId Asset
+      controller owner
+      do
+        otherAsset <- fetch otherAssetCid
+        assertMsg "Assets must have same issuer" (otherAsset.issuer == issuer)
+        assertMsg "Assets must have same owner" (otherAsset.owner == owner)
+        assertMsg "Assets must have same symbol" (otherAsset.symbol == symbol)
+
+        exercise otherAssetCid Archive
+        create this with amount = amount + otherAsset.amount
+
+    -- | Lock asset for trading (create escrow)
+    choice LockForOrder : ContractId LockedAsset
+      with
+        orderId : Text
+        orderSide : Text  -- "BUY" or "SELL"
+      controller owner
+      do
+        create LockedAsset with
+          issuer = issuer
+          owner = owner
+          symbol = symbol
+          amount = amount
+          lockedBy = orderId
+          orderSide = orderSide
+          observers = observers
+
+-- | Represents an asset locked for an order
+template LockedAsset
+  with
+    issuer : Party
+    owner : Party
+    symbol : Text
+    amount : Decimal
+    lockedBy : Text      -- Order ID that locked this asset
+    orderSide : Text     -- "BUY" or "SELL"
+    observers : [Party]
+  where
+    signatory issuer, owner
+    observer observers
+
+    ensure amount > 0.0
+
+    -- | Unlock asset (e.g., when order is cancelled)
+    choice Unlock : ContractId Asset
+      controller owner
+      do
+        create Asset with
+          issuer = issuer
+          owner = owner
+          symbol = symbol
+          amount = amount
+          observers = observers
+
+    -- | Transfer locked asset to another party (settlement)
+    choice SettleTransfer : ContractId Asset
+      with
+        newOwner : Party
+      controller owner
+      do
+        create Asset with
+          issuer = issuer
+          owner = newOwner
+          symbol = symbol
+          amount = amount
+          observers = observers
+
+    -- | Split locked asset
+    choice SplitLocked : (ContractId LockedAsset, ContractId LockedAsset)
+      with
+        splitAmount : Decimal
+      controller owner
+      do
+        assertMsg "Split amount must be positive" (splitAmount > 0.0)
+        assertMsg "Split amount cannot exceed total" (splitAmount < amount)
+
+        splitAsset <- create this with amount = splitAmount
+        remainderAsset <- create this with amount = amount - splitAmount
+
+        return (splitAsset, remainderAsset)
+
+-- | Asset issuance/minting template
+template AssetIssuance
+  with
+    issuer : Party
+    recipient : Party
+    symbol : Text
+    amount : Decimal
+  where
+    signatory issuer
+    observer recipient
+
+    -- | Issue the asset to recipient
+    choice IssueAsset : ContractId Asset
+      controller issuer
+      do
+        create Asset with
+          issuer = issuer
+          owner = recipient
+          symbol = symbol
+          amount = amount
+          observers = []
+
+-- | Faucet for test tokens
+template Faucet
+  with
+    operator : Party
+    allowedRecipients : [Party]  -- Empty list means anyone can mint
+  where
+    signatory operator
+
+    -- | Mint test tokens
+    choice MintTestTokens : [ContractId Asset]
+      with
+        recipient : Party
+        tokens : [(Text, Decimal)]  -- List of (symbol, amount)
+      controller operator
+      do
+        assertMsg "Must mint at least one token" (not $ null tokens)
+
+        forA tokens $ \(symbol, amount) -> do
+          create Asset with
+            issuer = operator
+            owner = recipient
+            symbol = symbol
+            amount = amount
+            observers = []

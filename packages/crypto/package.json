@@ -1,0 +1,33 @@
+{
+  "name": "@clob-exchange/crypto",
+  "version": "1.0.0",
+  "description": "Browser wallet crypto utilities (Ed25519, encryption, backup)",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@noble/ed25519": "^1.7.3",
+    "@types/bip39": "^3.0.4",
+    "bip39": "^3.1.0",
+    "buffer": "^6.0.3",
+    "tweetnacl": "^1.0.3",
+    "tweetnacl-util": "^0.15.1"
+  },
+  "devDependencies": {
+    "@types/bip39": "^3.0.0",
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.3"
+  }
+}

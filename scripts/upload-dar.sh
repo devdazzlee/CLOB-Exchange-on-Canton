@@ -6,7 +6,7 @@
 set -e
 
 # Configuration
-DAR_FILE="${1:-.daml/dist/clob-exchange-1.0.0.dar}"
+DAR_FILE="${1:-daml/.daml/dist/clob-exchange-1.0.0.dar}"
 JWT_TOKEN="${JWT_TOKEN:-}"
 PARTICIPANT_HOST="participant.dev.canton.wolfedgelabs.com"
 CANTON_ADMIN_GRPC_PORT=443
@@ -60,21 +60,24 @@ DAR_NAME=$(basename "$DAR_FILE")
 cp "$DAR_FILE" "$DAR_DIRECTORY/$DAR_NAME"
 echo -e "${GREEN}✓ Copied DAR file to $DAR_DIRECTORY/$DAR_NAME${NC}"
 
-# Base64 encode DAR file
+# Base64 encode DAR file to temporary file
 echo "Encoding DAR file..."
+TEMP_BASE64_FILE=$(mktemp)
+trap "rm -f $TEMP_BASE64_FILE" EXIT
+
 if [[ "$OSTYPE" == "darwin"* ]]; then
   # macOS (BSD base64)
-  BASE64_ENCODED_DAR=$(base64 -i "$DAR_DIRECTORY/$DAR_NAME" | tr -d '\n')
+  base64 -i "$DAR_DIRECTORY/$DAR_NAME" | tr -d '\n' > "$TEMP_BASE64_FILE"
 else
   # Linux (GNU base64)
-  BASE64_ENCODED_DAR=$(base64 -w 0 "$DAR_DIRECTORY/$DAR_NAME")
+  base64 -w 0 "$DAR_DIRECTORY/$DAR_NAME" > "$TEMP_BASE64_FILE"
 fi
 
-# Prepare gRPC request
+# Prepare gRPC request using file input to avoid argument length limit
 # If package already exists, set vet_all_packages to false to skip vetting
 # This allows uploading even if a package with the same name/version exists
 GRPC_UPLOAD_DAR_REQUEST=$(jq -n \
-  --arg bytes "$BASE64_ENCODED_DAR" \
+  --rawfile bytes "$TEMP_BASE64_FILE" \
   '{
     "dars": [{
       "bytes": $bytes
@@ -96,7 +99,7 @@ echo ""
 # Use a temp file for the request to avoid pipe issues
 TEMP_REQUEST_FILE=$(mktemp)
 echo "$GRPC_UPLOAD_DAR_REQUEST" > "$TEMP_REQUEST_FILE"
-trap "rm -f $TEMP_REQUEST_FILE" EXIT
+trap "rm -f $TEMP_REQUEST_FILE $TEMP_BASE64_FILE" EXIT
 
 # Run grpcurl directly with timeout
 # -max-time should handle timeout, but if it hangs we'll see it

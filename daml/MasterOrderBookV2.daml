@@ -1,0 +1,203 @@
+-- | MasterOrderBook V2 - With real asset locking and settlement
+module MasterOrderBookV2 where
+
+import qualified OrderV2
+import Trade
+import Asset
+import AssetHolding
+import qualified DA.Map as Map
+import DA.List (sortBy)
+import DA.Optional
+import DA.Time
+import DA.Text
+import DA.Foldable (forA_)
+import DA.Action (when)
+
+-- =============================================================================
+-- HELPER FUNCTIONS
+-- =============================================================================
+
+-- Helper to parse trading pair
+parseTradingPair : Text -> (Text, Text)
+parseTradingPair pair =
+  if pair == "BTC/USDT" || pair == "BTC-USDT" then ("BTC", "USDT")
+  else if pair == "ETH/USDT" || pair == "ETH-USDT" then ("ETH", "USDT")
+  else if pair == "SOL/USDT" || pair == "SOL-USDT" then ("SOL", "USDT")
+  else ("UNKNOWN", "UNKNOWN")
+
+-- Helper to determine trade price
+determineTradePrice : OrderV2.OrderV2 -> OrderV2.OrderV2 -> Decimal
+determineTradePrice buyOrder sellOrder = case buyOrder.price of
+  Some bp -> case sellOrder.price of
+    Some sp -> (bp + sp) / 2.0
+    None -> bp
+  None -> case sellOrder.price of
+    Some sp -> sp
+    None -> 0.0
+
+-- Helper to check if orders can match
+canOrdersMatch : OrderV2.OrderV2 -> OrderV2.OrderV2 -> Bool
+canOrdersMatch buyOrder sellOrder = case buyOrder.price of
+  Some buyPrice -> case sellOrder.price of
+    Some sellPrice -> buyPrice >= sellPrice
+    None -> True
+  None -> True
+
+-- =============================================================================
+-- SETTLEMENT WITH REAL ASSET TRANSFERS
+-- =============================================================================
+
+-- | Execute match with real asset settlement
+-- | Transfers locked assets between buyer and seller
+executeMatchV2 :
+  ContractId OrderV2.OrderV2
+  -> OrderV2.OrderV2
+  -> ContractId OrderV2.OrderV2
+  -> OrderV2.OrderV2
+  -> ContractId AssetHolding  -- Buyer's holding
+  -> ContractId AssetHolding  -- Seller's holding
+  -> Text  -- Base token (e.g., "BTC")
+  -> Text  -- Quote token (e.g., "USDT")
+  -> Update ()
+executeMatchV2 buyCid buyOrder sellCid sellOrder buyerHoldingCid sellerHoldingCid baseToken quoteToken = do
+  -- Calculate trade details
+  let buyRemaining = buyOrder.quantity - buyOrder.filled
+  let sellRemaining = sellOrder.quantity - sellOrder.filled
+  let tradeQuantity = min buyRemaining sellRemaining
+  let tradePrice = determineTradePrice buyOrder sellOrder
+  let quoteAmount = tradeQuantity * tradePrice
+
+  -- Fill the orders
+  _ <- exercise buyCid OrderV2.FillOrderV2 with fillQuantity = tradeQuantity
+  _ <- exercise sellCid OrderV2.FillOrderV2 with fillQuantity = tradeQuantity
+
+  -- Settle assets:
+  -- 1. Transfer quote token (USDT) from buyer's locked to seller's available
+  (newBuyerHolding, newSellerHolding1) <- exercise buyerHoldingCid AssetHolding.SettleLockedTransfer with
+    symbol = quoteToken
+    amount = quoteAmount
+    recipientHoldingCid = sellerHoldingCid
+
+  -- 2. Transfer base token (BTC) from seller's locked to buyer's available
+  (newSellerHolding, _) <- exercise sellerHoldingCid AssetHolding.SettleLockedTransfer with
+    symbol = baseToken
+    amount = tradeQuantity
+    recipientHoldingCid = newBuyerHolding
+
+  -- Create trade record
+  now <- getTime
+  let tradeIdText = buyOrder.orderId <> "-" <> sellOrder.orderId <> "-" <> show now
+  _ <- create Trade with
+    tradeId = tradeIdText
+    buyer = buyOrder.owner
+    seller = sellOrder.owner
+    tradingPair = buyOrder.tradingPair
+    price = tradePrice
+    quantity = tradeQuantity
+    timestamp = now
+    buyOrderId = buyOrder.orderId
+    sellOrderId = sellOrder.orderId
+
+  return ()
+
+-- =============================================================================
+-- MASTER ORDER BOOK TEMPLATE V2
+-- =============================================================================
+
+template MasterOrderBookV2
+  with
+    tradingPair : Text
+    buyOrders : [ContractId OrderV2.OrderV2]
+    sellOrders : [ContractId OrderV2.OrderV2]
+    lastPrice : Optional Decimal
+    operator : Party
+    publicObserver : Party
+    activeUsers : [Party]
+    -- Track user holdings for settlement
+    userHoldings : Map.Map Party (ContractId AssetHolding)
+  where
+    signatory operator
+    observer publicObserver, activeUsers
+
+    -- | Add a user's asset holding for tracking
+    choice RegisterUserHolding : ContractId MasterOrderBookV2
+      with
+        user : Party
+        holdingCid : ContractId AssetHolding
+      controller operator
+      do
+        let newUserHoldings = Map.insert user holdingCid userHoldings
+        create this with userHoldings = newUserHoldings
+
+    -- | Match orders and settle trades
+    nonconsuming choice MatchOrdersV2 : ()
+      controller operator
+      do
+        -- Fetch all buy and sell orders
+        buyOrderPairs <- forA buyOrders $ \cid -> do
+          order <- fetch cid
+          return (cid, order)
+
+        sellOrderPairs <- forA sellOrders $ \cid -> do
+          order <- fetch cid
+          return (cid, order)
+
+        -- Filter only OPEN orders
+        let openBuyOrders = filter (\(_, o) -> o.status == "OPEN") buyOrderPairs
+        let openSellOrders = filter (\(_, o) -> o.status == "OPEN") sellOrderPairs
+
+        -- Sort orders (FIFO price-time priority)
+        let sortedBuys = sortBy (\(_, a) (_, b) ->
+              case (a.price, b.price) of
+                (None, Some _) -> GT  -- Market orders first
+                (Some _, None) -> LT
+                (None, None) -> if a.timestamp < b.timestamp then GT else LT
+                (Some pa, Some pb) ->
+                  if pa > pb then GT
+                  else if pa < pb then LT
+                  else if a.timestamp < b.timestamp then GT
+                  else LT
+              ) openBuyOrders
+
+        let sortedSells = sortBy (\(_, a) (_, b) ->
+              case (a.price, b.price) of
+                (None, Some _) -> GT
+                (Some _, None) -> LT
+                (None, None) -> if a.timestamp < b.timestamp then GT else LT
+                (Some pa, Some pb) ->
+                  if pa < pb then GT
+                  else if pa > pb then LT
+                  else if a.timestamp < b.timestamp then GT
+                  else LT
+              ) openSellOrders
+
+        -- Match orders
+        let (baseToken, quoteToken) = parseTradingPair tradingPair
+
+        forA_ sortedBuys $ \(buyCid, buyOrder) -> do
+          forA_ sortedSells $ \(sellCid, sellOrder) -> do
+            -- Prevent self-trading
+            when (buyOrder.owner /= sellOrder.owner) $ do
+              -- Check if orders can match
+              when (canOrdersMatch buyOrder sellOrder) $ do
+                -- Get holdings
+                case (Map.lookup buyOrder.owner userHoldings, Map.lookup sellOrder.owner userHoldings) of
+                  (Some buyerHoldingCid, Some sellerHoldingCid) -> do
+                    -- Execute settlement
+                    executeMatchV2 buyCid buyOrder sellCid sellOrder buyerHoldingCid sellerHoldingCid baseToken quoteToken
+                  _ -> return ()  -- Skip if holdings not found
+
+        return ()
+
+-- | Initialize a new order book
+createMasterOrderBookV2 : Party -> Party -> Text -> Update (ContractId MasterOrderBookV2)
+createMasterOrderBookV2 operator publicObserver tradingPair = do
+  create MasterOrderBookV2 with
+    tradingPair = tradingPair
+    buyOrders = []
+    sellOrders = []
+    lastPrice = None
+    operator = operator
+    publicObserver = publicObserver
+    activeUsers = []
+    userHoldings = Map.empty
