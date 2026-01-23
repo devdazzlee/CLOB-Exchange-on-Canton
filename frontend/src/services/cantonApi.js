@@ -15,15 +15,30 @@ import apiClient from './apiClient';
 import { getValidAccessToken } from './keycloakAuth';
 
 // Canton JSON API endpoint
-// Use Vite proxy in development, direct calls in production (like old working code)
+// Use backend proxy at port 3001 (NOT Vite proxy at port 3000)
 const CANTON_API_BASE = import.meta.env.DEV 
-  ? '/api/canton'  // Use Vite proxy in development
+  ? 'http://localhost:3001/api/ledger'  // Use backend proxy in development
   : 'https://clob-exchange-on-canton.vercel.app/api/proxy';  // Use Vercel proxy in production
 const API_VERSION = 'v2';
 
-// CRITICAL: Hardcoded Package IDs to prevent 413 errors
-// These package IDs were discovered from logs and are used to bypass broken discovery logic
-const USER_ACCOUNT_PACKAGE_ID = "51522c778cf057ce80b3aa38d272a2fb72ae60ae871bca67940aaccf59567ac9";
+/**
+ * Authenticated fetch helper - ensures Authorization header is always sent
+ * @param {string} path - API path (e.g., '/v2/state/active-contracts')
+ * @param {Object} options - Fetch options
+ * @returns {Promise<Response>} Fetch response
+ */
+async function cantonFetch(path, options = {}) {
+  const token = await getValidAccessToken();
+  if (!token) throw new Error("No access token available");
+
+  const headers = {
+    ...(options.headers || {}),
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${token}`,
+  };
+
+  return fetch(`${CANTON_API_BASE}${path}`, { ...options, headers });
+}
 const MASTER_ORDERBOOK_PACKAGE_ID = "dd500bf887d7e153ee6628b3f6722f234d3d62ce855572ff7ce73b7b3c2afefd";
 
 /**
@@ -214,12 +229,10 @@ export async function queryContractsAtOffset(templateId, party = null, offset = 
       }
     };
 
-    const headers = getHeaders();
     console.log('[API] Querying contracts at offset:', offsetStr, templateId, `for party ${party}`);
 
-    const response = await fetch(`${CANTON_API_BASE}/${API_VERSION}/state/active-contracts`, {
-      method: 'POST',
-      headers: headers,
+    const response = await cantonFetch(`/${API_VERSION}/state/active-contracts`, {
+      method: "POST",
       body: JSON.stringify(requestBody)
     });
 
@@ -335,14 +348,12 @@ export async function queryContracts(templateId, party = null) {
       }
     };
 
-    const headers = getHeaders();
     console.log('[API] Querying contracts:', templateId, `for party ${party}`);
     console.log('[API] Using filter: filtersByParty (required for non-admin users)');
 
-    const response = await fetch(`${CANTON_API_BASE}/${API_VERSION}/state/active-contracts`, {
-      method: 'POST',
-      headers: headers,
-      body: JSON.stringify(requestBody)
+    const response = await cantonFetch(`/${API_VERSION}/state/active-contracts`, {
+      method: "POST",
+      body: JSON.stringify(requestBody),
     });
 
     if (!response.ok) {
@@ -869,10 +880,8 @@ export async function fetchContract(contractId, party = null, offset = null) {
     
     console.log('[API] Fetching contract by ID:', contractId.substring(0, 20) + '...', 'at offset:', offsetStr);
 
-    const headers = getHeaders();
-    const response = await fetch(`${CANTON_API_BASE}/${API_VERSION}/state/active-contracts`, {
-      method: 'POST',
-      headers: headers,
+    const response = await cantonFetch(`/${API_VERSION}/state/active-contracts`, {
+      method: "POST",
       body: JSON.stringify(requestBody)
     });
 
@@ -955,10 +964,8 @@ export async function fetchContracts(contractIds, party = null, offset = null) {
     
     console.log('[API] Fetching', contractIds.length, 'contracts by ID at offset:', offsetStr);
 
-    const headers = getHeaders();
-    const response = await fetch(`${CANTON_API_BASE}/${API_VERSION}/state/active-contracts`, {
-      method: 'POST',
-      headers: headers,
+    const response = await cantonFetch(`/${API_VERSION}/state/active-contracts`, {
+      method: "POST",
       body: JSON.stringify(requestBody)
     });
 

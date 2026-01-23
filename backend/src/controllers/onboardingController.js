@@ -87,14 +87,14 @@ class OnboardingController {
       });
 
       try {
-        const result = await this.onboardingService.allocateParty(
+        const result = await this.onboardingService.completeOnboarding(
           publicKeyBase64,
           signatureBase64,
           txs,
           publicKeyFingerprint
         );
 
-        return success(res, result, 'Party allocated successfully', 200);
+        return success(res, result, 'Party onboarded successfully with UserAccount and tokens', 200);
       } catch (err) {
         const statusCode = err.statusCode || 500;
         return error(res, err.message, statusCode, err.cause);

@@ -120,38 +120,17 @@ class OrderService {
         quantity
       });
 
-      const exerciseResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/commands/submit-and-wait`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`
-        },
-        body: JSON.stringify({
-          commandId: commandId,
-          commands: [{
-            ExerciseCommand: {
-              templateId: orderBookTemplateId,
-              contractId: orderBookContractId,
-              choice: 'AddOrder',
-              choiceArgument: addOrderArgument
-            }
-          }],
-          actAs: actAsParties
-        })
+      const exerciseResponse = await cantonService.exerciseChoice({
+        token: adminToken,
+        actAsParty: actAsParties[0],
+        templateId: orderBookTemplateId,
+        contractId: orderBookContractId,
+        choice: 'AddOrder',
+        choiceArgument: addOrderArgument,
+        readAs: actAsParties,
       });
 
-      if (!exerciseResponse.ok) {
-        const errorText = await exerciseResponse.text();
-        let error;
-        try {
-          error = JSON.parse(errorText);
-        } catch {
-          error = { message: errorText };
-        }
-        throw new Error(error.message || error.cause || `Failed to place order: ${exerciseResponse.statusText}`);
-      }
-
-      const result = await exerciseResponse.json();
+      const result = exerciseResponse; // exerciseChoice returns the result directly
 
       console.log(`[Order Service] ✅ Order placed successfully with Allocation. Update ID: ${result.updateId}`);
 
@@ -268,45 +247,24 @@ class OrderService {
         actAsParties.push(operator);
       }
 
-      const exerciseResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/commands/submit-and-wait`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`
+      const exerciseResponse = await cantonService.exerciseChoice({
+        token: adminToken,
+        actAsParty: actAsParties[0],
+        templateId: orderBookTemplateId,
+        contractId: orderBookContractId,
+        choice: 'AddOrder',
+        choiceArgument: {
+          orderId: orderId,
+          owner: partyId,
+          orderType: orderType,
+          orderMode: orderMode,
+          price: orderMode === 'LIMIT' && price ? price.toString() : null,
+          quantity: quantity.toString()
         },
-        body: JSON.stringify({
-          commandId: commandId,
-          commands: [{
-            exercise: {
-              templateId: orderBookTemplateId,
-              contractId: orderBookContractId,
-              choice: 'AddOrder',
-              argument: {
-                orderId: orderId,
-                owner: partyId,
-                orderType: orderType,
-                orderMode: orderMode,
-                price: orderMode === 'LIMIT' && price ? price.toString() : null,
-                quantity: quantity.toString()
-              }
-            }
-          }],
-          actAs: actAsParties
-        })
+        readAs: actAsParties,
       });
 
-      if (!exerciseResponse.ok) {
-        const errorText = await exerciseResponse.text();
-        let error;
-        try {
-          error = JSON.parse(errorText);
-        } catch {
-          error = { message: errorText };
-        }
-        throw new Error(error.message || error.cause || `Failed to place order: ${exerciseResponse.statusText}`);
-      }
-
-      const result = await exerciseResponse.json();
+      const result = exerciseResponse; // exerciseChoice returns the result directly
 
       console.log(`[Order Service] ✅ Order placed successfully. Update ID: ${result.updateId}`);
       console.log(`[Order Service] Matchmaking should have executed automatically (MatchOrders called in AddOrder)`);
@@ -399,38 +357,16 @@ class OrderService {
       // Step 2: Cancel order
       const cancelCommandId = `cancel-order-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
       
-      const cancelResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/commands/submit-and-wait`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`
-        },
-        body: JSON.stringify({
-          commandId: cancelCommandId,
-          commands: [{
-            exercise: {
-              templateId: orderTemplateId,
-              contractId: orderContractId,
-              choice: 'CancelOrder',
-              argument: {}
-            }
-          }],
-          actAs: [partyId]
-        })
+      const cancelResult = await cantonService.exerciseChoice({
+        token: adminToken,
+        actAsParty: partyId,
+        templateId: orderTemplateId,
+        contractId: orderContractId,
+        choice: 'CancelOrder',
+        choiceArgument: {},
+        readAs: [partyId],
       });
 
-      if (!cancelResponse.ok) {
-        const errorText = await cancelResponse.text();
-        let error;
-        try {
-          error = JSON.parse(errorText);
-        } catch {
-          error = { message: errorText };
-        }
-        throw new Error(error.message || error.cause || `Failed to cancel order: ${cancelResponse.statusText}`);
-      }
-
-      const cancelResult = await cancelResponse.json();
       console.log(`[Order Service] ✅ Order cancelled. Update ID: ${cancelResult.updateId}`);
 
       // Step 3: Remove from OrderBook (if orderBookContractId provided)

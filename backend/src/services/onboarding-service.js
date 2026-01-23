@@ -8,6 +8,7 @@
 
 const crypto = require('crypto');
 const config = require('../config');
+const cantonService = require('./cantonService');
 
 class OnboardingService {
   constructor() {
@@ -258,6 +259,46 @@ class OnboardingService {
   }
 
   /**
+   * Discover Identity Provider ID from Canton
+   * Uses GET /v2/idps to list available identity providers
+   */
+  async discoverIdentityProviderId() {
+    const token = await this.getCantonToken();
+    const url = `${config.canton.jsonApiBase}/v2/idps`;
+
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${token}` }
+    });
+
+    if (!res.ok) {
+      console.warn('[Onboarding] Failed to list IDPs, using empty string:', res.status, await res.text());
+      return ""; // Fallback to empty string if endpoint not available
+    }
+
+    const data = await res.json();
+
+    // Handle different response formats
+    const idps = data.identityProviderConfigs || data.result || data || [];
+    if (!Array.isArray(idps) || idps.length === 0) {
+      console.warn('[Onboarding] No IDPs found, using empty string');
+      return ""; // Fallback to empty string
+    }
+
+    // Prefer active/default if present, otherwise first
+    const active = idps.find(x => x.isDeactivated === false) || idps[0];
+    const idpId = active.identityProviderId || active.id;
+
+    if (!idpId) {
+      console.warn('[Onboarding] Could not extract identityProviderId, using empty string');
+      return ""; // Fallback to empty string
+    }
+
+    console.log('[Onboarding] Discovered identityProviderId:', idpId);
+    return idpId;
+  }
+
+  /**
    * STEP 2: Allocate party
    * Calls /v2/parties/external/allocate
    * Requires signature from wallet
@@ -268,116 +309,178 @@ class OnboardingService {
    * - Proper error handling with cause details
    */
   async allocateParty(publicKeyBase64, signatureBase64, topologyTransactions, publicKeyFingerprint) {
-    const token = await this.getCantonToken();
-    const synchronizerId = await this.discoverSynchronizerId();
+    try {
+      const token = await this.getCantonToken();
+      const synchronizerId = await this.discoverSynchronizerId();
+      const identityProviderId = await this.discoverIdentityProviderId();
 
-    console.log('[OnboardingService] Allocating party with signature');
+      const url = `${config.canton.jsonApiBase}/v2/parties/external/allocate`;
 
-    // Normalize topology transactions (accept either key name)
-    const txs = topologyTransactions || [];
+      // IMPORTANT: allocate expects onboardingTransactions = [{ transaction }]
+      const onboardingTransactions = topologyTransactions.map((t) => ({ transaction: t }));
 
-    if (!txs || txs.length === 0) {
-      throw new Error('topologyTransactions required for allocate step');
-    }
-
-    if (!signatureBase64 || signatureBase64.trim() === '') {
-      throw new Error('signatureBase64 required for allocate step');
-    }
-
-    const url = `${config.canton.jsonApiBase}/v2/parties/external/allocate`;
-
-    // Construct the publicKey object (Canton needs the full key, not just fingerprint)
-    const publicKeyObj = {
-      format: 'CRYPTO_KEY_FORMAT_RAW',
-      keyData: publicKeyBase64,
-      keySpec: 'SIGNING_KEY_SPEC_EC_CURVE25519',
-    };
-
-    const requestBody = {
-      synchronizer: synchronizerId,
-      topologyTransactions: txs,
-      multiHashSignatures: [
-        {
-          publicKey: publicKeyObj,
-          signature: {
-            format: 'SIGNATURE_FORMAT_RAW',
+      const body = {
+        synchronizer: synchronizerId,
+        identityProviderId, // Add identityProviderId (may be empty string)
+        onboardingTransactions,
+        multiHashSignatures: [
+          {
+            format: "SIGNATURE_FORMAT_CONCAT",
             signature: signatureBase64,
             signedBy: publicKeyFingerprint,
-            signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
-          },
+            signingAlgorithmSpec: "SIGNING_ALGORITHM_SPEC_ED25519"
+          }
+        ]
+      };
+
+      console.log('[OnboardingService] Allocate request (formatted):', JSON.stringify(body, null, 2));
+
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { 
+          Authorization: `Bearer ${token}`, 
+          "Content-Type": "application/json" 
         },
-      ],
-    };
+        body: JSON.stringify(body),
+      });
 
-    // Log the exact JSON string being sent
-    const requestBodyString = JSON.stringify(requestBody);
-    console.log('[OnboardingService] Allocate request JSON string length:', requestBodyString.length);
-    console.log('[OnboardingService] Allocate request (formatted):', JSON.stringify(requestBody, null, 2));
+      const text = await res.text();
+      console.log('[OnboardingService] Allocate response status:', res.status);
+      console.log('[OnboardingService] Allocate response text:', text);
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: requestBodyString,
-    });
-
-    const responseText = await response.text();
-
-    // Always log the response, even on error
-    console.log('[OnboardingService] Allocate response status:', response.status);
-    console.log('[OnboardingService] Allocate response text:', responseText);
-
-    if (!response.ok) {
-      // Try to parse error response as JSON for better error messages
-      let errorDetails = responseText;
-      try {
-        const errorJson = JSON.parse(responseText);
-        errorDetails = JSON.stringify(errorJson, null, 2);
-        console.log('[OnboardingService] Parsed error response:', errorDetails);
-      } catch (e) {
-        // Not JSON, use as-is
+      if (!res.ok) {
+        throw new Error(`Allocate failed ${res.status}: ${text}`);
       }
 
-      // Include upstream error as cause
-      const statusCode = response.status;
+      const data = JSON.parse(text);
+      console.log('[OnboardingService] Allocate response:', JSON.stringify(data, null, 2));
 
-      // Return proper status codes
-      if (statusCode >= 400 && statusCode < 500) {
-        const error = new Error(`Client error: ${responseText}`);
-        error.statusCode = 400;
-        error.cause = responseText;
-        throw error;
-      } else {
-        const error = new Error(`Canton upstream error: ${responseText}`);
-        error.statusCode = 502;
-        error.cause = responseText;
-        throw error;
+      // Extract partyId from response
+      const partyId = data.partyId || data.party || data.identifier;
+
+      if (!partyId) {
+        throw new Error('Allocate response missing partyId');
       }
+
+      return {
+        step: 'ALLOCATED',
+        partyId,
+        synchronizerId,
+      };
+    } catch (error) {
+      console.error('[OnboardingService] Allocate error:', error);
+      throw error;
     }
+  }
 
-    let data;
+  /**
+   * Complete onboarding flow - allocate party and create UserAccount with tokens
+   */
+  async completeOnboarding(publicKeyBase64, signatureBase64, topologyTransactions, publicKeyFingerprint) {
     try {
-      data = JSON.parse(responseText);
-    } catch (e) {
-      throw new Error(`Invalid JSON response from allocate: ${responseText}`);
+      // Step 1: Allocate party
+      const allocationResult = await this.allocateParty(
+        publicKeyBase64,
+        signatureBase64,
+        topologyTransactions,
+        publicKeyFingerprint
+      );
+
+      console.log('[Onboarding] Party allocated successfully:', allocationResult.partyId);
+
+      // Step 2: Create UserAccount and mint tokens
+      const tokenResult = await this.createUserAccountAndMintTokens(allocationResult.partyId);
+
+      return {
+        ...allocationResult,
+        ...tokenResult,
+      };
+    } catch (error) {
+      console.error('[Onboarding] Complete onboarding failed:', error);
+      throw error;
     }
+  }
 
-    console.log('[OnboardingService] Allocate response:', JSON.stringify(data, null, 2));
+  /**
+   * Create UserAccount and seed 10,000 USDT for a new party
+   * Uses correct JSON API v2 format
+   */
+  async createUserAccountAndMintTokens(partyId) {
+    try {
+      const adminToken = await this.getCantonToken();
+      const operatorPartyId = config.canton.operatorPartyId;
 
-    // Extract partyId from response
-    const partyId = data.partyId || data.party || data.identifier;
+      console.log('[Onboarding] Creating UserAccount for party:', partyId);
+      
+      // ✅ Use package-name reference: "#<package-name>:Module:Entity"
+      const templateId = `#clob-exchange-splice:UserAccount:UserAccount`;
 
-    if (!partyId) {
-      throw new Error('Allocate response missing partyId');
+      const createArguments = {
+        party: partyId,
+        operator: operatorPartyId,
+        // DA.Map.Map Text Decimal => array of [key, value] pairs
+        balances: [
+          ["USDT", "10000.0"],
+        ],
+      };
+
+      // Get synchronizer ID for command submission
+      const synchronizerId = await this.discoverSynchronizerId();
+
+      const result = await cantonService.createContract({
+        token: adminToken,
+        actAsParty: operatorPartyId, // because signatory is operator
+        templateId,
+        createArguments,
+        readAs: [operatorPartyId],
+        synchronizerId, // Required for NO_SYNCHRONIZER error
+      });
+
+      console.log('[Onboarding] UserAccount created successfully:', result);
+      
+      return {
+        userAccountCreated: true,
+        usdtMinted: 10000,
+        userAccountResult: result
+      };
+    } catch (error) {
+      console.error('[Onboarding] Failed to create UserAccount or mint tokens:', error);
+      throw error;
     }
+  }
 
-    return {
-      step: 'ALLOCATED',
-      partyId,
+  /**
+   * Helper method to mint tokens via Faucet
+   */
+  async mintTokens(partyId, tokenType, amount) {
+    const adminToken = await this.getCantonToken();
+    const synchronizerId = await this.discoverSynchronizerId();
+    
+    // ✅ Use package-name reference: "#<package-name>:Module:Entity"
+    const templateId = `#clob-exchange-splice:Faucet:Faucet`;
+    
+    // First, we need to find the Faucet contract ID
+    const faucetContracts = await cantonService.queryActiveContracts(adminToken, {
+      templateIds: [templateId],
+      readAs: [config.canton.operatorPartyId]
+    });
+    
+    if (!faucetContracts.activeContracts || faucetContracts.activeContracts.length === 0) {
+      throw new Error('Faucet contract not found');
+    }
+    
+    const faucetContractId = faucetContracts.activeContracts[0].contractId;
+    
+    return cantonService.exerciseChoice({
+      token: adminToken,
+      actAsParty: config.canton.operatorPartyId,
+      templateId,
+      contractId: faucetContractId,
+      choice: "MintTestTokens",
+      choiceArgument: { party: partyId, tokenType, amount },
+      readAs: [config.canton.operatorPartyId],
       synchronizerId,
-    };
+    });
   }
 
   /**

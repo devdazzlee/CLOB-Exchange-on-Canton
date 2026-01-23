@@ -36,6 +36,7 @@ router.use('/token-exchange', authRoutes); // POST /api/token-exchange
 router.post('/inspect-token', authController.inspectToken); // POST /api/inspect-token
 router.use('/ws/status', healthRoutes); // GET /api/ws/status
 router.use('/ledger', ledgerRoutes);
+router.use('/canton', ledgerRoutes);
 router.use('/testnet', mintingRoutes); // Test token minting endpoints
 
 // Debug: Log all registered routes
@@ -50,6 +51,7 @@ console.log('  POST /api/token-exchange');
 console.log('  POST /api/inspect-token');
 console.log('  GET  /api/ws/status');
 console.log('  ALL  /api/ledger/*');
+console.log('  ALL  /api/canton/*');
 console.log('  POST /api/testnet/mint-tokens');
 console.log('  POST /api/testnet/quick-mint');
 console.log('  GET  /api/testnet/balances/:partyId');

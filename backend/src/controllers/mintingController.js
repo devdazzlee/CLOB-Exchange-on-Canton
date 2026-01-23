@@ -5,6 +5,34 @@
 
 const cantonService = require('../services/cantonService');
 const { broadcastBalanceUpdate } = require('../services/websocketService');
+const config = require('../config');
+
+/**
+ * Discover synchronizer ID from Canton
+ */
+async function discoverSynchronizerId() {
+  try {
+    const response = await fetch(`${config.canton.jsonApiBase}/v2/state/connected-synchronizers`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${await cantonService.getAdminToken()}`,
+        'Content-Type': 'application/json',
+      },
+    });
+    
+    if (response.ok) {
+      const data = await response.json();
+      const synchronizers = data.synchronizers || [];
+      if (synchronizers.length > 0) {
+        return synchronizers[0]; // Return first synchronizer
+      }
+    }
+    throw new Error('No synchronizers found');
+  } catch (error) {
+    console.error('[MintingController] Failed to discover synchronizer:', error);
+    throw error;
+  }
+}
 
 /**
  * Mint test tokens for a user
@@ -73,12 +101,17 @@ async function mintTestTokens(req, res) {
       // Exercise UpdateAvailable choice for each token
       for (const token of tokens) {
         const updateResult = await cantonService.exerciseChoice({
+          token: await cantonService.getAdminToken(),
+          actAsParty: operatorPartyId,
+          templateId: '#clob-exchange-splice:AssetHolding:AssetHolding',
           contractId: holdingContractId,
           choice: 'UpdateAvailable',
-          argument: {
+          choiceArgument: {
             symbol: token.symbol,
             delta: token.amount
-          }
+          },
+          readAs: [operatorPartyId],
+          synchronizerId: await discoverSynchronizerId(),
         });
 
         if (updateResult && updateResult.contractId) {
@@ -96,13 +129,17 @@ async function mintTestTokens(req, res) {
       }
 
       const createResult = await cantonService.createContract({
-        templateId: 'AssetHolding',
-        payload: {
+        token: await cantonService.getAdminToken(),
+        actAsParty: operatorPartyId,
+        templateId: '#clob-exchange-splice:AssetHolding:AssetHolding',
+        createArguments: {
           operator: operatorPartyId,
           party: partyId,
           assets: currentAssets,
           lockedAssets: {}
-        }
+        },
+        readAs: [operatorPartyId],
+        synchronizerId: await discoverSynchronizerId(),
       });
 
       holdingContractId = createResult.contractId;

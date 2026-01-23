@@ -1,168 +1,106 @@
 /**
- * Canton Service
- * Handles all Canton ledger interactions
+ * Canton Service - JSON Ledger API v2
  */
+const config = require("../config");
+const CantonAdmin = require("./canton-admin");
+const crypto = require("crypto");
 
-const config = require('../config');
-const CantonAdmin = require('./canton-admin');
+function normalizeTemplateId(templateId) {
+  // v2 expects templateId as STRING.
+  // Use package-id reference: "<packageId>:<Module>:<Entity>"
+  if (templateId && typeof templateId === "object" && templateId.packageId) {
+    return `${templateId.packageId}:${templateId.moduleName}:${templateId.entityName}`;
+  }
+  return templateId;
+}
 
 class CantonService {
-  constructor() {
-    this.cantonAdmin = new CantonAdmin();
-    this.cantonApiBase = config.canton.jsonApiBase;
+  constructor(cantonApiBase) {
+    this.cantonApiBase = cantonApiBase || config.canton.jsonApiBase;
     this.operatorPartyId = config.canton.operatorPartyId;
   }
 
-  /**
-   * Get admin token
-   */
-  async getAdminToken() {
-    return await this.cantonAdmin.getAdminToken();
-  }
-
-  /**
-   * Get ledger end offset
-   */
-  async getLedgerEndOffset(adminToken) {
-    try {
-      const response = await fetch(`${this.cantonApiBase}/v2/state/ledger-end`, {
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${adminToken}`,
-          'Content-Type': 'application/json',
-        },
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        return data.offset || null;
-      }
-    } catch (error) {
-      console.warn('[CantonService] Failed to get ledger end:', error.message);
-    }
-    return null;
-  }
-
-  /**
-   * Get active at offset (for queries)
-   */
-  async getActiveAtOffset(adminToken) {
-    const ledgerEnd = await this.getLedgerEndOffset(adminToken);
-    return ledgerEnd || '0';
-  }
-
-  /**
-   * Query active contracts
-   */
-  async queryActiveContracts(adminToken, options = {}) {
-    const {
-      templateIds = [],
-      contractIds = [],
-      readAs = [this.operatorPartyId],
-      activeAtOffset = null,
-    } = options;
-
-    const offset = activeAtOffset || await this.getActiveAtOffset(adminToken);
-
-    const body = {
-      readAs,
-      activeAtOffset: offset,
-      filter: {
-        filtersByParty: {
-          [this.operatorPartyId]: {
-            inclusive: {},
-          },
-        },
-      },
-    };
-
-    if (templateIds.length > 0) {
-      body.filter.filtersByParty[this.operatorPartyId].inclusive.templateIds = templateIds;
-    }
-
-    if (contractIds.length > 0) {
-      body.filter.filtersByParty[this.operatorPartyId].inclusive.contractIds = contractIds;
-    }
-
-    const response = await fetch(`${this.cantonApiBase}/v2/state/active-contracts`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${adminToken}`,
-      },
+  async submitAndWait(token, body) {
+    const res = await fetch(`${this.cantonApiBase}/v2/commands/submit-and-wait`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
       body: JSON.stringify(body),
     });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Failed to query active contracts: ${response.status} - ${errorText}`);
-    }
-
-    return await response.json();
+    const text = await res.text();
+    if (!res.ok) throw new Error(`submit-and-wait failed ${res.status}: ${text}`);
+    return JSON.parse(text);
   }
 
-  /**
-   * Submit command
-   */
-  async submitCommand(adminToken, command, actAs = [this.operatorPartyId]) {
-    const commandId = `cmd-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  // ✅ Correct v2 envelope: commandId/actAs/... at TOP LEVEL
+  async createContract({ token, actAsParty, templateId, createArguments, readAs, userId, synchronizerId }) {
+    if (!actAsParty) throw new Error("createContract: actAsParty is required");
+    if (!templateId) throw new Error("createContract: templateId is required");
+    if (!createArguments) throw new Error("createContract: createArguments is required");
 
-    const response = await fetch(`${this.cantonApiBase}/v2/commands/submit-and-wait`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${adminToken}`,
-      },
-      body: JSON.stringify({
-        commandId,
-        commands: [command],
-        actAs,
-      }),
+    const templateIdStr = normalizeTemplateId(templateId);
+
+    const body = {
+      commandId: crypto.randomUUID(),
+      actAs: [actAsParty],
+      ...(Array.isArray(readAs) && readAs.length ? { readAs } : {}),
+      ...(userId ? { userId } : {}),
+      ...(synchronizerId ? { synchronizerId } : {}),
+      commands: [
+        {
+          CreateCommand: {
+            templateId: templateIdStr,
+            createArguments,
+          },
+        },
+      ],
+    };
+
+    return this.submitAndWait(token, body);
+  }
+
+  async exerciseChoice({ token, actAsParty, templateId, contractId, choice, choiceArgument, readAs, userId, synchronizerId }) {
+    if (!actAsParty) throw new Error("exerciseChoice: actAsParty is required");
+    if (!templateId) throw new Error("exerciseChoice: templateId is required");
+    if (!contractId) throw new Error("exerciseChoice: contractId is required");
+    if (!choice) throw new Error("exerciseChoice: choice is required");
+
+    const templateIdStr = normalizeTemplateId(templateId);
+
+    const body = {
+      commandId: crypto.randomUUID(),
+      actAs: [actAsParty],
+      ...(Array.isArray(readAs) && readAs.length ? { readAs } : {}),
+      ...(userId ? { userId } : {}),
+      ...(synchronizerId ? { synchronizerId } : {}),
+      commands: [
+        {
+          ExerciseCommand: {
+            templateId: templateIdStr,
+            contractId,
+            choice,
+            choiceArgument: choiceArgument ?? {},
+          },
+        },
+      ],
+    };
+
+    return this.submitAndWait(token, body);
+  }
+
+  async getAdminToken() {
+    const cantonAdmin = new CantonAdmin();
+    return cantonAdmin.getAdminToken();
+  }
+
+  async discoverPackages(adminToken) {
+    const response = await fetch(`${this.cantonApiBase}/v2/packages`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${adminToken}` },
     });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      let error;
-      try {
-        error = JSON.parse(errorText);
-      } catch {
-        error = { message: errorText };
-      }
-      throw new Error(error.message || error.cause || `Command failed: ${response.status}`);
-    }
-
-    return await response.json();
-  }
-
-  /**
-   * Exercise choice on contract
-   */
-  async exerciseChoice(adminToken, templateId, contractId, choice, argument, actAs = [this.operatorPartyId]) {
-    const command = {
-      exercise: {
-        templateId,
-        contractId,
-        choice,
-        argument,
-      },
-    };
-
-    return await this.submitCommand(adminToken, command, actAs);
-  }
-
-  /**
-   * Create contract
-   */
-  async createContract(adminToken, templateId, argument, actAs = [this.operatorPartyId]) {
-    const command = {
-      create: {
-        templateId,
-        argument,
-      },
-    };
-
-    return await this.submitCommand(adminToken, command, actAs);
+    if (!response.ok) return null;
+    return response.json();
   }
 }
 
-module.exports = new CantonService();
+module.exports = new CantonService(config.canton.jsonApiBase);

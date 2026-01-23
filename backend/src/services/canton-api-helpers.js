@@ -1,14 +1,27 @@
 /**
  * Helper functions for Canton API interactions
  */
+const config = require('../config');
+
+function getOrderBookTemplateId() {
+  const packageId = config.canton.packageIds?.clobExchange;
+  if (!packageId) {
+    throw new Error('Missing package ID for OrderBook template');
+  }
+  return {
+    packageId,
+    moduleName: 'OrderBook',
+    entityName: 'OrderBook',
+  };
+}
 
 /**
  * Get OrderBook contract ID for a trading pair
  * ROOT CAUSE FIX: Try multiple query methods to find OrderBook
  */
 async function getOrderBookContractId(tradingPair, adminToken, cantonApiBase) {
-  const operatorPartyId = process.env.OPERATOR_PARTY_ID || 
-    '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
+  const operatorPartyId = config.canton.operatorPartyId;
+  const orderBookTemplateId = getOrderBookTemplateId();
   
   // Method 1: Try filtersForAnyParty (doesn't require specific party permissions)
   try {
@@ -24,7 +37,7 @@ async function getOrderBookContractId(tradingPair, adminToken, cantonApiBase) {
         filter: {
           filtersForAnyParty: {
             inclusive: {
-              templateIds: ['OrderBook:OrderBook']
+              templateIds: [orderBookTemplateId]
             }
           }
         }
@@ -68,7 +81,7 @@ async function getOrderBookContractId(tradingPair, adminToken, cantonApiBase) {
           filtersByParty: {
             [operatorPartyId]: {
               inclusive: {
-                templateIds: ['OrderBook:OrderBook']
+                templateIds: [orderBookTemplateId]
               }
             }
           }
@@ -134,4 +147,3 @@ module.exports = {
   broadcastOrderBookUpdate,
   broadcastTradeUpdate
 };
-

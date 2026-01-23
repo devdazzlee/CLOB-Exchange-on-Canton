@@ -9,6 +9,7 @@
  */
 
 const CantonAdmin = require('./canton-admin');
+const config = require('../config');
 
 class MatchingEngine {
   constructor() {
@@ -90,10 +91,9 @@ class MatchingEngine {
 
       // Get admin token
       const adminToken = await this.getAdminToken();
-      const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
 
       // Step 1: Get all OrderBook contracts
-      const orderBooks = await this.queryContracts('MasterOrderBook:MasterOrderBook', adminToken);
+      const orderBooks = await this.queryContracts(this.getMasterOrderBookTemplateId(), adminToken);
 
       if (orderBooks.length === 0) {
         // No order books yet
@@ -156,33 +156,88 @@ class MatchingEngine {
   }
 
   /**
-   * Query contracts from Canton
+   * Get ledger end offset
    */
-  async queryContracts(templateId, adminToken) {
-    const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
+  async getLedgerEndOffset(adminToken) {
+    const response = await fetch(`${config.canton.jsonApiBase}/v2/state/ledger-end`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${adminToken}`,
+        'Content-Type': 'application/json',
+      },
+    });
 
-    const response = await fetch(`${CANTON_JSON_API_BASE}/v2/query`, {
+    if (!response.ok) {
+      throw new Error(`Failed to get ledger end: ${response.status}`);
+    }
+
+    const data = await response.json();
+    return data.offset || data.ledgerEnd || '0';
+  }
+
+  /**
+   * Query active contracts by template (revert to working filter structure)
+   */
+  async queryContracts(templateId, adminToken, limit = 100) {
+    // Get current ledger end
+    const activeAtOffset = await this.getLedgerEndOffset(adminToken);
+
+    // Use actual operator party ID from config
+    const operatorPartyId = config.canton.operatorPartyId;
+
+    const response = await fetch(`${config.canton.jsonApiBase}/v2/state/active-contracts?limit=${limit}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${adminToken}`,
       },
       body: JSON.stringify({
-        templateId: templateId,
+        readAs: [operatorPartyId],
+        activeAtOffset,
+        verbose: false,
+        filter: {
+          filtersByParty: {
+            [operatorPartyId]: {
+              inclusive: {
+                templateIds: [templateId],
+              },
+            },
+          },
+        },
       }),
     });
 
     if (!response.ok) {
-      throw new Error(`Failed to query contracts: ${response.status}`);
+      const errorText = await response.text();
+      console.error('[MatchingEngine] Query error details:', {
+        status: response.status,
+        statusText: response.statusText,
+        errorText: errorText,
+        templateId: templateId,
+        operatorPartyId: operatorPartyId
+      });
+      throw new Error(`Failed to query contracts: ${response.status} - ${errorText}`);
     }
 
     const data = await response.json();
-    const contracts = data.result || data.contracts || [];
+    const contracts = data.activeContracts || [];
 
     return contracts.map(c => ({
       contractId: c.contractId || c.contract_id,
       payload: c.payload || c.argument,
     }));
+  }
+
+  getMasterOrderBookTemplateId() {
+    const packageId = config.canton.packageIds?.clobExchange || config.canton.packageIds?.masterOrderBook;
+    if (!packageId) {
+      throw new Error('Missing package ID for MasterOrderBook template');
+    }
+    return {
+      packageId,
+      moduleName: 'MasterOrderBook',
+      entityName: 'MasterOrderBook',
+    };
   }
 
   /**
@@ -209,7 +264,7 @@ class MatchingEngine {
   }
 
   /**
-   * Fetch single contract
+   * Fetch single contract using correct endpoint
    */
   async fetchContract(contractId, adminToken) {
     const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
@@ -226,6 +281,7 @@ class MatchingEngine {
     });
 
     if (!response.ok) {
+      console.warn('[MatchingEngine] Failed to fetch contract:', contractId, response.status);
       return null;
     }
 
@@ -346,45 +402,24 @@ class MatchingEngine {
    */
   async executeMatch(orderBookCid, match, operator, adminToken) {
     try {
-      const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
-
       console.log('[MatchingEngine] Executing match:');
       console.log('  Buy Order:', match.buyOrderCid.substring(0, 20) + '...');
       console.log('  Sell Order:', match.sellOrderCid.substring(0, 20) + '...');
 
-      // Call MatchOrders choice on OrderBook
-      const commandId = `match-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-
-      const response = await fetch(`${CANTON_JSON_API_BASE}/v2/command/exercise`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`,
+      // Call MatchOrders choice on OrderBook using proper exerciseChoice
+      const result = await cantonService.exerciseChoice({
+        token: adminToken,
+        actAsParty: operator,
+        templateId: this.getMasterOrderBookTemplateId(),
+        contractId: orderBookCid,
+        choice: 'MatchOrders',
+        choiceArgument: {
+          buyCid: match.buyOrderCid,
+          sellCid: match.sellOrderCid,
         },
-        body: JSON.stringify({
-          commandId: commandId,
-          actAs: [operator],
-          commands: {
-            exerciseCommand: {
-              templateId: 'MasterOrderBook:MasterOrderBook',
-              contractId: orderBookCid,
-              choice: 'MatchOrders',
-              argument: {
-                buyCid: match.buyOrderCid,
-                sellCid: match.sellOrderCid,
-              },
-            },
-          },
-        }),
+        readAs: [operator],
       });
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('[MatchingEngine] Match failed:', errorText);
-        return;
-      }
-
-      const result = await response.json();
       console.log('[MatchingEngine] ✓ Match executed successfully');
 
       // Emit WebSocket event for real-time updates

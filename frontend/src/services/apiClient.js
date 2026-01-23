@@ -14,11 +14,31 @@
 import { getValidAccessToken } from './keycloakAuth';
 
 // Base URL configuration
+// Use backend proxy at port 3001 (NOT Vite proxy at port 3000)
 const CANTON_API_BASE = import.meta.env.DEV 
-  ? '/api/canton'  // Use Vite proxy in development
+  ? 'http://localhost:3001/api/ledger'  // Use backend proxy in development
   : 'https://clob-exchange-on-canton.vercel.app/api/proxy';  // Use Vercel proxy in production
 
 const API_VERSION = 'v2';
+
+/**
+ * Authenticated fetch helper - ensures Authorization header is always sent
+ * @param {string} path - API path (e.g., '/v2/state/active-contracts')
+ * @param {Object} options - Fetch options
+ * @returns {Promise<Response>} Fetch response
+ */
+async function authedFetch(path, options = {}) {
+  const token = await getValidAccessToken();
+  if (!token) throw new Error("No valid Keycloak access token");
+
+  const headers = {
+    "Content-Type": "application/json",
+    ...(options.headers || {}),
+    Authorization: `Bearer ${token}`, // ✅ REQUIRED
+  };
+
+  return fetch(`${CANTON_API_BASE}${path}`, { ...options, headers });
+}
 
 /**
  * Global flag to prevent concurrent token refresh requests

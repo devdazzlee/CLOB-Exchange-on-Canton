@@ -1,5 +1,6 @@
 // Backend Token Exchange Service
 // Exchanges Keycloak OAuth token for Canton Ledger API token
+const config = require('../config');
 
 class TokenExchangeService {
   constructor() {
@@ -65,17 +66,25 @@ class TokenExchangeService {
     return allowedUsers.includes(userId);
   }
 
-  // Proxy ledger API calls with proper token
+  // Proxy ledger API calls with proper token validation and forwarding
   async proxyLedgerApiCall(req, res) {
     try {
+      // Validate Authorization header early
+      if (!req.headers.authorization?.startsWith('Bearer ')) {
+        return res.status(401).json({ 
+          error: 'Missing or invalid Authorization header',
+          details: 'Expected: Authorization: Bearer <token>'
+        });
+      }
+
       // Get Keycloak token from request
       const keycloakToken = this.extractToken(req);
       
       // Exchange for ledger token
       const { ledgerToken } = await this.exchangeToken(keycloakToken);
       
-      // Forward request to Canton with ledger token
-      const response = await fetch('https://participant.dev.canton.wolfedgelabs.com/json-api' + req.url, {
+      // Forward request to Canton with the exchanged ledger token
+      const response = await fetch(`${config.canton.jsonApiBase}${req.url}`, {
         method: req.method,
         headers: {
           'Content-Type': 'application/json',
@@ -89,17 +98,31 @@ class TokenExchangeService {
       
     } catch (error) {
       console.error('Ledger API proxy error:', error);
+      if (error.message.includes('Missing') || error.message.includes('token')) {
+        return res.status(401).json({ 
+          error: 'Authentication failed',
+          details: error.message
+        });
+      }
       res.status(500).json({ error: 'Internal server error' });
     }
   }
 
   extractToken(req) {
     const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      throw new Error('Missing authorization header');
+    if (!authHeader) {
+      throw new Error('Missing Authorization header');
+    }
+    if (!authHeader.startsWith('Bearer ')) {
+      throw new Error('Invalid Authorization header format. Expected: Bearer <token>');
     }
     
-    return authHeader.substring(7);
+    const token = authHeader.substring(7);
+    if (!token) {
+      throw new Error('Empty token in Authorization header');
+    }
+    
+    return token;
   }
 }
 

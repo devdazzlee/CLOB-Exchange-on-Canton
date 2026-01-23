@@ -86,6 +86,29 @@ class OrderBookController {
       sellOrders: [],
     }, 'Orders retrieved successfully');
   });
+
+  /**
+   * Get trades for a trading pair using proper templateId objects
+   */
+  getTrades = asyncHandler(async (req, res) => {
+    const { tradingPair } = req.params;
+    const decodedTradingPair = decodeURIComponent(tradingPair);
+
+    try {
+      const trades = await orderBookService.getTrades(decodedTradingPair);
+      return success(res, {
+        tradingPair: decodedTradingPair,
+        trades,
+      }, 'Trades retrieved successfully');
+    } catch (error) {
+      console.error('[OrderBookController] Error fetching trades:', error);
+      // Return empty array on error to prevent frontend crashes
+      return success(res, {
+        tradingPair: decodedTradingPair,
+        trades: [],
+      }, 'Trades retrieved successfully');
+    }
+  });
 }
 
 module.exports = new OrderBookController();

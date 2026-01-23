@@ -15,4 +15,7 @@ router.get('/:tradingPair', orderBookController.getByTradingPair);
 // GET /api/orderbooks/:tradingPair/orders - Get orders for trading pair
 router.get('/:tradingPair/orders', orderBookController.getOrders);
 
+// GET /api/orderbooks/:tradingPair/trades - Get trades for trading pair
+router.get('/:tradingPair/trades', orderBookController.getTrades);
+
 module.exports = router;
