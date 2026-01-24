@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { motion } from 'framer-motion';
-import { AlertCircle } from 'lucide-react';
+import { AlertCircle, LogOut } from 'lucide-react';
 import { useConfirmationModal } from './ConfirmationModal';
 
 // Import trading components
@@ -24,6 +24,9 @@ import {
   getAvailableTradingPairs
 } from '../services/cantonApi';
 import websocketService from '../services/websocketService';
+import { clearWallet } from '../wallet/keyManager';
+import { getOrCreateUserId } from '../services/userId';
+import { normalizeDamlMap } from '../utils/daml';
 
 export default function TradingInterface({ partyId }) {
   // Guard clause
@@ -171,7 +174,7 @@ export default function TradingInterface({ partyId }) {
       
       if (accounts.length > 0) {
         const account = accounts[0];
-        const balances = account.payload?.balances || {};
+        const balances = normalizeDamlMap(account.payload?.balances);
         
         let btcBalance = '0.0';
         let usdtBalance = '0.0';
@@ -192,23 +195,26 @@ export default function TradingInterface({ partyId }) {
         console.log('[Balance] UserAccount not found, auto-creating with test tokens...');
         try {
           const backendBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
-          const response = await fetch(`${backendBase}/api/testnet/mint-tokens`, {
+          const response = await fetch(`${backendBase}/api/testnet/quick-mint`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
-              'Authorization': `Bearer ${localStorage.getItem('access_token')}`
+              'x-user-id': getOrCreateUserId(),
             },
             body: JSON.stringify({ partyId })
           });
           
+          const responseJson = await response.json().catch(() => ({}));
+          const result = responseJson?.data ?? responseJson;
+          
           if (response.ok) {
-            const result = await response.json();
             console.log('[Balance] ✅ UserAccount created with test tokens:', result.balances);
             
             // IMMEDIATELY set balances from mint response (even if UserAccount not queryable yet)
             if (result.balances && typeof result.balances === 'object') {
-              const btcBalance = result.balances?.BTC?.toString() || '0.0';
-              const usdtBalance = result.balances?.USDT?.toString() || '0.0';
+              const normalized = normalizeDamlMap(result.balances);
+              const btcBalance = normalized?.BTC?.toString() || '0.0';
+              const usdtBalance = normalized?.USDT?.toString() || '0.0';
               setBalance({ BTC: btcBalance, USDT: usdtBalance });
               console.log('[Balance] ✅ Set balances immediately from mint response:', { BTC: btcBalance, USDT: usdtBalance });
             }
@@ -220,7 +226,7 @@ export default function TradingInterface({ partyId }) {
                 
                 if (newAccounts.length > 0) {
                   const account = newAccounts[0];
-                  const balances = account.payload?.balances || {};
+                  const balances = normalizeDamlMap(account.payload?.balances);
                   
                   let btcBalance = '0.0';
                   let usdtBalance = '0.0';
@@ -987,6 +993,15 @@ export default function TradingInterface({ partyId }) {
     }
   };
 
+  // Handle logout
+  const handleLogout = () => {
+    // Clear all authentication and wallet data
+    clearWallet();
+    localStorage.removeItem('canton_party_id');
+    // Force redirect to home page
+    window.location.href = '/';
+  };
+
   // Memoize modal component to prevent re-renders
   const memoizedModal = useMemo(() => <ModalComponent />, [ModalComponent]);
 
@@ -996,9 +1011,19 @@ export default function TradingInterface({ partyId }) {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
           <h2 className="text-3xl font-bold text-foreground">Trading Interface</h2>
-        <div className="flex items-center space-x-2">
-          <div className="w-2 h-2 bg-success rounded-full animate-pulse"></div>
+        <div className="flex items-center space-x-4">
+          <div className="flex items-center space-x-2">
+            <div className="w-2 h-2 bg-success rounded-full animate-pulse"></div>
             <span className="text-sm text-muted-foreground">Connected</span>
+          </div>
+          <button
+            onClick={handleLogout}
+            className="flex items-center space-x-2 px-4 py-2 bg-destructive/10 hover:bg-destructive/20 text-destructive border border-destructive/20 hover:border-destructive/40 rounded-md transition-colors text-sm font-medium"
+            title="Logout"
+          >
+            <LogOut className="w-4 h-4" />
+            <span>Logout</span>
+          </button>
         </div>
       </div>
       

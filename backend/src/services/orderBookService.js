@@ -279,11 +279,15 @@ class OrderBookService {
       throw new Error('Invalid trading pair format. Expected BASE/QUOTE');
     }
 
+    // Get package IDs for templates (use package-id format to avoid vetting issues)
+    const masterOrderBookPackageId = await cantonService.getPackageIdForTemplate('MasterOrderBook', adminToken);
+    const orderBookPackageId = await cantonService.getPackageIdForTemplate('OrderBook', adminToken);
+
     // Create MasterOrderBook contract first
     const masterOrderBookResult = await cantonService.createContract({
       token: adminToken,
       actAsParty: config.canton.operatorPartyId,
-      templateId: "#clob-exchange-splice:MasterOrderBook:MasterOrderBook",
+      templateId: `${masterOrderBookPackageId}:MasterOrderBook:MasterOrderBook`,
       createArguments: {
         tradingPair,
         base,
@@ -304,7 +308,7 @@ class OrderBookService {
     const orderBookResult = await cantonService.createContract({
       token: adminToken,
       actAsParty: config.canton.operatorPartyId,
-      templateId: "#clob-exchange-splice:OrderBook:OrderBook",
+      templateId: `${orderBookPackageId}:OrderBook:OrderBook`,
       createArguments: {
         masterOrderBook: masterOrderBookContractId,
         tradingPair,

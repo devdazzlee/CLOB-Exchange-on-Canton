@@ -4,6 +4,8 @@
  * Supports both legacy single-call and new 2-step topology + allocate flow
  */
 
+import { getOrCreateUserId } from './userId';
+
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ||
   (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
 
@@ -32,6 +34,7 @@ export async function createPartyForUser(publicKey) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'x-user-id': getOrCreateUserId(),
       },
       body: JSON.stringify({
         publicKeyHex: publicKeyHex,
@@ -102,6 +105,7 @@ export async function generateTopology(publicKeyBase64, partyHint) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'x-user-id': getOrCreateUserId(),
       },
       body: JSON.stringify({
         publicKeyBase64,
@@ -142,6 +146,7 @@ export async function allocatePartyWithSignature(publicKeyBase64, signatureBase6
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'x-user-id': getOrCreateUserId(),
       },
       body: JSON.stringify({
         publicKeyBase64,
@@ -178,6 +183,7 @@ export async function getQuotaStatus() {
       method: 'GET',
       headers: {
         'Content-Type': 'application/json',
+        'x-user-id': getOrCreateUserId(),
       },
     });
 

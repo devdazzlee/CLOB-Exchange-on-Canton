@@ -7,11 +7,49 @@ const cantonService = require('../services/cantonService');
 const { broadcastBalanceUpdate } = require('../services/websocketService');
 const config = require('../config');
 
+function normalizeDecimal(value) {
+  if (value === null || value === undefined) return '0';
+  if (typeof value === 'number') return value.toString();
+  if (typeof value === 'string') return value;
+  return String(value);
+}
+
+function damlMapToObject(value) {
+  if (Array.isArray(value)) {
+    const obj = {};
+    for (const entry of value) {
+      if (Array.isArray(entry) && entry.length >= 2) {
+        const [key, val] = entry;
+        obj[key] = val;
+        continue;
+      }
+      if (entry && typeof entry === 'object' && 'key' in entry && 'value' in entry) {
+        obj[entry.key] = entry.value;
+      }
+    }
+    return obj;
+  }
+  if (value && typeof value === 'object') {
+    return { ...value };
+  }
+  return {};
+}
+
+function objectToDamlMap(value) {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== 'object') return [];
+  return Object.entries(value).map(([key, val]) => [key, normalizeDecimal(val)]);
+}
+
 /**
  * Discover synchronizer ID from Canton
  */
 async function discoverSynchronizerId() {
   try {
+    if (config.canton.synchronizerId) {
+      return config.canton.synchronizerId;
+    }
+
     const response = await fetch(`${config.canton.jsonApiBase}/v2/state/connected-synchronizers`, {
       method: 'GET',
       headers: {
@@ -21,10 +59,34 @@ async function discoverSynchronizerId() {
     });
     
     if (response.ok) {
-      const data = await response.json();
-      const synchronizers = data.synchronizers || [];
-      if (synchronizers.length > 0) {
-        return synchronizers[0]; // Return first synchronizer
+      const data = await response.json().catch(() => ({}));
+      let synchronizerId = null;
+
+      if (data.connectedSynchronizers && Array.isArray(data.connectedSynchronizers) && data.connectedSynchronizers.length > 0) {
+        const synchronizers = data.connectedSynchronizers;
+        const globalSync = synchronizers.find(s =>
+          s.synchronizerAlias === 'global' || s.alias === 'global'
+        );
+        if (globalSync?.synchronizerId) {
+          synchronizerId = globalSync.synchronizerId;
+        } else {
+          const globalDomainSync = synchronizers.find(s =>
+            s.synchronizerId && s.synchronizerId.includes('global-domain')
+          );
+          synchronizerId = globalDomainSync?.synchronizerId || synchronizers[0].synchronizerId || synchronizers[0].id;
+        }
+      } else if (data.synchronizers && Array.isArray(data.synchronizers) && data.synchronizers.length > 0) {
+        const first = data.synchronizers[0];
+        synchronizerId = typeof first === 'string' ? first : (first.synchronizerId || first.id);
+      } else if (data.synchronizerId) {
+        synchronizerId = data.synchronizerId;
+      } else if (Array.isArray(data) && data.length > 0) {
+        const first = data[0];
+        synchronizerId = typeof first === 'string' ? first : (first.synchronizerId || first.id);
+      }
+
+      if (synchronizerId) {
+        return synchronizerId;
       }
     }
     throw new Error('No synchronizers found');
@@ -36,7 +98,7 @@ async function discoverSynchronizerId() {
 
 /**
  * Mint test tokens for a user
- * Creates or updates AssetHolding contract with initial balances
+ * Creates or updates UserAccount balances with initial test tokens
  */
 async function mintTestTokens(req, res) {
   try {
@@ -60,7 +122,7 @@ async function mintTestTokens(req, res) {
     console.log(`[Minting] User ${partyId} requesting tokens:`, tokens);
 
     // Get operator party ID from environment
-    const operatorPartyId = process.env.OPERATOR_PARTY_ID;
+    const operatorPartyId = config.canton.operatorPartyId;
     if (!operatorPartyId) {
       return res.status(500).json({
         success: false,
@@ -68,88 +130,113 @@ async function mintTestTokens(req, res) {
       });
     }
 
-    // Check if user already has an AssetHolding contract
-    const existingHoldings = await cantonService.queryContracts({
-      templateId: 'AssetHolding',
+    // Check if user already has a UserAccount contract
+    const adminToken = await cantonService.getAdminToken();
+    await cantonService.ensurePartyRights(partyId, adminToken);
+    const synchronizerId = await discoverSynchronizerId();
+
+    const existingAccounts = await cantonService.queryContracts({
+      templateId: 'UserAccount:UserAccount',
       filter: {
         party: partyId
-      }
-    });
+      },
+      party: partyId
+    }, adminToken);
 
-    let holdingContractId;
-    let currentAssets = {};
-    let currentLocked = {};
+    let accountContractId;
+    let currentBalances = {};
 
-    if (existingHoldings && existingHoldings.length > 0) {
-      // Update existing holding
-      const holding = existingHoldings[0];
-      holdingContractId = holding.contractId;
-      currentAssets = holding.payload.assets || {};
-      currentLocked = holding.payload.lockedAssets || {};
+    // Get package ID for UserAccount (use package-id format to avoid vetting issues)
+    const userAccountPackageId = await cantonService.getPackageIdForTemplate('UserAccount', adminToken);
+    const userAccountTemplateId = `${userAccountPackageId}:UserAccount:UserAccount`;
 
-      console.log(`[Minting] Found existing holding for ${partyId}:`, holdingContractId);
+    if (existingAccounts && existingAccounts.length > 0) {
+      // Update existing UserAccount balances via Deposit
+      const account = existingAccounts[0];
+      accountContractId = account.contractId;
+      currentBalances = damlMapToObject(account.payload.balances);
 
-      // Add requested tokens to current balances
+      console.log(`[Minting] Found existing UserAccount for ${partyId}:`, accountContractId);
+
+      // Add requested tokens to current balances (local view)
       for (const token of tokens) {
-        const { symbol, amount } = token;
-        const current = currentAssets[symbol] || 0;
-        currentAssets[symbol] = current + amount;
+        const { symbol } = token;
+        const amountValue = Number(token.amount);
+        const safeAmount = Number.isFinite(amountValue) ? amountValue : 0;
+        const current = Number(currentBalances[symbol] ?? 0);
+        currentBalances[symbol] = current + safeAmount;
 
-        console.log(`[Minting] ${symbol}: ${current} + ${amount} = ${currentAssets[symbol]}`);
+        console.log(`[Minting] ${symbol}: ${current} + ${safeAmount} = ${currentBalances[symbol]}`);
       }
 
-      // Exercise UpdateAvailable choice for each token
+      // Exercise Deposit choice for each token (controller is party)
       for (const token of tokens) {
-        const updateResult = await cantonService.exerciseChoice({
-          token: await cantonService.getAdminToken(),
-          actAsParty: operatorPartyId,
-          templateId: '#clob-exchange-splice:AssetHolding:AssetHolding',
-          contractId: holdingContractId,
-          choice: 'UpdateAvailable',
+        await cantonService.exerciseChoice({
+          token: adminToken,
+          actAsParty: partyId,
+          templateId: userAccountTemplateId,
+          contractId: accountContractId,
+          choice: 'Deposit',
           choiceArgument: {
-            symbol: token.symbol,
-            delta: token.amount
+            token: token.symbol,
+            amount: normalizeDecimal(token.amount)
           },
-          readAs: [operatorPartyId],
-          synchronizerId: await discoverSynchronizerId(),
+          readAs: [partyId],
+          synchronizerId,
         });
 
-        if (updateResult && updateResult.contractId) {
-          holdingContractId = updateResult.contractId;
+        const refreshedAccounts = await cantonService.queryContracts({
+          templateId: 'UserAccount:UserAccount',
+          filter: {
+            party: partyId
+          },
+          party: partyId
+        }, adminToken);
+        if (refreshedAccounts && refreshedAccounts.length > 0) {
+          accountContractId = refreshedAccounts[0].contractId;
         }
       }
-
     } else {
-      // Create new AssetHolding contract
-      console.log(`[Minting] Creating new holding for ${partyId}`);
+      // Create new UserAccount contract
+      console.log(`[Minting] Creating new UserAccount for ${partyId}`);
 
-      // Build initial assets map
+      // Build initial balances map (Daml JSON expects array-of-pairs)
+      const balancesMap = tokens.map((token) => [
+        token.symbol,
+        normalizeDecimal(token.amount)
+      ]);
       for (const token of tokens) {
-        currentAssets[token.symbol] = token.amount;
+        currentBalances[token.symbol] = normalizeDecimal(token.amount);
       }
 
       const createResult = await cantonService.createContract({
-        token: await cantonService.getAdminToken(),
+        token: adminToken,
         actAsParty: operatorPartyId,
-        templateId: '#clob-exchange-splice:AssetHolding:AssetHolding',
+        templateId: userAccountTemplateId,
         createArguments: {
           operator: operatorPartyId,
           party: partyId,
-          assets: currentAssets,
-          lockedAssets: {}
+          balances: balancesMap,
         },
         readAs: [operatorPartyId],
-        synchronizerId: await discoverSynchronizerId(),
+        synchronizerId,
       });
 
-      holdingContractId = createResult.contractId;
+      accountContractId = createResult.contractId;
     }
 
     // Query updated balance
-    const updatedHolding = await cantonService.fetchContract(holdingContractId);
+    const updatedAccounts = await cantonService.queryContracts({
+      templateId: 'UserAccount:UserAccount',
+      filter: {
+        party: partyId
+      },
+      party: partyId
+    }, adminToken);
 
-    const finalBalances = updatedHolding?.payload?.assets || currentAssets;
-    const finalLocked = updatedHolding?.payload?.lockedAssets || currentLocked;
+    const updatedAccount = updatedAccounts && updatedAccounts.length > 0 ? updatedAccounts[0] : null;
+    const finalBalances = damlMapToObject(updatedAccount?.payload?.balances || currentBalances);
+    const finalLocked = {};
 
     // Broadcast balance update to WebSocket clients
     broadcastBalanceUpdate(partyId, finalBalances, finalLocked);
@@ -161,7 +248,8 @@ async function mintTestTokens(req, res) {
       message: 'Test tokens minted successfully',
       data: {
         partyId,
-        holdingContractId,
+        accountContractId,
+        holdingContractId: accountContractId,
         balances: finalBalances,
         lockedBalances: finalLocked,
         mintedTokens: tokens
@@ -191,15 +279,18 @@ async function getUserBalances(req, res) {
       });
     }
 
-    // Query user's AssetHolding contract
-    const holdings = await cantonService.queryContracts({
-      templateId: 'AssetHolding',
+    // Query user's UserAccount contract
+    const adminToken = await cantonService.getAdminToken();
+    await cantonService.ensurePartyRights(partyId, adminToken);
+    const accounts = await cantonService.queryContracts({
+      templateId: 'UserAccount:UserAccount',
       filter: {
         party: partyId
-      }
-    });
+      },
+      party: partyId
+    }, adminToken);
 
-    if (!holdings || holdings.length === 0) {
+    if (!accounts || accounts.length === 0) {
       return res.json({
         success: true,
         data: {
@@ -211,16 +302,17 @@ async function getUserBalances(req, res) {
       });
     }
 
-    const holding = holdings[0];
+    const account = accounts[0];
 
     return res.json({
       success: true,
       data: {
         partyId,
-        holdingContractId: holding.contractId,
-        balances: holding.payload.assets || {},
-        lockedBalances: holding.payload.lockedAssets || {},
-        lastUpdated: holding.createdAt || new Date().toISOString()
+        accountContractId: account.contractId,
+        holdingContractId: account.contractId,
+        balances: damlMapToObject(account.payload.balances),
+        lockedBalances: {},
+        lastUpdated: account.createdAt || new Date().toISOString()
       }
     });
 

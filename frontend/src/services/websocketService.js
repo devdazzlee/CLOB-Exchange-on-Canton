@@ -16,9 +16,15 @@ class WebSocketService {
   }
 
   connect() {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      console.log('[WebSocket] Already connected');
-      return;
+    if (this.ws) {
+      if (this.ws.readyState === WebSocket.OPEN) {
+        console.log('[WebSocket] Already connected');
+        return;
+      }
+      if (this.ws.readyState === WebSocket.CONNECTING) {
+        console.log('[WebSocket] Already connecting');
+        return;
+      }
     }
 
     this.isManualClose = false;

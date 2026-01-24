@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { isAuthenticated, getValidAccessToken } from '../services/keycloakAuth';
 import { loadWallet } from '../wallet/keyManager';
 
 export default function AuthGuard({ children }) {
@@ -30,44 +29,12 @@ export default function AuthGuard({ children }) {
       const wallet = loadWallet();
       const partyId = localStorage.getItem('canton_party_id');
       
-      // If wallet and party ID exist, allow access even if token is expired
-      // (The party ID is what matters for trading, not the token)
+      // If wallet and party ID exist, allow access (authentication is optional)
       if (wallet && partyId) {
         console.log('[AuthGuard] Wallet and party ID found, allowing access');
-        // Try to get a valid token, but don't block if it fails
-        try {
-          const token = await getValidAccessToken();
-          console.log('[AuthGuard] Token is valid');
-        } catch (error) {
-          console.log('[AuthGuard] Token expired or invalid, but wallet exists - allowing access');
-          // Token is expired, but we have wallet and party ID, so allow access
-          // The API calls will need to handle token refresh or re-authentication
-        }
         setIsAuth(true);
         setIsChecking(false);
         return;
-      }
-      
-      // Check if user is authenticated (for users who logged in via Keycloak)
-      const authStatus = isAuthenticated();
-      console.log('[AuthGuard] isAuthenticated result:', authStatus);
-      
-      if (authStatus) {
-        console.log('[AuthGuard] User appears authenticated, verifying token...');
-        // Verify token is still valid
-        try {
-          const token = await getValidAccessToken();
-          console.log('[AuthGuard] Token validation successful');
-          setIsAuth(true);
-          setIsChecking(false);
-          return;
-        } catch (error) {
-          // Token refresh failed - redirect to home
-          console.log('[AuthGuard] Token refresh failed, redirecting to home:', error.message);
-          navigate('/');
-          setIsChecking(false);
-          return;
-        }
       }
 
       // Not authenticated and no wallet - redirect to home

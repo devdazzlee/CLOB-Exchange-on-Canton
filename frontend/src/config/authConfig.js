@@ -34,32 +34,28 @@ export const PUBLIC_OBSERVER_PARTY_ID = 'public-observer';
  * Keycloak OAuth 2.0 Configuration
  * Used for authenticating users with Canton's Keycloak instance
  */
-export const KEYCLOAK_CONFIG = {
-  url: 'https://keycloak.wolfedgelabs.com:8443',
-  realm: 'canton-devnet',
-  clientId: 'snp3u6udkFF983rfprvsBbx3X3mBpw',
-  clientSecret: 'l5Td3OUSanQoGeNMWg2nnPxq1VYc'
-};
+// NOTE: End users do NOT use Keycloak. Keep this config empty to avoid accidental usage.
+export const KEYCLOAK_CONFIG = null;
 
 /**
  * Get the Keycloak authorization URL
  */
 export function getAuthorizationUrl() {
-  return `${KEYCLOAK_CONFIG.url}/realms/${KEYCLOAK_CONFIG.realm}/protocol/openid-connect/auth`;
+  throw new Error('Keycloak is disabled in the frontend (wallet-only mode).');
 }
 
 /**
  * Get the Keycloak token URL
  */
 export function getTokenUrl() {
-  return `${KEYCLOAK_CONFIG.url}/realms/${KEYCLOAK_CONFIG.realm}/protocol/openid-connect/token`;
+  throw new Error('Keycloak is disabled in the frontend (wallet-only mode).');
 }
 
 /**
  * Get the Keycloak logout URL
  */
 export function getLogoutUrl() {
-  return `${KEYCLOAK_CONFIG.url}/realms/${KEYCLOAK_CONFIG.realm}/protocol/openid-connect/logout`;
+  throw new Error('Keycloak is disabled in the frontend (wallet-only mode).');
 }
 
 // =============================================================================
@@ -70,8 +66,9 @@ export function getLogoutUrl() {
  * Canton Ledger API Configuration
  */
 export const CANTON_CONFIG = {
-  jsonApiBase: 'https://participant.dev.canton.wolfedgelabs.com/json-api',
-  participantBase: 'https://participant.dev.canton.wolfedgelabs.com',
+  // Frontend must not call Canton directly; leave placeholders.
+  jsonApiBase: '',
+  participantBase: '',
   version: 'v2'
 };
 

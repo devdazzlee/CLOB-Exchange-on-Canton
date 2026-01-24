@@ -403,7 +403,7 @@ class OnboardingService {
 
   /**
    * Create UserAccount and seed 10,000 USDT for a new party
-   * Uses correct JSON API v2 format
+   * Uses correct JSON API v2 format with package-id (not package-name) to avoid vetting issues
    */
   async createUserAccountAndMintTokens(partyId) {
     try {
@@ -412,8 +412,12 @@ class OnboardingService {
 
       console.log('[Onboarding] Creating UserAccount for party:', partyId);
       
-      // ✅ Use package-name reference: "#<package-name>:Module:Entity"
-      const templateId = `#clob-exchange-splice:UserAccount:UserAccount`;
+      // ✅ Use package-id format: "<packageId>:Module:Entity" (NOT package-name format)
+      // This avoids package selection/vetting issues
+      const packageId = await cantonService.getPackageIdForTemplate('UserAccount', adminToken);
+      const templateId = `${packageId}:UserAccount:UserAccount`;
+      
+      console.log('[Onboarding] Using templateId:', templateId.substring(0, 50) + '...');
 
       const createArguments = {
         party: partyId,
@@ -445,6 +449,17 @@ class OnboardingService {
       };
     } catch (error) {
       console.error('[Onboarding] Failed to create UserAccount or mint tokens:', error);
+      
+      // Provide more helpful error message for package vetting issues
+      if (error.message && error.message.includes('PACKAGE_SELECTION_FAILED')) {
+        const enhancedError = new Error(
+          `Package vetting issue: The package may not be vetted on all hosting participants. ` +
+          `Original error: ${error.message}`
+        );
+        enhancedError.cause = error;
+        throw enhancedError;
+      }
+      
       throw error;
     }
   }
@@ -456,8 +471,9 @@ class OnboardingService {
     const adminToken = await this.getCantonToken();
     const synchronizerId = await this.discoverSynchronizerId();
     
-    // ✅ Use package-name reference: "#<package-name>:Module:Entity"
-    const templateId = `#clob-exchange-splice:Faucet:Faucet`;
+    // ✅ Use package-id format: "<packageId>:Module:Entity" (NOT package-name format)
+    const packageId = await cantonService.getPackageIdForTemplate('Faucet', adminToken);
+    const templateId = `${packageId}:Faucet:Faucet`;
     
     // First, we need to find the Faucet contract ID
     const faucetContracts = await cantonService.queryActiveContracts(adminToken, {

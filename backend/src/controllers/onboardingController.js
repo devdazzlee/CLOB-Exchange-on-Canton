@@ -6,6 +6,8 @@
 const OnboardingService = require('../services/onboarding-service');
 const { success, error } = require('../utils/response');
 const asyncHandler = require('../middleware/asyncHandler');
+const quota = require('../state/quota');
+const userRegistry = require('../state/userRegistry');
 
 class OnboardingController {
   constructor() {
@@ -24,6 +26,7 @@ class OnboardingController {
    * Response: { step: "ALLOCATED", partyId, synchronizerId }
    */
   allocateParty = asyncHandler(async (req, res) => {
+    const userId = req.userId;
     // Accept both publicKey and publicKeyBase64 for compatibility
     let publicKeyBase64 = req.body.publicKeyBase64 || req.body.publicKey;
     // Accept both signature and signatureBase64 for compatibility
@@ -87,6 +90,9 @@ class OnboardingController {
       });
 
       try {
+        // Quota enforcement BEFORE completing allocation
+        quota.assertAvailable();
+
         const result = await this.onboardingService.completeOnboarding(
           publicKeyBase64,
           signatureBase64,
@@ -94,7 +100,16 @@ class OnboardingController {
           publicKeyFingerprint
         );
 
-        return success(res, result, 'Party onboarded successfully with UserAccount and tokens', 200);
+        // Increment quota only after successful allocation+onboarding
+        const quotaStatus = quota.increment();
+
+        // Store mapping userId -> { partyId, publicKeyBase64 }
+        userRegistry.upsertUser(userId, {
+          partyId: result.partyId,
+          publicKeyBase64,
+        });
+
+        return success(res, { ...result, quotaStatus }, 'Party onboarded successfully', 200);
       } catch (err) {
         const statusCode = err.statusCode || 500;
         return error(res, err.message, statusCode, err.cause);
@@ -109,12 +124,40 @@ class OnboardingController {
           partyHint
         );
 
+        // Store public key early for signature verification later (MVP)
+        userRegistry.upsertUser(userId, { publicKeyBase64 });
+
         return success(res, result, 'Topology generated successfully', 200);
       } catch (err) {
         const statusCode = err.statusCode || 500;
         return error(res, err.message, statusCode, err.cause);
       }
     }
+  });
+
+  /**
+   * Rehydrate user mapping after refresh/restart
+   * Request: { partyId, publicKeyBase64? }
+   * Response: { partyId }
+   */
+  rehydrate = asyncHandler(async (req, res) => {
+    const userId = req.userId;
+    const { partyId, publicKeyBase64 } = req.body || {};
+
+    if (!partyId || typeof partyId !== 'string' || partyId.trim() === '') {
+      return error(res, 'partyId is required', 400);
+    }
+
+    if (publicKeyBase64 && (typeof publicKeyBase64 !== 'string' || publicKeyBase64.trim() === '')) {
+      return error(res, 'publicKeyBase64 must be a non-empty string if provided', 400);
+    }
+
+    userRegistry.upsertUser(userId, {
+      partyId: partyId.trim(),
+      ...(publicKeyBase64 ? { publicKeyBase64: publicKeyBase64.trim() } : {}),
+    });
+
+    return success(res, { partyId: partyId.trim() }, 'User mapping restored', 200);
   });
 
   /**

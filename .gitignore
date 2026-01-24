@@ -41,4 +41,6 @@ frontend/build/
 # Temporary files
 *.tmp
 *.temp
+# Local user registry
+.user-registry.json
 

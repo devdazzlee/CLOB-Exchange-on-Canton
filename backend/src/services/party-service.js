@@ -782,12 +782,11 @@ class PartyService {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${adminToken}`,
-          'Content-Type': 'application/json'
         },
         body: JSON.stringify(scriptMapper)
       });
       
-      let responseText = await mapperResponse.text();
+      let mapperResponseText = await mapperResponse.text();
       let usedScriptMapper = true;
       
       // If script mapper fails (not available in this Keycloak version), use hardcoded mapper
@@ -804,19 +803,19 @@ class PartyService {
           body: JSON.stringify(hardcodedMapper)
         });
         
-        responseText = await mapperResponse.text();
+        mapperResponseText = await mapperResponse.text();
       }
       
       if (!mapperResponse.ok) {
         console.error('[PartyService] ✗ Mapper creation FAILED:', mapperResponse.status);
-        console.error('[PartyService] Error response:', responseText);
+        console.error('[PartyService] Error response:', mapperResponseText);
         console.error('[PartyService] Mapper type tried:', usedScriptMapper ? 'script' : 'hardcoded');
-        return { success: false, error: `Failed to create mapper: ${mapperResponse.status} - ${responseText}` };
+        return { success: false, error: `Failed to create mapper: ${mapperResponse.status} - ${mapperResponseText}` };
       }
       
       let mapperData = null;
       try {
-        mapperData = responseText ? JSON.parse(responseText) : { id: 'created' };
+        mapperData = mapperResponseText ? JSON.parse(mapperResponseText) : { id: 'created' };
       } catch (e) {
         if (mapperResponse.status === 201) {
           mapperData = { id: 'created' };
@@ -827,227 +826,160 @@ class PartyService {
       console.log('[PartyService] Mapper ID:', mapperData?.id);
       console.log('[PartyService] Parties in mapper:', parties);
       
-      return { success: true, parties, mapperId: mapperData?.id, mapperType: usedScriptMapper ? 'script' : 'hardcoded' };
-    } catch (error) {
-      return { success: false, error: error.message };
+      throw new Error(`Token generation failed (${response.status}): ${errorMessage}`);
+
+    const data = JSON.parse(tokenResponseText);
+    
+    if (!data || !data.access_token || typeof data.access_token !== 'string' || data.access_token.trim() === '') {
+      throw new Error('Invalid token response from Keycloak');
     }
+    
+    return String(data.access_token);
+    
+  } catch (error) {
+    throw error;
+  }
+}
+
+checkQuota() {
+  const now = new Date();
+  const today = now.toISOString().split('T')[0];
+  const week = this.getWeekKey(now);
+
+  const dailyCount = quotaTracker.daily.get(today) || 0;
+  if (dailyCount >= DAILY_QUOTA) {
+    throw new Error(`Daily quota exceeded. Limit: ${DAILY_QUOTA}`);
   }
 
-  /**
-   * Generate a token for the validator-app service account (validator-operator user).
-   *
-   * We rely on Canton user rights (UserManagementService) rather than Keycloak token mappers.
-   */
-  async generateTokenForValidatorOperator(partyId) {
+  const weeklyCount = quotaTracker.weekly.get(week) || 0;
+  if (weeklyCount >= WEEKLY_QUOTA) {
+    throw new Error(`Weekly quota exceeded. Limit: ${WEEKLY_QUOTA}`);
+  }
+
+  return { dailyCount, weeklyCount };
+}
+
+incrementQuota() {
+  const now = new Date();
+  const today = now.toISOString().split('T')[0];
+  const week = this.getWeekKey(now);
+
+  quotaTracker.daily.set(today, (quotaTracker.daily.get(today) || 0) + 1);
+  quotaTracker.weekly.set(week, (quotaTracker.weekly.get(week) || 0) + 1);
+  this.cleanupQuotaTracker();
+}
+
+getWeekKey(date) {
+  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  const week = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+  return `${d.getUTCFullYear()}-W${week.toString().padStart(2, '0')}`;
+}
+
+cleanupQuotaTracker() {
+  const now = new Date();
+  const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const cutoffDate = sevenDaysAgo.toISOString().split('T')[0];
+  const cutoffWeek = this.getWeekKey(sevenDaysAgo);
+
+  for (const [date] of quotaTracker.daily) {
+    if (date < cutoffDate) quotaTracker.daily.delete(date);
+  }
+  for (const [week] of quotaTracker.weekly) {
+    if (week < cutoffWeek) quotaTracker.weekly.delete(week);
+  }
+}
+
+createPartyHintFromPublicKey(publicKeyHex, prefix = 'external-wallet-user') {
+  // PartyManagementService.AllocateParty takes a *hint*, not a full party id.
+  // Passing values with "::" has been triggering INTERNAL errors on the devnet participant.
+  // We create a stable, short hint derived from the public key.
+  const pubKeyBytes = Buffer.from(publicKeyHex, 'hex');
+  const digestHex = crypto.createHash('sha256').update(pubKeyBytes).digest('hex');
+  return `${prefix}-${digestHex.slice(0, 16)}`;
+}
+
+/**
+ * MAIN FUNCTION: Create party for user
+ * CRITICAL FIX: Store token in variable immediately and verify before creating result
+ */
+async createPartyForUser(publicKeyHex) {
+  try {
+    // Step 1: Check quota
+    const quotaStatus = this.checkQuota();
+
+    // Step 2: Generate party allocation hint
+    const partyHint = this.createPartyHintFromPublicKey(publicKeyHex, 'external-wallet-user');
+
+    // Step 3: Register party in Canton
     const cantonAdmin = new CantonAdminService();
-    return await cantonAdmin.getAdminToken();
-  }
-
-  async generateTokenForParty(partyId, userInfo, retryCount = 0) {
+    let registrationResult;
     try {
-      // If userInfo is null or missing, use validator-operator instead
-      if (!userInfo || !userInfo.username || !userInfo.password) {
-        return await this.generateTokenForValidatorOperator(partyId);
+      registrationResult = await cantonAdmin.registerParty(partyHint);
+
+      if (!registrationResult || !registrationResult.success) {
+        throw new Error(`Failed to register party: ${registrationResult?.error}`);
       }
-
-      const tokenUrl = `${KEYCLOAK_BASE_URL}/realms/${KEYCLOAK_REALM}/protocol/openid-connect/token`;
-      
-      // Build request parameters
-      const params = new URLSearchParams({
-        grant_type: 'password',
-        client_id: KEYCLOAK_CLIENT_ID,
-        username: userInfo.username,
-        password: userInfo.password,
-        scope: 'openid profile email daml_ledger_api',
-      });
-      
-      // Only add client_secret if provided (for confidential clients)
-      if (KEYCLOAK_CLIENT_SECRET && KEYCLOAK_CLIENT_SECRET.trim() !== '') {
-        params.append('client_secret', KEYCLOAK_CLIENT_SECRET);
-      }
-      
-      const response = await fetch(tokenUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: params,
-      });
-
-      const responseText = await response.text();
-
-      if (!response.ok) {
-        let errorMessage = responseText;
-        try {
-          const errorData = JSON.parse(responseText);
-          errorMessage = errorData.error_description || errorData.error || responseText;
-        } catch (e) {
-          // Keep original error message
-        }
-        
-        // Retry once if user might not be ready yet
-        if (retryCount === 0 && (response.status === 401 || response.status === 403)) {
-          const errorLower = errorMessage.toLowerCase();
-          if (errorLower.includes('required action') || errorLower.includes('account') || errorLower.includes('invalid')) {
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            return this.generateTokenForParty(partyId, userInfo, 1);
-          }
-        }
-        
-        throw new Error(`Token generation failed (${response.status}): ${errorMessage}`);
-      }
-
-      const data = JSON.parse(responseText);
-      
-      if (!data || !data.access_token || typeof data.access_token !== 'string' || data.access_token.trim() === '') {
-        throw new Error('Invalid token response from Keycloak');
-      }
-      
-      return String(data.access_token);
-      
-    } catch (error) {
-      throw error;
-    }
-  }
-
-  checkQuota() {
-    const now = new Date();
-    const today = now.toISOString().split('T')[0];
-    const week = this.getWeekKey(now);
-
-    const dailyCount = quotaTracker.daily.get(today) || 0;
-    if (dailyCount >= DAILY_QUOTA) {
-      throw new Error(`Daily quota exceeded. Limit: ${DAILY_QUOTA}`);
+    } catch (regError) {
+      registrationResult = { success: false, error: regError.message };
     }
 
-    const weeklyCount = quotaTracker.weekly.get(week) || 0;
-    if (weeklyCount >= WEEKLY_QUOTA) {
-      throw new Error(`Weekly quota exceeded. Limit: ${WEEKLY_QUOTA}`);
+    if (!registrationResult?.success) {
+      throw new Error(`Party allocation failed: ${registrationResult?.error || 'unknown error'}`);
     }
 
-    return { dailyCount, weeklyCount };
-  }
-
-  incrementQuota() {
-    const now = new Date();
-    const today = now.toISOString().split('T')[0];
-    const week = this.getWeekKey(now);
-
-    quotaTracker.daily.set(today, (quotaTracker.daily.get(today) || 0) + 1);
-    quotaTracker.weekly.set(week, (quotaTracker.weekly.get(week) || 0) + 1);
-    this.cleanupQuotaTracker();
-  }
-
-  getWeekKey(date) {
-    const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
-    const dayNum = d.getUTCDay() || 7;
-    d.setUTCDate(d.getUTCDate() + 4 - dayNum);
-    const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
-    const week = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-    return `${d.getUTCFullYear()}-W${week.toString().padStart(2, '0')}`;
-  }
-
-  cleanupQuotaTracker() {
-    const now = new Date();
-    const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-    const cutoffDate = sevenDaysAgo.toISOString().split('T')[0];
-    const cutoffWeek = this.getWeekKey(sevenDaysAgo);
-
-    for (const [date] of quotaTracker.daily) {
-      if (date < cutoffDate) quotaTracker.daily.delete(date);
-    }
-    for (const [week] of quotaTracker.weekly) {
-      if (week < cutoffWeek) quotaTracker.weekly.delete(week);
-    }
-  }
-
-  createPartyHintFromPublicKey(publicKeyHex, prefix = 'external-wallet-user') {
-    // PartyManagementService.AllocateParty takes a *hint*, not a full party id.
-    // Passing values with "::" has been triggering INTERNAL errors on the devnet participant.
-    // We create a stable, short hint derived from the public key.
-    const pubKeyBytes = Buffer.from(publicKeyHex, 'hex');
-    const digestHex = crypto.createHash('sha256').update(pubKeyBytes).digest('hex');
-    return `${prefix}-${digestHex.slice(0, 16)}`;
-  }
-
-  /**
-   * MAIN FUNCTION: Create party for user
-   * CRITICAL FIX: Store token in variable immediately and verify before creating result
-   */
-  async createPartyForUser(publicKeyHex) {
+    // Step 4: Assign party to validator-operator user (optional - may not be available via JSON API)
     try {
-      // Step 1: Check quota
-      const quotaStatus = this.checkQuota();
-
-      // Step 2: Generate party allocation hint
-      const partyHint = this.createPartyHintFromPublicKey(publicKeyHex, 'external-wallet-user');
-
-      // Step 3: Register party in Canton
-      const cantonAdmin = new CantonAdminService();
-      let registrationResult;
-      try {
-        registrationResult = await cantonAdmin.registerParty(partyHint);
-
-        if (!registrationResult || !registrationResult.success) {
-          throw new Error(`Failed to register party: ${registrationResult?.error}`);
-        }
-      } catch (regError) {
-        registrationResult = { success: false, error: regError.message };
-      }
-
-      if (!registrationResult?.success) {
-        throw new Error(`Party allocation failed: ${registrationResult?.error || 'unknown error'}`);
-      }
-
-      // Step 4: Assign party to validator-operator user (optional - may not be available via JSON API)
-      try {
-        // Ensure we grant rights for the allocated party identifier returned by the API (source of truth)
-        const allocatedPartyId = registrationResult.partyId;
-        await this.assignPartyToValidatorOperator(allocatedPartyId);
-      } catch (assignError) {
-        // At this point, assignment is REQUIRED for Canton JSON API access.
-        throw assignError;
-      }
-
-      // Step 5: Generate JWT token for validator-operator
-      const tokenString = await this.generateTokenForValidatorOperator(registrationResult.partyId);
-      
-      if (!tokenString || typeof tokenString !== 'string' || tokenString.trim() === '') {
-        throw new Error('Token generation failed - invalid token returned');
-      }
-
-      // Step 6: Verify party registration
-      const verification = await cantonAdmin.verifyPartyRegistration(registrationResult.partyId, tokenString);
-
-      // Step 7: Increment quota
-      this.incrementQuota();
-
-      const result = {
-        partyId: String(registrationResult.partyId),
-        token: String(tokenString),
-        quotaStatus: {
-        dailyUsed: quotaStatus.dailyCount + 1,
-        dailyLimit: DAILY_QUOTA,
-        weeklyUsed: quotaStatus.weeklyCount + 1,
-        weeklyLimit: WEEKLY_QUOTA,
-        },
-        registered: registrationResult?.success || false,
-        verified: (verification?.verified && verification?.registered) || false,
-        registrationMethod: registrationResult?.method || 'unknown',
-      };
-      
-      if (!result.token || typeof result.token !== 'string' || result.token.trim() === '') {
-        throw new Error('Result token validation failed');
-        throw new Error('Result object has invalid token after creation');
-      }
-      
-      return result;
-      
-    } catch (error) {
-      console.error('[PartyService] Error creating party:', error);
-      throw error;
+      // Ensure we grant rights for the allocated party identifier returned by the API (source of truth)
+      const allocatedPartyId = registrationResult.partyId;
+      await this.assignPartyToValidatorOperator(allocatedPartyId);
+    } catch (assignError) {
+      // At this point, assignment is REQUIRED for Canton JSON API access.
+      throw assignError;
     }
+
+    // Step 5: Generate JWT token for validator-operator
+    const tokenString = await this.generateTokenForValidatorOperator(registrationResult.partyId);
+    
+    if (!tokenString || typeof tokenString !== 'string' || tokenString.trim() === '') {
+      throw new Error('Token generation failed - invalid token returned');
+    }
+
+    // Step 6: Verify party registration
+    const verification = await cantonAdmin.verifyPartyRegistration(registrationResult.partyId, tokenString);
+
+    // Step 7: Increment quota
+    this.incrementQuota();
+
+    const result = {
+      partyId: String(registrationResult.partyId),
+      token: String(tokenString),
+      quotaStatus: {
+      dailyUsed: quotaStatus.dailyCount + 1,
+      dailyLimit: DAILY_QUOTA,
+      weeklyUsed: quotaStatus.weeklyCount + 1,
+      weeklyLimit: WEEKLY_QUOTA,
+      },
+      registered: registrationResult?.success || false,
+      verified: (verification?.verified && verification?.registered) || false,
+      registrationMethod: registrationResult?.method || 'unknown',
+    };
+    
+    if (!result.token || typeof result.token !== 'string' || result.token.trim() === '') {
+      throw new Error('Result token validation failed');
+      throw new Error('Result object has invalid token after creation');
+    }
+    
+    return result;
+    
+  } catch (error) {
+    console.error('[PartyService] Error creating party:', error);
+    throw error;
   }
+}
+
 }
 
 module.exports = PartyService;

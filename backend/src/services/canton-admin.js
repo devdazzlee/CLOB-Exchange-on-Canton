@@ -11,10 +11,34 @@ const CANTON_JSON_API_HOST = process.env.CANTON_JSON_API_HOST || '65.108.40.104'
 const CANTON_JSON_API_PORT = process.env.CANTON_JSON_API_PORT || '31539';
 const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || `http://${CANTON_JSON_API_HOST}:${CANTON_JSON_API_PORT}`;
 
+// Keycloak token fetch hardening (network timeouts/retries)
+const KEYCLOAK_TOKEN_TIMEOUT_MS = parseInt(process.env.KEYCLOAK_TOKEN_TIMEOUT_MS || '15000', 10);
+const KEYCLOAK_TOKEN_RETRIES = parseInt(process.env.KEYCLOAK_TOKEN_RETRIES || '3', 10);
+const KEYCLOAK_TOKEN_RETRY_BASE_DELAY_MS = parseInt(process.env.KEYCLOAK_TOKEN_RETRY_BASE_DELAY_MS || '400', 10);
+// Optional (only if you *must* bypass TLS issues; keep default false)
+const KEYCLOAK_ALLOW_INSECURE_TLS = (process.env.KEYCLOAK_ALLOW_INSECURE_TLS || '').toLowerCase() === 'true';
+
+let cachedAdminToken = null;
+let cachedAdminTokenExpiry = null;
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isRetryableNetworkError(err) {
+  const code = err?.cause?.code || err?.code;
+  return (
+    code === 'ECONNRESET' ||
+    code === 'ETIMEDOUT' ||
+    code === 'UND_ERR_CONNECT_TIMEOUT' ||
+    code === 'UND_ERR_SOCKET' ||
+    code === 'ENOTFOUND' ||
+    code === 'EAI_AGAIN'
+  );
+}
+
 class CantonAdminService {
   constructor() {
-    this.adminToken = null;
-    this.adminTokenExpiry = null;
   }
 
   /**
@@ -22,9 +46,12 @@ class CantonAdminService {
    * Uses validator-app service account token which has validator-operator permissions
    */
   async getAdminToken() {
-    if (this.adminToken && this.adminTokenExpiry && Date.now() < this.adminTokenExpiry) {
-      return this.adminToken;
+    if (cachedAdminToken && cachedAdminTokenExpiry && Date.now() < cachedAdminTokenExpiry) {
+      console.log('[CantonAdmin] Using cached admin token');
+      return cachedAdminToken;
     }
+
+    console.log('[CantonAdmin] Fetching new admin token...');
 
     // Get token from Keycloak using validator-app service account
     // This token has validator-operator permissions for Canton
@@ -42,33 +69,83 @@ class CantonAdminService {
     const params = new URLSearchParams({
       grant_type: 'client_credentials',
       client_id: KEYCLOAK_ADMIN_CLIENT_ID,
-      scope: 'openid profile email daml_ledger_api',
+      scope: 'openid profile daml_ledger_api email',
     });
     params.append('client_secret', KEYCLOAK_ADMIN_CLIENT_SECRET);
-    
-    const response = await fetch(tokenUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: params,
-    });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Failed to get validator-app token for Canton: ${errorText}`);
+    // We use undici dispatcher to optionally allow insecure TLS if explicitly enabled.
+    // Default remains secure.
+    let dispatcher;
+    if (KEYCLOAK_ALLOW_INSECURE_TLS) {
+      try {
+        const { Agent } = require('undici');
+        dispatcher = new Agent({ connect: { rejectUnauthorized: false } });
+      } catch {
+        // If undici Agent isn't available, proceed without dispatcher (still secure)
+        dispatcher = undefined;
+      }
     }
 
-    const data = await response.json();
-    
-    if (!data || !data.access_token) {
-      throw new Error('Validator-app token response missing access_token');
+    let lastErr;
+    for (let attempt = 1; attempt <= KEYCLOAK_TOKEN_RETRIES; attempt++) {
+      try {
+        const response = await fetch(tokenUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: params,
+          // Node 18+ supports AbortSignal.timeout
+          signal: AbortSignal.timeout(KEYCLOAK_TOKEN_TIMEOUT_MS),
+          ...(dispatcher ? { dispatcher } : {}),
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          // Retry only on 5xx/429; other errors are usually config issues.
+          if ((response.status >= 500 || response.status === 429) && attempt < KEYCLOAK_TOKEN_RETRIES) {
+            lastErr = new Error(`Keycloak token endpoint error ${response.status}: ${errorText}`);
+            const backoff = KEYCLOAK_TOKEN_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+            await sleep(backoff);
+            continue;
+          }
+          throw new Error(`Failed to get validator-app token for Canton: ${errorText}`);
+        }
+
+        const data = await response.json();
+        console.log('[CantonAdmin] Token response received, expires_in:', data.expires_in);
+        if (!data || !data.access_token) {
+          throw new Error('Validator-app token response missing access_token');
+        }
+
+        cachedAdminToken = data.access_token;
+        console.log('[CantonAdmin] Admin token fetched successfully');
+        // Cache slightly shorter than exp to avoid edge expiry
+        const expiresIn = Number(data.expires_in || 0);
+        const safetySeconds = 300; // 5 min
+        cachedAdminTokenExpiry = Date.now() + (Math.max(0, expiresIn - safetySeconds) * 1000);
+        return cachedAdminToken;
+      } catch (err) {
+        lastErr = err;
+        // If it's a transient network failure, retry
+        if (attempt < KEYCLOAK_TOKEN_RETRIES && isRetryableNetworkError(err)) {
+          const backoff = KEYCLOAK_TOKEN_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+          await sleep(backoff);
+          continue;
+        }
+        break;
+      }
     }
 
-    this.adminToken = data.access_token;
-    this.adminTokenExpiry = Date.now() + ((data.expires_in - 300) * 1000);
-    
-    return this.adminToken;
+    // Last-resort fallback: if we have a previously cached token, return it (may still work).
+    // This prevents brief Keycloak blips from breaking the whole backend.
+    if (cachedAdminToken) {
+      console.warn('[CantonAdmin] Keycloak token fetch failed; using cached admin token as fallback:', lastErr?.message || lastErr);
+      return cachedAdminToken;
+    }
+
+    throw lastErr || new Error('Failed to get validator-app token for Canton');
+
   }
 
   /**

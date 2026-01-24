@@ -227,6 +227,64 @@ export function storeWallet(encryptedPrivateKey, publicKey) {
   };
   
   localStorage.setItem('canton_wallet', JSON.stringify(walletData));
+
+  // Best-effort IndexedDB write (preferred storage, but keep localStorage for sync reads)
+  try {
+    writeWalletToIndexedDB(walletData);
+  } catch {
+    // ignore
+  }
+}
+
+function writeWalletToIndexedDB(walletData) {
+  const request = indexedDB.open('clob_wallet_db', 1);
+  request.onupgradeneeded = () => {
+    const db = request.result;
+    if (!db.objectStoreNames.contains('wallet')) {
+      db.createObjectStore('wallet');
+    }
+  };
+  request.onsuccess = () => {
+    const db = request.result;
+    const tx = db.transaction('wallet', 'readwrite');
+    tx.objectStore('wallet').put(walletData, 'primary');
+    tx.oncomplete = () => db.close();
+    tx.onerror = () => db.close();
+  };
+}
+
+export async function loadWalletAsync() {
+  // Prefer IndexedDB, fallback to localStorage
+  const fromIdb = await readWalletFromIndexedDB().catch(() => null);
+  if (fromIdb) {
+    return {
+      publicKey: hexToBytes(fromIdb.publicKey),
+      encryptedPrivateKey: fromIdb.encryptedPrivateKey,
+    };
+  }
+  return loadWallet();
+}
+
+function readWalletFromIndexedDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open('clob_wallet_db', 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains('wallet')) {
+        db.createObjectStore('wallet');
+      }
+    };
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const db = request.result;
+      const tx = db.transaction('wallet', 'readonly');
+      const getReq = tx.objectStore('wallet').get('primary');
+      getReq.onsuccess = () => resolve(getReq.result || null);
+      getReq.onerror = () => reject(getReq.error);
+      tx.oncomplete = () => db.close();
+      tx.onerror = () => db.close();
+    };
+  });
 }
 
 /**
@@ -256,6 +314,25 @@ export function loadWallet() {
  */
 export function clearWallet() {
   localStorage.removeItem('canton_wallet');
+  // Best-effort IndexedDB clear
+  try {
+    const request = indexedDB.open('clob_wallet_db', 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains('wallet')) {
+        db.createObjectStore('wallet');
+      }
+    };
+    request.onsuccess = () => {
+      const db = request.result;
+      const tx = db.transaction('wallet', 'readwrite');
+      tx.objectStore('wallet').delete('primary');
+      tx.oncomplete = () => db.close();
+      tx.onerror = () => db.close();
+    };
+  } catch {
+    // ignore
+  }
 }
 
 /**

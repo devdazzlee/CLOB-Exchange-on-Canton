@@ -11,7 +11,6 @@ import {
   signMessage,
 } from '../wallet/keyManager';
 import { generateTopology, allocatePartyWithSignature } from '../services/partyService';
-import { storeTokens } from '../services/keycloakAuth';
 import PasswordInput from './PasswordInput';
 
 export default function WalletSetup({ onWalletReady }) {
@@ -169,12 +168,6 @@ export default function WalletSetup({ onWalletReady }) {
       setPartyId(allocatedPartyId);
       localStorage.setItem('canton_party_id', allocatedPartyId);
 
-      // 6. Store token if provided (validator token)
-      if (result.token) {
-        console.log('[WalletSetup] Storing token');
-        storeTokens(result.token, null, 1800);
-      }
-
       setStep('ready');
       if (onWalletReady) {
         onWalletReady(allocatedPartyId);
@@ -247,12 +240,6 @@ export default function WalletSetup({ onWalletReady }) {
       setPartyId(allocatedPartyId);
       localStorage.setItem('canton_party_id', allocatedPartyId);
 
-      // 6. Store token if provided
-      if (result.token) {
-        console.log('[WalletSetup] Storing token');
-        storeTokens(result.token, null, 1800);
-      }
-
       setStep('ready');
       if (onWalletReady) {
         onWalletReady(allocatedPartyId);
@@ -318,12 +305,6 @@ export default function WalletSetup({ onWalletReady }) {
       const allocatedPartyId = result.partyId;
       setPartyId(allocatedPartyId);
       localStorage.setItem('canton_party_id', allocatedPartyId);
-
-      // 5. Store token if provided
-      if (result.token) {
-        console.log('[WalletSetup] Storing token');
-        storeTokens(result.token, null, 1800);
-      }
 
       setShowUnlockModal(false);
       setStep('ready');

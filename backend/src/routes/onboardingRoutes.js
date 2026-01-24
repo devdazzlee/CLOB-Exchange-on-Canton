@@ -6,6 +6,7 @@
 const express = require('express');
 const router = express.Router();
 const onboardingController = require('../controllers/onboardingController');
+const requireUserId = require('../middleware/requireUserId');
 
 // Debug middleware
 router.use((req, res, next) => {
@@ -13,8 +14,14 @@ router.use((req, res, next) => {
   next();
 });
 
+// MVP identity (x-user-id required)
+router.use(requireUserId);
+
 // POST /api/onboarding/allocate-party - 2-step allocate (topology + allocate)
 router.post('/allocate-party', onboardingController.allocateParty);
+
+// POST /api/onboarding/rehydrate - restore userId -> partyId mapping (after refresh/server restart)
+router.post('/rehydrate', onboardingController.rehydrate);
 
 // POST /api/onboarding/ensure-rights - NO-OP verification
 router.post('/ensure-rights', onboardingController.ensureRights);

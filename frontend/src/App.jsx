@@ -4,29 +4,41 @@ import WalletSetup from './components/WalletSetup';
 import TradingInterface from './components/TradingInterface';
 import AdminPanel from './components/AdminPanel';
 import AuthGuard from './components/AuthGuard';
-import AuthCallback from './components/AuthCallback';
-import { loadWallet, clearWallet } from './wallet/keyManager';
-import { logout, isAuthenticated } from './services/keycloakAuth';
+import { loadWallet, clearWallet, bytesToBase64 } from './wallet/keyManager';
+import { getOrCreateUserId } from './services/userId';
 import './index.css';
+
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ||
+  (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
+
+async function rehydrateUserMapping(partyId, wallet) {
+  if (!partyId || !wallet?.publicKey) return;
+
+  const publicKeyBase64 = bytesToBase64(wallet.publicKey);
+
+  try {
+    await fetch(`${API_BASE_URL}/onboarding/rehydrate`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-user-id': getOrCreateUserId(),
+      },
+      body: JSON.stringify({
+        partyId,
+        publicKeyBase64,
+      }),
+    });
+  } catch (error) {
+    console.warn('[App] Failed to rehydrate user mapping:', error);
+  }
+}
 
 function App() {
   const [partyId, setPartyId] = useState(null);
   const [walletReady, setWalletReady] = useState(false);
   const [copiedPartyId, setCopiedPartyId] = useState(false);
-  const [authenticated, setAuthenticated] = useState(false);
 
   useEffect(() => {
-    // Check if user explicitly logged out - don't load wallet
-    const userLoggedOut = sessionStorage.getItem('user_logged_out');
-    if (userLoggedOut === 'true') {
-      console.log('[App] User logged out, skipping wallet load');
-      sessionStorage.removeItem('user_logged_out');
-      setWalletReady(false);
-      setPartyId(null);
-      setAuthenticated(false);
-      return;
-    }
-    
     // Check if wallet exists
     const wallet = loadWallet();
     if (wallet) {
@@ -36,7 +48,8 @@ function App() {
       const storedPartyId = localStorage.getItem('canton_party_id');
       if (storedPartyId) {
         setPartyId(storedPartyId);
-        setWalletReady(true);
+        Promise.resolve(rehydrateUserMapping(storedPartyId, wallet))
+          .finally(() => setWalletReady(true));
       } else {
         // No fallback: force party registration via backend (WalletSetup will do it)
         setPartyId(null);
@@ -44,19 +57,7 @@ function App() {
       }
     }
     
-    // Check authentication status
-    setAuthenticated(isAuthenticated());
-    
-    // Listen for auth token changes
-    const handleAuthChange = () => {
-      setAuthenticated(isAuthenticated());
-    };
-    
-    window.addEventListener('auth-token-stored', handleAuthChange);
-    
-    return () => {
-      window.removeEventListener('auth-token-stored', handleAuthChange);
-    };
+    // No Keycloak auth for end users. Wallet presence is the only gating signal.
   }, []);
 
   const handleWalletReady = (newPartyId) => {
@@ -77,20 +78,18 @@ function App() {
   };
 
   const handleLogout = () => {
-    // Clear all authentication and wallet data
+    // Clear wallet + onboarding identity (frontend-side)
     clearWallet();
     localStorage.removeItem('canton_party_id');
-    logout();
     // Reset all state
     setPartyId(null);
     setWalletReady(false);
-    setAuthenticated(false);
     // Force redirect to home page
     window.location.href = '/';
   };
 
   return (
-    <Router>
+    <Router future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
       <div className="min-h-screen bg-[#0B0E11]">
         {/* Header */}
         <header className="bg-[#181A20] border-b border-[#2B3139] sticky top-0 z-50 shadow-sm">
@@ -129,16 +128,15 @@ function App() {
                     </button>
                   </div>
                 )}
-                {authenticated && (
+                {walletReady && (
                   <button
                     onClick={handleLogout}
-                    className="px-3 sm:px-4 py-1.5 sm:py-2 rounded-md border border-red-500/50 text-sm font-medium text-red-400 hover:bg-red-500/10 hover:border-red-500 hover:text-red-300 transition-colors flex items-center space-x-1.5"
-                    title="Logout"
+                    className="text-[#848E9C] hover:text-[#EAECEF] transition-colors flex items-center space-x-2"
                   >
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
                     </svg>
-                    <span className="hidden sm:inline">Logout</span>
+                    <span>Logout</span>
                   </button>
                 )}
               </div>
@@ -153,13 +151,9 @@ function App() {
           
           <Routes>
             <Route
-              path="/auth/callback"
-              element={<AuthCallback />}
-            />
-            <Route
               path="/"
               element={
-                walletReady && authenticated ? (
+                walletReady ? (
                   <Navigate to="/trading" replace />
                 ) : (
                   <div className="max-w-2xl mx-auto">
@@ -187,9 +181,11 @@ function App() {
             <Route
               path="/trading"
               element={
-                <AuthGuard>
+                walletReady ? (
                   <TradingInterface partyId={partyId} />
-                </AuthGuard>
+                ) : (
+                  <Navigate to="/" replace />
+                )
               }
             />
             <Route

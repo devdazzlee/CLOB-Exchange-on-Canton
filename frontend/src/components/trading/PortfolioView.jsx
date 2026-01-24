@@ -3,6 +3,7 @@ import { motion } from 'framer-motion';
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
 import { TrendingUp, TrendingDown, Wallet } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { normalizeDamlMap } from '../../utils/daml';
 
 /**
  * Portfolio View Component - Shows user's positions across all trading pairs
@@ -26,7 +27,7 @@ export default function PortfolioView({ partyId, cantonApi }) {
       
       if (accounts.length > 0) {
         const account = accounts[0];
-        const balances = account.payload?.balances || {};
+        const balances = normalizeDamlMap(account.payload?.balances);
         
         // Get all trades to calculate P&L
         const trades = await cantonApi.queryContracts('Trade:Trade', partyId);
