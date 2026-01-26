@@ -26,6 +26,17 @@ class UTXOMerger {
    */
   async mergeUTXOs(partyId, token, userAccountContractId) {
     try {
+      // Skip UTXO merging for external parties (they can't submit commands)
+      if (partyId.startsWith('ext-')) {
+        console.log(`[UTXO Merger] Skipping UTXO merge for external party ${partyId}`);
+        return {
+          success: true,
+          partyId,
+          token,
+          result: { skipped: true, reason: 'External party cannot submit commands' }
+        };
+      }
+
       const adminToken = await this.cantonAdmin.getAdminToken();
       const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
 
@@ -41,22 +52,24 @@ class UTXOMerger {
         },
         body: JSON.stringify({
           commandId: commandId,
+          actAs: [partyId],
+          readAs: ["8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292"],
           commands: [
             {
-              exercise: {
-                templateId: 'UserAccount:UserAccount',
+              ExerciseCommand: {
+                templateId: 'f10023e35e41e6c76e2863bca154fbec275d01fdf528012dc3954e5f4a769454:UserAccount:UserAccount',
                 contractId: userAccountContractId,
                 choice: 'MergeBalances',
-                argument: {}
+                choiceArgument: {}
               }
             }
-          ],
-          actAs: [partyId]
+          ]
         })
       });
 
       if (!response.ok) {
         const errorText = await response.text();
+        console.error('[UTXO Merger] Error response:', errorText);
         let error;
         try {
           error = JSON.parse(errorText);

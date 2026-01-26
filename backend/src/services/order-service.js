@@ -214,9 +214,12 @@ class OrderService {
    * 2. Place order via Ledger API
    * 3. Return result
    */
-  async placeOrderWithUTXOHandling(partyId, tradingPair, orderType, orderMode, quantity, price, orderBookContractId, userAccountContractId) {
+  async placeOrderWithUTXOHandling(partyId, tradingPair, orderType, orderMode, quantity, price, orderBookContractId, userAccountContractIdParam) {
     try {
       console.log(`[Order Service] Placing order with UTXO handling for ${partyId}`);
+      
+      // Ensure userAccountContractId is defined (handle undefined from missing request body field)
+      const userAccountContractIdSafe = userAccountContractIdParam || null;
       
       // Step 1: Pre-order UTXO handling
       const preOrderResult = await this.utxoHandler.handlePreOrderPlacement(
@@ -225,7 +228,7 @@ class OrderService {
         orderType,
         parseFloat(quantity),
         price ? parseFloat(price) : null,
-        userAccountContractId // Pass contract ID if available
+        userAccountContractIdSafe // Pass contract ID if available
       );
 
       if (!preOrderResult.success) {
@@ -346,9 +349,12 @@ class OrderService {
    * 2. Remove from OrderBook
    * 3. Merge UTXOs after cancellation
    */
-  async cancelOrderWithUTXOHandling(partyId, tradingPair, orderType, orderContractId, orderBookContractId, userAccountContractId) {
+  async cancelOrderWithUTXOHandling(partyId, tradingPair, orderType, orderContractId, orderBookContractId, userAccountContractIdParam) {
     try {
       console.log(`[Order Service] Cancelling order with UTXO handling for ${partyId}`);
+
+      // Ensure userAccountContractId is defined (handle undefined from missing request body field)
+      const userAccountContractIdSafe = userAccountContractIdParam || null;
 
       const adminToken = await this.cantonAdmin.getAdminToken();
       await cantonService.ensurePartyRights(partyId, adminToken);
@@ -467,12 +473,12 @@ class OrderService {
       }
 
       // Step 4: Post-cancellation UTXO merge
-      if (userAccountContractId) {
+      if (userAccountContractIdSafe) {
         const postCancelResult = await this.utxoHandler.handlePostCancellation(
           partyId,
           tradingPair,
           orderType,
-          userAccountContractId
+          userAccountContractIdSafe
         );
 
         console.log(`[Order Service] ✅ Post-cancellation UTXO merge: ${postCancelResult.success ? 'success' : 'failed'}`);

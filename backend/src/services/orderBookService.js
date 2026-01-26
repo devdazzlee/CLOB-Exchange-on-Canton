@@ -357,10 +357,10 @@ class OrderBookService {
     // Get package ID for OrderBook template (use package-id format to avoid vetting issues)
     const orderBookPackageId = await cantonService.getPackageIdForTemplate('OrderBook', adminToken);
 
-    // Create OrderBook contract (UTXO model)
-    // Try without synchronizer first, then with synchronizer if needed
+    // Create OrderBook contract
     let orderBookResult;
     try {
+      // Try without synchronizer first
       orderBookResult = await cantonService.createContract({
         token: adminToken,
         actAsParty: config.canton.operatorPartyId,
@@ -407,8 +407,83 @@ class OrderBookService {
       throw new Error(`Failed to create OrderBook contract. Result: ${JSON.stringify(orderBookResult)}`);
     }
 
+    // Wait for OrderBook to become visible in queries (race condition fix)
+    console.log('[OrderBook] Waiting for OrderBook to become visible...');
+    let retries = 20; // Increase retries
+    let visibleContractId = null;
+    
+    // First, try to get the contract ID from the updateId
+    if (orderBookResult.updateId && orderBookResult.completionOffset) {
+      console.log('[OrderBook] Querying transaction result using updateId...');
+      try {
+        const txResponse = await fetch(`${config.canton.jsonApiBase}/v2/updates/update-by-id`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${adminToken}`
+          },
+          body: JSON.stringify({
+            updateId: orderBookResult.updateId
+          })
+        });
+        
+        if (txResponse.ok) {
+          const txData = await txResponse.json();
+          console.log('[OrderBook] Transaction result:', JSON.stringify(txData, null, 2));
+          
+          // Extract the actual contract ID from the transaction
+          const events = txData.events || [];
+          const createdEvent = events.find(e => e.created && e.created.contractId);
+          if (createdEvent && createdEvent.created.contractId) {
+            visibleContractId = createdEvent.created.contractId;
+            console.log('[OrderBook] ✅ Found real contract ID from transaction:', visibleContractId.substring(0, 30) + '...');
+          }
+        }
+      } catch (error) {
+        console.log('[OrderBook] Failed to query transaction result:', error.message);
+      }
+    }
+    
+    // If we didn't get the contract ID from the transaction, try polling
+    while (retries > 0 && !visibleContractId) {
+      await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
+      
+      try {
+        visibleContractId = await this.getOrderBookContractId(tradingPair);
+        if (visibleContractId) {
+          console.log('[OrderBook] ✅ OrderBook is now visible:', visibleContractId.substring(0, 30) + '...');
+          break;
+        }
+      } catch (error) {
+        console.log(`[OrderBook] Retry ${20 - retries + 1}: OrderBook not yet visible...`);
+      }
+      
+      retries--;
+    }
+    
+    if (!visibleContractId) {
+      // If still not visible, try one more time with a longer delay
+      console.log('[OrderBook] Final retry with longer delay...');
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      try {
+        visibleContractId = await this.getOrderBookContractId(tradingPair);
+        if (visibleContractId) {
+          console.log('[OrderBook] ✅ OrderBook finally visible:', visibleContractId.substring(0, 30) + '...');
+        }
+      } catch (error) {
+        console.error('[OrderBook] ❌ OrderBook still not visible after all retries');
+      }
+    }
+    
+    // Use the visible contract ID if available, otherwise fall back to pending
+    const finalContractId = visibleContractId || orderBookContractId;
+    
+    if (!visibleContractId) {
+      console.warn('[OrderBook] ⚠️ Using pending contract ID - OrderBook may not be immediately usable');
+    }
+
     return {
-      contractId: orderBookContractId,
+      contractId: finalContractId,
       masterOrderBookContractId: null,
       alreadyExists: false,
     };

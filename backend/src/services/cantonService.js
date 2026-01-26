@@ -36,6 +36,36 @@ class CantonService {
     this.cantonAdmin = new CantonAdmin();
   }
 
+  async submitAndWaitForTransaction(token, body) {
+    const res = await fetch(`${this.cantonApiBase}/v2/commands/submit-and-wait-for-transaction`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+
+    const text = await res.text();
+    if (!res.ok) {
+      // Parse error response for better error messages
+      let errorMessage = `submit-and-wait-for-transaction failed ${res.status}: ${text}`;
+      try {
+        const errorData = JSON.parse(text);
+        if (errorData.code === 'JSON_API_PACKAGE_SELECTION_FAILED') {
+          errorMessage = `Package vetting error: ${errorData.cause || errorData.message || text}\n` +
+            `This usually means the package is not vetted on all hosting participants. ` +
+            `Ensure the DAR is uploaded and vetted on all participants that host the parties involved.`;
+        } else if (errorData.code) {
+          errorMessage = `${errorData.code}: ${errorData.cause || errorData.message || text}`;
+        }
+      } catch (e) {
+        // If parsing fails, use original text
+      }
+      throw new Error(errorMessage);
+    }
+    
+    const result = JSON.parse(text);
+    return result;
+  }
+
   async submitAndWait(token, body) {
     const res = await fetch(`${this.cantonApiBase}/v2/commands/submit-and-wait`, {
       method: "POST",
@@ -93,6 +123,33 @@ class CantonService {
   }
 
   // ✅ Correct v2 envelope: commandId/actAs/... at TOP LEVEL
+  async createContractWithTransaction({ token, actAsParty, templateId, createArguments, readAs, userId, synchronizerId }) {
+    const actAsParties = Array.isArray(actAsParty) ? actAsParty : [actAsParty];
+    if (!actAsParties.length || !actAsParties[0]) throw new Error("createContract: actAsParty is required");
+    if (!templateId) throw new Error("createContract: templateId is required");
+    if (!createArguments) throw new Error("createContract: createArguments is required");
+
+    const templateIdStr = normalizeTemplateId(templateId);
+
+    const body = {
+      commandId: crypto.randomUUID(),
+      actAs: actAsParties,
+      ...(Array.isArray(readAs) && readAs.length ? { readAs } : {}),
+      ...(userId ? { userId } : {}),
+      ...(synchronizerId ? { synchronizerId } : {}),
+      commands: [
+        {
+          CreateCommand: {
+            templateId: templateIdStr,
+            createArguments,
+          },
+        },
+      ],
+    };
+
+    return this.submitAndWaitForTransaction(token, body);
+  }
+
   async createContract({ token, actAsParty, templateId, createArguments, readAs, userId, synchronizerId }) {
     const actAsParties = Array.isArray(actAsParty) ? actAsParty : [actAsParty];
     if (!actAsParties.length || !actAsParties[0]) throw new Error("createContract: actAsParty is required");

@@ -42,11 +42,16 @@ class OrderController {
 
     let resolvedOrderBookContractId = orderBookContractId;
     if (!resolvedOrderBookContractId) {
+      console.log(`[OrderController] Getting OrderBook contract ID for ${decodedTradingPair}`);
       resolvedOrderBookContractId = await orderBookService.getOrderBookContractId(decodedTradingPair);
     }
     if (!resolvedOrderBookContractId) {
+      console.log(`[OrderController] OrderBook not found, creating new one for ${decodedTradingPair}`);
       const created = await orderBookService.createOrderBook(decodedTradingPair);
       resolvedOrderBookContractId = created.contractId;
+      console.log(`[OrderController] OrderBook created with ID: ${resolvedOrderBookContractId?.substring(0, 30)}...`);
+    } else {
+      console.log(`[OrderController] Using existing OrderBook: ${resolvedOrderBookContractId.substring(0, 30)}...`);
     }
 
     let result;

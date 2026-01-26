@@ -24,7 +24,7 @@ module.exports = {
       'Sesnp3u6udkFF983rfprvsBbx3X3mBpw',
     oauthClientSecret: process.env.CANTON_OAUTH_CLIENT_SECRET || '',
     // Optional synchronizer ID override (will be discovered if not set)
-    synchronizerId: process.env.CANTON_SYNCHRONIZER_ID || 'global-domain::1220be58c29e65de40bf273be1dc2b266d43a9a002ea5b18955aeef7aac881bb471a::34-0',
+    synchronizerId: process.env.CANTON_SYNCHRONIZER_ID || 'global-domain::1220be58c29e65de40bf273be1dc2b266d43a9a002ea5b18955aeef7aac881bb471a',
     // Package IDs - NEW DAR uploaded 2026-01-22 with all features
     // The system auto-discovers package IDs, these are fallbacks
     packageIds: {

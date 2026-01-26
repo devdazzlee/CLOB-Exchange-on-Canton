@@ -21,6 +21,12 @@ const KEYCLOAK_ALLOW_INSECURE_TLS = (process.env.KEYCLOAK_ALLOW_INSECURE_TLS || 
 let cachedAdminToken = null;
 let cachedAdminTokenExpiry = null;
 
+function clearAdminTokenCache() {
+  console.log('[CantonAdmin] Clearing admin token cache');
+  cachedAdminToken = null;
+  cachedAdminTokenExpiry = null;
+}
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -52,9 +58,14 @@ class CantonAdminService {
       return process.env.CANTON_ADMIN_TOKEN;
     }
     
-    if (cachedAdminToken && cachedAdminTokenExpiry && Date.now() < cachedAdminTokenExpiry) {
+    if (cachedAdminToken && cachedAdminTokenExpiry && Date.now() < cachedAdminTokenExpiry && cachedAdminToken !== null) {
       console.log('[CantonAdmin] Using cached admin token');
       return cachedAdminToken;
+    }
+
+    // Clear cache if we have a null token
+    if (cachedAdminToken === null) {
+      clearAdminTokenCache();
     }
 
     console.log('[CantonAdmin] Fetching new admin token...');
