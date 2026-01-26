@@ -18,6 +18,45 @@ class CantonGrpcClient {
     this.metadata = null;
   }
 
+/**
+   * Upload DAR file to Canton
+   */
+  async uploadDar(darBuffer, adminToken) {
+    await this.initialize(adminToken);
+    
+    return new Promise((resolve, reject) => {
+      const packageServiceProto = grpc.loadPackageDefinition(
+        protoLoader.loadSync(path.join(__dirname, '..', 'proto', 'package_service.proto'), {
+          keepCase: true,
+          longs: String,
+          enums: String,
+          defaults: true,
+          oneofs: true
+        })
+      );
+      
+      const packageClient = new packageServiceProto.com.daml.ledger.api.v1.admin.PackageService(
+        CANTON_LEDGER_API_URL,
+        grpc.credentials.createInsecure()
+      );
+      
+      const request = {
+        darFile: darBuffer,
+        submissionId: `upload-${Date.now()}`
+      };
+      
+      packageClient.uploadDarFile(request, this.metadata, (err, response) => {
+        if (err) {
+          console.error('[gRPC] Upload DAR error:', err);
+          reject(err);
+        } else {
+          console.log('[gRPC] DAR uploaded successfully:', response);
+          resolve(response);
+        }
+      });
+    });
+  }
+
   /**
    * Initialize gRPC client
    */

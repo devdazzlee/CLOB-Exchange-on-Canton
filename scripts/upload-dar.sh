@@ -102,7 +102,6 @@ echo "$GRPC_UPLOAD_DAR_REQUEST" > "$TEMP_REQUEST_FILE"
 trap "rm -f $TEMP_REQUEST_FILE $TEMP_BASE64_FILE" EXIT
 
 # Run grpcurl directly with timeout
-# -max-time should handle timeout, but if it hangs we'll see it
 echo "Connecting to ${PARTICIPANT_HOST}:${CANTON_ADMIN_GRPC_PORT}..."
 echo "Uploading DAR file (this may take 30-60 seconds for large files)..."
 echo ""
@@ -170,6 +169,7 @@ else
     echo "1. Your token might be expired or invalid"
     echo "2. The token might not have permission to upload DAR files"
     echo "3. Get a fresh token from the Wallet UI"
+    echo "4. Check if the token is correctly formatted"
   elif echo "$RESPONSE" | grep -qi "connection refused\|refused"; then
     echo -e "${YELLOW}Connection Error:${NC}"
     echo "1. The server is not accepting connections"

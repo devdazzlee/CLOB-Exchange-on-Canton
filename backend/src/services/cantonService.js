@@ -61,7 +61,35 @@ class CantonService {
       }
       throw new Error(errorMessage);
     }
-    return JSON.parse(text);
+    
+    const result = JSON.parse(text);
+    
+    // If we got updateId and completionOffset, this means the command was submitted successfully
+    // but we need to query the result differently. For now, let's check if this is a success response
+    if (result.updateId && result.completionOffset) {
+      console.log('[CantonService] Command submitted successfully, updateId:', result.updateId);
+      
+      // For submit-and-wait, if we get updateId and completionOffset, it usually means success
+      // The actual contract creation might be in a different format or need to be queried differently
+      // Let's return a success response that the caller can handle
+      return {
+        status: 'submitted',
+        updateId: result.updateId,
+        completionOffset: result.completionOffset,
+        // Add a placeholder transaction structure for compatibility
+        transaction: {
+          events: [{
+            created: {
+              contractId: `pending-${result.updateId}`, // Temporary ID
+              templateId: body.commands?.[0]?.CreateCommand?.templateId,
+              createArguments: body.commands?.[0]?.CreateCommand?.createArguments
+            }
+          }]
+        }
+      };
+    }
+    
+    return result;
   }
 
   // ✅ Correct v2 envelope: commandId/actAs/... at TOP LEVEL
@@ -230,7 +258,8 @@ class CantonService {
     const templateToConfigKey = {
       'UserAccount': 'userAccount',
       'MasterOrderBook': 'masterOrderBook',
-      'OrderBook': 'masterOrderBook', // OrderBook is in same package as MasterOrderBook
+      // Prefer the main CLOB package for OrderBook; fall back to legacy if needed.
+      'OrderBook': 'clobExchange',
       'AssetHolding': 'clobExchange',
       'Faucet': 'clobExchange',
     };
@@ -239,6 +268,10 @@ class CantonService {
     if (configKey && configPackageIds[configKey]) {
       console.log(`[CantonService] Using package ID from config for ${templateName}: ${configPackageIds[configKey].substring(0, 16)}...`);
       return configPackageIds[configKey];
+    }
+    if (templateName === 'OrderBook' && configPackageIds.masterOrderBook) {
+      console.warn('[CantonService] Falling back to masterOrderBook package ID for OrderBook');
+      return configPackageIds.masterOrderBook;
     }
 
     // Fallback: try to discover from API

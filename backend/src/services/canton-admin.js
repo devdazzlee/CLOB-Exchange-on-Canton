@@ -4,9 +4,9 @@
  */
 
 // Canton Admin API endpoints - Updated to new client endpoints
-const CANTON_ADMIN_HOST = process.env.CANTON_ADMIN_HOST || '65.108.40.104';
-const CANTON_ADMIN_PORT = process.env.CANTON_ADMIN_PORT || '30100';
-const CANTON_ADMIN_BASE = process.env.CANTON_ADMIN_BASE || `http://${CANTON_ADMIN_HOST}:${CANTON_ADMIN_PORT}`;
+const CANTON_ADMIN_HOST = process.env.CANTON_ADMIN_HOST || 'participant.dev.canton.wolfedgelabs.com';
+const CANTON_ADMIN_PORT = process.env.CANTON_ADMIN_PORT || '443';
+const CANTON_ADMIN_BASE = process.env.CANTON_ADMIN_BASE || `https://${CANTON_ADMIN_HOST}:${CANTON_ADMIN_PORT}`;
 const CANTON_JSON_API_HOST = process.env.CANTON_JSON_API_HOST || '65.108.40.104';
 const CANTON_JSON_API_PORT = process.env.CANTON_JSON_API_PORT || '31539';
 const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || `http://${CANTON_JSON_API_HOST}:${CANTON_JSON_API_PORT}`;
@@ -46,6 +46,12 @@ class CantonAdminService {
    * Uses validator-app service account token which has validator-operator permissions
    */
   async getAdminToken() {
+    // Use provided token directly if available
+    if (process.env.CANTON_ADMIN_TOKEN) {
+      console.log('[CantonAdmin] Using provided admin token');
+      return process.env.CANTON_ADMIN_TOKEN;
+    }
+    
     if (cachedAdminToken && cachedAdminTokenExpiry && Date.now() < cachedAdminTokenExpiry) {
       console.log('[CantonAdmin] Using cached admin token');
       return cachedAdminToken;

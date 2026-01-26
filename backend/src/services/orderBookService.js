@@ -93,6 +93,10 @@ class OrderBookService {
 
   async discoverSynchronizerId() {
     try {
+      if (config.canton.synchronizerId) {
+        return config.canton.synchronizerId;
+      }
+
       const response = await fetch(`${config.canton.jsonApiBase}/v2/state/connected-synchronizers`, {
         method: 'GET',
         headers: {
@@ -101,13 +105,41 @@ class OrderBookService {
         },
       });
       
-      if (response.ok) {
-        const data = await response.json();
-        const synchronizers = data.synchronizers || [];
-        if (synchronizers.length > 0) {
-          return synchronizers[0]; // Return first synchronizer
-        }
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Failed to discover synchronizerId: ${response.status} - ${errorText}`);
       }
+
+      const data = await response.json().catch(() => ({}));
+      let synchronizerId = null;
+
+      if (data.connectedSynchronizers && Array.isArray(data.connectedSynchronizers) && data.connectedSynchronizers.length > 0) {
+        const synchronizers = data.connectedSynchronizers;
+        const globalSync = synchronizers.find(s =>
+          s.synchronizerAlias === 'global' || s.alias === 'global'
+        );
+        if (globalSync?.synchronizerId) {
+          synchronizerId = globalSync.synchronizerId;
+        } else {
+          const globalDomainSync = synchronizers.find(s =>
+            s.synchronizerId && s.synchronizerId.includes('global-domain')
+          );
+          synchronizerId = globalDomainSync?.synchronizerId || synchronizers[0].synchronizerId || synchronizers[0].id;
+        }
+      } else if (data.synchronizers && Array.isArray(data.synchronizers) && data.synchronizers.length > 0) {
+        const first = data.synchronizers[0];
+        synchronizerId = typeof first === 'string' ? first : (first.synchronizerId || first.id);
+      } else if (data.synchronizerId) {
+        synchronizerId = data.synchronizerId;
+      } else if (Array.isArray(data) && data.length > 0) {
+        const first = data[0];
+        synchronizerId = typeof first === 'string' ? first : (first.synchronizerId || first.id);
+      }
+
+      if (synchronizerId) {
+        return synchronizerId;
+      }
+
       throw new Error('No synchronizers found');
     } catch (error) {
       console.error('[OrderBookService] Failed to discover synchronizer:', error);
@@ -326,27 +358,53 @@ class OrderBookService {
     const orderBookPackageId = await cantonService.getPackageIdForTemplate('OrderBook', adminToken);
 
     // Create OrderBook contract (UTXO model)
-    const orderBookResult = await cantonService.createContract({
-      token: adminToken,
-      actAsParty: config.canton.operatorPartyId,
-      templateId: `${orderBookPackageId}:OrderBook:OrderBook`,
-      createArguments: {
-        tradingPair,
-        buyOrders: [],
-        sellOrders: [],
-        lastPrice: null,
-        operator: config.canton.operatorPartyId,
-        activeUsers: [],
-        userAccounts: null,
-      },
-      readAs: [config.canton.operatorPartyId],
-      synchronizerId: await this.discoverSynchronizerId(),
-    });
+    // Try without synchronizer first, then with synchronizer if needed
+    let orderBookResult;
+    try {
+      orderBookResult = await cantonService.createContract({
+        token: adminToken,
+        actAsParty: config.canton.operatorPartyId,
+        templateId: `${orderBookPackageId}:OrderBook:OrderBook`,
+        createArguments: {
+          tradingPair,
+          buyOrders: [],
+          sellOrders: [],
+          lastPrice: null,
+          operator: config.canton.operatorPartyId,
+          activeUsers: [],
+          userAccounts: null,
+        },
+        readAs: [config.canton.operatorPartyId],
+        synchronizerId: null, // Try without synchronizer first
+      });
+    } catch (syncError) {
+      // If synchronizer is required, fall back to using it
+      console.log('[OrderBook] Synchronizer required, using:', syncError.message);
+      orderBookResult = await cantonService.createContract({
+        token: adminToken,
+        actAsParty: config.canton.operatorPartyId,
+        templateId: `${orderBookPackageId}:OrderBook:OrderBook`,
+        createArguments: {
+          tradingPair,
+          buyOrders: [],
+          sellOrders: [],
+          lastPrice: null,
+          operator: config.canton.operatorPartyId,
+          activeUsers: [],
+          userAccounts: null,
+        },
+        readAs: [config.canton.operatorPartyId],
+        synchronizerId: await this.discoverSynchronizerId(),
+      });
+    }
 
     const orderBookContractId = orderBookResult.transaction?.events?.[0]?.created?.contractId;
 
+    console.log('[OrderBook] Contract creation result:', JSON.stringify(orderBookResult, null, 2));
+    console.log('[OrderBook] Contract ID:', orderBookContractId);
+
     if (!orderBookContractId) {
-      throw new Error('Failed to create OrderBook contract');
+      throw new Error(`Failed to create OrderBook contract. Result: ${JSON.stringify(orderBookResult)}`);
     }
 
     return {

@@ -14,6 +14,14 @@ import TransactionHistory from './trading/TransactionHistory';
 import PortfolioView from './trading/PortfolioView';
 import MarketData from './trading/MarketData';
 
+// Import skeleton components
+import OrderBookSkeleton from './trading/OrderBookSkeleton';
+import TradesSkeleton from './trading/TradesSkeleton';
+import BalanceSkeleton from './trading/BalanceSkeleton';
+import OrdersSkeleton from './trading/OrdersSkeleton';
+import MarketDataSkeleton from './trading/MarketDataSkeleton';
+import OrderFormSkeleton from './trading/OrderFormSkeleton';
+
 // Import services
 import { 
   createContract, 
@@ -81,6 +89,7 @@ export default function TradingInterface({ partyId }) {
   const [error, setError] = useState('');
   const [creatingOrderBook, setCreatingOrderBook] = useState(false);
   const [trades, setTrades] = useState([]);
+  const [tradesLoading, setTradesLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('trading'); // 'trading', 'portfolio', 'history'
   const { showModal, ModalComponent, isOpenRef: modalIsOpenRef } = useConfirmationModal();
   const isLoadingRef = useRef(false);
@@ -492,6 +501,7 @@ export default function TradingInterface({ partyId }) {
 
   // Load recent trades
   const loadTrades = useCallback(async () => {
+    setTradesLoading(true);
     try {
       const backendBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
       const res = await fetch(
@@ -520,6 +530,8 @@ export default function TradingInterface({ partyId }) {
     } catch (err) {
       console.error('[Trades] Error loading trades:', err);
       setTrades([]);
+    } finally {
+      setTradesLoading(false);
     }
   }, [partyId, tradingPair]);
 
@@ -1014,24 +1026,58 @@ export default function TradingInterface({ partyId }) {
         )}
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          <OrderForm
-            tradingPair={tradingPair}
-            availablePairs={availablePairs}
-            onTradingPairChange={setTradingPair}
-            orderBookExists={orderBookExists}
-            orderType={orderType}
-            onOrderTypeChange={(e) => setOrderType(e.target.value)}
-            orderMode={orderMode}
-            onOrderModeChange={(e) => setOrderMode(e.target.value)}
-            price={price}
-            onPriceChange={setPrice}
-            quantity={quantity}
-            onQuantityChange={setQuantity}
-            loading={loading}
-            onSubmit={handlePlaceOrder}
-            balance={balance}
-            orderBook={orderBook}
-          />
+          {balanceLoading ? (
+            <OrderFormSkeleton />
+          ) : (
+            <OrderForm
+              tradingPair={tradingPair}
+              availablePairs={availablePairs}
+              onTradingPairChange={setTradingPair}
+              orderBookExists={orderBookExists}
+              orderType={orderType}
+              onOrderTypeChange={(e) => setOrderType(e.target.value)}
+              orderMode={orderMode}
+              onOrderModeChange={(e) => setOrderMode(e.target.value)}
+              price={price}
+              onPriceChange={setPrice}
+              quantity={quantity}
+              onQuantityChange={setQuantity}
+              loading={loading}
+              onSubmit={handlePlaceOrder}
+              balance={balance}
+              orderBook={orderBook}
+            />
+          )}
+          
+          {/* Balance Card */}
+          {balanceLoading ? (
+            <BalanceSkeleton />
+          ) : (
+            <div className="space-y-4">
+              <div className="bg-card border border-border rounded-lg p-4">
+                <h3 className="text-lg font-semibold mb-4">Balances</h3>
+                <div className="space-y-3">
+                  {Object.entries(balance).map(([token, amount]) => (
+                    <div key={token} className="flex items-center justify-between p-3 bg-muted/50 rounded-lg">
+                      <div className="flex items-center space-x-3">
+                        <div className="w-8 h-8 bg-primary/20 rounded-full flex items-center justify-center text-xs font-bold">
+                          {token.substring(0, 2)}
+                        </div>
+                        <div>
+                          <div className="font-medium">{token}</div>
+                          <div className="text-sm text-muted-foreground">Available</div>
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <div className="font-mono font-semibold">{parseFloat(amount).toLocaleString()}</div>
+                        <div className="text-sm text-muted-foreground">{token}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
               </div>
 
         {/* Tabs Navigation */}
@@ -1074,31 +1120,43 @@ export default function TradingInterface({ partyId }) {
         {activeTab === 'trading' && (
           <div className="space-y-6">
             {/* Market Data */}
-            <MarketData
-              tradingPair={tradingPair}
-              orderBook={orderBook}
-              trades={trades}
-            />
+            {orderBookLoading && tradesLoading ? (
+              <MarketDataSkeleton />
+            ) : (
+              <MarketData
+                tradingPair={tradingPair}
+                orderBook={orderBook}
+                trades={trades}
+              />
+            )}
             
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
               {/* OrderBook - Left Column (2/3 width) */}
               <div className="lg:col-span-2">
-                <OrderBookCard
-                  tradingPair={tradingPair}
-                  orderBook={orderBook}
-                  loading={orderBookLoading}
-                  onRefresh={() => loadOrderBook(true)}
-                  // Global OrderBook model - these props are deprecated
-                  // onCreateOrderBook and creatingOrderBook are no longer used
-                />
+                {orderBookLoading ? (
+                  <OrderBookSkeleton />
+                ) : (
+                  <OrderBookCard
+                    tradingPair={tradingPair}
+                    orderBook={orderBook}
+                    loading={orderBookLoading}
+                    onRefresh={() => loadOrderBook(true)}
+                    // Global OrderBook model - these props are deprecated
+                    // onCreateOrderBook and creatingOrderBook are no longer used
+                  />
+                )}
               </div>
               
               {/* Right Column (1/3 width) - Global Trades */}
               <div className="space-y-6">
-                <GlobalTrades
-                  tradingPair={tradingPair}
-                  limit={50}
-                />
+                {tradesLoading ? (
+                  <TradesSkeleton limit={8} />
+                ) : (
+                  <GlobalTrades
+                    tradingPair={tradingPair}
+                    limit={50}
+                  />
+                )}
               </div>
             </div>
             
@@ -1110,17 +1168,26 @@ export default function TradingInterface({ partyId }) {
                 tradingPair={tradingPair}
               />
               
-              <RecentTrades
-                trades={trades}
-                tradingPair={tradingPair}
-                loading={false}
-              />
+              {tradesLoading ? (
+                <TradesSkeleton limit={10} />
+              ) : (
+                <RecentTrades
+                  trades={trades}
+                  tradingPair={tradingPair}
+                  loading={tradesLoading}
+                />
+              )}
             </div>
 
-            <ActiveOrdersTable
-              orders={orders}
-              onCancelOrder={handleCancelOrder}
-            />
+            {/* Active Orders */}
+            {loading ? (
+              <OrdersSkeleton limit={5} />
+            ) : (
+              <ActiveOrdersTable
+                orders={orders}
+                onCancelOrder={handleCancelOrder}
+              />
+            )}
           </div>
         )}
 
