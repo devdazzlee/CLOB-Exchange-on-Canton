@@ -119,18 +119,22 @@ class LedgerProxyController {
   queryActiveContracts = async (req, res) => {
     const userId = req.userId;
     const templateId = req.body?.templateId;
+    const limitInput = req.body?.limit;
     if (!templateId || typeof templateId !== 'string') {
       return res.status(400).json({ error: 'templateId is required (string)' });
     }
 
     const partyId = requirePartyId(userId);
     const completionOffset = req.body?.offset ?? null;
+    const limit = Number.isFinite(Number(limitInput))
+      ? Math.min(Math.max(Number(limitInput), 1), 200)
+      : Math.min(Math.max(Number(config.api.batchSize || 200), 1), 200);
 
     const result = await this.withCantonTokenRetry(async (token) => {
       const qualified = await qualifyTemplateId(templateId, token);
       const activeAtOffset = await cantonService.getActiveAtOffset(token, completionOffset);
 
-      const response = await fetch(`${config.canton.jsonApiBase}/v2/state/active-contracts`, {
+      const response = await fetch(`${config.canton.jsonApiBase}/v2/state/active-contracts?limit=${limit}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

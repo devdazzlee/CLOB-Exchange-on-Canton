@@ -28,6 +28,27 @@ import { clearWallet } from '../wallet/keyManager';
 import { getOrCreateUserId } from '../services/userId';
 import { normalizeDamlMap } from '../utils/daml';
 
+const USER_ACCOUNT_STORAGE_KEY = 'user_account_contract_id';
+
+function getUserAccountStorageKey(partyId) {
+  return partyId ? `${USER_ACCOUNT_STORAGE_KEY}:${partyId}` : USER_ACCOUNT_STORAGE_KEY;
+}
+
+function getStoredUserAccountId(partyId) {
+  if (typeof localStorage === 'undefined') return null;
+  return localStorage.getItem(getUserAccountStorageKey(partyId));
+}
+
+function setStoredUserAccountId(partyId, contractId) {
+  if (typeof localStorage === 'undefined' || !contractId) return;
+  localStorage.setItem(getUserAccountStorageKey(partyId), contractId);
+}
+
+function clearStoredUserAccountId(partyId) {
+  if (typeof localStorage === 'undefined') return;
+  localStorage.removeItem(getUserAccountStorageKey(partyId));
+}
+
 export default function TradingInterface({ partyId }) {
   // Guard clause
   if (!partyId) {
@@ -50,6 +71,8 @@ export default function TradingInterface({ partyId }) {
   const [quantity, setQuantity] = useState('');
   const [balance, setBalance] = useState({ BTC: '0.0', USDT: '0.0' });
   const [balanceLoading, setBalanceLoading] = useState(false);
+  const isMintingRef = useRef(false);
+  const lastMintAtRef = useRef(0);
   const [orders, setOrders] = useState([]);
   const [orderBook, setOrderBook] = useState({ buys: [], sells: [] });
   const [loading, setLoading] = useState(false);
@@ -169,100 +192,118 @@ export default function TradingInterface({ partyId }) {
   // Data loading functions
   const loadBalance = async (showLoader = true) => {
     if (showLoader) setBalanceLoading(true);
+
+    const applyBalances = (balances) => {
+      const normalized = normalizeDamlMap(balances);
+      let btcBalance = '0.0';
+      let usdtBalance = '0.0';
+
+      if (Array.isArray(normalized)) {
+        normalized.forEach(([key, value]) => {
+          if (key === 'BTC') btcBalance = value?.toString() || '0.0';
+          if (key === 'USDT') usdtBalance = value?.toString() || '0.0';
+        });
+      } else if (normalized && typeof normalized === 'object') {
+        btcBalance = normalized?.BTC?.toString() || '0.0';
+        usdtBalance = normalized?.USDT?.toString() || '0.0';
+      }
+
+      setBalance({ BTC: btcBalance, USDT: usdtBalance });
+    };
+
     try {
-      const accounts = await queryContracts('UserAccount:UserAccount', partyId);
-      
-      if (accounts.length > 0) {
-        const account = accounts[0];
-        const balances = normalizeDamlMap(account.payload?.balances);
-        
-        let btcBalance = '0.0';
-        let usdtBalance = '0.0';
-        
-        if (Array.isArray(balances)) {
-          balances.forEach(([key, value]) => {
-            if (key === 'BTC') btcBalance = value?.toString() || '0.0';
-            if (key === 'USDT') usdtBalance = value?.toString() || '0.0';
-          });
-        } else if (balances && typeof balances === 'object') {
-          btcBalance = balances?.BTC?.toString() || '0.0';
-          usdtBalance = balances?.USDT?.toString() || '0.0';
-        }
-        
-        setBalance({ BTC: btcBalance, USDT: usdtBalance });
-      } else {
-        // TESTNET: Auto-create UserAccount with test tokens if it doesn't exist
-        console.log('[Balance] UserAccount not found, auto-creating with test tokens...');
+      const storedAccountId = getStoredUserAccountId(partyId);
+      if (storedAccountId) {
         try {
-          const backendBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
-          const response = await fetch(`${backendBase}/api/testnet/quick-mint`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-user-id': getOrCreateUserId(),
-            },
-            body: JSON.stringify({ partyId })
-          });
-          
-          const responseJson = await response.json().catch(() => ({}));
-          const result = responseJson?.data ?? responseJson;
-          
-          if (response.ok) {
-            console.log('[Balance] ✅ UserAccount created with test tokens:', result.balances);
-            
-            // IMMEDIATELY set balances from mint response (even if UserAccount not queryable yet)
-            if (result.balances && typeof result.balances === 'object') {
-              const normalized = normalizeDamlMap(result.balances);
-              const btcBalance = normalized?.BTC?.toString() || '0.0';
-              const usdtBalance = normalized?.USDT?.toString() || '0.0';
-              setBalance({ BTC: btcBalance, USDT: usdtBalance });
-              console.log('[Balance] ✅ Set balances immediately from mint response:', { BTC: btcBalance, USDT: usdtBalance });
-            }
-            
-            // Then try to reload from UserAccount after a delay (for accuracy)
-            setTimeout(async () => {
-              try {
-                const newAccounts = await queryContracts('UserAccount:UserAccount', partyId);
-                
-                if (newAccounts.length > 0) {
-                  const account = newAccounts[0];
-                  const balances = normalizeDamlMap(account.payload?.balances);
-                  
-                  let btcBalance = '0.0';
-                  let usdtBalance = '0.0';
-                  
-                  if (Array.isArray(balances)) {
-                    balances.forEach(([key, value]) => {
-                      if (key === 'BTC') btcBalance = value?.toString() || '0.0';
-                      if (key === 'USDT') usdtBalance = value?.toString() || '0.0';
-                    });
-                  } else if (balances && typeof balances === 'object') {
-                    btcBalance = balances?.BTC?.toString() || '0.0';
-                    usdtBalance = balances?.USDT?.toString() || '0.0';
-                  }
-                  
-                  setBalance({ BTC: btcBalance, USDT: usdtBalance });
-                  console.log('[Balance] ✅ Updated balances from UserAccount query:', { BTC: btcBalance, USDT: usdtBalance });
-                } else {
-                  console.log('[Balance] UserAccount not yet queryable, using mint response balances');
-                }
-              } catch (retryErr) {
-                console.warn('[Balance] Retry query failed (non-critical):', retryErr.message);
-                // Keep using balances from mint response
-              }
-            }, 2000); // Wait 2 seconds then retry
-          } else {
-            console.warn('[Balance] Failed to auto-create UserAccount:', response.status);
-            setBalance({ BTC: '0.0', USDT: '0.0' });
+          const account = await fetchContract(storedAccountId, partyId);
+          if (account?.payload?.balances) {
+            applyBalances(account.payload.balances);
+            return;
           }
-        } catch (mintErr) {
-          console.error('[Balance] Error auto-creating UserAccount:', mintErr);
-          setBalance({ BTC: '0.0', USDT: '0.0' });
+          clearStoredUserAccountId(partyId);
+        } catch (storedErr) {
+          console.warn('[Balance] Stored UserAccount fetch failed:', storedErr.message);
+          clearStoredUserAccountId(partyId);
         }
+      }
+
+      const accounts = await queryContracts('UserAccount:UserAccount', partyId);
+      const matching = accounts.filter((acc) => acc.payload?.party === partyId);
+      const sorted = matching.length > 0
+        ? matching.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
+        : accounts;
+
+      if (sorted.length > 0) {
+        const account = sorted[0];
+        if (account?.contractId) {
+          setStoredUserAccountId(partyId, account.contractId);
+        }
+        applyBalances(account.payload?.balances || {});
+        return;
+      }
+
+      // TESTNET: Auto-create UserAccount with test tokens if it doesn't exist
+      const now = Date.now();
+      if (isMintingRef.current || now - lastMintAtRef.current < 60000) {
+        console.warn('[Balance] Skipping quick mint (cooldown active)');
+        return;
+      }
+
+      isMintingRef.current = true;
+      lastMintAtRef.current = now;
+      console.log('[Balance] UserAccount not found, auto-creating with test tokens...');
+      try {
+        const backendBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
+        const response = await fetch(`${backendBase}/api/testnet/quick-mint`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-user-id': getOrCreateUserId(),
+          },
+          body: JSON.stringify({ partyId })
+        });
+
+        const responseJson = await response.json().catch(() => ({}));
+        const result = responseJson?.data ?? responseJson;
+
+        if (response.ok) {
+          console.log('[Balance] ✅ UserAccount created with test tokens:', result.balances);
+          if (result.accountContractId) {
+            setStoredUserAccountId(partyId, result.accountContractId);
+          }
+          if (result.balances && typeof result.balances === 'object') {
+            applyBalances(result.balances);
+            console.log('[Balance] ✅ Set balances immediately from mint response');
+          }
+
+          setTimeout(async () => {
+            try {
+              const newAccounts = await queryContracts('UserAccount:UserAccount', partyId);
+              const newMatching = newAccounts.filter((acc) => acc.payload?.party === partyId);
+              if (newMatching.length > 0) {
+                const account = newMatching.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))[0];
+                if (account?.contractId) {
+                  setStoredUserAccountId(partyId, account.contractId);
+                }
+                applyBalances(account.payload?.balances || {});
+                console.log('[Balance] ✅ Updated balances from UserAccount query');
+              } else {
+                console.log('[Balance] UserAccount not yet queryable, using mint response balances');
+              }
+            } catch (retryErr) {
+              console.warn('[Balance] Retry query failed (non-critical):', retryErr.message);
+            }
+          }, 2000);
+        } else {
+          console.warn('[Balance] Failed to auto-create UserAccount:', response.status);
+        }
+      } catch (mintErr) {
+        console.error('[Balance] Error auto-creating UserAccount:', mintErr);
+      } finally {
+        isMintingRef.current = false;
       }
     } catch (err) {
       console.error('[Balance] Error:', err);
-      setBalance({ BTC: '0.0', USDT: '0.0' });
     } finally {
       if (showLoader) setBalanceLoading(false);
     }
@@ -271,110 +312,73 @@ export default function TradingInterface({ partyId }) {
   // Memoize loadOrders to prevent unnecessary re-renders
   const loadOrders = useCallback(async () => {
     try {
-      console.log('[Active Orders] Querying Order contracts for party:', partyId, 'trading pair:', tradingPair);
-      
-      // First try querying at current ledger end
-      let userOrders = await queryContracts('Order:Order', partyId);
-      console.log('[Active Orders] Found', userOrders.length, 'total Order contracts at current ledger end');
-      
-      // If empty, try querying at stored OrderBook completion offset (where orders were created)
-      // Also check the latest order completion offset if available
-      if (userOrders.length === 0) {
-        const storedOffset = localStorage.getItem(`orderBook_${tradingPair}_${partyId}_offset`);
-        const latestOrderOffset = localStorage.getItem(`latestOrder_${tradingPair}_${partyId}_offset`);
-        const offsetToUse = latestOrderOffset || storedOffset;
-        
-        if (offsetToUse) {
-          console.log('[Active Orders] No orders at current ledger end, trying stored offset:', offsetToUse);
-          try {
-            const { queryContractsAtOffset } = await import('../services/cantonApi');
-            const ordersAtOffset = await queryContractsAtOffset('Order:Order', partyId, offsetToUse);
-            console.log('[Active Orders] Found', ordersAtOffset.length, 'Order contracts at stored offset', offsetToUse);
-            
-            if (ordersAtOffset.length > 0) {
-              userOrders = ordersAtOffset;
-              console.log('[Active Orders] ✅ Using orders from stored offset');
-            }
-          } catch (err) {
-            console.warn('[Active Orders] Error querying at stored offset:', err);
-          }
-        }
-      } else {
-        // If we found orders at current ledger end, also check stored offset to get all orders
-        // (Some orders might only be visible at their creation offset)
-        const latestOrderOffset = localStorage.getItem(`latestOrder_${tradingPair}_${partyId}_offset`);
-        if (latestOrderOffset) {
-          try {
-            const { queryContractsAtOffset } = await import('../services/cantonApi');
-            const ordersAtOffset = await queryContractsAtOffset('Order:Order', partyId, latestOrderOffset);
-            // Merge with existing orders, avoiding duplicates
-            const existingContractIds = new Set(userOrders.map(o => o.contractId));
-            const newOrders = ordersAtOffset.filter(o => !existingContractIds.has(o.contractId));
-            if (newOrders.length > 0) {
-              console.log('[Active Orders] Found', newOrders.length, 'additional orders at latest order offset');
-              userOrders = [...userOrders, ...newOrders];
-            }
-          } catch (err) {
-            console.warn('[Active Orders] Error querying at latest order offset:', err);
-          }
-        }
+      console.log('[Active Orders] Loading open orders for party:', partyId, 'trading pair:', tradingPair);
+
+      const { getGlobalOrderBook, fetchContracts } = await import('../services/cantonApi');
+      const globalOrderBook = await getGlobalOrderBook(tradingPair);
+
+      if (!globalOrderBook) {
+        setOrders([]);
+        return;
       }
-      
-      // Filter out invalid contracts (must have orderId and status)
-      // Also ensure templateId is Order:Order (not OrderBook or other types)
-      const validOrders = userOrders.filter(o => {
-        const isOrderContract = o.templateId?.includes('Order:Order') || !o.templateId; // Allow if templateId is missing (legacy)
-        const hasRequiredFields = o.payload?.orderId && o.payload?.status;
-        return isOrderContract && hasRequiredFields;
-      });
-      
-      if (validOrders.length !== userOrders.length) {
-        console.warn(`[Active Orders] Filtered out ${userOrders.length - validOrders.length} invalid contracts (missing orderId/status or wrong template)`);
-        console.warn('[Active Orders] Invalid contracts:', userOrders
-          .filter(o => !(o.templateId?.includes('Order:Order') || !o.templateId) || !o.payload?.orderId || !o.payload?.status)
-          .map(o => ({
-            contractId: o.contractId?.substring(0, 30) + '...',
-            templateId: o.templateId,
-            hasOrderId: !!o.payload?.orderId,
-            hasStatus: !!o.payload?.status,
-            payloadKeys: o.payload ? Object.keys(o.payload) : []
-          }))
+
+      const rawOrders = [
+        ...(globalOrderBook.buyOrders || []),
+        ...(globalOrderBook.sellOrders || [])
+      ];
+
+      if (rawOrders.length === 0) {
+        setOrders([]);
+        return;
+      }
+
+      const hasDetails = rawOrders.some((order) => typeof order === 'object' && order !== null);
+      let activeOrders = [];
+
+      if (hasDetails) {
+        activeOrders = rawOrders.filter((order) =>
+          order?.owner === partyId &&
+          order?.status === 'OPEN' &&
+          order?.tradingPair === tradingPair
+        );
+      } else {
+        const orderIds = rawOrders
+          .map((order) => (typeof order === 'string' ? order : order?.contractId))
+          .filter(Boolean);
+
+        const uniqueOrderIds = Array.from(new Set(orderIds));
+        const limitedOrderIds = uniqueOrderIds.length > 200 ? uniqueOrderIds.slice(0, 200) : uniqueOrderIds;
+        if (uniqueOrderIds.length > limitedOrderIds.length) {
+          console.warn('[Active Orders] Truncated order fetch to 200 contracts');
+        }
+
+        const orderContracts = await fetchContracts(limitedOrderIds, partyId);
+        activeOrders = orderContracts.filter((o) =>
+          o.payload?.owner === partyId &&
+          o.payload?.status === 'OPEN' &&
+          o.payload?.tradingPair === tradingPair
         );
       }
-      
-      if (validOrders.length > 0) {
-        console.log('[Active Orders] All valid orders:', validOrders.map(o => ({
-          contractId: o.contractId?.substring(0, 20) + '...',
-          orderId: o.payload?.orderId,
-          status: o.payload?.status,
-          tradingPair: o.payload?.tradingPair,
-          owner: o.payload?.owner,
-          orderType: o.payload?.orderType
-        })));
-      }
-      
-      const activeOrders = validOrders.filter(o => 
-        o.payload?.status === 'OPEN' && 
-        o.payload?.tradingPair === tradingPair
-      );
-      
+
       console.log('[Active Orders] Filtered to', activeOrders.length, 'OPEN orders for', tradingPair);
-      
-      setOrders(activeOrders.map(o => ({
-        id: o.payload?.orderId,
-        type: o.payload?.orderType,
-        mode: o.payload?.orderMode,
-        pair: o.payload?.tradingPair,
-        price: o.payload?.price,
-        quantity: o.payload?.quantity,
-        filled: o.payload?.filled,
-        status: o.payload?.status,
-        contractId: o.contractId
-      })));
+
+      setOrders(activeOrders.map(o => {
+        const payload = o.payload || o;
+        return {
+          id: payload?.orderId,
+          type: payload?.orderType,
+          mode: payload?.orderMode || (payload?.price ? 'LIMIT' : 'MARKET'),
+          pair: payload?.tradingPair,
+          price: payload?.price,
+          quantity: payload?.quantity,
+          filled: payload?.filled,
+          status: payload?.status,
+          contractId: o.contractId || payload?.contractId
+        };
+      }));
     } catch (err) {
       console.error('[Active Orders] Error loading orders:', err);
       console.error('[Active Orders] Error details:', err.message, err.stack);
-      // Don't set empty array on error - keep existing orders
     }
   }, [partyId, tradingPair]);
 
@@ -404,6 +408,43 @@ export default function TradingInterface({ partyId }) {
         console.log('[OrderBook] ❌ Global OrderBook not found for', tradingPair);
         setOrderBookExists(false);
         setOrderBook({ buys: [], sells: [] });
+
+        const allowAutoCreate = import.meta.env.DEV || import.meta.env.VITE_AUTO_CREATE_ORDERBOOK === 'true';
+        if (allowAutoCreate && !creatingOrderBook) {
+          setCreatingOrderBook(true);
+          try {
+            const backendBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
+            const createResponse = await fetch(
+              `${backendBase}/api/admin/orderbooks/${encodeURIComponent(tradingPair)}`,
+              { method: 'POST', headers: { 'Content-Type': 'application/json' } }
+            );
+
+            const createJson = await createResponse.json().catch(() => ({}));
+            const createData = createJson?.data ?? createJson;
+
+            if (createResponse.ok) {
+              console.log('[OrderBook] ✅ Created OrderBook:', createData?.contractId || tradingPair);
+              const createdOrderBook = await getGlobalOrderBook(tradingPair);
+              if (createdOrderBook) {
+                setOrderBookExists(true);
+                setOrderBook({
+                  buys: createdOrderBook.buyOrders || [],
+                  sells: createdOrderBook.sellOrders || []
+                });
+                setOrderBookLoading(false);
+                isLoadingRef.current = false;
+                return;
+              }
+            } else {
+              console.warn('[OrderBook] Failed to create OrderBook:', createJson?.message || createJson?.error || createResponse.statusText);
+            }
+          } catch (createErr) {
+            console.warn('[OrderBook] Auto-create OrderBook failed:', createErr.message);
+          } finally {
+            setCreatingOrderBook(false);
+          }
+        }
+
         setOrderBookLoading(false);
         isLoadingRef.current = false;
         return;
@@ -452,26 +493,30 @@ export default function TradingInterface({ partyId }) {
   // Load recent trades
   const loadTrades = useCallback(async () => {
     try {
-      const tradeContracts = await queryContracts('Trade:Trade', partyId);
-      const filteredTrades = tradeContracts
-        .filter(trade => {
-          const pair = trade.payload?.tradingPair || trade.tradingPair;
-          return pair === tradingPair;
-        })
-        .map(trade => ({
-          tradeId: trade.contractId,
-          tradingPair: trade.payload?.tradingPair || trade.tradingPair,
-          buyer: trade.payload?.buyer || trade.buyer,
-          seller: trade.payload?.seller || trade.seller,
-          price: trade.payload?.price || trade.price,
-          quantity: trade.payload?.quantity || trade.quantity,
-          timestamp: trade.payload?.timestamp || trade.timestamp || trade.createdAt,
-          partyId: partyId
-        }))
-        .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
-        .slice(0, 100); // Keep last 100 trades
-      
-      setTrades(filteredTrades);
+      const backendBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
+      const res = await fetch(
+        `${backendBase}/api/orderbooks/${encodeURIComponent(tradingPair)}/trades?limit=100`
+      );
+      const json = await res.json().catch(() => ({}));
+      const data = json?.data ?? json;
+
+      if (!res.ok) {
+        throw new Error(data?.message || data?.error || 'Failed to load trades');
+      }
+
+      const tradeList = data?.trades || [];
+      const normalized = tradeList.map((trade) => ({
+        tradeId: trade.tradeId || trade.contractId,
+        tradingPair: trade.tradingPair,
+        buyer: trade.buyer,
+        seller: trade.seller,
+        price: trade.price,
+        quantity: trade.quantity,
+        timestamp: trade.timestamp,
+        partyId: partyId
+      }));
+
+      setTrades(normalized);
     } catch (err) {
       console.error('[Trades] Error loading trades:', err);
       setTrades([]);
@@ -498,7 +543,7 @@ export default function TradingInterface({ partyId }) {
     return { success: false, error: 'Global OrderBook model - users cannot create order books' };
   };
 
-  // Order placement with Splice Allocation model (Two-Step Process)
+  // Order placement with UserAccount/UTXO model
   const handlePlaceOrder = async (e) => {
     e.preventDefault();
     setError('');
@@ -514,79 +559,14 @@ export default function TradingInterface({ partyId }) {
       }
 
       const orderId = `ORDER-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-      const OPERATOR_PARTY_ID = '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
-      
-      // Parse trading pair to determine which token to lock
-      const parseTradingPair = (pair) => {
-        if (pair.includes('/')) {
-          const [base, quote] = pair.split('/');
-          return { base, quote };
-        } else if (pair.includes('-')) {
-          const [base, quote] = pair.split('-');
-          return { base, quote };
-        }
-        return { base: 'BTC', quote: 'USDT' }; // Default
-      };
-      
-      const { base, quote } = parseTradingPair(tradingPair);
-      // BUY order: lock quote token (USDT) to buy base token (BTC)
-      // SELL order: lock base token (BTC) to sell for quote token (USDT)
-      const tokenToLock = orderType === 'BUY' ? quote : base;
-      const lockAmount = quantity; // For BUY: amount of USDT, For SELL: amount of BTC
-      
-      console.log('[Place Order] Splice Allocation Flow:', {
+
+      console.log('[Place Order] UTXO Order Flow:', {
         orderType,
-        tokenToLock,
-        lockAmount,
-        tradingPair: `${base}/${quote}`
+        orderMode,
+        quantity,
+        price: orderMode === 'LIMIT' ? price : null,
+        tradingPair
       });
-      
-      // ============================================================================
-      // STEP A: Create Allocation (Lock Funds)
-      // ============================================================================
-      console.log('[Place Order] Step A: Creating Allocation...');
-      setError('Creating Allocation (locking funds)...');
-      
-      const { findTokenContracts, createAllocation } = await import('../services/cantonApi');
-      
-      // Find user's Token contracts with sufficient balance
-      const tokenContracts = await findTokenContracts(partyId, tokenToLock, lockAmount);
-      
-      if (tokenContracts.length === 0) {
-        throw new Error(`Insufficient ${tokenToLock} balance. Need ${lockAmount} ${tokenToLock} to place this order.`);
-      }
-      
-      // Use the first matching token contract
-      const tokenContract = tokenContracts[0];
-      console.log('[Place Order] Using Token contract:', tokenContract.contractId.substring(0, 30) + '...');
-      
-      // Create Allocation by locking the token
-      let allocationCid;
-      try {
-        allocationCid = await createAllocation(
-          tokenContract.contractId,
-          partyId,
-          OPERATOR_PARTY_ID,
-          lockAmount,
-          tokenToLock
-        );
-        console.log('[Place Order] ✅ Step A Complete: Allocation created:', allocationCid.substring(0, 30) + '...');
-      } catch (allocationError) {
-        console.error('[Place Order] ❌ Step A Failed: Allocation creation error:', allocationError);
-        throw new Error(`Failed to create Allocation: ${allocationError.message}. Please ensure you have sufficient ${tokenToLock} balance.`);
-      }
-      
-      // ============================================================================
-      // STEP B: Wait for Allocation to be confirmed
-      // ============================================================================
-      console.log('[Place Order] Step B: Waiting for Allocation confirmation...');
-      setError('Allocation created. Confirming...');
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      
-      // ============================================================================
-      // STEP C: Place Order with Allocation CID
-      // ============================================================================
-      console.log('[Place Order] Step C: Placing order with Allocation CID...');
       setError('Placing order...');
       
       // Get OrderBook - try backend endpoint first (for global OrderBooks)
@@ -694,23 +674,26 @@ export default function TradingInterface({ partyId }) {
         quantity: parseFloat(quantity).toString()
       });
       
-      // Get UserAccount contract ID for UTXO handling
-      let userAccountContractId = null;
-      try {
-        const { queryContracts } = await import('../services/cantonApi');
-        const userAccounts = await queryContracts('UserAccount:UserAccount', partyId);
-        const userAccount = userAccounts.find(ua => ua.payload?.party === partyId);
-        if (userAccount) {
-          userAccountContractId = userAccount.contractId;
-          console.log('[Place Order] Found UserAccount:', userAccountContractId.substring(0, 30) + '...');
-        } else {
-          console.warn('[Place Order] UserAccount not found - UTXO handling may be limited');
+        // Get UserAccount contract ID for UTXO handling
+        let userAccountContractId = getStoredUserAccountId(partyId);
+        if (!userAccountContractId) {
+          try {
+            const { queryContracts } = await import('../services/cantonApi');
+            const userAccounts = await queryContracts('UserAccount:UserAccount', partyId);
+            const userAccount = userAccounts.find(ua => ua.payload?.party === partyId);
+            if (userAccount) {
+              userAccountContractId = userAccount.contractId;
+              setStoredUserAccountId(partyId, userAccountContractId);
+              console.log('[Place Order] Found UserAccount:', userAccountContractId.substring(0, 30) + '...');
+            } else {
+              console.warn('[Place Order] UserAccount not found - UTXO handling may be limited');
+            }
+          } catch (err) {
+            console.warn('[Place Order] Could not fetch UserAccount:', err.message);
+          }
         }
-      } catch (err) {
-        console.warn('[Place Order] Could not fetch UserAccount:', err.message);
-      }
       
-      // Use new Splice Allocation-aware order placement endpoint
+      // Use UTXO-aware order placement endpoint
       const backendBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
       const placeOrderResponse = await fetch(`${backendBase}/api/orders/place`, {
         method: 'POST',
@@ -725,17 +708,21 @@ export default function TradingInterface({ partyId }) {
           quantity: parseFloat(quantity).toString(),
           price: orderMode === 'LIMIT' && price ? parseFloat(price).toString() : null,
           orderBookContractId: orderBookContract?.contractId || null, // Can be null - backend will auto-create
-          allocationCid: allocationCid, // CRITICAL: Pass the Allocation CID from Step A
           userAccountContractId: userAccountContractId
         })
       });
       
+      const responseJson = await placeOrderResponse.json().catch(() => ({}));
+      const result = responseJson?.data ?? responseJson;
+        const orderContractId = result.orderContractId || null;
+        const nextUserAccountId = result.userAccountContractId || result.userAccount?.contractId || null;
+        if (nextUserAccountId) {
+          setStoredUserAccountId(partyId, nextUserAccountId);
+        }
+
       if (!placeOrderResponse.ok) {
-        const errorData = await placeOrderResponse.json();
-        throw new Error(errorData.message || errorData.error || 'Failed to place order');
+        throw new Error(responseJson.message || responseJson.error || result.message || result.error || 'Failed to place order');
       }
-      
-      const result = await placeOrderResponse.json();
       
       // Backend returns: { success, updateId, completionOffset, orderId, utxoHandled, ... }
       const exerciseResult = {
@@ -743,6 +730,7 @@ export default function TradingInterface({ partyId }) {
         completionOffset: result.completionOffset,
         orderId: result.orderId || orderId
       };
+      const resolvedOrderId = exerciseResult.orderId || orderId;
       
       console.log('[Place Order] Order placed with UTXO handling:', {
         updateId: result.updateId,
@@ -793,36 +781,20 @@ export default function TradingInterface({ partyId }) {
       console.log('[Place Order] Waiting for Order contract to be visible...');
       await new Promise(resolve => setTimeout(resolve, 3000));
       
-      // Try to query Order at completion offset if available
+      // Try to fetch the new Order contract directly (avoids large queries)
       let newOrder = null;
-      if (exerciseResult.completionOffset !== undefined) {
+      if (orderContractId) {
         try {
-          const { queryContractsAtOffset } = await import('../services/cantonApi');
-          console.log('[Place Order] Querying Order at completion offset:', exerciseResult.completionOffset);
-          const ordersAtOffset = await queryContractsAtOffset('Order:Order', partyId, exerciseResult.completionOffset);
-          newOrder = ordersAtOffset.find(o => 
-            o.payload?.orderId === orderId && 
-            o.payload?.tradingPair === tradingPair
-          );
-          
+          console.log('[Place Order] Fetching Order contract:', orderContractId.substring(0, 30) + '...');
+          newOrder = await fetchContract(orderContractId, partyId, exerciseResult.completionOffset);
           if (newOrder) {
-            console.log('[Place Order] ✅ Found Order at completion offset:', newOrder.contractId);
-              } else {
-            console.log('[Place Order] Order not found at completion offset, will try current ledger end');
+            console.log('[Place Order] ✅ Found Order contract:', newOrder.contractId);
           }
         } catch (err) {
-          console.warn('[Place Order] Error querying at completion offset:', err);
+          console.warn('[Place Order] Error fetching Order contract:', err);
         }
-      }
-      
-      // If not found at offset, try current ledger end
-      if (!newOrder) {
-        console.log('[Place Order] Querying Order at current ledger end...');
-        const updatedOrders = await queryContracts('Order:Order', partyId);
-        newOrder = updatedOrders.find(o => 
-          (o.payload?.orderId === orderId || o.payload?.orderId === exerciseResult.orderId) && 
-          o.payload?.tradingPair === tradingPair
-        );
+      } else {
+        console.warn('[Place Order] Order contract ID not returned; skipping fetch');
       }
       
       // Store the latest order completion offset for future queries
@@ -844,7 +816,7 @@ export default function TradingInterface({ partyId }) {
         console.log('[Place Order] ✅ Order confirmed visible:', newOrder.contractId);
       await showModal({
         title: 'Order Placed',
-          message: `Order placed successfully!\n\nOrder ID: ${orderId}\nStatus: ${newOrder.payload?.status || 'OPEN'}`,
+          message: `Order placed successfully!\n\nOrder ID: ${resolvedOrderId}\nStatus: ${newOrder.payload?.status || 'OPEN'}`,
         type: 'success',
         confirmText: 'OK',
       });
@@ -938,18 +910,21 @@ export default function TradingInterface({ partyId }) {
         console.warn('[Cancel Order] Could not fetch OrderBook:', err.message);
       }
 
-      // Get UserAccount contract ID for UTXO handling
-      let userAccountContractId = null;
-      try {
-        const { queryContracts } = await import('../services/cantonApi');
-        const userAccounts = await queryContracts('UserAccount:UserAccount', partyId);
-        const userAccount = userAccounts.find(ua => ua.payload?.party === partyId);
-        if (userAccount) {
-          userAccountContractId = userAccount.contractId;
+        // Get UserAccount contract ID for UTXO handling
+        let userAccountContractId = getStoredUserAccountId(partyId);
+        if (!userAccountContractId) {
+          try {
+            const { queryContracts } = await import('../services/cantonApi');
+            const userAccounts = await queryContracts('UserAccount:UserAccount', partyId);
+            const userAccount = userAccounts.find(ua => ua.payload?.party === partyId);
+            if (userAccount) {
+              userAccountContractId = userAccount.contractId;
+              setStoredUserAccountId(partyId, userAccountContractId);
+            }
+          } catch (err) {
+            console.warn('[Cancel Order] Could not fetch UserAccount:', err.message);
+          }
         }
-      } catch (err) {
-        console.warn('[Cancel Order] Could not fetch UserAccount:', err.message);
-      }
 
       // Use new UTXO-aware order cancellation endpoint
       const backendBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
@@ -998,6 +973,7 @@ export default function TradingInterface({ partyId }) {
     // Clear all authentication and wallet data
     clearWallet();
     localStorage.removeItem('canton_party_id');
+    clearStoredUserAccountId(partyId);
     // Force redirect to home page
     window.location.href = '/';
   };

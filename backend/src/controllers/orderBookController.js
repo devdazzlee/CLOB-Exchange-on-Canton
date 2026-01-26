@@ -93,9 +93,11 @@ class OrderBookController {
   getTrades = asyncHandler(async (req, res) => {
     const { tradingPair } = req.params;
     const decodedTradingPair = decodeURIComponent(tradingPair);
+    const limitInput = req.query?.limit;
+    const limit = Number.isFinite(Number(limitInput)) ? Number(limitInput) : 100;
 
     try {
-      const trades = await orderBookService.getTrades(decodedTradingPair);
+      const trades = await orderBookService.getTrades(decodedTradingPair, limit);
       return success(res, {
         tradingPair: decodedTradingPair,
         trades,

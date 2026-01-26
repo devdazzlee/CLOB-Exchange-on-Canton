@@ -39,7 +39,7 @@ function parseTradingPair(pair: string): { base: string; quote: string } {
  * @param minAmount - Minimum amount required
  * @returns Array of Token contracts with sufficient balance
  */
-async function findTokenContracts(
+export async function findTokenContracts(
   partyId: string, 
   currency: string, 
   minAmount: string
@@ -82,7 +82,7 @@ async function findTokenContracts(
  * @param currency - Currency/token type (e.g., "USDT", "BTC")
  * @returns Allocation contract ID
  */
-async function createAllocation(
+export async function createAllocation(
   tokenContractId: string,
   partyId: string,
   amount: string,

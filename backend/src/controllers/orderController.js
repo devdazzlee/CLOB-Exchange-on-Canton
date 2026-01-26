@@ -4,7 +4,8 @@
  */
 
 const OrderService = require('../services/order-service');
-const { success, error } = require('../utils/response');
+const orderBookService = require('../services/orderBookService');
+const { success } = require('../utils/response');
 const asyncHandler = require('../middleware/asyncHandler');
 const { ValidationError } = require('../utils/errors');
 
@@ -17,26 +18,61 @@ class OrderController {
    * Place an order
    */
   place = asyncHandler(async (req, res) => {
-    const { tradingPair } = req.params;
-    const { side, orderType, price, quantity, partyId } = req.body;
+    const {
+      tradingPair,
+      orderType,
+      orderMode,
+      price,
+      quantity,
+      partyId,
+      orderBookContractId,
+      userAccountContractId,
+      allocationCid
+    } = req.body;
 
-    if (!side || !orderType || !quantity || !partyId) {
-      throw new ValidationError('Missing required fields: side, orderType, quantity, partyId');
+    if (!tradingPair || !orderType || !orderMode || !quantity || !partyId) {
+      throw new ValidationError('Missing required fields: tradingPair, orderType, orderMode, quantity, partyId');
     }
 
-    if (orderType === 'LIMIT' && !price) {
+    if (orderMode === 'LIMIT' && !price) {
       throw new ValidationError('Price is required for LIMIT orders');
     }
 
     const decodedTradingPair = decodeURIComponent(tradingPair);
-    const result = await this.orderService.placeOrder({
-      tradingPair: decodedTradingPair,
-      side,
-      orderType,
-      price,
-      quantity,
-      partyId,
-    });
+
+    let resolvedOrderBookContractId = orderBookContractId;
+    if (!resolvedOrderBookContractId) {
+      resolvedOrderBookContractId = await orderBookService.getOrderBookContractId(decodedTradingPair);
+    }
+    if (!resolvedOrderBookContractId) {
+      const created = await orderBookService.createOrderBook(decodedTradingPair);
+      resolvedOrderBookContractId = created.contractId;
+    }
+
+    let result;
+    if (allocationCid) {
+      result = await this.orderService.placeOrderWithAllocation(
+        partyId,
+        decodedTradingPair,
+        orderType,
+        orderMode,
+        quantity,
+        price,
+        resolvedOrderBookContractId,
+        allocationCid
+      );
+    } else {
+      result = await this.orderService.placeOrderWithUTXOHandling(
+        partyId,
+        decodedTradingPair,
+        orderType,
+        orderMode,
+        quantity,
+        price,
+        resolvedOrderBookContractId,
+        userAccountContractId
+      );
+    }
 
     return success(res, result, 'Order placed successfully', 201);
   });
@@ -45,17 +81,28 @@ class OrderController {
    * Cancel an order
    */
   cancel = asyncHandler(async (req, res) => {
-    const { orderContractId, partyId, tradingPair } = req.body;
-
-    if (!orderContractId || !partyId || !tradingPair) {
-      throw new ValidationError('Missing required fields: orderContractId, partyId, tradingPair');
-    }
-
-    const result = await this.orderService.cancelOrder({
+    const {
       orderContractId,
       partyId,
       tradingPair,
-    });
+      orderType,
+      orderBookContractId,
+      userAccountContractId
+    } = req.body;
+
+    if (!orderContractId || !partyId || !tradingPair || !orderType) {
+      throw new ValidationError('Missing required fields: orderContractId, partyId, tradingPair, orderType');
+    }
+
+    const decodedTradingPair = decodeURIComponent(tradingPair);
+    const result = await this.orderService.cancelOrderWithUTXOHandling(
+      partyId,
+      decodedTradingPair,
+      orderType,
+      orderContractId,
+      orderBookContractId,
+      userAccountContractId
+    );
 
     return success(res, result, 'Order cancelled successfully');
   });

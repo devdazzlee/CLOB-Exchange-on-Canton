@@ -10,6 +10,29 @@
 
 const CantonAdmin = require('./canton-admin');
 const config = require('../config');
+const tradeStore = require('./trade-store');
+const { extractTradesFromEvents } = require('./trade-utils');
+
+function recordTradesFromResult(result) {
+  const trades = extractTradesFromEvents(result?.events);
+  if (trades.length === 0) return [];
+
+  trades.forEach((trade) => {
+    tradeStore.addTrade(trade);
+    if (global.broadcastWebSocket) {
+      global.broadcastWebSocket(`trades:${trade.tradingPair}`, {
+        type: 'NEW_TRADE',
+        ...trade,
+      });
+      global.broadcastWebSocket('trades:all', {
+        type: 'NEW_TRADE',
+        ...trade,
+      });
+    }
+  });
+
+  return trades;
+}
 
 class MatchingEngine {
   constructor() {
@@ -421,6 +444,8 @@ class MatchingEngine {
       });
 
       console.log('[MatchingEngine] ✓ Match executed successfully');
+
+      recordTradesFromResult(result);
 
       // Emit WebSocket event for real-time updates
       this.emitMatchEvent(match, result);

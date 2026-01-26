@@ -9,6 +9,7 @@ const router = express.Router();
 // Import route modules
 const orderBookRoutes = require('./orderBookRoutes');
 const orderRoutes = require('./orderRoutes');
+const tradeRoutes = require('./tradeRoutes');
 const adminRoutes = require('./adminRoutes');
 const partyRoutes = require('./partyRoutes');
 const onboardingRoutes = require('./onboardingRoutes');
@@ -29,6 +30,7 @@ router.use((req, res, next) => {
 // Mount routes (matching existing API structure)
 router.use('/orderbooks', orderBookRoutes);
 router.use('/orders', orderRoutes);
+router.use('/trades', tradeRoutes);
 router.use('/admin', adminRoutes);
 router.use('/create-party', partyRoutes); // POST /api/create-party (legacy)
 router.use('/onboarding', onboardingRoutes); // POST /api/onboarding/* (new external party flow)

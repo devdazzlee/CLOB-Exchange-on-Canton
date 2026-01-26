@@ -7,18 +7,19 @@ const { tradingPairSchema } = require('./common');
 
 const placeOrderSchema = Joi.object({
   body: Joi.object({
-    side: Joi.string().valid('BUY', 'SELL').required(),
-    orderType: Joi.string().valid('LIMIT', 'MARKET').required(),
-    price: Joi.when('orderType', {
+    tradingPair: tradingPairSchema.required(),
+    orderType: Joi.string().valid('BUY', 'SELL').required(),
+    orderMode: Joi.string().valid('LIMIT', 'MARKET').required(),
+    price: Joi.when('orderMode', {
       is: 'LIMIT',
       then: Joi.number().positive().required(),
       otherwise: Joi.number().positive().allow(null),
     }),
     quantity: Joi.number().positive().required(),
     partyId: Joi.string().required(),
-  }),
-  params: Joi.object({
-    tradingPair: tradingPairSchema.optional(),
+    orderBookContractId: Joi.string().allow(null, ''),
+    userAccountContractId: Joi.string().allow(null, ''),
+    allocationCid: Joi.string().allow(null, ''),
   }),
 });
 
@@ -26,7 +27,10 @@ const cancelOrderSchema = Joi.object({
   body: Joi.object({
     orderContractId: Joi.string().required(),
     partyId: Joi.string().required(),
-    tradingPair: tradingPairSchema,
+    tradingPair: tradingPairSchema.required(),
+    orderType: Joi.string().valid('BUY', 'SELL').required(),
+    orderBookContractId: Joi.string().allow(null, ''),
+    userAccountContractId: Joi.string().allow(null, ''),
   }),
 });
 

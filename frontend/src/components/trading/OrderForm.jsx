@@ -411,8 +411,8 @@ export default function OrderForm({
                 <div className="space-y-2">
                   <Label>Time In Force</Label>
                   <Select value={timeInForce} onValueChange={setTimeInForce}>
-                    <SelectTrigger>
-                      <SelectValue />
+                    <SelectTrigger className="text-white">
+                      <SelectValue placeholder="Select time in force" />
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="GTC">GTC - Good Till Cancel</SelectItem>

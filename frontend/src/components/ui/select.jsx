@@ -2,10 +2,11 @@ import * as React from "react";
 import { cn } from "@/lib/utils";
 import { ChevronDown, Check } from "lucide-react";
 
-const SelectContext = React.createContext({});
+const SelectContext = React.createContext(null);
 
 const Select = ({ value, onValueChange, children }) => {
   const [open, setOpen] = React.useState(false);
+  const [items, setItems] = React.useState({}); // value -> label
   const selectRef = React.useRef(null);
 
   React.useEffect(() => {
@@ -18,8 +19,16 @@ const Select = ({ value, onValueChange, children }) => {
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
+  const registerItem = React.useCallback((itemValue, label) => {
+    setItems((prev) => {
+      // avoid rerenders if same
+      if (prev[itemValue] === label) return prev;
+      return { ...prev, [itemValue]: label };
+    });
+  }, []);
+
   return (
-    <SelectContext.Provider value={{ value, onValueChange, open, setOpen }}>
+    <SelectContext.Provider value={{ value, onValueChange, open, setOpen, items, registerItem }}>
       <div ref={selectRef} className="relative">
         {children}
       </div>
@@ -56,15 +65,18 @@ const SelectTrigger = React.forwardRef(({ className, children, ...props }, ref) 
 });
 SelectTrigger.displayName = "SelectTrigger";
 
-const SelectValue = ({ placeholder, children }) => {
-  const { value } = React.useContext(SelectContext);
+const SelectValue = ({ placeholder, className }) => {
+  const { value, items } = React.useContext(SelectContext);
+
+  const label = value ? items?.[value] : null;
 
   return (
-    <span className={cn(!value && "text-muted-foreground")}>
-      {value ? children : placeholder}
+    <span className={cn("text-white", !value && "text-muted-foreground", className)}>
+      {value ? (label ?? value) : placeholder}
     </span>
   );
 };
+
 
 const SelectContent = React.forwardRef(({ className, children, ...props }, ref) => {
   const { open } = React.useContext(SelectContext);
@@ -89,37 +101,46 @@ const SelectContent = React.forwardRef(({ className, children, ...props }, ref) 
 });
 SelectContent.displayName = "SelectContent";
 
-const SelectItem = React.forwardRef(({ className, value, disabled = false, children, ...props }, ref) => {
-  const { value: selectedValue, onValueChange, setOpen } = React.useContext(SelectContext);
-  const isSelected = selectedValue === value;
-  
-  return (
-    <button
-      ref={ref}
-      type="button"
-      disabled={disabled}
-      onClick={() => {
-        if (disabled) return;
-        onValueChange(value);
-        setOpen(false);
-      }}
-      className={cn(
-        "relative flex w-full cursor-pointer select-none items-center rounded-sm px-3 py-2.5",
-        "text-sm text-[#EAECEF] outline-none transition-colors",
-        "hover:bg-[#2B3139] focus:bg-[#2B3139]",
-        isSelected && "bg-primary/10 text-primary",
-        disabled && "cursor-not-allowed opacity-50 hover:bg-transparent",
-        className
-      )}
-      {...props}
-    >
-      <span className="flex-1 text-left">{children}</span>
-      {isSelected && (
-        <Check className="h-4 w-4 text-primary" />
-      )}
-    </button>
-  );
-});
+const SelectItem = React.forwardRef(
+  ({ className, value, disabled = false, children, ...props }, ref) => {
+    const { value: selectedValue, onValueChange, setOpen, registerItem } =
+      React.useContext(SelectContext);
+
+    const isSelected = selectedValue === value;
+
+    React.useEffect(() => {
+      // register label (string only; if children is ReactNode, fallback)
+      const label =
+        typeof children === "string" ? children : (Array.isArray(children) ? children.join("") : String(value));
+      registerItem?.(value, label);
+    }, [value, children, registerItem]);
+
+    return (
+      <button
+        ref={ref}
+        type="button"
+        disabled={disabled}
+        onClick={() => {
+          if (disabled) return;
+          onValueChange(value);
+          setOpen(false);
+        }}
+        className={cn(
+          "relative flex w-full cursor-pointer select-none items-center rounded-sm px-3 py-2.5",
+          "text-sm text-[#EAECEF] outline-none transition-colors",
+          "hover:bg-[#2B3139] focus:bg-[#2B3139]",
+          isSelected && "bg-primary/10 text-primary",
+          disabled && "cursor-not-allowed opacity-50 hover:bg-transparent",
+          className
+        )}
+        {...props}
+      >
+        <span className="flex-1 text-left">{children}</span>
+        {isSelected && <Check className="h-4 w-4 text-primary" />}
+      </button>
+    );
+  }
+);
 SelectItem.displayName = "SelectItem";
 
 export { Select, SelectTrigger, SelectValue, SelectContent, SelectItem };

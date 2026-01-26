@@ -15,15 +15,24 @@ export default function TransactionHistory({ partyId, cantonApi }) {
 
   useEffect(() => {
     loadTransactions();
-  }, [partyId]);
+  }, [partyId, filter]);
 
   const loadTransactions = async () => {
-    if (!partyId || !cantonApi) return;
+    if (!partyId) return;
     
     setLoading(true);
     try {
-      // Query Trade contracts where user is buyer or seller
-      const trades = await cantonApi.queryContracts('Trade:Trade', partyId);
+      const backendBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
+      const response = await fetch(
+        `${backendBase}/api/trades/user/${encodeURIComponent(partyId)}?limit=500`,
+        { method: 'GET' }
+      );
+      if (!response.ok) {
+        throw new Error(`Failed to fetch trades: ${response.statusText}`);
+      }
+      const json = await response.json().catch(() => ({}));
+      const payload = json?.data ?? json;
+      const trades = payload?.trades || [];
       
       // Filter trades where user participated
       const userTrades = trades.filter(trade => {

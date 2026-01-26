@@ -36,13 +36,10 @@ export default function GlobalTrades({ tradingPair, limit = 50 }) {
         throw new Error(`Failed to fetch trades: ${response.statusText}`);
       }
 
-      const data = await response.json();
-      
-      if (data.success && data.trades) {
-        setTrades(data.trades);
-      } else {
-        setTrades([]);
-      }
+      const data = await response.json().catch(() => ({}));
+      const payload = data?.data ?? data;
+      const nextTrades = payload?.trades || [];
+      setTrades(nextTrades);
     } catch (err) {
       console.error('[GlobalTrades] Error loading trades:', err);
       setError(err.message);

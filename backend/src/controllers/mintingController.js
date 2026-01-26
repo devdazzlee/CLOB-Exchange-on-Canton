@@ -137,9 +137,6 @@ async function mintTestTokens(req, res) {
 
     const existingAccounts = await cantonService.queryContracts({
       templateId: 'UserAccount:UserAccount',
-      filter: {
-        party: partyId
-      },
       party: partyId
     }, adminToken);
 
@@ -187,9 +184,6 @@ async function mintTestTokens(req, res) {
 
         const refreshedAccounts = await cantonService.queryContracts({
           templateId: 'UserAccount:UserAccount',
-          filter: {
-            party: partyId
-          },
           party: partyId
         }, adminToken);
         if (refreshedAccounts && refreshedAccounts.length > 0) {
@@ -228,9 +222,6 @@ async function mintTestTokens(req, res) {
     // Query updated balance
     const updatedAccounts = await cantonService.queryContracts({
       templateId: 'UserAccount:UserAccount',
-      filter: {
-        party: partyId
-      },
       party: partyId
     }, adminToken);
 
@@ -284,9 +275,6 @@ async function getUserBalances(req, res) {
     await cantonService.ensurePartyRights(partyId, adminToken);
     const accounts = await cantonService.queryContracts({
       templateId: 'UserAccount:UserAccount',
-      filter: {
-        party: partyId
-      },
       party: partyId
     }, adminToken);
 

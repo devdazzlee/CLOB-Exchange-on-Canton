@@ -4,17 +4,29 @@ import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
 import { TrendingUp, TrendingDown, Wallet } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { normalizeDamlMap } from '../../utils/daml';
+import { fetchContract } from '../../services/cantonApi';
 
 /**
  * Portfolio View Component - Shows user's positions across all trading pairs
  */
+const USER_ACCOUNT_STORAGE_KEY = 'user_account_contract_id';
+
+function getUserAccountStorageKey(partyId) {
+  return partyId ? `${USER_ACCOUNT_STORAGE_KEY}:${partyId}` : USER_ACCOUNT_STORAGE_KEY;
+}
+
+function getStoredUserAccountId(partyId) {
+  if (typeof localStorage === 'undefined') return null;
+  return localStorage.getItem(getUserAccountStorageKey(partyId));
+}
+
 export default function PortfolioView({ partyId, cantonApi }) {
   const [positions, setPositions] = useState([]);
   const [loading, setLoading] = useState(true);
   const [totalValue, setTotalValue] = useState(0);
 
   useEffect(() => {
-    if (partyId && cantonApi) {
+    if (partyId) {
       loadPortfolio();
     }
   }, [partyId]);
@@ -22,20 +34,29 @@ export default function PortfolioView({ partyId, cantonApi }) {
   const loadPortfolio = async () => {
     setLoading(true);
     try {
-      // Get user's balance
-      const accounts = await cantonApi.queryContracts('UserAccount:UserAccount', partyId);
-      
-      if (accounts.length > 0) {
-        const account = accounts[0];
-        const balances = normalizeDamlMap(account.payload?.balances);
-        
-        // Get all trades to calculate P&L
-        const trades = await cantonApi.queryContracts('Trade:Trade', partyId);
-        const userTrades = trades.filter(t => {
-          const buyer = t.payload?.buyer || t.buyer;
-          const seller = t.payload?.seller || t.seller;
-          return buyer === partyId || seller === partyId;
-        });
+      const accountContractId = getStoredUserAccountId(partyId);
+      let balances = {};
+      if (accountContractId) {
+        const account = await fetchContract(accountContractId, partyId);
+        balances = normalizeDamlMap(account?.payload?.balances);
+      }
+
+      const backendBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
+      const tradesResponse = await fetch(
+        `${backendBase}/api/trades/user/${encodeURIComponent(partyId)}?limit=500`,
+        { method: 'GET' }
+      );
+      if (!tradesResponse.ok) {
+        throw new Error(`Failed to fetch trades: ${tradesResponse.statusText}`);
+      }
+      const tradesJson = await tradesResponse.json().catch(() => ({}));
+      const tradesPayload = tradesJson?.data ?? tradesJson;
+      const trades = tradesPayload?.trades || [];
+      const userTrades = trades.filter(t => {
+        const buyer = t.payload?.buyer || t.buyer;
+        const seller = t.payload?.seller || t.seller;
+        return buyer === partyId || seller === partyId;
+      });
 
         // Calculate positions per trading pair
         const positionMap = new Map();
@@ -111,7 +132,6 @@ export default function PortfolioView({ partyId, cantonApi }) {
         }, 0);
         
         setTotalValue(total);
-      }
     } catch (error) {
       console.error('[PortfolioView] Error loading portfolio:', error);
       setPositions([]);

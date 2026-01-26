@@ -5,6 +5,48 @@
 
 const UTXOHandler = require('./utxo-handler');
 const CantonAdmin = require('./canton-admin');
+const cantonService = require('./cantonService');
+const tradeStore = require('./trade-store');
+const { extractTradesFromEvents } = require('./trade-utils');
+
+function recordTradesFromResult(result) {
+  const trades = extractTradesFromEvents(result?.events);
+  if (trades.length === 0) return [];
+
+  trades.forEach((trade) => {
+    tradeStore.addTrade(trade);
+    if (global.broadcastWebSocket) {
+      global.broadcastWebSocket(`trades:${trade.tradingPair}`, {
+        type: 'NEW_TRADE',
+        ...trade,
+      });
+      global.broadcastWebSocket('trades:all', {
+        type: 'NEW_TRADE',
+        ...trade,
+      });
+    }
+  });
+
+  return trades;
+}
+
+function extractLatestUserAccountContractId(events, partyId) {
+  if (!Array.isArray(events)) return null;
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const created = events[i]?.created;
+    if (!created) continue;
+    const templateId = created.templateId;
+    const templateName = typeof templateId === 'string'
+      ? templateId
+      : `${templateId?.moduleName || ''}:${templateId?.entityName || ''}`;
+    if (!templateName.includes('UserAccount')) continue;
+    const args = created.createArguments || created.createArgument || created.argument || {};
+    if (!partyId || args.party === partyId) {
+      return created.contractId || null;
+    }
+  }
+  return null;
+}
 
 async function getLedgerEndOffset(adminToken) {
   const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
@@ -44,7 +86,7 @@ class OrderService {
   }
 
   /**
-   * Place order with Splice Allocation (NEW - replaces UTXO handling)
+   * Place order with Splice Allocation (optional path)
    * Uses Allocation CID created by frontend (Step A of two-step process)
    */
   async placeOrderWithAllocation(partyId, tradingPair, orderType, orderMode, quantity, price, orderBookContractId, allocationCid) {
@@ -54,6 +96,7 @@ class OrderService {
       
       // Step 1: Get admin token for Ledger API
       const adminToken = await this.cantonAdmin.getAdminToken();
+      await cantonService.ensurePartyRights(partyId, adminToken);
       const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
 
       // Step 2: Get OrderBook to find operator and template
@@ -92,15 +135,9 @@ class OrderService {
 
       // Step 3: Place order via AddOrder choice with Allocation CID
       const orderId = `ORDER-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-      const commandId = `place-order-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
       const orderBookTemplateId = orderBook?.templateId || 'MasterOrderBook:MasterOrderBook';
-      
-      // Determine actAs parties
-      const actAsParties = [partyId];
-      if (operator && operator !== partyId) {
-        actAsParties.push(operator);
-      }
+      const readAsParties = operator && operator !== partyId ? [partyId, operator] : [partyId];
 
       // Build AddOrder argument with Allocation CID
       const addOrderArgument = {
@@ -122,12 +159,12 @@ class OrderService {
 
       const exerciseResponse = await cantonService.exerciseChoice({
         token: adminToken,
-        actAsParty: actAsParties[0],
+        actAsParty: partyId,
         templateId: orderBookTemplateId,
         contractId: orderBookContractId,
         choice: 'AddOrder',
         choiceArgument: addOrderArgument,
-        readAs: actAsParties,
+        readAs: readAsParties,
       });
 
       const result = exerciseResponse; // exerciseChoice returns the result directly
@@ -146,14 +183,13 @@ class OrderService {
         }
       }
 
-      // Check if trades were created (matchmaking executed)
-      let tradesCreated = 0;
-      if (result.events && Array.isArray(result.events)) {
-        tradesCreated = result.events.filter(e => e.created?.templateId?.includes('Trade')).length;
-        if (tradesCreated > 0) {
-          console.log(`[Order Service] ✅ Matchmaking executed! ${tradesCreated} trade(s) created`);
-        }
+      const recordedTrades = recordTradesFromResult(result);
+      const tradesCreated = recordedTrades.length;
+      if (tradesCreated > 0) {
+        console.log(`[Order Service] ✅ Matchmaking executed! ${tradesCreated} trade(s) created`);
       }
+
+      const userAccountContractId = extractLatestUserAccountContractId(result.events, partyId);
 
       return {
         success: true,
@@ -162,6 +198,7 @@ class OrderService {
         updateId: result.updateId,
         completionOffset: result.completionOffset,
         allocationUsed: allocationCid,
+        userAccountContractId: userAccountContractId,
         tradesCreated: tradesCreated,
         matchmakingExecuted: tradesCreated > 0
       };
@@ -172,7 +209,7 @@ class OrderService {
   }
 
   /**
-   * Place order with UTXO handling (DEPRECATED - kept for backward compatibility)
+   * Place order with UserAccount/UTXO handling
    * 1. Check balance and merge UTXOs if needed
    * 2. Place order via Ledger API
    * 3. Return result
@@ -199,6 +236,7 @@ class OrderService {
 
       // Step 2: Get admin token for Ledger API
       const adminToken = await this.cantonAdmin.getAdminToken();
+      await cantonService.ensurePartyRights(partyId, adminToken);
       const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
 
       // Step 3: Get OrderBook to find operator
@@ -237,19 +275,13 @@ class OrderService {
 
       // Step 4: Place order via AddOrder choice
       const orderId = `ORDER-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-      const commandId = `place-order-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
       const orderBookTemplateId = orderBook?.templateId || 'OrderBook:OrderBook';
-      
-      // Determine actAs parties
-      const actAsParties = [partyId];
-      if (operator && operator !== partyId) {
-        actAsParties.push(operator);
-      }
+      const readAsParties = operator && operator !== partyId ? [partyId, operator] : [partyId];
 
       const exerciseResponse = await cantonService.exerciseChoice({
         token: adminToken,
-        actAsParty: actAsParties[0],
+        actAsParty: partyId,
         templateId: orderBookTemplateId,
         contractId: orderBookContractId,
         choice: 'AddOrder',
@@ -261,7 +293,7 @@ class OrderService {
           price: orderMode === 'LIMIT' && price ? price.toString() : null,
           quantity: quantity.toString()
         },
-        readAs: actAsParties,
+        readAs: readAsParties,
       });
 
       const result = exerciseResponse; // exerciseChoice returns the result directly
@@ -281,14 +313,14 @@ class OrderService {
         }
       }
 
-      // Check if trades were created (matchmaking executed)
-      let tradesCreated = 0;
-      if (result.events && Array.isArray(result.events)) {
-        tradesCreated = result.events.filter(e => e.created?.templateId?.includes('Trade')).length;
-        if (tradesCreated > 0) {
-          console.log(`[Order Service] ✅ Matchmaking executed! ${tradesCreated} trade(s) created`);
-        }
+      const recordedTrades = recordTradesFromResult(result);
+      const tradesCreated = recordedTrades.length;
+      if (tradesCreated > 0) {
+        console.log(`[Order Service] ✅ Matchmaking executed! ${tradesCreated} trade(s) created`);
       }
+
+      const updatedUserAccountId = extractLatestUserAccountContractId(result.events, partyId);
+      const userAccountContractId = updatedUserAccountId || preOrderResult.userAccount?.contractId || null;
 
       return {
         success: true,
@@ -298,6 +330,7 @@ class OrderService {
         completionOffset: result.completionOffset,
         utxoHandled: preOrderResult.merged,
         userAccount: preOrderResult.userAccount,
+        userAccountContractId: userAccountContractId,
         tradesCreated: tradesCreated,
         matchmakingExecuted: tradesCreated > 0
       };
@@ -318,6 +351,7 @@ class OrderService {
       console.log(`[Order Service] Cancelling order with UTXO handling for ${partyId}`);
 
       const adminToken = await this.cantonAdmin.getAdminToken();
+      await cantonService.ensurePartyRights(partyId, adminToken);
       const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
 
       // Step 1: Get order details
