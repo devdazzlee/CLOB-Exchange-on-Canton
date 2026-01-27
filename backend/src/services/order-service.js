@@ -99,31 +99,51 @@ class OrderService {
       await cantonService.ensurePartyRights(partyId, adminToken);
       const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
 
-      // Step 2: Get OrderBook to find operator and template
+      // Step 2: Get OrderBook to find operator and template with retry logic
       const activeAtOffset = await getActiveAtOffset(adminToken);
-      const orderBookResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`
-        },
-        body: JSON.stringify({
-          activeAtOffset: activeAtOffset,
-          filter: {
-            filtersForAnyParty: {
-              inclusive: {
-                contractIds: [orderBookContractId]
+      let orderBookResponse;
+      let orderBookData;
+      let retries = 10;
+      
+      // Retry logic for pending OrderBook contracts
+      while (retries > 0) {
+        orderBookResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${adminToken}`
+          },
+          body: JSON.stringify({
+            activeAtOffset: activeAtOffset,
+            filter: {
+              filtersForAnyParty: {
+                inclusive: {
+                  contractIds: [orderBookContractId]
+                }
               }
             }
-          }
-        })
-      });
+          })
+        });
 
-      if (!orderBookResponse.ok) {
-        throw new Error('Failed to fetch OrderBook');
+        if (orderBookResponse.ok) {
+          orderBookData = await orderBookResponse.json();
+          if (orderBookData.activeContracts && orderBookData.activeContracts.length > 0) {
+            // OrderBook found, break the retry loop
+            break;
+          }
+        }
+        
+        // If not found or not ok, wait and retry
+        if (retries > 1) {
+          console.log(`[Order Service] OrderBook not yet visible (Allocation), retrying in 1 second... (${11 - retries}/10)`);
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+        retries--;
       }
 
-      const orderBookData = await orderBookResponse.json();
+      if (!orderBookResponse.ok || !orderBookData?.activeContracts?.length) {
+        throw new Error('Failed to fetch OrderBook after retries');
+      }
       const orderBook = orderBookData.activeContracts?.[0]?.contractEntry?.JsActiveContract?.createdEvent || 
                        orderBookData.activeContracts?.[0]?.createdEvent ||
                        orderBookData.activeContracts?.[0];
@@ -242,31 +262,51 @@ class OrderService {
       await cantonService.ensurePartyRights(partyId, adminToken);
       const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
 
-      // Step 3: Get OrderBook to find operator
+      // Step 3: Get OrderBook to find operator with retry logic for pending contracts
       const activeAtOffset = await getActiveAtOffset(adminToken);
-      const orderBookResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`
-        },
-        body: JSON.stringify({
-          activeAtOffset: activeAtOffset,
-          filter: {
-            filtersForAnyParty: {
-              inclusive: {
-                contractIds: [orderBookContractId]
+      let orderBookResponse;
+      let orderBookData;
+      let retries = 10;
+      
+      // Retry logic for pending OrderBook contracts
+      while (retries > 0) {
+        orderBookResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${adminToken}`
+          },
+          body: JSON.stringify({
+            activeAtOffset: activeAtOffset,
+            filter: {
+              filtersForAnyParty: {
+                inclusive: {
+                  contractIds: [orderBookContractId]
+                }
               }
             }
-          }
-        })
-      });
+          })
+        });
 
-      if (!orderBookResponse.ok) {
-        throw new Error('Failed to fetch OrderBook');
+        if (orderBookResponse.ok) {
+          orderBookData = await orderBookResponse.json();
+          if (orderBookData.activeContracts && orderBookData.activeContracts.length > 0) {
+            // OrderBook found, break the retry loop
+            break;
+          }
+        }
+        
+        // If not found or not ok, wait and retry
+        if (retries > 1) {
+          console.log(`[Order Service] OrderBook not yet visible, retrying in 1 second... (${11 - retries}/10)`);
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+        retries--;
       }
 
-      const orderBookData = await orderBookResponse.json();
+      if (!orderBookResponse.ok || !orderBookData?.activeContracts?.length) {
+        throw new Error('Failed to fetch OrderBook after retries');
+      }
       const orderBook = orderBookData.activeContracts?.[0]?.contractEntry?.JsActiveContract?.createdEvent || 
                        orderBookData.activeContracts?.[0]?.createdEvent ||
                        orderBookData.activeContracts?.[0];

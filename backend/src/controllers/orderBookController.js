@@ -29,10 +29,34 @@ class OrderBookController {
       return success(res, { orderBook }, 'OrderBook retrieved successfully');
     } catch (err) {
       if (err instanceof NotFoundError) {
-        return success(res, {
-          orderBook: null,
-          tradingPair: decodedTradingPair,
-        }, 'OrderBook not found', 200);
+        // Auto-create the order book when missing to unblock UX
+        try {
+          const created = await orderBookService.createOrderBook(decodedTradingPair);
+          // Try to fetch it immediately (may still be pending; return what we have)
+          let orderBook = null;
+          try {
+            orderBook = await orderBookService.getOrderBook(decodedTradingPair);
+          } catch (_) {
+            // ignore; return minimal info
+          }
+          return success(res, {
+            orderBook: orderBook || {
+              contractId: created.contractId,
+              tradingPair: decodedTradingPair,
+              buyOrders: [],
+              sellOrders: [],
+              lastPrice: null,
+              operator: null,
+            },
+            created: true,
+          }, 'OrderBook created on-demand');
+        } catch (createErr) {
+          return success(res, {
+            orderBook: null,
+            tradingPair: decodedTradingPair,
+            error: createErr.message,
+          }, 'OrderBook not found and creation failed', 200);
+        }
       }
       throw err;
     }

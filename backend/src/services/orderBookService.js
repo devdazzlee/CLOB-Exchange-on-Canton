@@ -20,6 +20,37 @@ function chunkArray(items, size) {
 }
 
 class OrderBookService {
+  constructor() {
+    this.orderBookCache = new Map();
+  }
+
+  cacheOrderBookId(tradingPair, contractId) {
+    if (tradingPair && contractId) {
+      this.orderBookCache.set(tradingPair, contractId);
+    }
+  }
+
+  getCachedOrderBookId(tradingPair) {
+    return this.orderBookCache.get(tradingPair);
+  }
+
+  extractCreatedContractId(updatePayload) {
+    if (!updatePayload) {
+      return null;
+    }
+
+    const candidateEvents = [
+      updatePayload.events,
+      updatePayload.transaction?.events,
+      updatePayload.update?.events,
+      updatePayload.update?.transaction?.events,
+      updatePayload.transactions?.flatMap(t => t.events || [])
+    ].flat().filter(Boolean);
+
+    const createdEvent = candidateEvents.find(event => event?.created?.contractId);
+    return createdEvent?.created?.contractId || null;
+  }
+
   async fetchOrderDetails(orderIds, adminToken, activeAtOffset) {
     if (!Array.isArray(orderIds) || orderIds.length === 0) {
       return [];
@@ -152,7 +183,7 @@ class OrderBookService {
     if (!packageId) {
       throw new Error(`Missing package ID for ${moduleName}:${entityName}`);
     }
-    return { packageId, moduleName, entityName };
+    return `${packageId}:${moduleName}:${entityName}`;
   }
 
   getMasterOrderBookTemplateId() {
@@ -171,12 +202,17 @@ class OrderBookService {
    * Get OrderBook contract ID for a trading pair
    */
   async getOrderBookContractId(tradingPair) {
+    const cached = this.getCachedOrderBookId(tradingPair);
+    if (cached) {
+      return cached;
+    }
     const adminToken = await cantonService.getAdminToken();
     const contractId = await getOrderBookContractId(
       tradingPair,
       adminToken,
       config.canton.jsonApiBase
     );
+    this.cacheOrderBookId(tradingPair, contractId);
     return contractId;
   }
 
@@ -188,6 +224,18 @@ class OrderBookService {
     
     if (!contractId) {
       throw new NotFoundError(`OrderBook not found for trading pair: ${tradingPair}`);
+    }
+
+    if (contractId.startsWith('pending-')) {
+      return {
+        contractId,
+        tradingPair,
+        operator: null,
+        buyOrders: [],
+        sellOrders: [],
+        lastPrice: null,
+        userAccounts: {},
+      };
     }
 
     const adminToken = await cantonService.getAdminToken();
@@ -231,7 +279,15 @@ class OrderBookService {
     const contracts = data.activeContracts || [];
     
     if (contracts.length === 0) {
-      throw new NotFoundError(`OrderBook contract not found: ${contractId}`);
+      return {
+        contractId,
+        tradingPair,
+        operator: null,
+        buyOrders: [],
+        sellOrders: [],
+        lastPrice: null,
+        userAccounts: {},
+      };
     }
 
     const contract = contracts[0].contractEntry?.JsActiveContract?.createdEvent ||
@@ -409,7 +465,7 @@ class OrderBookService {
 
     // Wait for OrderBook to become visible in queries (race condition fix)
     console.log('[OrderBook] Waiting for OrderBook to become visible...');
-    let retries = 20; // Increase retries
+    let retries = 30; // Increase retries for better reliability
     let visibleContractId = null;
     
     // First, try to get the contract ID from the updateId
@@ -423,21 +479,30 @@ class OrderBookService {
             'Authorization': `Bearer ${adminToken}`
           },
           body: JSON.stringify({
-            updateId: orderBookResult.updateId
+            updateId: orderBookResult.updateId,
+            updateFormat: "verbose",
+            includeTransactions: true
           })
         });
+        
+        console.log('[OrderBook] Transaction query response status:', txResponse.status);
         
         if (txResponse.ok) {
           const txData = await txResponse.json();
           console.log('[OrderBook] Transaction result:', JSON.stringify(txData, null, 2));
           
           // Extract the actual contract ID from the transaction
-          const events = txData.events || [];
-          const createdEvent = events.find(e => e.created && e.created.contractId);
-          if (createdEvent && createdEvent.created.contractId) {
-            visibleContractId = createdEvent.created.contractId;
+          const extractedContractId = this.extractCreatedContractId(txData);
+          if (extractedContractId) {
+            visibleContractId = extractedContractId;
             console.log('[OrderBook] ✅ Found real contract ID from transaction:', visibleContractId.substring(0, 30) + '...');
+            this.cacheOrderBookId(tradingPair, visibleContractId);
+          } else {
+            console.log('[OrderBook] No created event found in transaction');
           }
+        } else {
+          const errorText = await txResponse.text();
+          console.log('[OrderBook] Transaction query failed:', txResponse.status, errorText);
         }
       } catch (error) {
         console.log('[OrderBook] Failed to query transaction result:', error.message);
@@ -449,13 +514,53 @@ class OrderBookService {
       await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
       
       try {
+        // First try the standard method
         visibleContractId = await this.getOrderBookContractId(tradingPair);
         if (visibleContractId) {
           console.log('[OrderBook] ✅ OrderBook is now visible:', visibleContractId.substring(0, 30) + '...');
           break;
         }
+        
+        // If standard method fails, try querying at the completion offset
+        if (orderBookResult.completionOffset && retries % 5 === 0) {
+          console.log('[OrderBook] Trying direct query at completion offset...');
+          const offsetResponse = await fetch(`${config.canton.jsonApiBase}/v2/state/active-contracts`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${adminToken}`
+            },
+            body: JSON.stringify({
+              activeAtOffset: orderBookResult.completionOffset.toString(),
+              verbose: true,
+              filter: {
+                filtersForAnyParty: {
+                  inclusive: {
+                    templateIds: [this.getOrderBookTemplateId()]
+                  }
+                }
+              }
+            })
+          });
+          
+          if (offsetResponse.ok) {
+            const offsetData = await offsetResponse.json();
+            const contracts = offsetData.activeContracts || [];
+            const orderBook = contracts.find(ob => {
+              const contractData = ob.contractEntry?.JsActiveContract?.createdEvent || ob.createdEvent || ob;
+              return contractData.createArgument?.tradingPair === tradingPair || contractData.argument?.tradingPair === tradingPair;
+            });
+            
+            if (orderBook) {
+              const contractData = orderBook.contractEntry?.JsActiveContract?.createdEvent || orderBook.createdEvent || orderBook;
+              visibleContractId = contractData.contractId;
+              console.log('[OrderBook] ✅ Found OrderBook at completion offset:', visibleContractId.substring(0, 30) + '...');
+              break;
+            }
+          }
+        }
       } catch (error) {
-        console.log(`[OrderBook] Retry ${20 - retries + 1}: OrderBook not yet visible...`);
+        console.log(`[OrderBook] Retry ${30 - retries + 1}: OrderBook not yet visible...`);
       }
       
       retries--;
@@ -464,7 +569,7 @@ class OrderBookService {
     if (!visibleContractId) {
       // If still not visible, try one more time with a longer delay
       console.log('[OrderBook] Final retry with longer delay...');
-      await new Promise(resolve => setTimeout(resolve, 3000));
+      await new Promise(resolve => setTimeout(resolve, 5000)); // Increased final delay
       try {
         visibleContractId = await this.getOrderBookContractId(tradingPair);
         if (visibleContractId) {
@@ -477,6 +582,7 @@ class OrderBookService {
     
     // Use the visible contract ID if available, otherwise fall back to pending
     const finalContractId = visibleContractId || orderBookContractId;
+    this.cacheOrderBookId(tradingPair, finalContractId);
     
     if (!visibleContractId) {
       console.warn('[OrderBook] ⚠️ Using pending contract ID - OrderBook may not be immediately usable');
