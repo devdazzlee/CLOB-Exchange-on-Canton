@@ -20,6 +20,7 @@ const healthRoutes = require('./healthRoutes');
 const ledgerProxyRoutes = require('./ledgerProxyRoutes');
 const ledgerRoutes = require('./ledgerRoutes');
 const mintingRoutes = require('./mintingRoutes');
+const balanceRoutes = require('./balanceRoutes');
 
 // Debug middleware to log all incoming requests to this router
 router.use((req, res, next) => {
@@ -38,6 +39,7 @@ router.use('/quota-status', quotaRoutes); // GET /api/quota-status
 router.use('/token-exchange', authRoutes); // POST /api/token-exchange
 router.post('/inspect-token', authController.inspectToken); // POST /api/inspect-token
 router.use('/ws/status', healthRoutes); // GET /api/ws/status
+router.use('/balance', balanceRoutes); // GET /api/balance/:partyId
 // New BFF routes (no Keycloak / no Canton token in browser)
 router.use('/ledger', ledgerProxyRoutes);
 // Legacy raw proxy (kept for backwards compatibility / debugging)
@@ -55,6 +57,8 @@ console.log('  GET  /api/quota-status');
 console.log('  POST /api/token-exchange');
 console.log('  POST /api/inspect-token');
 console.log('  GET  /api/ws/status');
+console.log('  GET  /api/balance/:partyId');
+console.log('  POST /api/balance/:partyId/mint');
 console.log('  GET  /api/ledger/challenge');
 console.log('  POST /api/ledger/query-active-contracts');
 console.log('  POST /api/ledger/create');

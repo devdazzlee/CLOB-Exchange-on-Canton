@@ -148,10 +148,10 @@ export default function OrderBookCard({
                                   {order.price !== null ? parseFloat(order.price).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 }) : 'Market'}
                                 </td>
                                 <td className="py-2.5 px-3 text-right text-foreground text-sm relative z-10">
-                                  {order.remaining.toFixed(8)}
+                                  {order.remaining != null ? parseFloat(order.remaining).toFixed(8) : '0.00000000'}
                                 </td>
                                 <td className="py-2.5 px-3 text-right text-muted-foreground text-sm relative z-10">
-                                  {order.price !== null ? (order.price * order.remaining).toLocaleString(undefined, { maximumFractionDigits: 2 }) : '-'}
+                                  {order.price !== null && order.remaining != null ? (parseFloat(order.price) * parseFloat(order.remaining)).toLocaleString(undefined, { maximumFractionDigits: 2 }) : '-'}
                                 </td>
                               </motion.tr>
                             );
@@ -206,10 +206,10 @@ export default function OrderBookCard({
                                   {order.price !== null ? parseFloat(order.price).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 }) : 'Market'}
                                 </td>
                                 <td className="py-2.5 px-3 text-right text-foreground text-sm relative z-10">
-                                  {order.remaining.toFixed(8)}
+                                  {order.remaining != null ? parseFloat(order.remaining).toFixed(8) : '0.00000000'}
                                 </td>
                                 <td className="py-2.5 px-3 text-right text-muted-foreground text-sm relative z-10">
-                                  {order.price !== null ? (order.price * order.remaining).toLocaleString(undefined, { maximumFractionDigits: 2 }) : '-'}
+                                  {order.price !== null && order.remaining != null ? (parseFloat(order.price) * parseFloat(order.remaining)).toLocaleString(undefined, { maximumFractionDigits: 2 }) : '-'}
                                 </td>
                               </motion.tr>
                             );

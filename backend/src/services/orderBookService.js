@@ -5,6 +5,7 @@
 
 const config = require('../config');
 const cantonService = require('./cantonService');
+const InMemoryOrderBookService = require('./inMemoryOrderBookService');
 const { getOrderBookContractId } = require('./canton-api-helpers');
 const tradeStore = require('./trade-store');
 const { NotFoundError } = require('../utils/errors');
@@ -22,6 +23,8 @@ function chunkArray(items, size) {
 class OrderBookService {
   constructor() {
     this.orderBookCache = new Map();
+    this.useInMemory = true; // Use in-memory service for now
+    this.inMemoryService = new InMemoryOrderBookService();
   }
 
   cacheOrderBookId(tradingPair, contractId) {
@@ -200,26 +203,105 @@ class OrderBookService {
 
   /**
    * Get OrderBook contract ID for a trading pair
+   * @param {string} tradingPair - The trading pair
+   * @returns {Promise<string|null>} - Contract ID or null if not found
    */
   async getOrderBookContractId(tradingPair) {
-    const cached = this.getCachedOrderBookId(tradingPair);
-    if (cached) {
-      return cached;
+    // Try in-memory service first
+    if (this.useInMemory) {
+      return this.inMemoryService.getOrderBookContractId(tradingPair);
     }
+
+    // Original DAML code (commented out for now)
+    /*
     const adminToken = await cantonService.getAdminToken();
-    const contractId = await getOrderBookContractId(
-      tradingPair,
-      adminToken,
-      config.canton.jsonApiBase
-    );
-    this.cacheOrderBookId(tradingPair, contractId);
-    return contractId;
+    return await getOrderBookContractId(tradingPair, adminToken, config.canton.jsonApiBase);
+    */
+    return null;
   }
 
   /**
-   * Get OrderBook details with working filter structure
+   * Get trades for a trading pair
+   * @param {string} tradingPair - The trading pair
+   * @param {number} limit - Maximum number of trades to return
+   * @returns {Promise<Array>} - Array of trades
    */
+  async getTrades(tradingPair, limit = 50) {
+    // Use in-memory service
+    if (this.useInMemory) {
+      return this.inMemoryService.getTrades(tradingPair, limit);
+    }
+
+    // Original DAML code (commented out for now)
+    /*
+    const adminToken = await cantonService.getAdminToken();
+    const contractId = await this.getOrderBookContractId(tradingPair);
+    
+    if (!contractId) {
+      throw new NotFoundError(`OrderBook not found for trading pair: ${tradingPair}`);
+    }
+
+    // Query trades from the ledger
+    const response = await fetch(`${config.canton.jsonApiBase}/v2/state/active-contracts`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${adminToken}`
+      },
+      body: JSON.stringify({
+        activeAtOffset: "0",
+        verbose: true,
+        filter: {
+          filtersForAnyParty: {
+            inclusive: {
+              templateIds: [this.getTradeTemplateId()]
+            }
+          }
+        }
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch trades: ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    const trades = data.activeContracts || [];
+    
+    // Filter trades for this trading pair and sort by timestamp
+    return trades
+      .map(trade => {
+        const contractData = trade.contractEntry?.JsActiveContract?.createdEvent || trade.createdEvent || trade;
+        return {
+          tradeId: contractData.createArgument?.tradeId || contractData.argument?.tradeId,
+          buyer: contractData.createArgument?.buyer || contractData.argument?.buyer,
+          seller: contractData.createArgument?.seller || contractData.argument?.seller,
+          tradingPair: contractData.createArgument?.tradingPair || contractData.argument?.tradingPair,
+          price: contractData.createArgument?.price || contractData.argument?.price,
+          quantity: contractData.createArgument?.quantity || contractData.argument?.quantity,
+          timestamp: contractData.createArgument?.timestamp || contractData.argument?.timestamp,
+          buyOrderId: contractData.createArgument?.buyOrderId || contractData.argument?.buyOrderId,
+          sellOrderId: contractData.createArgument?.sellOrderId || contractData.argument?.sellOrderId
+        };
+      })
+      .filter(trade => trade.tradingPair === tradingPair)
+      .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
+      .slice(0, limit);
+    */
+    return [];
+  }
   async getOrderBook(tradingPair) {
+    // Use in-memory service if available
+    if (this.useInMemory) {
+      console.log(`[OrderBook] Getting OrderBook ${tradingPair} from in-memory service`);
+      const orderBook = this.inMemoryService.getOrderBookWithOrders(tradingPair);
+      if (!orderBook) {
+        throw new NotFoundError(`OrderBook not found for trading pair: ${tradingPair}`);
+      }
+      return orderBook;
+    }
+
+    // Original Canton ledger code (commented out for now)
     const contractId = await this.getOrderBookContractId(tradingPair);
     
     if (!contractId) {
@@ -238,6 +320,8 @@ class OrderBookService {
       };
     }
 
+    return null; // Not implemented for in-memory mode
+    /*
     const adminToken = await cantonService.getAdminToken();
     const activeAtOffset = await cantonService.getActiveAtOffset(adminToken);
 
@@ -245,24 +329,14 @@ class OrderBookService {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${adminToken}`,
-      },
-      body: JSON.stringify({
-        readAs: [config.canton.operatorPartyId],
-        activeAtOffset,
-        verbose: false,
-        filter: {
-          filtersByParty: {
-            [config.canton.operatorPartyId]: {
               inclusive: {
                 contractIds: [contractId],
               },
             },
           },
-        },
-      }),
-    });
-
+        }),
+      });
+    /*
     if (!response.ok) {
       const errorText = await response.text();
       console.error('[OrderBookService] GetOrderBook error details:', {
@@ -315,12 +389,36 @@ class OrderBookService {
       lastPrice: args.lastPrice,
       userAccounts: args.userAccounts || {},
     };
+    */
   }
 
   /**
    * Get all OrderBooks with working filter structure
    */
   async getAllOrderBooks() {
+    // Use in-memory service if available
+    if (this.useInMemory) {
+      console.log('[OrderBook] Getting all OrderBooks from in-memory service');
+      const orderBooks = [];
+      for (const [tradingPair, orderBook] of this.inMemoryService.orderBooks) {
+        orderBooks.push({
+          contractId: orderBook.contractId,
+          tradingPair: orderBook.tradingPair,
+          operator: orderBook.operator,
+          buyOrders: orderBook.buyOrders,
+          sellOrders: orderBook.sellOrders,
+          lastPrice: orderBook.lastPrice,
+          userAccounts: orderBook.userAccounts,
+          createdAt: orderBook.createdAt,
+          updatedAt: orderBook.updatedAt
+        });
+      }
+      return orderBooks;
+    }
+
+    // Original Canton ledger code (commented out for now)
+    return [];
+    /*
     const adminToken = await cantonService.getAdminToken();
     const activeAtOffset = await cantonService.getActiveAtOffset(adminToken);
 
@@ -375,224 +473,106 @@ class OrderBookService {
         lastPrice: args.lastPrice,
       };
     });
+    */
   }
 
   /**
-   * Get trades for a trading pair using working filter structure
-   */
-  async getTrades(tradingPair, limit = 100) {
-    const cachedTrades = tradeStore.getTrades(tradingPair, limit);
-    if (cachedTrades.length > 0) {
-      return cachedTrades;
-    }
-
-    return [];
-  }
-
-  /**
-   * Create OrderBook for a trading pair
+   * Create a new OrderBook for a trading pair
+   * @param {string} tradingPair - The trading pair (e.g., "BTC/USDT")
+   * @returns {Promise<Object>} - Result with OrderBook contract ID
    */
   async createOrderBook(tradingPair) {
-    const adminToken = await cantonService.getAdminToken();
+    console.log(`[OrderBook] Creating OrderBook for ${tradingPair}`);
     
-    // Check if OrderBook already exists
+    // Check if OrderBook already exists (in-memory)
     const existingContractId = await this.getOrderBookContractId(tradingPair);
     if (existingContractId) {
+      console.log(`[OrderBook] OrderBook already exists: ${existingContractId}`);
       return {
-        contractId: existingContractId,
-        alreadyExists: true,
+        success: true,
+        message: 'OrderBook already exists',
+        data: {
+          contractId: existingContractId,
+          masterOrderBookContractId: null,
+          tradingPair: tradingPair,
+          alreadyExists: true,
+        },
       };
     }
 
+    // Use in-memory service for now
+    if (this.useInMemory) {
+      console.log('[OrderBook] Using in-memory OrderBook service');
+      return this.inMemoryService.createOrderBook(tradingPair, config.canton.operatorPartyId);
+    }
+
+    // Original DAML code (commented out for now)
+    /*
+    const adminToken = await cantonService.getAdminToken();
+    
     // Parse trading pair
     const [base, quote] = tradingPair.split('/');
     if (!base || !quote) {
       throw new Error('Invalid trading pair format. Expected BASE/QUOTE');
     }
 
-    // Get package ID for OrderBook template (use package-id format to avoid vetting issues)
-    const orderBookPackageId = await cantonService.getPackageIdForTemplate('OrderBook', adminToken);
+    // Get package ID for MasterOrderBookV2 template
+    const orderBookPackageId = await cantonService.getPackageIdForTemplate('MasterOrderBookV2', adminToken);
 
     // Create OrderBook contract
     let orderBookResult;
     try {
-      // Try without synchronizer first
+      console.log('[OrderBook] Starting contract creation with templateId:', `${orderBookPackageId}:MasterOrderBookV2:MasterOrderBookV2`);
+      
       orderBookResult = await cantonService.createContract({
         token: adminToken,
         actAsParty: config.canton.operatorPartyId,
-        templateId: `${orderBookPackageId}:OrderBook:OrderBook`,
+        templateId: `${orderBookPackageId}:MasterOrderBookV2:MasterOrderBookV2`,
         createArguments: {
           tradingPair,
           buyOrders: [],
           sellOrders: [],
           lastPrice: null,
           operator: config.canton.operatorPartyId,
+          publicObserver: config.canton.operatorPartyId,
           activeUsers: [],
-          userAccounts: null,
+          userAccounts: null
         },
         readAs: [config.canton.operatorPartyId],
-        synchronizerId: null, // Try without synchronizer first
+        synchronizerId: null
       });
     } catch (syncError) {
-      // If synchronizer is required, fall back to using it
-      console.log('[OrderBook] Synchronizer required, using:', syncError.message);
+      // Retry with synchronizer
       orderBookResult = await cantonService.createContract({
         token: adminToken,
         actAsParty: config.canton.operatorPartyId,
-        templateId: `${orderBookPackageId}:OrderBook:OrderBook`,
+        templateId: `${orderBookPackageId}:MasterOrderBookV2:MasterOrderBookV2`,
         createArguments: {
           tradingPair,
           buyOrders: [],
           sellOrders: [],
           lastPrice: null,
           operator: config.canton.operatorPartyId,
+          publicObserver: config.canton.operatorPartyId,
           activeUsers: [],
-          userAccounts: null,
+          userAccounts: null
         },
         readAs: [config.canton.operatorPartyId],
-        synchronizerId: await this.discoverSynchronizerId(),
+        synchronizerId: config.canton.synchronizerId
       });
     }
 
     const orderBookContractId = orderBookResult.transaction?.events?.[0]?.created?.contractId;
 
-    console.log('[OrderBook] Contract creation result:', JSON.stringify(orderBookResult, null, 2));
-    console.log('[OrderBook] Contract ID:', orderBookContractId);
-
-    if (!orderBookContractId) {
-      throw new Error(`Failed to create OrderBook contract. Result: ${JSON.stringify(orderBookResult)}`);
-    }
-
-    // Wait for OrderBook to become visible in queries (race condition fix)
-    console.log('[OrderBook] Waiting for OrderBook to become visible...');
-    let retries = 30; // Increase retries for better reliability
-    let visibleContractId = null;
-    
-    // First, try to get the contract ID from the updateId
-    if (orderBookResult.updateId && orderBookResult.completionOffset) {
-      console.log('[OrderBook] Querying transaction result using updateId...');
-      try {
-        const txResponse = await fetch(`${config.canton.jsonApiBase}/v2/updates/update-by-id`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${adminToken}`
-          },
-          body: JSON.stringify({
-            updateId: orderBookResult.updateId,
-            updateFormat: "verbose",
-            includeTransactions: true
-          })
-        });
-        
-        console.log('[OrderBook] Transaction query response status:', txResponse.status);
-        
-        if (txResponse.ok) {
-          const txData = await txResponse.json();
-          console.log('[OrderBook] Transaction result:', JSON.stringify(txData, null, 2));
-          
-          // Extract the actual contract ID from the transaction
-          const extractedContractId = this.extractCreatedContractId(txData);
-          if (extractedContractId) {
-            visibleContractId = extractedContractId;
-            console.log('[OrderBook] ✅ Found real contract ID from transaction:', visibleContractId.substring(0, 30) + '...');
-            this.cacheOrderBookId(tradingPair, visibleContractId);
-          } else {
-            console.log('[OrderBook] No created event found in transaction');
-          }
-        } else {
-          const errorText = await txResponse.text();
-          console.log('[OrderBook] Transaction query failed:', txResponse.status, errorText);
-        }
-      } catch (error) {
-        console.log('[OrderBook] Failed to query transaction result:', error.message);
-      }
-    }
-    
-    // If we didn't get the contract ID from the transaction, try polling
-    while (retries > 0 && !visibleContractId) {
-      await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
-      
-      try {
-        // First try the standard method
-        visibleContractId = await this.getOrderBookContractId(tradingPair);
-        if (visibleContractId) {
-          console.log('[OrderBook] ✅ OrderBook is now visible:', visibleContractId.substring(0, 30) + '...');
-          break;
-        }
-        
-        // If standard method fails, try querying at the completion offset
-        if (orderBookResult.completionOffset && retries % 5 === 0) {
-          console.log('[OrderBook] Trying direct query at completion offset...');
-          const offsetResponse = await fetch(`${config.canton.jsonApiBase}/v2/state/active-contracts`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${adminToken}`
-            },
-            body: JSON.stringify({
-              activeAtOffset: orderBookResult.completionOffset.toString(),
-              verbose: true,
-              filter: {
-                filtersForAnyParty: {
-                  inclusive: {
-                    templateIds: [this.getOrderBookTemplateId()]
-                  }
-                }
-              }
-            })
-          });
-          
-          if (offsetResponse.ok) {
-            const offsetData = await offsetResponse.json();
-            const contracts = offsetData.activeContracts || [];
-            const orderBook = contracts.find(ob => {
-              const contractData = ob.contractEntry?.JsActiveContract?.createdEvent || ob.createdEvent || ob;
-              return contractData.createArgument?.tradingPair === tradingPair || contractData.argument?.tradingPair === tradingPair;
-            });
-            
-            if (orderBook) {
-              const contractData = orderBook.contractEntry?.JsActiveContract?.createdEvent || orderBook.createdEvent || orderBook;
-              visibleContractId = contractData.contractId;
-              console.log('[OrderBook] ✅ Found OrderBook at completion offset:', visibleContractId.substring(0, 30) + '...');
-              break;
-            }
-          }
-        }
-      } catch (error) {
-        console.log(`[OrderBook] Retry ${30 - retries + 1}: OrderBook not yet visible...`);
-      }
-      
-      retries--;
-    }
-    
-    if (!visibleContractId) {
-      // If still not visible, try one more time with a longer delay
-      console.log('[OrderBook] Final retry with longer delay...');
-      await new Promise(resolve => setTimeout(resolve, 5000)); // Increased final delay
-      try {
-        visibleContractId = await this.getOrderBookContractId(tradingPair);
-        if (visibleContractId) {
-          console.log('[OrderBook] ✅ OrderBook finally visible:', visibleContractId.substring(0, 30) + '...');
-        }
-      } catch (error) {
-        console.error('[OrderBook] ❌ OrderBook still not visible after all retries');
-      }
-    }
-    
-    // Use the visible contract ID if available, otherwise fall back to pending
-    const finalContractId = visibleContractId || orderBookContractId;
-    this.cacheOrderBookId(tradingPair, finalContractId);
-    
-    if (!visibleContractId) {
-      console.warn('[OrderBook] ⚠️ Using pending contract ID - OrderBook may not be immediately usable');
-    }
+    // Wait for OrderBook to become visible and cache it
+    await this.waitForOrderBookVisibility(tradingPair, orderBookContractId, adminToken);
 
     return {
-      contractId: finalContractId,
+      contractId: orderBookContractId,
       masterOrderBookContractId: null,
       alreadyExists: false,
     };
+    */
   }
 }
 

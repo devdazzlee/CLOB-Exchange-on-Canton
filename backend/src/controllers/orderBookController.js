@@ -96,6 +96,42 @@ class OrderBookController {
   });
 
   /**
+   * Get all recent trades across all trading pairs
+   */
+  getAllTrades = asyncHandler(async (req, res) => {
+    const limit = parseInt(req.query.limit) || 20;
+
+    // Use in-memory service if available
+    if (orderBookService.useInMemory) {
+      const allTrades = [];
+      
+      // Collect trades from all trading pairs
+      for (const [tradingPair, trades] of orderBookService.inMemoryService.trades) {
+        trades.forEach(trade => {
+          allTrades.push({
+            ...trade,
+            tradingPair
+          });
+        });
+      }
+
+      // Sort by timestamp (most recent first) and limit
+      const sortedTrades = allTrades
+        .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
+        .slice(0, limit);
+
+      return success(res, { trades: sortedTrades }, 'Trades retrieved successfully');
+    }
+
+    // Original DAML code (commented out for now)
+    /*
+    const trades = await orderBookService.getAllTrades(limit);
+    return success(res, { trades }, 'Trades retrieved successfully');
+    */
+    return success(res, { trades: [] }, 'Trades retrieved successfully');
+  });
+
+  /**
    * Get orders for a trading pair
    */
   getOrders = asyncHandler(async (req, res) => {

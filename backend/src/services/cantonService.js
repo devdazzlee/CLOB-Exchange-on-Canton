@@ -95,18 +95,49 @@ class CantonService {
     const result = JSON.parse(text);
     
     // If we got updateId and completionOffset, this means the command was submitted successfully
-    // but we need to query the result differently. For now, let's check if this is a success response
+    // We need to query the actual transaction result to get the real contract ID
     if (result.updateId && result.completionOffset) {
       console.log('[CantonService] Command submitted successfully, updateId:', result.updateId);
       
-      // For submit-and-wait, if we get updateId and completionOffset, it usually means success
-      // The actual contract creation might be in a different format or need to be queried differently
-      // Let's return a success response that the caller can handle
+      // Query the actual transaction result
+      try {
+        const txResponse = await fetch(`${this.cantonApiBase}/v2/updates/update-by-id`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify({
+            updateId: result.updateId,
+            updateFormat: "verbose"
+          })
+        });
+        
+        if (txResponse.ok) {
+          const txData = await txResponse.json();
+          console.log('[CantonService] ✅ Got transaction result:', JSON.stringify(txData, null, 2));
+          
+          // Return the actual transaction result
+          return {
+            status: 'completed',
+            updateId: result.updateId,
+            completionOffset: result.completionOffset,
+            transaction: txData.transaction || txData
+          };
+        } else {
+          console.warn('[CantonService] Failed to get transaction result:', txResponse.status);
+          // Fall back to submitted status
+        }
+      } catch (txError) {
+        console.warn('[CantonService] Error querying transaction result:', txError.message);
+        // Fall back to submitted status
+      }
+      
+      // If we can't get the transaction result, return submitted status
       return {
         status: 'submitted',
         updateId: result.updateId,
         completionOffset: result.completionOffset,
-        // Add a placeholder transaction structure for compatibility
         transaction: {
           events: [{
             created: {

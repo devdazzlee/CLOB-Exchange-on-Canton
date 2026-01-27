@@ -8,6 +8,7 @@ const CantonAdmin = require('./canton-admin');
 const cantonService = require('./cantonService');
 const tradeStore = require('./trade-store');
 const { extractTradesFromEvents } = require('./trade-utils');
+const config = require('../config');
 
 function recordTradesFromResult(result) {
   const trades = extractTradesFromEvents(result?.events);
@@ -105,43 +106,66 @@ class OrderService {
       let orderBookData;
       let retries = 10;
       
-      // Retry logic for pending OrderBook contracts
-      while (retries > 0) {
-        orderBookResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${adminToken}`
-          },
-          body: JSON.stringify({
-            activeAtOffset: activeAtOffset,
-            filter: {
-              filtersForAnyParty: {
-                inclusive: {
-                  contractIds: [orderBookContractId]
+      // Use the orderBookService to get the OrderBook contract ID (supports in-memory)
+      const orderBookService = require('./orderBookService');
+      const actualOrderBookContractId = await orderBookService.getOrderBookContractId(tradingPair);
+      if (!actualOrderBookContractId) {
+        throw new Error('OrderBook not found for trading pair: ' + tradingPair);
+      }
+      
+      // Check if we're using an in-memory OrderBook
+      if (actualOrderBookContractId.startsWith('in-memory-')) {
+        // For in-memory OrderBooks, we don't need to query the Canton API
+        console.log('[Order Service] Using in-memory OrderBook:', actualOrderBookContractId);
+        orderBookData = {
+          activeContracts: [{
+            contractId: actualOrderBookContractId,
+            templateId: 'in-memory:OrderBook:OrderBook',
+            createArgument: {
+              operator: config.canton.operatorPartyId,
+              tradingPair: tradingPair
+            }
+          }]
+        };
+      } else {
+        // Retry logic for OrderBook contract lookup (Canton ledger)
+        while (retries > 0) {
+          orderBookResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${adminToken}`
+            },
+            body: JSON.stringify({
+              activeAtOffset: activeAtOffset,
+              filter: {
+                filtersForAnyParty: {
+                  inclusive: {
+                    contractIds: [actualOrderBookContractId]
+                  }
                 }
               }
-            }
-          })
-        });
+            })
+          });
 
-        if (orderBookResponse.ok) {
-          orderBookData = await orderBookResponse.json();
-          if (orderBookData.activeContracts && orderBookData.activeContracts.length > 0) {
-            // OrderBook found, break the retry loop
-            break;
+          if (orderBookResponse.ok) {
+            orderBookData = await orderBookResponse.json();
+            if (orderBookData.activeContracts && orderBookData.activeContracts.length > 0) {
+              // OrderBook found, break the retry loop
+              break;
+            }
           }
+          
+          // If not found or not ok, wait and retry
+          if (retries > 1) {
+            console.log(`[Order Service] OrderBook not yet visible (Allocation), retrying in 1 second... (${11 - retries}/10)`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+          retries--;
         }
-        
-        // If not found or not ok, wait and retry
-        if (retries > 1) {
-          console.log(`[Order Service] OrderBook not yet visible (Allocation), retrying in 1 second... (${11 - retries}/10)`);
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-        retries--;
       }
 
-      if (!orderBookResponse.ok || !orderBookData?.activeContracts?.length) {
+      if (!orderBookData?.activeContracts?.length) {
         throw new Error('Failed to fetch OrderBook after retries');
       }
       const orderBook = orderBookData.activeContracts?.[0]?.contractEntry?.JsActiveContract?.createdEvent || 
@@ -153,9 +177,35 @@ class OrderService {
         throw new Error('OrderBook operator not found');
       }
 
-      // Step 3: Place order via AddOrder choice with Allocation CID
+      // Step 3: Place order (in-memory or Canton ledger)
       const orderId = `ORDER-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
+      // Check if we're using an in-memory OrderBook
+      if (actualOrderBookContractId.startsWith('in-memory-')) {
+        console.log('[Order Service] Placing order in in-memory OrderBook');
+        
+        // Use the in-memory service to place the order
+        const orderBookService = require('./orderBookService');
+        const result = await orderBookService.inMemoryService.addOrder({
+          tradingPair,
+          orderId,
+          owner: partyId,
+          orderType,
+          price: orderMode === 'LIMIT' && price ? price.toString() : null,
+          quantity: quantity.toString()
+        });
+        
+        console.log('[Order Service] ✅ Order placed in-memory:', result);
+        
+        return {
+          success: true,
+          orderId: orderId,
+          status: 'filled', // For market orders, assume immediate fill
+          message: 'Order placed successfully in in-memory OrderBook'
+        };
+      }
+
+      // Original Canton ledger order placement logic
       const orderBookTemplateId = orderBook?.templateId || 'MasterOrderBook:MasterOrderBook';
       const readAsParties = operator && operator !== partyId ? [partyId, operator] : [partyId];
 
@@ -268,43 +318,66 @@ class OrderService {
       let orderBookData;
       let retries = 10;
       
-      // Retry logic for pending OrderBook contracts
-      while (retries > 0) {
-        orderBookResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${adminToken}`
-          },
-          body: JSON.stringify({
-            activeAtOffset: activeAtOffset,
-            filter: {
-              filtersForAnyParty: {
-                inclusive: {
-                  contractIds: [orderBookContractId]
+      // Use the orderBookService to get the OrderBook contract ID (supports in-memory)
+      const orderBookService = require('./orderBookService');
+      const actualOrderBookContractId = await orderBookService.getOrderBookContractId(tradingPair);
+      if (!actualOrderBookContractId) {
+        throw new Error('OrderBook not found for trading pair: ' + tradingPair);
+      }
+      
+      // Check if we're using an in-memory OrderBook
+      if (actualOrderBookContractId.startsWith('in-memory-')) {
+        // For in-memory OrderBooks, we don't need to query the Canton API
+        console.log('[Order Service] Using in-memory OrderBook:', actualOrderBookContractId);
+        orderBookData = {
+          activeContracts: [{
+            contractId: actualOrderBookContractId,
+            templateId: 'in-memory:OrderBook:OrderBook',
+            createArgument: {
+              operator: config.canton.operatorPartyId,
+              tradingPair: tradingPair
+            }
+          }]
+        };
+      } else {
+        // Retry logic for OrderBook contract lookup (Canton ledger)
+        while (retries > 0) {
+          orderBookResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${adminToken}`
+            },
+            body: JSON.stringify({
+              activeAtOffset: activeAtOffset,
+              filter: {
+                filtersForAnyParty: {
+                  inclusive: {
+                    contractIds: [actualOrderBookContractId]
+                  }
                 }
               }
-            }
-          })
-        });
+            })
+          });
 
-        if (orderBookResponse.ok) {
-          orderBookData = await orderBookResponse.json();
-          if (orderBookData.activeContracts && orderBookData.activeContracts.length > 0) {
-            // OrderBook found, break the retry loop
-            break;
+          if (orderBookResponse.ok) {
+            orderBookData = await orderBookResponse.json();
+            if (orderBookData.activeContracts && orderBookData.activeContracts.length > 0) {
+              // OrderBook found, break the retry loop
+              break;
+            }
           }
+          
+          // If not found or not ok, wait and retry
+          if (retries > 1) {
+            console.log(`[Order Service] OrderBook not yet visible, retrying in 1 second... (${11 - retries}/10)`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+          retries--;
         }
-        
-        // If not found or not ok, wait and retry
-        if (retries > 1) {
-          console.log(`[Order Service] OrderBook not yet visible, retrying in 1 second... (${11 - retries}/10)`);
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-        retries--;
       }
 
-      if (!orderBookResponse.ok || !orderBookData?.activeContracts?.length) {
+      if (!orderBookData?.activeContracts?.length) {
         throw new Error('Failed to fetch OrderBook after retries');
       }
       const orderBook = orderBookData.activeContracts?.[0]?.contractEntry?.JsActiveContract?.createdEvent || 
@@ -316,9 +389,35 @@ class OrderService {
         throw new Error('OrderBook operator not found');
       }
 
-      // Step 4: Place order via AddOrder choice
+      // Step 4: Place order (in-memory or Canton ledger)
       const orderId = `ORDER-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
+      // Check if we're using an in-memory OrderBook
+      if (actualOrderBookContractId.startsWith('in-memory-')) {
+        console.log('[Order Service] Placing order in in-memory OrderBook (UTXO path)');
+        
+        // Use the in-memory service to place the order
+        const orderBookService = require('./orderBookService');
+        const result = await orderBookService.inMemoryService.addOrder({
+          tradingPair,
+          orderId,
+          owner: partyId,
+          orderType,
+          price: orderMode === 'LIMIT' && price ? price.toString() : null,
+          quantity: quantity.toString()
+        });
+        
+        console.log('[Order Service] ✅ Order placed in-memory (UTXO path):', result);
+        
+        return {
+          success: true,
+          orderId: orderId,
+          status: 'filled', // For market orders, assume immediate fill
+          message: 'Order placed successfully in in-memory OrderBook'
+        };
+      }
+
+      // Original Canton ledger order placement logic
       const orderBookTemplateId = orderBook?.templateId || 'OrderBook:OrderBook';
       const readAsParties = operator && operator !== partyId ? [partyId, operator] : [partyId];
 

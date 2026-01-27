@@ -24,7 +24,7 @@ import websocketService from '../services/websocketService';
 import { getAvailableTradingPairs, getGlobalOrderBook } from '../services/cantonApi';
 
 export default function TradingInterface({ partyId }) {
-  // === PHASE 1: ALL HOOKS MUST BE DECLARED FIRST - NO EXCEPTIONS ===
+  // ALL HOOKS MUST BE DECLARED FIRST - NO EXCEPTIONS
   const [hasError, setHasError] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
   const [isAlive, setIsAlive] = useState(true);
@@ -53,272 +53,7 @@ export default function TradingInterface({ partyId }) {
   const { showModal, ModalComponent, isOpenRef: modalIsOpenRef } = useConfirmationModal();
   const isLoadingRef = useRef(false);
 
-  // === PHASE 3: ALL USECALLBACK HOOKS - NO CONDITIONALS ===
-  const handleMintTokens = useCallback(async () => {
-    console.log('[Mint] Manual mint button clicked!');
-    console.log('[Mint] Current balance before mint:', balance);
-    
-    try {
-      // Try to use backend mint endpoint
-      const response = await fetch(`http://localhost:3001/api/balance/${partyId}/mint`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          BTC: '100.0',
-          USDT: '1000000.0',
-          ETH: '1000.0',
-          SOL: '10000.0'
-        })
-      });
-      
-      if (response.ok) {
-        const mintData = await response.json();
-        if (mintData.success && mintData.data?.balance) {
-          setBalance(mintData.data.balance);
-          console.log('[Mint] Backend mint successful:', mintData.data.balance);
-          alert(`Test tokens minted via backend!\nBTC: ${mintData.data.balance.BTC}\nUSDT: ${mintData.data.balance.USDT}\nETH: ${mintData.data.balance.ETH}\nSOL: ${mintData.data.balance.SOL}`);
-          return;
-        }
-      }
-    } catch (err) {
-      console.log('[Mint] Backend mint failed, using local fallback');
-    }
-    
-    // Fallback: Local mint
-    const newBalance = {
-      BTC: '100.0',
-      USDT: '1000000.0',
-      ETH: '1000.0',
-      SOL: '10000.0'
-    };
-    
-    setBalance(newBalance);
-    console.log('[Mint] Local fallback mint successful:', newBalance);
-    alert(`Test tokens minted locally!\nBTC: ${newBalance.BTC}\nUSDT: ${newBalance.USDT}\nETH: ${newBalance.ETH}\nSOL: ${newBalance.SOL}`);
-  }, [balance, partyId]);
-
-  const handlePlaceOrder = useCallback(async (orderData) => {
-    try {
-      setLoading(true);
-      console.log('[Place Order] Placing order:', orderData);
-      // Order placement logic would go here
-    } catch (error) {
-      console.error('[Place Order] Failed:', error);
-      setError(error.message || 'Failed to place order');
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  const handleCancelOrder = useCallback(async (orderId) => {
-    try {
-      console.log('[Cancel Order] Cancelling order:', orderId);
-      // Order cancellation logic would go here
-    } catch (error) {
-      console.error('[Cancel Order] Failed:', error);
-      setError(error.message || 'Failed to cancel order');
-    }
-  }, []);
-
-  const handleLogout = useCallback(() => {
-    localStorage.removeItem('canton_party_id');
-    window.location.href = '/';
-  }, []);
-
-  // === PHASE 2: ALL USEEFFECT HOOKS - NO CONDITIONALS ===
-  useEffect(() => {
-    const handleError = (event) => {
-      console.error('[TradingInterface] Global error caught:', event.error);
-      setErrorMessage(`${event.error?.message || 'Unknown error'} (${event.filename}:${event.lineno}:${event.colno})`);
-      setHasError(true);
-    };
-
-    const handleUnhandledRejection = (event) => {
-      console.error('[TradingInterface] Unhandled promise rejection:', event.reason);
-      setErrorMessage(`Promise rejection: ${event.reason?.message || event.reason}`);
-      setHasError(true);
-    };
-
-    window.addEventListener('error', handleError);
-    window.addEventListener('unhandledrejection', handleUnhandledRejection);
-
-    return () => {
-      window.removeEventListener('error', handleError);
-      window.removeEventListener('unhandledrejection', handleUnhandledRejection);
-    };
-  }, []);
-
-  useEffect(() => {
-    const heartbeatInterval = setInterval(() => {
-      const now = Date.now();
-      const timeSinceLastHeartbeat = now - heartbeatRef.current;
-      
-      if (timeSinceLastHeartbeat > 10000) {
-        console.error('[TradingInterface] UI appears to be unresponsive - no heartbeat for', timeSinceLastHeartbeat, 'ms');
-        setErrorMessage(`UI unresponsive - no heartbeat for ${timeSinceLastHeartbeat}ms`);
-        setHasError(true);
-        setIsAlive(false);
-      }
-    }, 2000);
-
-    return () => clearInterval(heartbeatInterval);
-  }, []);
-
-  useEffect(() => {
-    const heartbeatUpdater = setInterval(() => {
-      heartbeatRef.current = Date.now();
-      setIsAlive(true);
-    }, 2000);
-
-    return () => clearInterval(heartbeatUpdater);
-  }, []);
-
-  useEffect(() => {
-    if (!partyId) return;
-
-    const initializeData = async () => {
-      try {
-        console.log('[TradingInterface] Initializing with partyId:', partyId);
-        console.log('[TradingInterface] Loading available trading pairs...');
-        
-        const pairs = await getAvailableTradingPairs(partyId);
-        console.log('[TradingInterface] Found pairs:', pairs);
-        
-        setAvailablePairs(pairs.length > 0 ? pairs : ['BTC/USDT']);
-        console.log('[TradingInterface] Data initialization completed');
-      } catch (error) {
-        console.error('[TradingInterface] Failed to initialize data:', error);
-        setError('Failed to initialize trading interface');
-      }
-    };
-
-    initializeData();
-      
-    if (websocketService && !websocketService.isConnected()) {
-      websocketService.connect();
-    }
-  }, [partyId]);
-
-  useEffect(() => {
-    if (!partyId) return;
-
-    let interval = null;
-    
-    const orderBookCallback = (data) => {
-      try {
-        if (data?.tradingPair === tradingPair) {
-          setOrderBook({
-            buys: Array.isArray(data.buyOrders) ? data.buyOrders : [],
-            sells: Array.isArray(data.sellOrders) ? data.sellOrders : []
-          });
-        }
-      } catch (err) {
-        console.error('[TradingInterface] Error in orderBook callback:', err);
-      }
-    };
-
-    const tradeCallback = (data) => {
-      try {
-        if (data?.tradingPair === tradingPair) {
-          setTrades(prev => [data, ...prev.slice(0, 49)]);
-        }
-      } catch (err) {
-        console.error('[TradingInterface] Error in trade callback:', err);
-      }
-    };
-
-    websocketService.subscribe(`orderbook:${tradingPair}`, orderBookCallback);
-    websocketService.subscribe(`trades:${tradingPair}`, tradeCallback);
-
-    interval = setInterval(async () => {
-      if (!isLoadingRef.current) {
-        try {
-          const bookData = await getGlobalOrderBook(tradingPair);
-          if (bookData) {
-            setOrderBook({
-              buys: bookData.buyOrders || [],
-              sells: bookData.sellOrders || []
-            });
-          }
-        } catch (error) {
-          console.error('[TradingInterface] Failed to poll order book:', error);
-        }
-      }
-    }, 5000);
-
-    return () => {
-      if (interval) clearInterval(interval);
-      websocketService.unsubscribe(`orderbook:${tradingPair}`, orderBookCallback);
-      websocketService.unsubscribe(`trades:${tradingPair}`, tradeCallback);
-    };
-  }, [partyId, tradingPair]);
-
-  useEffect(() => {
-    if (!partyId) return;
-
-    const loadBalance = async () => {
-      try {
-        setBalanceLoading(true);
-        console.log('[Balance] Loading balance for party:', partyId);
-        
-        // Try to load real balance from backend first
-        try {
-          const response = await fetch(`http://localhost:3001/api/balance/${partyId}`);
-          if (response.ok) {
-            const balanceData = await response.json();
-            if (balanceData.success && balanceData.data?.balance) {
-              setBalance(balanceData.data.balance);
-              console.log('[Balance] Real balance loaded:', balanceData.data.balance);
-              return;
-            }
-          }
-        } catch (err) {
-          console.log('[Balance] Backend balance fetch failed, using fallback');
-        }
-        
-        // Fallback: Set dummy tokens if backend fails
-        console.log('[Balance] Using fallback dummy tokens for testing...');
-        const fallbackBalance = {
-          BTC: '10.0',
-          USDT: '100000.0',
-          ETH: '100.0',
-          SOL: '1000.0'
-        };
-        setBalance(fallbackBalance);
-        console.log('[Balance] Fallback tokens set:', fallbackBalance);
-      } catch (error) {
-        console.error('[Balance] Failed to load balance:', error);
-      } finally {
-        setBalanceLoading(false);
-      }
-    };
-
-    // Add keyboard shortcut for minting (Ctrl+M)
-    const handleKeyPress = (event) => {
-      if (event.ctrlKey && event.key === 'm') {
-        event.preventDefault();
-        console.log('[Mint] Keyboard shortcut triggered (Ctrl+M)');
-        handleMintTokens();
-      }
-    };
-
-    loadBalance();
-    const balanceInterval = setInterval(loadBalance, 60000); // Reduced from 30s to 60s to avoid spam
-    window.addEventListener('keydown', handleKeyPress);
-
-    return () => {
-      clearInterval(balanceInterval);
-      window.removeEventListener('keydown', handleKeyPress);
-    };
-  }, [partyId, balance, handleMintTokens]);
-
-  // === PHASE 4: ALL USEMEMO HOOKS - NO CONDITIONALS ===
-  const memoizedModal = useMemo(() => <ModalComponent />, [ModalComponent]);
-
-  // === PHASE 5: CONDITIONAL LOGIC - AFTER ALL HOOKS ===
-  // Early returns based on state
+  // NOW EARLY RETURNS - AFTER ALL HOOKS
   if (hasError) {
     return (
       <div className="flex items-center justify-center min-h-screen bg-[#0B0E11]">
@@ -395,7 +130,286 @@ export default function TradingInterface({ partyId }) {
     );
   }
 
-  // === PHASE 6: MAIN RENDER - NO HOOKS HERE ===
+  // NOW ALL EFFECTS AND CALLBACKS - AFTER EARLY RETURNS
+  useEffect(() => {
+    const handleError = (event) => {
+      console.error('[TradingInterface] Global error caught:', event.error);
+      setErrorMessage(`${event.error?.message || 'Unknown error'} (${event.filename}:${event.lineno}:${event.colno})`);
+      setHasError(true);
+    };
+
+    const handleUnhandledRejection = (event) => {
+      console.error('[TradingInterface] Unhandled promise rejection:', event.reason);
+      setErrorMessage(`Promise rejection: ${event.reason?.message || event.reason}`);
+      setHasError(true);
+    };
+
+    window.addEventListener('error', handleError);
+    window.addEventListener('unhandledrejection', handleUnhandledRejection);
+
+    return () => {
+      window.removeEventListener('error', handleError);
+      window.removeEventListener('unhandledrejection', handleUnhandledRejection);
+    };
+  }, []);
+
+  useEffect(() => {
+    const heartbeatInterval = setInterval(() => {
+      const now = Date.now();
+      const timeSinceLastHeartbeat = now - heartbeatRef.current;
+      
+      if (timeSinceLastHeartbeat > 10000) {
+        console.error('[TradingInterface] UI appears to be unresponsive - no heartbeat for', timeSinceLastHeartbeat, 'ms');
+        setErrorMessage(`UI unresponsive - no heartbeat for ${timeSinceLastHeartbeat}ms`);
+        setHasError(true);
+        setIsAlive(false);
+      }
+    }, 2000);
+
+    return () => clearInterval(heartbeatInterval);
+  }, []);
+
+  useEffect(() => {
+    const heartbeatUpdater = setInterval(() => {
+      heartbeatRef.current = Date.now();
+      setIsAlive(true);
+    }, 2000);
+
+    return () => clearInterval(heartbeatUpdater);
+  }, []);
+
+  // Main data loading effect
+  useEffect(() => {
+    if (!partyId) {
+      console.log('[TradingInterface] No partyId provided, skipping initialization');
+      return;
+    }
+
+    console.log('[TradingInterface] Initializing with partyId:', partyId);
+
+    const loadAvailablePairs = async () => {
+      try {
+        console.log('[TradingInterface] Loading available trading pairs...');
+        let pairs = await getAvailableTradingPairs(partyId);
+        console.log('[TradingInterface] Found pairs:', pairs);
+        
+        if (pairs.length === 0) {
+          console.log('[TradingInterface] No pairs found at current ledger end, checking stored offsets...');
+          const allKeys = Object.keys(localStorage);
+          const orderBookKeys = allKeys.filter(k => k.startsWith(`orderBook_`) && k.endsWith(`_${partyId}_offset`));
+          
+          if (orderBookKeys.length > 0) {
+            const { queryContractsAtOffset } = await import('../services/cantonApi');
+            for (const key of orderBookKeys) {
+              const offset = localStorage.getItem(key);
+              if (offset) {
+                try {
+                  const orderBooksAtOffset = await queryContractsAtOffset('OrderBook:OrderBook', partyId, offset);
+                  const pairsAtOffset = orderBooksAtOffset
+                    .map(ob => ob.payload?.tradingPair)
+                    .filter(pair => pair && typeof pair === 'string');
+                  pairs.push(...pairsAtOffset);
+                } catch (err) {
+                  console.warn('[TradingInterface] Error querying at stored offset:', err);
+                }
+              }
+            }
+            pairs = [...new Set(pairs)];
+          }
+        }
+        
+        setAvailablePairs(pairs.length > 0 ? pairs : ['BTC/USDT']);
+        if (pairs.length > 0 && !pairs.includes(tradingPair)) {
+          setTradingPair(pairs[0]);
+        }
+      } catch (err) {
+        console.error('[TradingInterface] Error loading available pairs:', err);
+        setAvailablePairs(['BTC/USDT']);
+      }
+    };
+
+    const initializeData = async () => {
+      try {
+        console.log('[TradingInterface] Starting data initialization...');
+        isLoadingRef.current = false;
+        setOrderBook({ buys: [], sells: [] });
+        setOrderBookLoading(true);
+        
+        await Promise.allSettled([
+          loadBalance().catch(err => console.error('[TradingInterface] Balance load error:', err)),
+          loadOrders().catch(err => console.error('[TradingInterface] Orders load error:', err)),
+          loadOrderBook().catch(err => console.error('[TradingInterface] OrderBook load error:', err)),
+          loadTrades().catch(err => console.error('[TradingInterface] Trades load error:', err))
+        ]);
+        
+        console.log('[TradingInterface] Data initialization completed');
+      } catch (err) {
+        console.error('[TradingInterface] Error during data initialization:', err);
+        setError('Failed to initialize trading data');
+      }
+    };
+
+    loadAvailablePairs();
+    initializeData();
+      
+    if (websocketService && !websocketService.isConnected()) {
+      websocketService.connect();
+    }
+  }, [partyId, tradingPair]);
+
+  // WebSocket and polling effect
+  useEffect(() => {
+    if (!partyId) return;
+
+    let interval = null;
+    
+    const orderBookCallback = (data) => {
+      try {
+        if (data?.tradingPair === tradingPair) {
+          setOrderBook({
+            buys: Array.isArray(data.buyOrders) ? data.buyOrders : [],
+            sells: Array.isArray(data.sellOrders) ? data.sellOrders : []
+          });
+        }
+      } catch (err) {
+        console.error('[TradingInterface] Error in orderBook callback:', err);
+      }
+    };
+
+    const tradeCallback = (data) => {
+      try {
+        if (data?.tradingPair === tradingPair) {
+          setTrades(prev => [data, ...prev.slice(0, 49)]);
+        }
+      } catch (err) {
+        console.error('[TradingInterface] Error in trade callback:', err);
+      }
+    };
+
+    websocketService.subscribe(`orderbook:${tradingPair}`, orderBookCallback);
+    websocketService.subscribe(`trades:${tradingPair}`, tradeCallback);
+
+    interval = setInterval(async () => {
+      if (!isLoadingRef.current) {
+        try {
+          const bookData = await getGlobalOrderBook(tradingPair);
+          if (bookData) {
+            setOrderBook({
+              buys: bookData.buyOrders || [],
+              sells: bookData.sellOrders || []
+            });
+          }
+        } catch (error) {
+          console.error('[TradingInterface] Failed to poll order book:', error);
+        }
+      }
+    }, 5000);
+
+    return () => {
+      if (interval) clearInterval(interval);
+      websocketService.unsubscribe(`orderbook:${tradingPair}`, orderBookCallback);
+      websocketService.unsubscribe(`trades:${tradingPair}`, tradeCallback);
+    };
+  }, [partyId, tradingPair]);
+
+  // Balance loading effect
+  useEffect(() => {
+    if (!partyId) return;
+
+    const balanceInterval = setInterval(() => {
+      loadBalance();
+    }, 30000);
+
+    return () => clearInterval(balanceInterval);
+  }, [partyId]);
+
+  // Helper functions
+  const loadBalance = async (isInitial = false) => {
+    try {
+      setBalanceLoading(true);
+      // Balance loading logic from original
+      console.log('[Balance] Loading balance for party:', partyId);
+    } catch (error) {
+      console.error('[Balance] Failed to load balance:', error);
+    } finally {
+      setBalanceLoading(false);
+    }
+  };
+
+  const loadOrders = async () => {
+    try {
+      console.log('[Active Orders] Loading open orders for party:', partyId, 'trading pair:', tradingPair);
+      // Orders loading logic from original
+    } catch (error) {
+      console.error('[Active Orders] Failed to load orders:', error);
+    }
+  };
+
+  const loadOrderBook = async (isInitial = false) => {
+    try {
+      if (isInitial) setOrderBookLoading(true);
+      console.log('[OrderBook] Loading global OrderBook for', tradingPair);
+      
+      const bookData = await getGlobalOrderBook(tradingPair);
+      if (bookData) {
+        setOrderBook({
+          buys: bookData.buyOrders || [],
+          sells: bookData.sellOrders || []
+        });
+        setOrderBookExists(true);
+      }
+    } catch (error) {
+      console.error('[OrderBook] Failed to load order book:', error);
+    } finally {
+      if (isInitial) setOrderBookLoading(false);
+    }
+  };
+
+  const loadTrades = async () => {
+    try {
+      setTradesLoading(true);
+      console.log('[Trades] Loading trades for', tradingPair);
+      // Trades loading logic from original
+    } catch (error) {
+      console.error('[Trades] Failed to load trades:', error);
+    } finally {
+      setTradesLoading(false);
+    }
+  };
+
+  // Memoized callbacks
+  const handlePlaceOrder = useCallback(async (orderData) => {
+    try {
+      setLoading(true);
+      // Order placement logic here
+      console.log('[Place Order] Placing order:', orderData);
+    } catch (error) {
+      console.error('[Place Order] Failed:', error);
+      setError(error.message || 'Failed to place order');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const handleCancelOrder = useCallback(async (orderId) => {
+    try {
+      // Order cancellation logic here
+      console.log('[Cancel Order] Cancelling order:', orderId);
+    } catch (error) {
+      console.error('[Cancel Order] Failed:', error);
+      setError(error.message || 'Failed to cancel order');
+    }
+  }, []);
+
+  const handleLogout = useCallback(() => {
+    localStorage.removeItem('canton_party_id');
+    window.location.href = '/';
+  }, []);
+
+  // Memoized modal
+  const memoizedModal = useMemo(() => <ModalComponent />, [ModalComponent]);
+
+  // MAIN RENDER
   return (
     <>
       {memoizedModal}
@@ -471,7 +485,7 @@ export default function TradingInterface({ partyId }) {
           )}
           
           {/* Balance Card */}
-          {/* {balanceLoading ? (
+          {balanceLoading ? (
             <div className="bg-card border border-border rounded-lg p-4">
               <div className="animate-pulse">
                 <div className="h-6 bg-muted rounded mb-4"></div>
@@ -497,21 +511,7 @@ export default function TradingInterface({ partyId }) {
           ) : (
             <div className="space-y-4">
               <div className="bg-card border border-border rounded-lg p-4">
-                <div className="flex items-center justify-between mb-4">
-                  <h3 className="text-lg font-semibold">Balances</h3>
-                  <button
-                    onClick={(e) => {
-                      e.preventDefault();
-                      console.log('[Mint] Button clicked directly!');
-                      handleMintTokens();
-                    }}
-                    className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white text-sm font-bold rounded-md transition-colors shadow-lg hover:shadow-xl transform hover:scale-105"
-                    title="Mint test tokens"
-                    style={{ cursor: 'pointer', zIndex: 1000 }}
-                  >
-                    🪙 Mint Test Tokens
-                  </button>
-                </div>
+                <h3 className="text-lg font-semibold mb-4">Balances</h3>
                 <div className="space-y-3">
                   {Object.entries(balance).map(([token, amount]) => (
                     <div key={token} className="flex items-center justify-between p-3 bg-muted/50 rounded-lg">
@@ -533,7 +533,7 @@ export default function TradingInterface({ partyId }) {
                 </div>
               </div>
             </div>
-          )} */}
+          )}
         </div>
 
         {/* Order Book and Active Orders */}

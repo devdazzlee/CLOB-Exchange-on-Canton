@@ -2,8 +2,10 @@ import { useState, useEffect } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
 import WalletSetup from './components/WalletSetup';
 import TradingInterface from './components/TradingInterface';
+import TradingTest from './components/TradingTest';
 import AdminPanel from './components/AdminPanel';
 import AuthGuard from './components/AuthGuard';
+import ErrorBoundary from './components/ErrorBoundary';
 import { loadWallet, clearWallet, bytesToBase64 } from './wallet/keyManager';
 import { getOrCreateUserId } from './services/userId';
 import './index.css';
@@ -182,7 +184,21 @@ function App() {
               path="/trading"
               element={
                 walletReady ? (
-                  <TradingInterface partyId={partyId} />
+                  <ErrorBoundary>
+                    <TradingInterface partyId={partyId} />
+                  </ErrorBoundary>
+                ) : (
+                  <Navigate to="/" replace />
+                )
+              }
+            />
+            <Route
+              path="/trading-test"
+              element={
+                walletReady ? (
+                  <ErrorBoundary>
+                    <TradingTest partyId={partyId} />
+                  </ErrorBoundary>
                 ) : (
                   <Navigate to="/" replace />
                 )

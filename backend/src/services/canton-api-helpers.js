@@ -8,15 +8,15 @@ async function getOrderBookTemplateId(adminToken) {
   let packageId = config.canton.packageIds?.clobExchange;
   if (!packageId && adminToken) {
     try {
-      packageId = await cantonService.getPackageIdForTemplate('OrderBook', adminToken);
+      packageId = await cantonService.getPackageIdForTemplate('MasterOrderBookV2', adminToken);
     } catch (error) {
       // Fall through to error below if discovery fails
     }
   }
   if (!packageId) {
-    throw new Error('Missing package ID for OrderBook template');
+    throw new Error('Missing package ID for MasterOrderBookV2 template');
   }
-  return `${packageId}:OrderBook:OrderBook`;
+  return `${packageId}:MasterOrderBookV2:MasterOrderBookV2`;
 }
 
 /**
@@ -81,8 +81,8 @@ async function getOrderBookContractId(tradingPair, adminToken, cantonApiBase) {
       })
     },
     {
-      name: 'No filter - just OrderBook template',
-      query: () => fetch(`${cantonApiBase}/v2/state/active-contracts?limit=50`, {
+      name: 'Minimal template filter',
+      query: () => fetch(`${cantonApiBase}/v2/state/active-contracts?limit=100`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -94,7 +94,7 @@ async function getOrderBookContractId(tradingPair, adminToken, cantonApiBase) {
           filter: {
             filtersForAnyParty: {
               inclusive: {
-                templateIds: [orderBookTemplateId]
+                templateIds: ["%"]  // Wildcard to match any template
               }
             }
           }
@@ -126,7 +126,7 @@ async function getOrderBookContractId(tradingPair, adminToken, cantonApiBase) {
           console.log(`[getOrderBookContractId] ✅ Found OrderBook using ${attempt.name}: ${contractData.contractId.substring(0, 30)}...`);
           return contractData.contractId;
         } else {
-          console.log(`[getOrderBookContractId] No matching OrderBook found with ${attempt.name}`);
+          console.log(`[getOrderBookContractId] No matching OrderBook found with ${attempt.name} for ${tradingPair}`);
         }
       } else {
         const errorText = await response.text();

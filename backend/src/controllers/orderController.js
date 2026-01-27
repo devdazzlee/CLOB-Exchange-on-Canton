@@ -48,7 +48,8 @@ class OrderController {
     if (!resolvedOrderBookContractId) {
       console.log(`[OrderController] OrderBook not found, creating new one for ${decodedTradingPair}`);
       const created = await orderBookService.createOrderBook(decodedTradingPair);
-      resolvedOrderBookContractId = created.contractId;
+      // Handle both old and new response structures
+      resolvedOrderBookContractId = created.contractId || created.data?.contractId;
       console.log(`[OrderController] OrderBook created with ID: ${resolvedOrderBookContractId?.substring(0, 30)}...`);
     } else {
       console.log(`[OrderController] Using existing OrderBook: ${resolvedOrderBookContractId.substring(0, 30)}...`);
