@@ -3,11 +3,12 @@
  * Wraps order operations (placement, cancellation, matching) with UTXO handling
  */
 
-const UTXOHandler = require('./utxo-handler');
-const CantonAdmin = require('./canton-admin');
-const cantonService = require('./cantonService');
-const tradeStore = require('./trade-store');
-const { extractTradesFromEvents } = require('./trade-utils');
+const UTXOHandler = require("./utxo-handler");
+const CantonAdmin = require("./canton-admin");
+const cantonService = require("./cantonService");
+const orderBookService = require("./orderBookService");
+const tradeStore = require("./trade-store");
+const { extractTradesFromEvents } = require("./trade-utils");
 
 function recordTradesFromResult(result) {
   const trades = extractTradesFromEvents(result?.events);
@@ -17,11 +18,11 @@ function recordTradesFromResult(result) {
     tradeStore.addTrade(trade);
     if (global.broadcastWebSocket) {
       global.broadcastWebSocket(`trades:${trade.tradingPair}`, {
-        type: 'NEW_TRADE',
+        type: "NEW_TRADE",
         ...trade,
       });
-      global.broadcastWebSocket('trades:all', {
-        type: 'NEW_TRADE',
+      global.broadcastWebSocket("trades:all", {
+        type: "NEW_TRADE",
         ...trade,
       });
     }
@@ -36,11 +37,16 @@ function extractLatestUserAccountContractId(events, partyId) {
     const created = events[i]?.created;
     if (!created) continue;
     const templateId = created.templateId;
-    const templateName = typeof templateId === 'string'
-      ? templateId
-      : `${templateId?.moduleName || ''}:${templateId?.entityName || ''}`;
-    if (!templateName.includes('UserAccount')) continue;
-    const args = created.createArguments || created.createArgument || created.argument || {};
+    const templateName =
+      typeof templateId === "string"
+        ? templateId
+        : `${templateId?.moduleName || ""}:${templateId?.entityName || ""}`;
+    if (!templateName.includes("UserAccount")) continue;
+    const args =
+      created.createArguments ||
+      created.createArgument ||
+      created.argument ||
+      {};
     if (!partyId || args.party === partyId) {
       return created.contractId || null;
     }
@@ -49,21 +55,25 @@ function extractLatestUserAccountContractId(events, partyId) {
 }
 
 async function getLedgerEndOffset(adminToken) {
-  const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
+  const CANTON_JSON_API_BASE =
+    process.env.CANTON_JSON_API_BASE || "http://65.108.40.104:31539";
   try {
-    const response = await fetch(`${CANTON_JSON_API_BASE}/v2/state/ledger-end`, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${adminToken}`,
-        'Content-Type': 'application/json'
-      }
-    });
+    const response = await fetch(
+      `${CANTON_JSON_API_BASE}/v2/state/ledger-end`,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${adminToken}`,
+          "Content-Type": "application/json",
+        },
+      },
+    );
     if (response.ok) {
       const data = await response.json();
       return data.offset || null;
     }
   } catch (e) {
-    console.warn('[Ledger End] Failed to get ledger end:', e.message);
+    console.warn("[Ledger End] Failed to get ledger end:", e.message);
   }
   return null;
 }
@@ -76,7 +86,7 @@ async function getActiveAtOffset(adminToken, completionOffset = null) {
   if (ledgerEnd) {
     return ledgerEnd.toString();
   }
-  throw new Error('Could not determine activeAtOffset');
+  throw new Error("Could not determine activeAtOffset");
 }
 
 class OrderService {
@@ -89,75 +99,116 @@ class OrderService {
    * Place order with Splice Allocation (optional path)
    * Uses Allocation CID created by frontend (Step A of two-step process)
    */
-  async placeOrderWithAllocation(partyId, tradingPair, orderType, orderMode, quantity, price, orderBookContractId, allocationCid) {
+  async placeOrderWithAllocation(
+    partyId,
+    tradingPair,
+    orderType,
+    orderMode,
+    quantity,
+    price,
+    orderBookContractId,
+    allocationCid,
+  ) {
     try {
-      console.log(`[Order Service] Placing order with Splice Allocation for ${partyId}`);
-      console.log(`[Order Service] Allocation CID: ${allocationCid.substring(0, 30)}...`);
-      
+      console.log(
+        `[Order Service] Placing order with Splice Allocation for ${partyId}`,
+      );
+      console.log(
+        `[Order Service] Allocation CID: ${allocationCid.substring(0, 30)}...`,
+      );
+
       // Step 1: Get admin token for Ledger API
       const adminToken = await this.cantonAdmin.getAdminToken();
       await cantonService.ensurePartyRights(partyId, adminToken);
-      const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
+      const CANTON_JSON_API_BASE =
+        process.env.CANTON_JSON_API_BASE || "http://65.108.40.104:31539";
 
-      // Step 2: Get OrderBook to find operator and template with retry logic
+      // Step 2: Get OrderBook to find operator and template with fast retry logic
       const activeAtOffset = await getActiveAtOffset(adminToken);
       let orderBookResponse;
       let orderBookData;
-      let retries = 10;
-      
-      // Retry logic for pending OrderBook contracts
+      let retries = 3;
+      let currentOrderBookContractId = orderBookContractId;
+
+      // Fast retry logic - try 3 times with 300ms delay
       while (retries > 0) {
-        orderBookResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${adminToken}`
+        orderBookResponse = await fetch(
+          `${CANTON_JSON_API_BASE}/v2/state/active-contracts`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${adminToken}`,
+            },
+            body: JSON.stringify({
+              activeAtOffset: activeAtOffset,
+              filter: {
+                filtersForAnyParty: {
+                  inclusive: {
+                    contractIds: [currentOrderBookContractId],
+                  },
+                },
+              },
+            }),
           },
-          body: JSON.stringify({
-            activeAtOffset: activeAtOffset,
-            filter: {
-              filtersForAnyParty: {
-                inclusive: {
-                  contractIds: [orderBookContractId]
-                }
-              }
-            }
-          })
-        });
+        );
 
         if (orderBookResponse.ok) {
           orderBookData = await orderBookResponse.json();
-          if (orderBookData.activeContracts && orderBookData.activeContracts.length > 0) {
+          if (
+            orderBookData.activeContracts &&
+            orderBookData.activeContracts.length > 0
+          ) {
             // OrderBook found, break the retry loop
             break;
           }
         }
-        
-        // If not found or not ok, wait and retry
+
+        // On first failure, try fetching a fresh contract ID
+        if (retries === 2) {
+          console.log(
+            `[Order Service] OrderBook contract not found, fetching fresh ID...`,
+          );
+          orderBookService.clearCachedOrderBookId(tradingPair);
+          const freshId =
+            await orderBookService.getOrderBookContractId(tradingPair);
+          if (freshId && freshId !== currentOrderBookContractId) {
+            console.log(
+              `[Order Service] Using fresh OrderBook ID: ${freshId.substring(0, 30)}...`,
+            );
+            currentOrderBookContractId = freshId;
+          }
+        }
+
+        // If not found or not ok, wait briefly and retry
         if (retries > 1) {
-          console.log(`[Order Service] OrderBook not yet visible (Allocation), retrying in 1 second... (${11 - retries}/10)`);
-          await new Promise(resolve => setTimeout(resolve, 1000));
+          await new Promise((resolve) => setTimeout(resolve, 300));
         }
         retries--;
       }
 
       if (!orderBookResponse.ok || !orderBookData?.activeContracts?.length) {
-        throw new Error('Failed to fetch OrderBook after retries');
+        throw new Error("Failed to fetch OrderBook after retries");
       }
-      const orderBook = orderBookData.activeContracts?.[0]?.contractEntry?.JsActiveContract?.createdEvent || 
-                       orderBookData.activeContracts?.[0]?.createdEvent ||
-                       orderBookData.activeContracts?.[0];
-      
-      const operator = orderBook?.createArgument?.operator || orderBook?.argument?.operator;
+      const orderBook =
+        orderBookData.activeContracts?.[0]?.contractEntry?.JsActiveContract
+          ?.createdEvent ||
+        orderBookData.activeContracts?.[0]?.createdEvent ||
+        orderBookData.activeContracts?.[0];
+
+      const operator =
+        orderBook?.createArgument?.operator || orderBook?.argument?.operator;
       if (!operator) {
-        throw new Error('OrderBook operator not found');
+        throw new Error("OrderBook operator not found");
       }
 
       // Step 3: Place order via AddOrder choice with Allocation CID
       const orderId = `ORDER-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
-      const orderBookTemplateId = orderBook?.templateId || 'MasterOrderBook:MasterOrderBook';
-      const readAsParties = operator && operator !== partyId ? [partyId, operator] : [partyId];
+      const orderBookTemplateId =
+        orderBook?.templateId || "MasterOrderBook:MasterOrderBook";
+      const readAsParties =
+        operator && operator !== partyId ? [partyId, operator] : [partyId];
 
       // Build AddOrder argument with Allocation CID
       const addOrderArgument = {
@@ -165,16 +216,16 @@ class OrderService {
         owner: partyId,
         orderType: orderType,
         orderMode: orderMode,
-        price: orderMode === 'LIMIT' && price ? price.toString() : null,
+        price: orderMode === "LIMIT" && price ? price.toString() : null,
         quantity: quantity.toString(),
-        allocationCid: allocationCid // CRITICAL: Pass Allocation CID for Splice model
+        allocationCid: allocationCid, // CRITICAL: Pass Allocation CID for Splice model
       };
 
-      console.log('[Order Service] Exercising AddOrder with Allocation:', {
+      console.log("[Order Service] Exercising AddOrder with Allocation:", {
         orderId,
-        allocationCid: allocationCid.substring(0, 30) + '...',
+        allocationCid: allocationCid.substring(0, 30) + "...",
         orderType,
-        quantity
+        quantity,
       });
 
       const exerciseResponse = await cantonService.exerciseChoice({
@@ -182,22 +233,29 @@ class OrderService {
         actAsParty: partyId,
         templateId: orderBookTemplateId,
         contractId: orderBookContractId,
-        choice: 'AddOrder',
+        choice: "AddOrder",
         choiceArgument: addOrderArgument,
         readAs: readAsParties,
       });
 
       const result = exerciseResponse; // exerciseChoice returns the result directly
 
-      console.log(`[Order Service] ✅ Order placed successfully with Allocation. Update ID: ${result.updateId}`);
+      console.log(
+        `[Order Service] ✅ Order placed successfully with Allocation. Update ID: ${result.updateId}`,
+      );
 
       // Extract order contract ID if available in response
       let orderContractId = null;
       if (result.events && Array.isArray(result.events)) {
         for (const event of result.events) {
-          if (event.created?.contractId && event.created?.templateId?.includes('Order')) {
+          if (
+            event.created?.contractId &&
+            event.created?.templateId?.includes("Order")
+          ) {
             orderContractId = event.created.contractId;
-            console.log(`[Order Service] ✅ Order contract ID from response: ${orderContractId.substring(0, 50)}...`);
+            console.log(
+              `[Order Service] ✅ Order contract ID from response: ${orderContractId.substring(0, 50)}...`,
+            );
             break;
           }
         }
@@ -206,10 +264,18 @@ class OrderService {
       const recordedTrades = recordTradesFromResult(result);
       const tradesCreated = recordedTrades.length;
       if (tradesCreated > 0) {
-        console.log(`[Order Service] ✅ Matchmaking executed! ${tradesCreated} trade(s) created`);
+        console.log(
+          `[Order Service] ✅ Matchmaking executed! ${tradesCreated} trade(s) created`,
+        );
       }
 
-      const userAccountContractId = extractLatestUserAccountContractId(result.events, partyId);
+      const userAccountContractId = extractLatestUserAccountContractId(
+        result.events,
+        partyId,
+      );
+
+      // CRITICAL: Clear OrderBook cache so next query gets the new contract
+      orderBookService.clearCachedOrderBookId(tradingPair);
 
       return {
         success: true,
@@ -220,10 +286,13 @@ class OrderService {
         allocationUsed: allocationCid,
         userAccountContractId: userAccountContractId,
         tradesCreated: tradesCreated,
-        matchmakingExecuted: tradesCreated > 0
+        matchmakingExecuted: tradesCreated > 0,
       };
     } catch (error) {
-      console.error('[Order Service] Error placing order with Allocation:', error);
+      console.error(
+        "[Order Service] Error placing order with Allocation:",
+        error,
+      );
       throw error;
     }
   }
@@ -234,13 +303,24 @@ class OrderService {
    * 2. Place order via Ledger API
    * 3. Return result
    */
-  async placeOrderWithUTXOHandling(partyId, tradingPair, orderType, orderMode, quantity, price, orderBookContractId, userAccountContractIdParam) {
+  async placeOrderWithUTXOHandling(
+    partyId,
+    tradingPair,
+    orderType,
+    orderMode,
+    quantity,
+    price,
+    orderBookContractId,
+    userAccountContractIdParam,
+  ) {
     try {
-      console.log(`[Order Service] Placing order with UTXO handling for ${partyId}`);
-      
+      console.log(
+        `[Order Service] Placing order with UTXO handling for ${partyId}`,
+      );
+
       // Ensure userAccountContractId is defined (handle undefined from missing request body field)
       const userAccountContractIdSafe = userAccountContractIdParam || null;
-      
+
       // Step 1: Pre-order UTXO handling
       const preOrderResult = await this.utxoHandler.handlePreOrderPlacement(
         partyId,
@@ -248,109 +328,150 @@ class OrderService {
         orderType,
         parseFloat(quantity),
         price ? parseFloat(price) : null,
-        userAccountContractIdSafe // Pass contract ID if available
+        userAccountContractIdSafe, // Pass contract ID if available
       );
 
       if (!preOrderResult.success) {
-        throw new Error(preOrderResult.error || 'Insufficient balance or UTXO issue');
+        throw new Error(
+          preOrderResult.error || "Insufficient balance or UTXO issue",
+        );
       }
 
-      console.log(`[Order Service] ✅ UTXO check passed. Balance: ${preOrderResult.totalBalance}, Merged: ${preOrderResult.merged}`);
+      console.log(
+        `[Order Service] ✅ UTXO check passed. Balance: ${preOrderResult.totalBalance}, Merged: ${preOrderResult.merged}`,
+      );
 
       // Step 2: Get admin token for Ledger API
       const adminToken = await this.cantonAdmin.getAdminToken();
       await cantonService.ensurePartyRights(partyId, adminToken);
-      const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
+      const CANTON_JSON_API_BASE =
+        process.env.CANTON_JSON_API_BASE || "http://65.108.40.104:31539";
 
-      // Step 3: Get OrderBook to find operator with retry logic for pending contracts
+      // Step 3: Get OrderBook to find operator with fast retry logic for pending contracts
       const activeAtOffset = await getActiveAtOffset(adminToken);
       let orderBookResponse;
       let orderBookData;
-      let retries = 10;
-      
-      // Retry logic for pending OrderBook contracts
+      let retries = 3;
+      let currentOrderBookContractId = orderBookContractId;
+
+      // Fast retry logic - try 3 times with 300ms delay
       while (retries > 0) {
-        orderBookResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${adminToken}`
+        orderBookResponse = await fetch(
+          `${CANTON_JSON_API_BASE}/v2/state/active-contracts`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${adminToken}`,
+            },
+            body: JSON.stringify({
+              activeAtOffset: activeAtOffset,
+              filter: {
+                filtersForAnyParty: {
+                  inclusive: {
+                    contractIds: [currentOrderBookContractId],
+                  },
+                },
+              },
+            }),
           },
-          body: JSON.stringify({
-            activeAtOffset: activeAtOffset,
-            filter: {
-              filtersForAnyParty: {
-                inclusive: {
-                  contractIds: [orderBookContractId]
-                }
-              }
-            }
-          })
-        });
+        );
 
         if (orderBookResponse.ok) {
           orderBookData = await orderBookResponse.json();
-          if (orderBookData.activeContracts && orderBookData.activeContracts.length > 0) {
+          if (
+            orderBookData.activeContracts &&
+            orderBookData.activeContracts.length > 0
+          ) {
             // OrderBook found, break the retry loop
             break;
           }
         }
-        
-        // If not found or not ok, wait and retry
+
+        // On first failure, try fetching a fresh contract ID
+        if (retries === 2) {
+          console.log(
+            `[Order Service] OrderBook contract not found, fetching fresh ID...`,
+          );
+          orderBookService.clearCachedOrderBookId(tradingPair);
+          const freshId =
+            await orderBookService.getOrderBookContractId(tradingPair);
+          if (freshId && freshId !== currentOrderBookContractId) {
+            console.log(
+              `[Order Service] Using fresh OrderBook ID: ${freshId.substring(0, 30)}...`,
+            );
+            currentOrderBookContractId = freshId;
+          }
+        }
+
+        // If not found or not ok, wait briefly and retry
         if (retries > 1) {
-          console.log(`[Order Service] OrderBook not yet visible, retrying in 1 second... (${11 - retries}/10)`);
-          await new Promise(resolve => setTimeout(resolve, 1000));
+          await new Promise((resolve) => setTimeout(resolve, 300));
         }
         retries--;
       }
 
       if (!orderBookResponse.ok || !orderBookData?.activeContracts?.length) {
-        throw new Error('Failed to fetch OrderBook after retries');
+        throw new Error("Failed to fetch OrderBook after retries");
       }
-      const orderBook = orderBookData.activeContracts?.[0]?.contractEntry?.JsActiveContract?.createdEvent || 
-                       orderBookData.activeContracts?.[0]?.createdEvent ||
-                       orderBookData.activeContracts?.[0];
-      
-      const operator = orderBook?.createArgument?.operator || orderBook?.argument?.operator;
+      const orderBook =
+        orderBookData.activeContracts?.[0]?.contractEntry?.JsActiveContract
+          ?.createdEvent ||
+        orderBookData.activeContracts?.[0]?.createdEvent ||
+        orderBookData.activeContracts?.[0];
+
+      const operator =
+        orderBook?.createArgument?.operator || orderBook?.argument?.operator;
       if (!operator) {
-        throw new Error('OrderBook operator not found');
+        throw new Error("OrderBook operator not found");
       }
 
       // Step 4: Place order via AddOrder choice
       const orderId = `ORDER-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
-      const orderBookTemplateId = orderBook?.templateId || 'OrderBook:OrderBook';
-      const readAsParties = operator && operator !== partyId ? [partyId, operator] : [partyId];
+      const orderBookTemplateId =
+        orderBook?.templateId || "OrderBook:OrderBook";
+      const readAsParties =
+        operator && operator !== partyId ? [partyId, operator] : [partyId];
 
       const exerciseResponse = await cantonService.exerciseChoice({
         token: adminToken,
         actAsParty: partyId,
         templateId: orderBookTemplateId,
         contractId: orderBookContractId,
-        choice: 'AddOrder',
+        choice: "AddOrder",
         choiceArgument: {
           orderId: orderId,
           owner: partyId,
           orderType: orderType,
           orderMode: orderMode,
-          price: orderMode === 'LIMIT' && price ? price.toString() : null,
-          quantity: quantity.toString()
+          price: orderMode === "LIMIT" && price ? price.toString() : null,
+          quantity: quantity.toString(),
         },
         readAs: readAsParties,
       });
 
       const result = exerciseResponse; // exerciseChoice returns the result directly
 
-      console.log(`[Order Service] ✅ Order placed successfully. Update ID: ${result.updateId}`);
-      console.log(`[Order Service] Matchmaking should have executed automatically (MatchOrders called in AddOrder)`);
+      console.log(
+        `[Order Service] ✅ Order placed successfully. Update ID: ${result.updateId}`,
+      );
+      console.log(
+        `[Order Service] Matchmaking should have executed automatically (MatchOrders called in AddOrder)`,
+      );
 
       // Extract order contract ID if available in response
       let orderContractId = null;
       if (result.events && Array.isArray(result.events)) {
         for (const event of result.events) {
-          if (event.created?.contractId && event.created?.templateId?.includes('Order')) {
+          if (
+            event.created?.contractId &&
+            event.created?.templateId?.includes("Order")
+          ) {
             orderContractId = event.created.contractId;
-            console.log(`[Order Service] ✅ Order contract ID from response: ${orderContractId.substring(0, 50)}...`);
+            console.log(
+              `[Order Service] ✅ Order contract ID from response: ${orderContractId.substring(0, 50)}...`,
+            );
             break;
           }
         }
@@ -359,11 +480,20 @@ class OrderService {
       const recordedTrades = recordTradesFromResult(result);
       const tradesCreated = recordedTrades.length;
       if (tradesCreated > 0) {
-        console.log(`[Order Service] ✅ Matchmaking executed! ${tradesCreated} trade(s) created`);
+        console.log(
+          `[Order Service] ✅ Matchmaking executed! ${tradesCreated} trade(s) created`,
+        );
       }
 
-      const updatedUserAccountId = extractLatestUserAccountContractId(result.events, partyId);
-      const userAccountContractId = updatedUserAccountId || preOrderResult.userAccount?.contractId || null;
+      const updatedUserAccountId = extractLatestUserAccountContractId(
+        result.events,
+        partyId,
+      );
+      const userAccountContractId =
+        updatedUserAccountId || preOrderResult.userAccount?.contractId || null;
+
+      // CRITICAL: Clear OrderBook cache so next query gets the new contract
+      orderBookService.clearCachedOrderBookId(tradingPair);
 
       return {
         success: true,
@@ -375,10 +505,10 @@ class OrderService {
         userAccount: preOrderResult.userAccount,
         userAccountContractId: userAccountContractId,
         tradesCreated: tradesCreated,
-        matchmakingExecuted: tradesCreated > 0
+        matchmakingExecuted: tradesCreated > 0,
       };
     } catch (error) {
-      console.error('[Order Service] Error placing order:', error);
+      console.error("[Order Service] Error placing order:", error);
       throw error;
     }
   }
@@ -389,126 +519,159 @@ class OrderService {
    * 2. Remove from OrderBook
    * 3. Merge UTXOs after cancellation
    */
-  async cancelOrderWithUTXOHandling(partyId, tradingPair, orderType, orderContractId, orderBookContractId, userAccountContractIdParam) {
+  async cancelOrderWithUTXOHandling(
+    partyId,
+    tradingPair,
+    orderType,
+    orderContractId,
+    orderBookContractId,
+    userAccountContractIdParam,
+  ) {
     try {
-      console.log(`[Order Service] Cancelling order with UTXO handling for ${partyId}`);
+      console.log(
+        `[Order Service] Cancelling order with UTXO handling for ${partyId}`,
+      );
 
       // Ensure userAccountContractId is defined (handle undefined from missing request body field)
       const userAccountContractIdSafe = userAccountContractIdParam || null;
 
       const adminToken = await this.cantonAdmin.getAdminToken();
       await cantonService.ensurePartyRights(partyId, adminToken);
-      const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
+      const CANTON_JSON_API_BASE =
+        process.env.CANTON_JSON_API_BASE || "http://65.108.40.104:31539";
 
       // Step 1: Get order details
-      const orderResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`
+      const orderResponse = await fetch(
+        `${CANTON_JSON_API_BASE}/v2/state/active-contracts`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${adminToken}`,
+          },
+          body: JSON.stringify({
+            activeAtOffset: await getActiveAtOffset(adminToken),
+            filter: {
+              filtersForAnyParty: {
+                inclusive: {
+                  contractIds: [orderContractId],
+                },
+              },
+            },
+          }),
         },
-        body: JSON.stringify({
-          activeAtOffset: await getActiveAtOffset(adminToken),
-          filter: {
-            filtersForAnyParty: {
-              inclusive: {
-                contractIds: [orderContractId]
-              }
-            }
-          }
-        })
-      });
+      );
 
       if (!orderResponse.ok) {
-        throw new Error('Failed to fetch order');
+        throw new Error("Failed to fetch order");
       }
 
       const orderData = await orderResponse.json();
-      const order = orderData.activeContracts?.[0]?.contractEntry?.JsActiveContract?.createdEvent || 
-                   orderData.activeContracts?.[0]?.createdEvent ||
-                   orderData.activeContracts?.[0];
+      const order =
+        orderData.activeContracts?.[0]?.contractEntry?.JsActiveContract
+          ?.createdEvent ||
+        orderData.activeContracts?.[0]?.createdEvent ||
+        orderData.activeContracts?.[0];
 
       if (!order) {
-        throw new Error('Order not found');
+        throw new Error("Order not found");
       }
 
-      const orderTemplateId = order?.templateId || 'Order:Order';
+      const orderTemplateId = order?.templateId || "Order:Order";
 
       // Step 2: Cancel order
       const cancelCommandId = `cancel-order-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-      
+
       const cancelResult = await cantonService.exerciseChoice({
         token: adminToken,
         actAsParty: partyId,
         templateId: orderTemplateId,
         contractId: orderContractId,
-        choice: 'CancelOrder',
+        choice: "CancelOrder",
         choiceArgument: {},
         readAs: [partyId],
       });
 
-      console.log(`[Order Service] ✅ Order cancelled. Update ID: ${cancelResult.updateId}`);
+      console.log(
+        `[Order Service] ✅ Order cancelled. Update ID: ${cancelResult.updateId}`,
+      );
 
       // Step 3: Remove from OrderBook (if orderBookContractId provided)
       if (orderBookContractId) {
         try {
-          const orderBookResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${adminToken}`
+          const orderBookResponse = await fetch(
+            `${CANTON_JSON_API_BASE}/v2/state/active-contracts`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${adminToken}`,
+              },
+              body: JSON.stringify({
+                activeAtOffset: "0",
+                filter: {
+                  filtersForAnyParty: {
+                    inclusive: {
+                      contractIds: [orderBookContractId],
+                    },
+                  },
+                },
+              }),
             },
-            body: JSON.stringify({
-              activeAtOffset: "0",
-              filter: {
-                filtersForAnyParty: {
-                  inclusive: {
-                    contractIds: [orderBookContractId]
-                  }
-                }
-              }
-            })
-          });
+          );
 
           if (orderBookResponse.ok) {
             const orderBookData = await orderBookResponse.json();
-            const orderBook = orderBookData.activeContracts?.[0]?.contractEntry?.JsActiveContract?.createdEvent || 
-                           orderBookData.activeContracts?.[0]?.createdEvent ||
-                           orderBookData.activeContracts?.[0];
-            
-            const operator = orderBook?.createArgument?.operator || orderBook?.argument?.operator;
-            const orderBookTemplateId = orderBook?.templateId || 'OrderBook:OrderBook';
+            const orderBook =
+              orderBookData.activeContracts?.[0]?.contractEntry
+                ?.JsActiveContract?.createdEvent ||
+              orderBookData.activeContracts?.[0]?.createdEvent ||
+              orderBookData.activeContracts?.[0];
+
+            const operator =
+              orderBook?.createArgument?.operator ||
+              orderBook?.argument?.operator;
+            const orderBookTemplateId =
+              orderBook?.templateId || "OrderBook:OrderBook";
 
             if (operator) {
               const removeCommandId = `remove-order-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-              
-              await fetch(`${CANTON_JSON_API_BASE}/v2/commands/submit-and-wait`, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'Authorization': `Bearer ${adminToken}`
+
+              await fetch(
+                `${CANTON_JSON_API_BASE}/v2/commands/submit-and-wait`,
+                {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                    Authorization: `Bearer ${adminToken}`,
+                  },
+                  body: JSON.stringify({
+                    commandId: removeCommandId,
+                    commands: [
+                      {
+                        exercise: {
+                          templateId: orderBookTemplateId,
+                          contractId: orderBookContractId,
+                          choice: "RemoveOrder",
+                          argument: {
+                            orderCid: orderContractId,
+                          },
+                        },
+                      },
+                    ],
+                    actAs: [operator],
+                  }),
                 },
-                body: JSON.stringify({
-                  commandId: removeCommandId,
-                  commands: [{
-                    exercise: {
-                      templateId: orderBookTemplateId,
-                      contractId: orderBookContractId,
-                      choice: 'RemoveOrder',
-                      argument: {
-                        orderCid: orderContractId
-                      }
-                    }
-                  }],
-                  actAs: [operator]
-                })
-              });
-              
+              );
+
               console.log(`[Order Service] ✅ Order removed from OrderBook`);
             }
           }
         } catch (removeError) {
-          console.warn('[Order Service] Failed to remove order from OrderBook (non-critical):', removeError.message);
+          console.warn(
+            "[Order Service] Failed to remove order from OrderBook (non-critical):",
+            removeError.message,
+          );
         }
       }
 
@@ -518,20 +681,25 @@ class OrderService {
           partyId,
           tradingPair,
           orderType,
-          userAccountContractIdSafe
+          userAccountContractIdSafe,
         );
 
-        console.log(`[Order Service] ✅ Post-cancellation UTXO merge: ${postCancelResult.success ? 'success' : 'failed'}`);
+        console.log(
+          `[Order Service] ✅ Post-cancellation UTXO merge: ${postCancelResult.success ? "success" : "failed"}`,
+        );
       }
+
+      // CRITICAL: Clear OrderBook cache so next query gets the new contract
+      orderBookService.clearCachedOrderBookId(tradingPair);
 
       return {
         success: true,
         updateId: cancelResult.updateId,
         completionOffset: cancelResult.completionOffset,
-        utxoMerged: true
+        utxoMerged: true,
       };
     } catch (error) {
-      console.error('[Order Service] Error cancelling order:', error);
+      console.error("[Order Service] Error cancelling order:", error);
       throw error;
     }
   }
@@ -540,13 +708,22 @@ class OrderService {
    * Handle matchmaking with UTXO handling
    * This is called after orders are matched to merge UTXOs for partial fills
    */
-  async handleMatchmakingWithUTXO(buyerPartyId, sellerPartyId, tradingPair, buyOrderType, sellOrderType, 
-                                  buyRemainingQuantity, sellRemainingQuantity, buyerUserAccountId, sellerUserAccountId) {
+  async handleMatchmakingWithUTXO(
+    buyerPartyId,
+    sellerPartyId,
+    tradingPair,
+    buyOrderType,
+    sellOrderType,
+    buyRemainingQuantity,
+    sellRemainingQuantity,
+    buyerUserAccountId,
+    sellerUserAccountId,
+  ) {
     try {
       console.log(`[Order Service] Handling matchmaking UTXO merge`);
 
       // Merge UTXOs for both parties after partial fills
-      const [baseToken, quoteToken] = tradingPair.split('/');
+      const [baseToken, quoteToken] = tradingPair.split("/");
 
       // Buyer: merge quote token UTXOs (if partial fill, remaining quote token needs merging)
       if (buyerUserAccountId && buyRemainingQuantity > 0) {
@@ -556,10 +733,13 @@ class OrderService {
             tradingPair,
             buyOrderType,
             buyRemainingQuantity,
-            buyerUserAccountId
+            buyerUserAccountId,
           );
         } catch (error) {
-          console.warn('[Order Service] Buyer UTXO merge failed (non-critical):', error.message);
+          console.warn(
+            "[Order Service] Buyer UTXO merge failed (non-critical):",
+            error.message,
+          );
         }
       }
 
@@ -571,27 +751,32 @@ class OrderService {
             tradingPair,
             sellOrderType,
             sellRemainingQuantity,
-            sellerUserAccountId
+            sellerUserAccountId,
           );
         } catch (error) {
-          console.warn('[Order Service] Seller UTXO merge failed (non-critical):', error.message);
+          console.warn(
+            "[Order Service] Seller UTXO merge failed (non-critical):",
+            error.message,
+          );
         }
       }
 
       return {
         success: true,
         buyerUTXOMerged: !!buyerUserAccountId,
-        sellerUTXOMerged: !!sellerUserAccountId
+        sellerUTXOMerged: !!sellerUserAccountId,
       };
     } catch (error) {
-      console.error('[Order Service] Error in matchmaking UTXO handling:', error);
+      console.error(
+        "[Order Service] Error in matchmaking UTXO handling:",
+        error,
+      );
       return {
         success: false,
-        error: error.message
+        error: error.message,
       };
     }
   }
 }
 
 module.exports = OrderService;
-

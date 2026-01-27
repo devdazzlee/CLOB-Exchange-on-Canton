@@ -3,11 +3,11 @@
  * Handles OrderBook-related business logic
  */
 
-const config = require('../config');
-const cantonService = require('./cantonService');
-const { getOrderBookContractId } = require('./canton-api-helpers');
-const tradeStore = require('./trade-store');
-const { NotFoundError } = require('../utils/errors');
+const config = require("../config");
+const cantonService = require("./cantonService");
+const { getOrderBookContractId } = require("./canton-api-helpers");
+const tradeStore = require("./trade-store");
+const { NotFoundError } = require("../utils/errors");
 
 const MAX_BATCH_SIZE = 200;
 
@@ -34,146 +34,260 @@ class OrderBookService {
     return this.orderBookCache.get(tradingPair);
   }
 
+  clearCachedOrderBookId(tradingPair) {
+    if (tradingPair) {
+      this.orderBookCache.delete(tradingPair);
+    }
+  }
+
   extractCreatedContractId(updatePayload) {
     if (!updatePayload) {
       return null;
     }
 
+    // Try multiple paths to find the created contract ID
     const candidateEvents = [
       updatePayload.events,
       updatePayload.transaction?.events,
       updatePayload.update?.events,
       updatePayload.update?.transaction?.events,
-      updatePayload.transactions?.flatMap(t => t.events || [])
-    ].flat().filter(Boolean);
+      updatePayload.transactions?.flatMap((t) => t.events || []),
+      updatePayload.updatePayload?.transaction?.events,
+    ]
+      .flat()
+      .filter(Boolean);
 
-    const createdEvent = candidateEvents.find(event => event?.created?.contractId);
-    return createdEvent?.created?.contractId || null;
+    // Look for created event in various formats
+    for (const event of candidateEvents) {
+      if (event?.created?.contractId) {
+        return event.created.contractId;
+      }
+      if (event?.createdEvent?.contractId) {
+        return event.createdEvent.contractId;
+      }
+      if (event?.JsCreateEvent?.contractId) {
+        return event.JsCreateEvent.contractId;
+      }
+      // Handle nested structure
+      const unwrappedEvent =
+        event?.transactionEntry?.JsActiveContract?.createdEvent || event;
+      if (unwrappedEvent?.contractId) {
+        return unwrappedEvent.contractId;
+      }
+    }
+
+    return null;
   }
 
   async fetchOrderDetails(orderIds, adminToken, activeAtOffset) {
     if (!Array.isArray(orderIds) || orderIds.length === 0) {
+      console.log("[OrderBookService] No order IDs to fetch");
       return [];
     }
+
+    console.log(
+      "[OrderBookService] Fetching details for",
+      orderIds.length,
+      "orders",
+    );
 
     const batches = chunkArray(orderIds, MAX_BATCH_SIZE);
     const results = [];
 
-    for (const batch of batches) {
-      const response = await fetch(`${config.canton.jsonApiBase}/v2/state/active-contracts?limit=${batch.length}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`,
-        },
-        body: JSON.stringify({
-          readAs: [config.canton.operatorPartyId],
-          activeAtOffset,
-          verbose: true,
-          filter: {
-            filtersByParty: {
-              [config.canton.operatorPartyId]: {
-                inclusive: {
-                  contractIds: batch,
+    for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+      const batch = batches[batchIndex];
+      console.log(
+        `[OrderBookService] Fetching batch ${batchIndex + 1}/${batches.length} with ${batch.length} orders`,
+      );
+
+      try {
+        const response = await fetch(
+          `${config.canton.jsonApiBase}/v2/state/active-contracts?limit=${batch.length}`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${adminToken}`,
+            },
+            body: JSON.stringify({
+              readAs: [config.canton.operatorPartyId],
+              activeAtOffset,
+              verbose: true,
+              filter: {
+                filtersByParty: {
+                  [config.canton.operatorPartyId]: {
+                    inclusive: {
+                      contractIds: batch,
+                    },
+                  },
                 },
               },
-            },
+            }),
           },
-        }),
-      });
+        );
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('[OrderBookService] Fetch orders error details:', {
-          status: response.status,
-          statusText: response.statusText,
-          errorText,
-        });
-        throw new Error(`Failed to fetch orders: ${response.status} - ${errorText}`);
+        if (!response.ok) {
+          const errorText = await response.text();
+          console.error("[OrderBookService] Fetch orders error details:", {
+            status: response.status,
+            statusText: response.statusText,
+            errorText: errorText.substring(0, 200),
+            batchSize: batch.length,
+            batchIndex,
+          });
+          // Continue with next batch instead of throwing
+          continue;
+        }
+
+        const data = await response.json();
+        const contracts = data.activeContracts || [];
+        console.log(
+          `[OrderBookService] Batch ${batchIndex + 1} returned ${contracts.length} contracts`,
+        );
+
+        results.push(
+          ...contracts.map((entry) => {
+            const contract =
+              entry.contractEntry?.JsActiveContract?.createdEvent ||
+              entry.createdEvent ||
+              entry;
+            const payload = contract.argument || contract.createArgument || {};
+            const quantity = payload.quantity;
+            const filled = payload.filled || 0;
+            const remaining =
+              quantity !== undefined
+                ? Math.max(0, Number(quantity) - Number(filled || 0))
+                : undefined;
+
+            return {
+              contractId: contract.contractId,
+              owner: payload.owner,
+              price: payload.price,
+              quantity,
+              filled,
+              remaining,
+              timestamp: payload.timestamp,
+              status: payload.status,
+              orderType: payload.orderType,
+              orderMode: payload.orderMode,
+              tradingPair: payload.tradingPair,
+            };
+          }),
+        );
+      } catch (batchError) {
+        console.error(
+          `[OrderBookService] Batch ${batchIndex + 1} failed:`,
+          batchError.message,
+        );
+        // Continue with next batch
+        continue;
       }
-
-      const data = await response.json();
-      const contracts = data.activeContracts || [];
-      results.push(...contracts.map((entry) => {
-        const contract = entry.contractEntry?.JsActiveContract?.createdEvent ||
-          entry.createdEvent ||
-          entry;
-        const payload = contract.argument || contract.createArgument || {};
-        const quantity = payload.quantity;
-        const filled = payload.filled || 0;
-        const remaining = quantity !== undefined ? Math.max(0, Number(quantity) - Number(filled || 0)) : undefined;
-
-        return {
-          contractId: contract.contractId,
-          owner: payload.owner,
-          price: payload.price,
-          quantity,
-          filled,
-          remaining,
-          timestamp: payload.timestamp,
-          status: payload.status,
-          orderType: payload.orderType,
-          orderMode: payload.orderMode,
-          tradingPair: payload.tradingPair,
-        };
-      }));
     }
 
+    console.log(
+      "[OrderBookService] Fetched total",
+      results.length,
+      "order details",
+    );
     return results;
   }
 
   async discoverSynchronizerId() {
     try {
       if (config.canton.synchronizerId) {
+        console.log("[OrderBookService] Using configured synchronizer ID");
         return config.canton.synchronizerId;
       }
 
-      const response = await fetch(`${config.canton.jsonApiBase}/v2/state/connected-synchronizers`, {
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${await cantonService.getAdminToken()}`,
-          'Content-Type': 'application/json',
+      const adminToken = await cantonService.getAdminToken();
+      const response = await fetch(
+        `${config.canton.jsonApiBase}/v2/state/connected-synchronizers`,
+        {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${adminToken}`,
+            "Content-Type": "application/json",
+          },
         },
-      });
-      
+      );
+
       if (!response.ok) {
         const errorText = await response.text();
-        throw new Error(`Failed to discover synchronizerId: ${response.status} - ${errorText}`);
+        console.error("[OrderBookService] Synchronizer discovery failed:", {
+          status: response.status,
+          statusText: response.statusText,
+          body: errorText,
+        });
+        throw new Error(
+          `Failed to discover synchronizerId: ${response.status} - ${errorText}`,
+        );
       }
 
       const data = await response.json().catch(() => ({}));
       let synchronizerId = null;
 
-      if (data.connectedSynchronizers && Array.isArray(data.connectedSynchronizers) && data.connectedSynchronizers.length > 0) {
+      // Try multiple possible response formats
+      if (
+        data.connectedSynchronizers &&
+        Array.isArray(data.connectedSynchronizers) &&
+        data.connectedSynchronizers.length > 0
+      ) {
         const synchronizers = data.connectedSynchronizers;
-        const globalSync = synchronizers.find(s =>
-          s.synchronizerAlias === 'global' || s.alias === 'global'
+        const globalSync = synchronizers.find(
+          (s) =>
+            s.synchronizerAlias === "global" ||
+            s.alias === "global" ||
+            (s.synchronizerId && s.synchronizerId.includes("global")),
         );
         if (globalSync?.synchronizerId) {
           synchronizerId = globalSync.synchronizerId;
         } else {
-          const globalDomainSync = synchronizers.find(s =>
-            s.synchronizerId && s.synchronizerId.includes('global-domain')
+          const globalDomainSync = synchronizers.find(
+            (s) =>
+              s.synchronizerId && s.synchronizerId.includes("global-domain"),
           );
-          synchronizerId = globalDomainSync?.synchronizerId || synchronizers[0].synchronizerId || synchronizers[0].id;
+          if (globalDomainSync?.synchronizerId) {
+            synchronizerId = globalDomainSync.synchronizerId;
+          } else if (synchronizers[0]?.synchronizerId) {
+            synchronizerId = synchronizers[0].synchronizerId;
+          } else if (typeof synchronizers[0] === "string") {
+            synchronizerId = synchronizers[0];
+          }
         }
-      } else if (data.synchronizers && Array.isArray(data.synchronizers) && data.synchronizers.length > 0) {
+      } else if (
+        data.synchronizers &&
+        Array.isArray(data.synchronizers) &&
+        data.synchronizers.length > 0
+      ) {
         const first = data.synchronizers[0];
-        synchronizerId = typeof first === 'string' ? first : (first.synchronizerId || first.id);
+        synchronizerId =
+          typeof first === "string" ? first : first.synchronizerId || first.id;
       } else if (data.synchronizerId) {
         synchronizerId = data.synchronizerId;
       } else if (Array.isArray(data) && data.length > 0) {
         const first = data[0];
-        synchronizerId = typeof first === 'string' ? first : (first.synchronizerId || first.id);
+        synchronizerId =
+          typeof first === "string" ? first : first.synchronizerId || first.id;
       }
 
-      if (synchronizerId) {
-        return synchronizerId;
+      if (!synchronizerId) {
+        console.error(
+          "[OrderBookService] No synchronizer found in response:",
+          JSON.stringify(data, null, 2),
+        );
+        throw new Error("No synchronizers found in discovery response");
       }
 
-      throw new Error('No synchronizers found');
+      console.log(
+        "[OrderBookService] Discovered synchronizer ID:",
+        synchronizerId.substring(0, 30) + "...",
+      );
+      return synchronizerId;
     } catch (error) {
-      console.error('[OrderBookService] Failed to discover synchronizer:', error);
+      console.error(
+        "[OrderBookService] Failed to discover synchronizer:",
+        error.message,
+      );
       throw error;
     }
   }
@@ -181,21 +295,28 @@ class OrderBookService {
   buildTemplateId(moduleName, entityName) {
     const packageId = config.canton.packageIds?.clobExchange;
     if (!packageId) {
-      throw new Error(`Missing package ID for ${moduleName}:${entityName}`);
+      console.error(
+        `[OrderBookService] Missing package ID for ${moduleName}:${entityName}`,
+        "Available config:",
+        config.canton.packageIds,
+      );
+      throw new Error(
+        `Missing package ID for ${moduleName}:${entityName}. Config: ${JSON.stringify(config.canton.packageIds)}`,
+      );
     }
     return `${packageId}:${moduleName}:${entityName}`;
   }
 
   getMasterOrderBookTemplateId() {
-    return this.buildTemplateId('MasterOrderBook', 'MasterOrderBook');
+    return this.buildTemplateId("MasterOrderBook", "MasterOrderBook");
   }
 
   getOrderBookTemplateId() {
-    return this.buildTemplateId('OrderBook', 'OrderBook');
+    return this.buildTemplateId("OrderBook", "OrderBook");
   }
 
   getTradeTemplateId() {
-    return this.buildTemplateId('Trade', 'Trade');
+    return this.buildTemplateId("Trade", "Trade");
   }
 
   /**
@@ -210,7 +331,7 @@ class OrderBookService {
     const contractId = await getOrderBookContractId(
       tradingPair,
       adminToken,
-      config.canton.jsonApiBase
+      config.canton.jsonApiBase,
     );
     this.cacheOrderBookId(tradingPair, contractId);
     return contractId;
@@ -221,12 +342,14 @@ class OrderBookService {
    */
   async getOrderBook(tradingPair) {
     const contractId = await this.getOrderBookContractId(tradingPair);
-    
+
     if (!contractId) {
-      throw new NotFoundError(`OrderBook not found for trading pair: ${tradingPair}`);
+      throw new NotFoundError(
+        `OrderBook not found for trading pair: ${tradingPair}`,
+      );
     }
 
-    if (contractId.startsWith('pending-')) {
+    if (contractId.startsWith("pending-")) {
       return {
         contractId,
         tradingPair,
@@ -241,43 +364,48 @@ class OrderBookService {
     const adminToken = await cantonService.getAdminToken();
     const activeAtOffset = await cantonService.getActiveAtOffset(adminToken);
 
-    const response = await fetch(`${config.canton.jsonApiBase}/v2/state/active-contracts?limit=10`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${adminToken}`,
-      },
-      body: JSON.stringify({
-        readAs: [config.canton.operatorPartyId],
-        activeAtOffset,
-        verbose: false,
-        filter: {
-          filtersByParty: {
-            [config.canton.operatorPartyId]: {
-              inclusive: {
-                contractIds: [contractId],
+    const response = await fetch(
+      `${config.canton.jsonApiBase}/v2/state/active-contracts?limit=10`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({
+          readAs: [config.canton.operatorPartyId],
+          activeAtOffset,
+          verbose: false,
+          filter: {
+            filtersByParty: {
+              [config.canton.operatorPartyId]: {
+                inclusive: {
+                  contractIds: [contractId],
+                },
               },
             },
           },
-        },
-      }),
-    });
+        }),
+      },
+    );
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error('[OrderBookService] GetOrderBook error details:', {
+      console.error("[OrderBookService] GetOrderBook error details:", {
         status: response.status,
         statusText: response.statusText,
         errorText: errorText,
         contractId: contractId,
-        operatorPartyId: config.canton.operatorPartyId
+        operatorPartyId: config.canton.operatorPartyId,
       });
-      throw new Error(`Failed to fetch OrderBook: ${response.status} - ${errorText}`);
+      throw new Error(
+        `Failed to fetch OrderBook: ${response.status} - ${errorText}`,
+      );
     }
 
     const data = await response.json();
     const contracts = data.activeContracts || [];
-    
+
     if (contracts.length === 0) {
       return {
         contractId,
@@ -290,21 +418,73 @@ class OrderBookService {
       };
     }
 
-    const contract = contracts[0].contractEntry?.JsActiveContract?.createdEvent ||
+    const contract =
+      contracts[0].contractEntry?.JsActiveContract?.createdEvent ||
       contracts[0].createdEvent ||
       contracts[0];
     const args = contract.argument || contract.createArgument || {};
-    const buyOrderIds = args.buyOrders || [];
-    const sellOrderIds = args.sellOrders || [];
+
+    // Debug logging
+    console.log("[OrderBookService] OrderBook contract args:", {
+      hasArgs: !!args,
+      argsKeys: Object.keys(args || {}),
+      buyOrdersType: typeof args.buyOrders,
+      buyOrdersLength: Array.isArray(args.buyOrders)
+        ? args.buyOrders.length
+        : "N/A",
+      sellOrdersType: typeof args.sellOrders,
+      sellOrdersLength: Array.isArray(args.sellOrders)
+        ? args.sellOrders.length
+        : "N/A",
+    });
+
+    const buyOrderIds = Array.isArray(args.buyOrders) ? args.buyOrders : [];
+    const sellOrderIds = Array.isArray(args.sellOrders) ? args.sellOrders : [];
+
+    console.log("[OrderBookService] Extracted order IDs:", {
+      buyOrderIds: buyOrderIds.length,
+      sellOrderIds: sellOrderIds.length,
+    });
 
     const orderDetails = await this.fetchOrderDetails(
       [...buyOrderIds, ...sellOrderIds],
       adminToken,
-      activeAtOffset
+      activeAtOffset,
     );
+
+    console.log("[OrderBookService] Fetched order details:", {
+      totalOrders: orderDetails.length,
+      buyOrdersRetrieved: orderDetails.filter((o) => o.orderType === "BUY")
+        .length,
+      sellOrdersRetrieved: orderDetails.filter((o) => o.orderType === "SELL")
+        .length,
+    });
+
     const orderById = new Map(orderDetails.map((o) => [o.contractId, o]));
-    const buyOrders = buyOrderIds.map((cid) => orderById.get(cid)).filter(Boolean);
-    const sellOrders = sellOrderIds.map((cid) => orderById.get(cid)).filter(Boolean);
+    const buyOrders = buyOrderIds
+      .map((cid) => {
+        const order = orderById.get(cid);
+        if (!order) {
+          console.warn(
+            "[OrderBookService] Buy order not found for contract ID:",
+            cid.substring(0, 30),
+          );
+        }
+        return order;
+      })
+      .filter(Boolean);
+    const sellOrders = sellOrderIds
+      .map((cid) => {
+        const order = orderById.get(cid);
+        if (!order) {
+          console.warn(
+            "[OrderBookService] Sell order not found for contract ID:",
+            cid.substring(0, 30),
+          );
+        }
+        return order;
+      })
+      .filter(Boolean);
 
     return {
       contractId: contract.contractId,
@@ -324,48 +504,54 @@ class OrderBookService {
     const adminToken = await cantonService.getAdminToken();
     const activeAtOffset = await cantonService.getActiveAtOffset(adminToken);
 
-    const response = await fetch(`${config.canton.jsonApiBase}/v2/state/active-contracts?limit=20`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${adminToken}`,
-      },
-      body: JSON.stringify({
-        readAs: [config.canton.operatorPartyId],
-        activeAtOffset,
-        verbose: false,
-        filter: {
-          filtersByParty: {
-            [config.canton.operatorPartyId]: {
-              inclusive: {
-                templateIds: [this.getOrderBookTemplateId()],
+    const response = await fetch(
+      `${config.canton.jsonApiBase}/v2/state/active-contracts?limit=20`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({
+          readAs: [config.canton.operatorPartyId],
+          activeAtOffset,
+          verbose: false,
+          filter: {
+            filtersByParty: {
+              [config.canton.operatorPartyId]: {
+                inclusive: {
+                  templateIds: [this.getOrderBookTemplateId()],
+                },
               },
             },
           },
-        },
-      }),
-    });
+        }),
+      },
+    );
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error('[OrderBookService] Query error details:', {
+      console.error("[OrderBookService] Query error details:", {
         status: response.status,
         statusText: response.statusText,
         errorText: errorText,
-        operatorPartyId: config.canton.operatorPartyId
+        operatorPartyId: config.canton.operatorPartyId,
       });
-      throw new Error(`Failed to fetch OrderBooks: ${response.status} - ${errorText}`);
+      throw new Error(
+        `Failed to fetch OrderBooks: ${response.status} - ${errorText}`,
+      );
     }
 
     const data = await response.json();
     const contracts = data.activeContracts || [];
 
-    return contracts.map(entry => {
-      const contract = entry.contractEntry?.JsActiveContract?.createdEvent || 
-                       entry.createdEvent || 
-                       entry;
+    return contracts.map((entry) => {
+      const contract =
+        entry.contractEntry?.JsActiveContract?.createdEvent ||
+        entry.createdEvent ||
+        entry;
       const args = contract.argument || contract.createArgument || {};
-      
+
       return {
         contractId: contract.contractId,
         tradingPair: args.tradingPair,
@@ -394,29 +580,41 @@ class OrderBookService {
    */
   async createOrderBook(tradingPair) {
     const adminToken = await cantonService.getAdminToken();
-    
+
     // Check if OrderBook already exists
-    const existingContractId = await this.getOrderBookContractId(tradingPair);
-    if (existingContractId) {
-      return {
-        contractId: existingContractId,
-        alreadyExists: true,
-      };
+    try {
+      const existingContractId = await this.getOrderBookContractId(tradingPair);
+      if (existingContractId && !existingContractId.startsWith("pending-")) {
+        return {
+          contractId: existingContractId,
+          alreadyExists: true,
+        };
+      }
+    } catch (e) {
+      // OrderBook doesn't exist yet, proceed with creation
     }
 
     // Parse trading pair
-    const [base, quote] = tradingPair.split('/');
+    const [base, quote] = tradingPair.split("/");
     if (!base || !quote) {
-      throw new Error('Invalid trading pair format. Expected BASE/QUOTE');
+      throw new Error("Invalid trading pair format. Expected BASE/QUOTE");
     }
 
-    // Get package ID for OrderBook template (use package-id format to avoid vetting issues)
-    const orderBookPackageId = await cantonService.getPackageIdForTemplate('OrderBook', adminToken);
+    // Get package ID for OrderBook template
+    const orderBookPackageId = await cantonService.getPackageIdForTemplate(
+      "OrderBook",
+      adminToken,
+    );
+
+    console.log("[OrderBook] Creating OrderBook for", tradingPair);
+    console.log(
+      "[OrderBook] Using package ID:",
+      orderBookPackageId.substring(0, 30) + "...",
+    );
 
     // Create OrderBook contract
     let orderBookResult;
     try {
-      // Try without synchronizer first
       orderBookResult = await cantonService.createContract({
         token: adminToken,
         actAsParty: config.canton.operatorPartyId,
@@ -431,165 +629,76 @@ class OrderBookService {
           userAccounts: null,
         },
         readAs: [config.canton.operatorPartyId],
-        synchronizerId: null, // Try without synchronizer first
       });
-    } catch (syncError) {
-      // If synchronizer is required, fall back to using it
-      console.log('[OrderBook] Synchronizer required, using:', syncError.message);
-      orderBookResult = await cantonService.createContract({
-        token: adminToken,
-        actAsParty: config.canton.operatorPartyId,
-        templateId: `${orderBookPackageId}:OrderBook:OrderBook`,
-        createArguments: {
-          tradingPair,
-          buyOrders: [],
-          sellOrders: [],
-          lastPrice: null,
-          operator: config.canton.operatorPartyId,
-          activeUsers: [],
-          userAccounts: null,
-        },
-        readAs: [config.canton.operatorPartyId],
-        synchronizerId: await this.discoverSynchronizerId(),
-      });
-    }
-
-    const orderBookContractId = orderBookResult.transaction?.events?.[0]?.created?.contractId;
-
-    console.log('[OrderBook] Contract creation result:', JSON.stringify(orderBookResult, null, 2));
-    console.log('[OrderBook] Contract ID:', orderBookContractId);
-
-    if (!orderBookContractId) {
-      throw new Error(`Failed to create OrderBook contract. Result: ${JSON.stringify(orderBookResult)}`);
-    }
-
-    // Wait for OrderBook to become visible in queries (race condition fix)
-    console.log('[OrderBook] Waiting for OrderBook to become visible...');
-    let retries = 30; // Increase retries for better reliability
-    let visibleContractId = null;
-    
-    // First, try to get the contract ID from the updateId
-    if (orderBookResult.updateId && orderBookResult.completionOffset) {
-      console.log('[OrderBook] Querying transaction result using updateId...');
-      try {
-        const txResponse = await fetch(`${config.canton.jsonApiBase}/v2/updates/update-by-id`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${adminToken}`
+    } catch (error) {
+      console.error("[OrderBook] Creation failed:", error.message);
+      // Try with explicit synchronizer if available
+      if (config.canton.synchronizerId) {
+        console.log(
+          "[OrderBook] Retrying with synchronizer:",
+          config.canton.synchronizerId,
+        );
+        orderBookResult = await cantonService.createContract({
+          token: adminToken,
+          actAsParty: config.canton.operatorPartyId,
+          templateId: `${orderBookPackageId}:OrderBook:OrderBook`,
+          createArguments: {
+            tradingPair,
+            buyOrders: [],
+            sellOrders: [],
+            lastPrice: null,
+            operator: config.canton.operatorPartyId,
+            activeUsers: [],
+            userAccounts: null,
           },
-          body: JSON.stringify({
-            updateId: orderBookResult.updateId,
-            updateFormat: "verbose",
-            includeTransactions: true
-          })
+          readAs: [config.canton.operatorPartyId],
+          synchronizerId: config.canton.synchronizerId,
         });
-        
-        console.log('[OrderBook] Transaction query response status:', txResponse.status);
-        
-        if (txResponse.ok) {
-          const txData = await txResponse.json();
-          console.log('[OrderBook] Transaction result:', JSON.stringify(txData, null, 2));
-          
-          // Extract the actual contract ID from the transaction
-          const extractedContractId = this.extractCreatedContractId(txData);
-          if (extractedContractId) {
-            visibleContractId = extractedContractId;
-            console.log('[OrderBook] ✅ Found real contract ID from transaction:', visibleContractId.substring(0, 30) + '...');
-            this.cacheOrderBookId(tradingPair, visibleContractId);
-          } else {
-            console.log('[OrderBook] No created event found in transaction');
-          }
-        } else {
-          const errorText = await txResponse.text();
-          console.log('[OrderBook] Transaction query failed:', txResponse.status, errorText);
-        }
-      } catch (error) {
-        console.log('[OrderBook] Failed to query transaction result:', error.message);
+      } else {
+        throw error;
       }
     }
-    
-    // If we didn't get the contract ID from the transaction, try polling
-    while (retries > 0 && !visibleContractId) {
-      await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
-      
-      try {
-        // First try the standard method
-        visibleContractId = await this.getOrderBookContractId(tradingPair);
-        if (visibleContractId) {
-          console.log('[OrderBook] ✅ OrderBook is now visible:', visibleContractId.substring(0, 30) + '...');
-          break;
-        }
-        
-        // If standard method fails, try querying at the completion offset
-        if (orderBookResult.completionOffset && retries % 5 === 0) {
-          console.log('[OrderBook] Trying direct query at completion offset...');
-          const offsetResponse = await fetch(`${config.canton.jsonApiBase}/v2/state/active-contracts`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${adminToken}`
-            },
-            body: JSON.stringify({
-              activeAtOffset: orderBookResult.completionOffset.toString(),
-              verbose: true,
-              filter: {
-                filtersForAnyParty: {
-                  inclusive: {
-                    templateIds: [this.getOrderBookTemplateId()]
-                  }
-                }
-              }
-            })
-          });
-          
-          if (offsetResponse.ok) {
-            const offsetData = await offsetResponse.json();
-            const contracts = offsetData.activeContracts || [];
-            const orderBook = contracts.find(ob => {
-              const contractData = ob.contractEntry?.JsActiveContract?.createdEvent || ob.createdEvent || ob;
-              return contractData.createArgument?.tradingPair === tradingPair || contractData.argument?.tradingPair === tradingPair;
-            });
-            
-            if (orderBook) {
-              const contractData = orderBook.contractEntry?.JsActiveContract?.createdEvent || orderBook.createdEvent || orderBook;
-              visibleContractId = contractData.contractId;
-              console.log('[OrderBook] ✅ Found OrderBook at completion offset:', visibleContractId.substring(0, 30) + '...');
-              break;
-            }
-          }
-        }
-      } catch (error) {
-        console.log(`[OrderBook] Retry ${30 - retries + 1}: OrderBook not yet visible...`);
-      }
-      
-      retries--;
+
+    // Extract contract ID from response
+    let contractId = null;
+
+    // Try various paths to get the contract ID
+    if (orderBookResult.transaction?.events?.[0]?.created?.contractId) {
+      contractId = orderBookResult.transaction.events[0].created.contractId;
+    } else if (orderBookResult.created?.contractId) {
+      contractId = orderBookResult.created.contractId;
+    } else if (orderBookResult.contractId) {
+      contractId = orderBookResult.contractId;
     }
-    
-    if (!visibleContractId) {
-      // If still not visible, try one more time with a longer delay
-      console.log('[OrderBook] Final retry with longer delay...');
-      await new Promise(resolve => setTimeout(resolve, 5000)); // Increased final delay
-      try {
-        visibleContractId = await this.getOrderBookContractId(tradingPair);
-        if (visibleContractId) {
-          console.log('[OrderBook] ✅ OrderBook finally visible:', visibleContractId.substring(0, 30) + '...');
-        }
-      } catch (error) {
-        console.error('[OrderBook] ❌ OrderBook still not visible after all retries');
-      }
+
+    console.log(
+      "[OrderBook] Creation result - UpdateId:",
+      orderBookResult.updateId,
+      "ContractId:",
+      contractId,
+    );
+
+    if (!contractId) {
+      throw new Error(
+        `Failed to extract contract ID from response. Result: ${JSON.stringify(orderBookResult).substring(0, 300)}`,
+      );
     }
-    
-    // Use the visible contract ID if available, otherwise fall back to pending
-    const finalContractId = visibleContractId || orderBookContractId;
-    this.cacheOrderBookId(tradingPair, finalContractId);
-    
-    if (!visibleContractId) {
-      console.warn('[OrderBook] ⚠️ Using pending contract ID - OrderBook may not be immediately usable');
+
+    // Cache the contract ID
+    this.cacheOrderBookId(tradingPair, contractId);
+
+    // Log success
+    if (!contractId.startsWith("pending-")) {
+      console.log(
+        "[OrderBook] ✅ Created successfully with ID:",
+        contractId.substring(0, 40) + "...",
+      );
+    } else {
+      console.log("[OrderBook] ⚠️  Created with temporary ID:", contractId);
     }
 
     return {
-      contractId: finalContractId,
+      contractId,
       masterOrderBookContractId: null,
       alreadyExists: false,
     };

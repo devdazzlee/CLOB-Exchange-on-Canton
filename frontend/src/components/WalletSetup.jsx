@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useState, useEffect, useRef } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   generateMnemonic,
   mnemonicToKeyPair,
@@ -9,20 +9,23 @@ import {
   loadWallet,
   bytesToBase64,
   signMessage,
-} from '../wallet/keyManager';
-import { generateTopology, allocatePartyWithSignature } from '../services/partyService';
-import PasswordInput from './PasswordInput';
+} from "../wallet/keyManager";
+import {
+  generateTopology,
+  allocatePartyWithSignature,
+} from "../services/partyService";
+import PasswordInput from "./PasswordInput";
 
 export default function WalletSetup({ onWalletReady }) {
   const navigate = useNavigate();
-  const [step, setStep] = useState('select');
-  const [mnemonic, setMnemonic] = useState('');
-  const [importMnemonic, setImportMnemonic] = useState('');
-  const [password, setPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState('');
-  const [unlockPassword, setUnlockPassword] = useState('');
-  const [partyId, setPartyId] = useState('');
-  const [error, setError] = useState('');
+  const [step, setStep] = useState("select");
+  const [mnemonic, setMnemonic] = useState("");
+  const [importMnemonic, setImportMnemonic] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [unlockPassword, setUnlockPassword] = useState("");
+  const [partyId, setPartyId] = useState("");
+  const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [copiedPartyId, setCopiedPartyId] = useState(false);
 
@@ -37,9 +40,9 @@ export default function WalletSetup({ onWalletReady }) {
   useEffect(() => {
     const existingWallet = loadWallet();
     if (existingWallet) {
-      const storedPartyId = localStorage.getItem('canton_party_id');
+      const storedPartyId = localStorage.getItem("canton_party_id");
       if (storedPartyId) {
-        setStep('ready');
+        setStep("ready");
         setPartyId(storedPartyId);
         return;
       }
@@ -63,9 +66,9 @@ export default function WalletSetup({ onWalletReady }) {
     try {
       onboardingInProgress.current = true;
       setLoading(true);
-      setError('');
+      setError("");
 
-      console.log('[WalletSetup] Starting onboarding for existing wallet...');
+      console.log("[WalletSetup] Starting onboarding for existing wallet...");
 
       // Step 1: Generate topology (no unlock needed)
       const publicKeyBase64 = bytesToBase64(wallet.publicKey);
@@ -79,11 +82,11 @@ export default function WalletSetup({ onWalletReady }) {
 
       // Show unlock modal to sign
       setShowUnlockModal(true);
-      setStep('unlock');
+      setStep("unlock");
     } catch (err) {
-      console.error('[WalletSetup] Failed to start onboarding:', err);
-      setError('Failed to start onboarding: ' + err.message);
-      setStep('select');
+      console.error("[WalletSetup] Failed to start onboarding:", err);
+      setError("Failed to start onboarding: " + err.message);
+      setStep("select");
     } finally {
       setLoading(false);
       onboardingInProgress.current = false;
@@ -96,20 +99,20 @@ export default function WalletSetup({ onWalletReady }) {
       setCopiedPartyId(true);
       setTimeout(() => setCopiedPartyId(false), 2000);
     } catch (err) {
-      console.error('Failed to copy Party ID:', err);
+      console.error("Failed to copy Party ID:", err);
     }
   };
 
   const handleCreateWallet = async () => {
     setLoading(true);
-    setError('');
+    setError("");
 
     try {
       const newMnemonic = generateMnemonic();
       setMnemonic(newMnemonic);
-      setStep('create');
+      setStep("create");
     } catch (err) {
-      setError('Failed to generate wallet: ' + err.message);
+      setError("Failed to generate wallet: " + err.message);
     } finally {
       setLoading(false);
     }
@@ -117,12 +120,12 @@ export default function WalletSetup({ onWalletReady }) {
 
   const handleConfirmCreate = async () => {
     if (!password || password.length < 8) {
-      setError('Password must be at least 8 characters');
+      setError("Password must be at least 8 characters");
       return;
     }
 
     if (password !== confirmPassword) {
-      setError('Passwords do not match');
+      setError("Passwords do not match");
       return;
     }
 
@@ -131,7 +134,7 @@ export default function WalletSetup({ onWalletReady }) {
     }
 
     setLoading(true);
-    setError('');
+    setError("");
 
     try {
       onboardingInProgress.current = true;
@@ -142,39 +145,46 @@ export default function WalletSetup({ onWalletReady }) {
       storeWallet(encryptedPrivateKey, publicKey);
 
       // 2. Step 1: Generate topology (no signature needed yet)
-      console.log('[WalletSetup] Step 1: Generating topology...');
+      console.log("[WalletSetup] Step 1: Generating topology...");
       const publicKeyBase64 = bytesToBase64(publicKey);
       const topology = await generateTopology(publicKeyBase64, null);
 
-      console.log('[WalletSetup] Topology generated:', topology);
+      console.log("[WalletSetup] Topology generated:", topology);
 
       // 3. Sign multiHash with private key (wallet is unlocked, we have it)
-      console.log('[WalletSetup] Signing multiHash...');
+      console.log("[WalletSetup] Signing multiHash...");
       const signatureBase64 = await signMessage(privateKey, topology.multiHash);
 
       // 4. Step 2: Allocate party with signature
-      console.log('[WalletSetup] Step 2: Allocating party...');
+      console.log("[WalletSetup] Step 2: Allocating party...");
       const result = await allocatePartyWithSignature(
         publicKeyBase64,
         signatureBase64,
         topology.topologyTransactions,
-        topology.publicKeyFingerprint
+        topology.publicKeyFingerprint,
       );
 
-      console.log('[WalletSetup] Party allocated:', result);
+      console.log("[WalletSetup] Party allocated:", result);
 
       // 5. Store party ID
       const allocatedPartyId = result.partyId;
+      if (!allocatedPartyId) {
+        console.error(
+          "[WalletSetup] ERROR: partyId is missing from result!",
+          result,
+        );
+        throw new Error("Party allocation failed: no partyId in response");
+      }
       setPartyId(allocatedPartyId);
-      localStorage.setItem('canton_party_id', allocatedPartyId);
+      localStorage.setItem("canton_party_id", allocatedPartyId);
 
-      setStep('ready');
+      setStep("ready");
       if (onWalletReady) {
         onWalletReady(allocatedPartyId);
       }
     } catch (err) {
-      console.error('[WalletSetup] Error creating wallet/party:', err);
-      setError('Failed to create wallet: ' + err.message);
+      console.error("[WalletSetup] Error creating wallet/party:", err);
+      setError("Failed to create wallet: " + err.message);
     } finally {
       setLoading(false);
       onboardingInProgress.current = false;
@@ -183,18 +193,18 @@ export default function WalletSetup({ onWalletReady }) {
 
   const handleImportWallet = async () => {
     if (!importMnemonic.trim()) {
-      setError('Please enter your mnemonic phrase');
+      setError("Please enter your mnemonic phrase");
       return;
     }
 
     const words = importMnemonic.trim().split(/\s+/);
     if (words.length !== 12) {
-      setError('Mnemonic must be exactly 12 words');
+      setError("Mnemonic must be exactly 12 words");
       return;
     }
 
     if (!password || password.length < 8) {
-      setError('Password must be at least 8 characters');
+      setError("Password must be at least 8 characters");
       return;
     }
 
@@ -203,50 +213,59 @@ export default function WalletSetup({ onWalletReady }) {
     }
 
     setLoading(true);
-    setError('');
+    setError("");
 
     try {
       onboardingInProgress.current = true;
 
       // 1. Import wallet locally (locked)
-      const { publicKey, privateKey } = await mnemonicToKeyPair(importMnemonic.trim());
+      const { publicKey, privateKey } = await mnemonicToKeyPair(
+        importMnemonic.trim(),
+      );
       const encryptedPrivateKey = await encryptPrivateKey(privateKey, password);
       storeWallet(encryptedPrivateKey, publicKey);
 
       // 2. Step 1: Generate topology
-      console.log('[WalletSetup] Step 1: Generating topology...');
+      console.log("[WalletSetup] Step 1: Generating topology...");
       const publicKeyBase64 = bytesToBase64(publicKey);
       const topology = await generateTopology(publicKeyBase64, null);
 
-      console.log('[WalletSetup] Topology generated:', topology);
+      console.log("[WalletSetup] Topology generated:", topology);
 
       // 3. Sign multiHash with private key
-      console.log('[WalletSetup] Signing multiHash...');
+      console.log("[WalletSetup] Signing multiHash...");
       const signatureBase64 = await signMessage(privateKey, topology.multiHash);
 
       // 4. Step 2: Allocate party
-      console.log('[WalletSetup] Step 2: Allocating party...');
+      console.log("[WalletSetup] Step 2: Allocating party...");
       const result = await allocatePartyWithSignature(
         publicKeyBase64,
         signatureBase64,
         topology.topologyTransactions,
-        topology.publicKeyFingerprint
+        topology.publicKeyFingerprint,
       );
 
-      console.log('[WalletSetup] Party allocated:', result);
+      console.log("[WalletSetup] Party allocated:", result);
 
       // 5. Store party ID
       const allocatedPartyId = result.partyId;
+      if (!allocatedPartyId) {
+        console.error(
+          "[WalletSetup] ERROR: partyId is missing from result!",
+          result,
+        );
+        throw new Error("Party allocation failed: no partyId in response");
+      }
       setPartyId(allocatedPartyId);
-      localStorage.setItem('canton_party_id', allocatedPartyId);
+      localStorage.setItem("canton_party_id", allocatedPartyId);
 
-      setStep('ready');
+      setStep("ready");
       if (onWalletReady) {
         onWalletReady(allocatedPartyId);
       }
     } catch (err) {
-      console.error('[WalletSetup] Error importing wallet/party:', err);
-      setError('Failed to import wallet: ' + err.message);
+      console.error("[WalletSetup] Error importing wallet/party:", err);
+      setError("Failed to import wallet: " + err.message);
     } finally {
       setLoading(false);
       onboardingInProgress.current = false;
@@ -259,12 +278,12 @@ export default function WalletSetup({ onWalletReady }) {
    */
   const handleUnlock = async () => {
     if (!unlockPassword) {
-      setError('Please enter your wallet password');
+      setError("Please enter your wallet password");
       return;
     }
 
     if (!topologyData) {
-      setError('Missing topology data');
+      setError("Missing topology data");
       return;
     }
 
@@ -273,50 +292,60 @@ export default function WalletSetup({ onWalletReady }) {
     }
 
     setLoading(true);
-    setError('');
+    setError("");
 
     try {
       onboardingInProgress.current = true;
 
       // 1. Decrypt private key
-      console.log('[WalletSetup] Unlocking wallet...');
+      console.log("[WalletSetup] Unlocking wallet...");
       const privateKey = await decryptPrivateKey(
         topologyData.encryptedPrivateKey,
-        unlockPassword
+        unlockPassword,
       );
 
       // 2. Sign multiHash
-      console.log('[WalletSetup] Signing multiHash...');
-      const signatureBase64 = await signMessage(privateKey, topologyData.multiHash);
+      console.log("[WalletSetup] Signing multiHash...");
+      const signatureBase64 = await signMessage(
+        privateKey,
+        topologyData.multiHash,
+      );
 
       // 3. Step 2: Allocate party
-      console.log('[WalletSetup] Step 2: Allocating party...');
+      console.log("[WalletSetup] Step 2: Allocating party...");
       const publicKeyBase64 = bytesToBase64(topologyData.publicKey);
       const result = await allocatePartyWithSignature(
         publicKeyBase64,
         signatureBase64,
         topologyData.topologyTransactions,
-        topologyData.publicKeyFingerprint
+        topologyData.publicKeyFingerprint,
       );
 
-      console.log('[WalletSetup] Party allocated:', result);
+      console.log("[WalletSetup] Party allocated:", result);
 
       // 4. Store party ID
       const allocatedPartyId = result.partyId;
+      if (!allocatedPartyId) {
+        console.error(
+          "[WalletSetup] ERROR: partyId is missing from result!",
+          result,
+        );
+        throw new Error("Party allocation failed: no partyId in response");
+      }
       setPartyId(allocatedPartyId);
-      localStorage.setItem('canton_party_id', allocatedPartyId);
+      localStorage.setItem("canton_party_id", allocatedPartyId);
 
       setShowUnlockModal(false);
-      setStep('ready');
+      setStep("ready");
       if (onWalletReady) {
         onWalletReady(allocatedPartyId);
       }
     } catch (err) {
-      console.error('[WalletSetup] Error unlocking/allocating:', err);
-      if (err.message.includes('decrypt') || err.message.includes('password')) {
-        setError('Incorrect password');
+      console.error("[WalletSetup] Error unlocking/allocating:", err);
+      if (err.message.includes("decrypt") || err.message.includes("password")) {
+        setError("Incorrect password");
       } else {
-        setError('Failed to complete onboarding: ' + err.message);
+        setError("Failed to complete onboarding: " + err.message);
       }
     } finally {
       setLoading(false);
@@ -328,17 +357,35 @@ export default function WalletSetup({ onWalletReady }) {
   if (showUnlockModal) {
     return (
       <div className="card max-w-2xl mx-auto">
-        <h2 className="text-2xl font-bold text-[#EAECEF] mb-2">Unlock Wallet</h2>
-        <p className="text-[#848E9C] mb-6">Please unlock your wallet to complete onboarding.</p>
+        <h2 className="text-2xl font-bold text-[#EAECEF] mb-2">
+          Unlock Wallet
+        </h2>
+        <p className="text-[#848E9C] mb-6">
+          Please unlock your wallet to complete onboarding.
+        </p>
 
         <div className="bg-[#F0B90B15] border border-[#F0B90B40] rounded-lg p-4 mb-6">
           <div className="flex items-start space-x-3">
-            <svg className="w-5 h-5 text-primary mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+            <svg
+              className="w-5 h-5 text-primary mt-0.5 flex-shrink-0"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"
+              />
             </svg>
             <div>
-              <p className="text-primary font-semibold mb-1">Signature Required</p>
-              <p className="text-[#848E9C] text-sm">We need your signature to complete party allocation on Canton.</p>
+              <p className="text-primary font-semibold mb-1">
+                Signature Required
+              </p>
+              <p className="text-[#848E9C] text-sm">
+                We need your signature to complete party allocation on Canton.
+              </p>
             </div>
           </div>
         </div>
@@ -369,46 +416,97 @@ export default function WalletSetup({ onWalletReady }) {
         >
           {loading ? (
             <span className="flex items-center justify-center">
-              <svg className="animate-spin -ml-1 mr-3 h-5 w-5" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              <svg
+                className="animate-spin -ml-1 mr-3 h-5 w-5"
+                fill="none"
+                viewBox="0 0 24 24"
+              >
+                <circle
+                  className="opacity-25"
+                  cx="12"
+                  cy="12"
+                  r="10"
+                  stroke="currentColor"
+                  strokeWidth="4"
+                ></circle>
+                <path
+                  className="opacity-75"
+                  fill="currentColor"
+                  d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                ></path>
               </svg>
               Unlocking...
             </span>
           ) : (
-            'Unlock & Complete Onboarding'
+            "Unlock & Complete Onboarding"
           )}
         </button>
       </div>
     );
   }
 
-  if (step === 'ready') {
+  if (step === "ready") {
     return (
       <div className="card max-w-2xl mx-auto">
         <div className="text-center">
           <div className="w-20 h-20 bg-success-light rounded-full flex items-center justify-center mx-auto mb-6 border-2 border-success">
-            <svg className="w-10 h-10 text-success" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+            <svg
+              className="w-10 h-10 text-success"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={3}
+                d="M5 13l4 4L19 7"
+              />
             </svg>
           </div>
-          <h2 className="text-3xl font-bold text-[#EAECEF] mb-2">Wallet Ready</h2>
-          <p className="text-[#848E9C] mb-6">Your wallet is set up and ready to use.</p>
+          <h2 className="text-3xl font-bold text-[#EAECEF] mb-2">
+            Wallet Ready
+          </h2>
+          <p className="text-[#848E9C] mb-6">
+            Your wallet is set up and ready to use.
+          </p>
           <div className="bg-[#1E2329] border border-[#2B3139] rounded-lg p-5 mb-6">
             <div className="flex items-center justify-between mb-3">
-              <p className="text-sm text-[#848E9C] font-medium">Your Party ID</p>
+              <p className="text-sm text-[#848E9C] font-medium">
+                Your Party ID
+              </p>
               <button
                 onClick={handleCopyPartyId}
                 className="p-2 hover:bg-[#2B3139] rounded-md transition-colors group"
                 title={copiedPartyId ? "Copied!" : "Copy Party ID"}
               >
                 {copiedPartyId ? (
-                  <svg className="w-4 h-4 text-success transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                  <svg
+                    className="w-4 h-4 text-success transition-colors"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={3}
+                      d="M5 13l4 4L19 7"
+                    />
                   </svg>
                 ) : (
-                  <svg className="w-4 h-4 text-[#848E9C] group-hover:text-[#F0B90B] transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                  <svg
+                    className="w-4 h-4 text-[#848E9C] group-hover:text-[#F0B90B] transition-colors"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"
+                    />
                   </svg>
                 )}
               </button>
@@ -419,7 +517,7 @@ export default function WalletSetup({ onWalletReady }) {
           </div>
           <button
             onClick={() => {
-              navigate('/trading');
+              navigate("/trading");
             }}
             className="btn btn-primary w-full py-3 text-base font-semibold"
           >
@@ -430,31 +528,50 @@ export default function WalletSetup({ onWalletReady }) {
     );
   }
 
-  if (step === 'create') {
+  if (step === "create") {
     return (
       <div className="card max-w-3xl mx-auto">
-        <h2 className="text-2xl font-bold text-[#EAECEF] mb-6">Create New Wallet</h2>
+        <h2 className="text-2xl font-bold text-[#EAECEF] mb-6">
+          Create New Wallet
+        </h2>
 
         <div className="bg-[#F0B90B15] border border-[#F0B90B40] rounded-lg p-4 mb-6">
           <div className="flex items-start space-x-3">
-            <svg className="w-5 h-5 text-primary mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+            <svg
+              className="w-5 h-5 text-primary mt-0.5 flex-shrink-0"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
+              />
             </svg>
             <div>
-              <p className="text-primary font-semibold mb-1">IMPORTANT: Save these 12 words securely!</p>
-              <p className="text-[#848E9C] text-sm">If you lose this phrase, you will lose access to your wallet permanently.</p>
+              <p className="text-primary font-semibold mb-1">
+                IMPORTANT: Save these 12 words securely!
+              </p>
+              <p className="text-[#848E9C] text-sm">
+                If you lose this phrase, you will lose access to your wallet
+                permanently.
+              </p>
             </div>
           </div>
         </div>
 
         <div className="grid grid-cols-2 md:grid-cols-3 gap-3 mb-6">
-          {mnemonic.split(' ').map((word, index) => (
+          {mnemonic.split(" ").map((word, index) => (
             <div
               key={index}
               className="bg-[#1E2329] border border-[#2B3139] rounded-lg p-3 text-center hover:border-[#3A4149] transition-colors"
             >
               <span className="text-xs text-[#848E9C] mr-2">{index + 1}.</span>
-              <span className="text-primary font-mono font-semibold">{word}</span>
+              <span className="text-primary font-mono font-semibold">
+                {word}
+              </span>
             </div>
           ))}
         </div>
@@ -496,18 +613,33 @@ export default function WalletSetup({ onWalletReady }) {
           >
             {loading ? (
               <span className="flex items-center justify-center">
-                <svg className="animate-spin -ml-1 mr-3 h-5 w-5" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                <svg
+                  className="animate-spin -ml-1 mr-3 h-5 w-5"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                >
+                  <circle
+                    className="opacity-25"
+                    cx="12"
+                    cy="12"
+                    r="10"
+                    stroke="currentColor"
+                    strokeWidth="4"
+                  ></circle>
+                  <path
+                    className="opacity-75"
+                    fill="currentColor"
+                    d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                  ></path>
                 </svg>
                 Creating...
               </span>
             ) : (
-              'Confirm & Create Wallet'
+              "Confirm & Create Wallet"
             )}
           </button>
           <button
-            onClick={() => setStep('select')}
+            onClick={() => setStep("select")}
             className="btn btn-secondary"
           >
             Back
@@ -520,7 +652,10 @@ export default function WalletSetup({ onWalletReady }) {
   return (
     <div className="card max-w-2xl mx-auto">
       <h2 className="text-2xl font-bold text-[#EAECEF] mb-2">Wallet Setup</h2>
-      <p className="text-[#848E9C] mb-8">Create a new wallet or import an existing one using your mnemonic phrase.</p>
+      <p className="text-[#848E9C] mb-8">
+        Create a new wallet or import an existing one using your mnemonic
+        phrase.
+      </p>
 
       <div className="space-y-6">
         <button
@@ -530,14 +665,29 @@ export default function WalletSetup({ onWalletReady }) {
         >
           {loading ? (
             <span className="flex items-center justify-center">
-              <svg className="animate-spin -ml-1 mr-3 h-5 w-5" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              <svg
+                className="animate-spin -ml-1 mr-3 h-5 w-5"
+                fill="none"
+                viewBox="0 0 24 24"
+              >
+                <circle
+                  className="opacity-25"
+                  cx="12"
+                  cy="12"
+                  r="10"
+                  stroke="currentColor"
+                  strokeWidth="4"
+                ></circle>
+                <path
+                  className="opacity-75"
+                  fill="currentColor"
+                  d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                ></path>
               </svg>
               Generating...
             </span>
           ) : (
-            'Create New Wallet'
+            "Create New Wallet"
           )}
         </button>
 
@@ -551,7 +701,9 @@ export default function WalletSetup({ onWalletReady }) {
         </div>
 
         <div className="space-y-4">
-          <h3 className="text-lg font-semibold text-[#EAECEF]">Import Existing Wallet</h3>
+          <h3 className="text-lg font-semibold text-[#EAECEF]">
+            Import Existing Wallet
+          </h3>
           <textarea
             placeholder="Enter your 12-word mnemonic phrase"
             value={importMnemonic}
@@ -571,14 +723,29 @@ export default function WalletSetup({ onWalletReady }) {
           >
             {loading ? (
               <span className="flex items-center justify-center">
-                <svg className="animate-spin -ml-1 mr-3 h-5 w-5" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                <svg
+                  className="animate-spin -ml-1 mr-3 h-5 w-5"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                >
+                  <circle
+                    className="opacity-25"
+                    cx="12"
+                    cy="12"
+                    r="10"
+                    stroke="currentColor"
+                    strokeWidth="4"
+                  ></circle>
+                  <path
+                    className="opacity-75"
+                    fill="currentColor"
+                    d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                  ></path>
                 </svg>
                 Importing...
               </span>
             ) : (
-              'Import Wallet'
+              "Import Wallet"
             )}
           </button>
         </div>

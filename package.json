@@ -4,11 +4,12 @@
   "private": true,
   "description": "CLOB Exchange on Canton - Monorepo",
   "workspaces": [
-    "apps/*",
+    "backend",
+    "frontend",
     "packages/*"
   ],
   "scripts": {
-    "dev": "concurrently \"yarn workspace @clob-exchange/api dev\" \"yarn workspace @clob-exchange/web dev\" \"yarn workspace @clob-exchange/matcher dev\" \"yarn workspace @clob-exchange/indexer dev\"",
+    "dev": "concurrently \"cd backend && yarn dev\" \"cd frontend && yarn dev\"",
     "build": "yarn workspaces run build",
     "test": "yarn workspaces run test",
     "migrate": "yarn workspace @clob-exchange/indexer migrate"

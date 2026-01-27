@@ -24,7 +24,8 @@ function decodeTokenPayload(token) {
     throw new Error("Invalid token format");
   }
   const payloadBase64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-  const padded = payloadBase64 + "=".repeat((4 - (payloadBase64.length % 4)) % 4);
+  const padded =
+    payloadBase64 + "=".repeat((4 - (payloadBase64.length % 4)) % 4);
   const payloadJson = Buffer.from(padded, "base64").toString("utf8");
   return JSON.parse(payloadJson);
 }
@@ -37,11 +38,17 @@ class CantonService {
   }
 
   async submitAndWaitForTransaction(token, body) {
-    const res = await fetch(`${this.cantonApiBase}/v2/commands/submit-and-wait-for-transaction`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-      body: JSON.stringify(body),
-    });
+    const res = await fetch(
+      `${this.cantonApiBase}/v2/commands/submit-and-wait-for-transaction`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(body),
+      },
+    );
 
     const text = await res.text();
     if (!res.ok) {
@@ -49,8 +56,9 @@ class CantonService {
       let errorMessage = `submit-and-wait-for-transaction failed ${res.status}: ${text}`;
       try {
         const errorData = JSON.parse(text);
-        if (errorData.code === 'JSON_API_PACKAGE_SELECTION_FAILED') {
-          errorMessage = `Package vetting error: ${errorData.cause || errorData.message || text}\n` +
+        if (errorData.code === "JSON_API_PACKAGE_SELECTION_FAILED") {
+          errorMessage =
+            `Package vetting error: ${errorData.cause || errorData.message || text}\n` +
             `This usually means the package is not vetted on all hosting participants. ` +
             `Ensure the DAR is uploaded and vetted on all participants that host the parties involved.`;
         } else if (errorData.code) {
@@ -61,73 +69,108 @@ class CantonService {
       }
       throw new Error(errorMessage);
     }
-    
+
     const result = JSON.parse(text);
     return result;
   }
 
   async submitAndWait(token, body) {
-    const res = await fetch(`${this.cantonApiBase}/v2/commands/submit-and-wait`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-      body: JSON.stringify(body),
-    });
+    const res = await fetch(
+      `${this.cantonApiBase}/v2/commands/submit-and-wait`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(body),
+      },
+    );
 
     const text = await res.text();
     if (!res.ok) {
-      // Parse error response for better error messages
       let errorMessage = `submit-and-wait failed ${res.status}: ${text}`;
       try {
         const errorData = JSON.parse(text);
-        if (errorData.code === 'JSON_API_PACKAGE_SELECTION_FAILED') {
-          errorMessage = `Package vetting error: ${errorData.cause || errorData.message || text}\n` +
+        if (errorData.code === "JSON_API_PACKAGE_SELECTION_FAILED") {
+          errorMessage =
+            `Package vetting error: ${errorData.cause || errorData.message || text}\n` +
             `This usually means the package is not vetted on all hosting participants. ` +
             `Ensure the DAR is uploaded and vetted on all participants that host the parties involved.`;
         } else if (errorData.code) {
           errorMessage = `${errorData.code}: ${errorData.cause || errorData.message || text}`;
         }
       } catch (e) {
-        // If parsing fails, use original text
+        // ignore
       }
       throw new Error(errorMessage);
     }
-    
+
     const result = JSON.parse(text);
-    
-    // If we got updateId and completionOffset, this means the command was submitted successfully
-    // but we need to query the result differently. For now, let's check if this is a success response
-    if (result.updateId && result.completionOffset) {
-      console.log('[CantonService] Command submitted successfully, updateId:', result.updateId);
-      
-      // For submit-and-wait, if we get updateId and completionOffset, it usually means success
-      // The actual contract creation might be in a different format or need to be queried differently
-      // Let's return a success response that the caller can handle
-      return {
-        status: 'submitted',
-        updateId: result.updateId,
-        completionOffset: result.completionOffset,
-        // Add a placeholder transaction structure for compatibility
-        transaction: {
-          events: [{
-            created: {
-              contractId: `pending-${result.updateId}`, // Temporary ID
-              templateId: body.commands?.[0]?.CreateCommand?.templateId,
-              createArguments: body.commands?.[0]?.CreateCommand?.createArguments
+
+    // If we got updateId, immediately query transaction for real contract ID
+    if (result.updateId) {
+      try {
+        const txRes = await fetch(
+          `${this.cantonApiBase}/v2/updates/update-by-id`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({
+              updateId: result.updateId,
+              updateFormat: "verbose",
+              includeTransactions: true,
+            }),
+          },
+        );
+
+        if (txRes.ok) {
+          const txData = await txRes.json();
+          if (txData.transactions && Array.isArray(txData.transactions)) {
+            for (const tx of txData.transactions) {
+              if (tx.events && Array.isArray(tx.events)) {
+                for (const event of tx.events) {
+                  if (event.created?.contractId) {
+                    return {
+                      ...result,
+                      transaction: {
+                        events: [event],
+                      },
+                    };
+                  }
+                }
+              }
             }
-          }]
+          }
         }
-      };
+      } catch (e) {
+        console.log("[CantonService] Could not query transaction:", e.message);
+      }
     }
-    
+
+    // Fallback: return whatever we got
     return result;
   }
 
   // ✅ Correct v2 envelope: commandId/actAs/... at TOP LEVEL
-  async createContractWithTransaction({ token, actAsParty, templateId, createArguments, readAs, userId, synchronizerId }) {
+  async createContractWithTransaction({
+    token,
+    actAsParty,
+    templateId,
+    createArguments,
+    readAs,
+    userId,
+    synchronizerId,
+  }) {
     const actAsParties = Array.isArray(actAsParty) ? actAsParty : [actAsParty];
-    if (!actAsParties.length || !actAsParties[0]) throw new Error("createContract: actAsParty is required");
+    if (!actAsParties.length || !actAsParties[0])
+      throw new Error("createContract: actAsParty is required");
     if (!templateId) throw new Error("createContract: templateId is required");
-    if (!createArguments) throw new Error("createContract: createArguments is required");
+    if (!createArguments)
+      throw new Error("createContract: createArguments is required");
 
     const templateIdStr = normalizeTemplateId(templateId);
 
@@ -150,11 +193,21 @@ class CantonService {
     return this.submitAndWaitForTransaction(token, body);
   }
 
-  async createContract({ token, actAsParty, templateId, createArguments, readAs, userId, synchronizerId }) {
+  async createContract({
+    token,
+    actAsParty,
+    templateId,
+    createArguments,
+    readAs,
+    userId,
+    synchronizerId,
+  }) {
     const actAsParties = Array.isArray(actAsParty) ? actAsParty : [actAsParty];
-    if (!actAsParties.length || !actAsParties[0]) throw new Error("createContract: actAsParty is required");
+    if (!actAsParties.length || !actAsParties[0])
+      throw new Error("createContract: actAsParty is required");
     if (!templateId) throw new Error("createContract: templateId is required");
-    if (!createArguments) throw new Error("createContract: createArguments is required");
+    if (!createArguments)
+      throw new Error("createContract: createArguments is required");
 
     const templateIdStr = normalizeTemplateId(templateId);
 
@@ -177,7 +230,17 @@ class CantonService {
     return this.submitAndWait(token, body);
   }
 
-  async exerciseChoice({ token, actAsParty, templateId, contractId, choice, choiceArgument, readAs, userId, synchronizerId }) {
+  async exerciseChoice({
+    token,
+    actAsParty,
+    templateId,
+    contractId,
+    choice,
+    choiceArgument,
+    readAs,
+    userId,
+    synchronizerId,
+  }) {
     const actAsParties = Array.isArray(actAsParty) ? actAsParty : [actAsParty];
     if (!actAsParties.length || !actAsParties[0]) {
       throw new Error("exerciseChoice: actAsParty is required");
@@ -218,16 +281,26 @@ class CantonService {
       throw new Error("ensurePartyRights: partyId is required");
     }
 
-    const token = adminToken || await this.getAdminToken();
+    const token = adminToken || (await this.getAdminToken());
     const payload = decodeTokenPayload(token);
     const userId = payload?.sub;
     if (!userId) {
       throw new Error("Token missing sub claim");
     }
 
-    const damlClaim = payload["https://daml.com/ledgerapi"] || payload["https://daml.com/ledger-api"];
-    const actAs = Array.isArray(damlClaim?.actAs) ? damlClaim.actAs : Array.isArray(payload.actAs) ? payload.actAs : [];
-    const readAs = Array.isArray(damlClaim?.readAs) ? damlClaim.readAs : Array.isArray(payload.readAs) ? payload.readAs : [];
+    const damlClaim =
+      payload["https://daml.com/ledgerapi"] ||
+      payload["https://daml.com/ledger-api"];
+    const actAs = Array.isArray(damlClaim?.actAs)
+      ? damlClaim.actAs
+      : Array.isArray(payload.actAs)
+        ? payload.actAs
+        : [];
+    const readAs = Array.isArray(damlClaim?.readAs)
+      ? damlClaim.readAs
+      : Array.isArray(payload.readAs)
+        ? payload.readAs
+        : [];
     if (actAs.includes(partyId) && readAs.includes(partyId)) {
       return { ensured: false, alreadyGranted: true, source: "token-claim" };
     }
@@ -236,13 +309,22 @@ class CantonService {
     let rights = [];
     try {
       const rightsResponse = await grpcClient.listUserRights(userId, token);
-      rights = Array.isArray(rightsResponse?.rights) ? rightsResponse.rights : [];
+      rights = Array.isArray(rightsResponse?.rights)
+        ? rightsResponse.rights
+        : [];
     } catch (error) {
-      console.warn("[CantonService] Could not list user rights, will try to grant:", error.message);
+      console.warn(
+        "[CantonService] Could not list user rights, will try to grant:",
+        error.message,
+      );
     }
 
-    const hasActAs = rights.some((right) => right?.can_act_as?.party === partyId);
-    const hasReadAs = rights.some((right) => right?.can_read_as?.party === partyId);
+    const hasActAs = rights.some(
+      (right) => right?.can_act_as?.party === partyId,
+    );
+    const hasReadAs = rights.some(
+      (right) => right?.can_read_as?.party === partyId,
+    );
     if (hasActAs && hasReadAs) {
       return { ensured: false, alreadyGranted: true };
     }
@@ -252,7 +334,11 @@ class CantonService {
       return { ensured: true, alreadyGranted: false };
     } catch (error) {
       const message = String(error.message || "");
-      if (message.includes("ALREADY_EXISTS") || message.includes("AlreadyExists") || message.includes("(6)")) {
+      if (
+        message.includes("ALREADY_EXISTS") ||
+        message.includes("AlreadyExists") ||
+        message.includes("(6)")
+      ) {
         return { ensured: false, alreadyGranted: true };
       }
       throw error;
@@ -264,7 +350,7 @@ class CantonService {
       throw new Error("fetchContract: contractId is required");
     }
 
-    const token = adminToken || await this.getAdminToken();
+    const token = adminToken || (await this.getAdminToken());
     const body = { contractId };
     if (Array.isArray(readAs) && readAs.length > 0) {
       body.readAs = readAs;
@@ -281,7 +367,9 @@ class CantonService {
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`Failed to fetch contract: ${response.status} - ${errorText}`);
+      throw new Error(
+        `Failed to fetch contract: ${response.status} - ${errorText}`,
+      );
     }
 
     const data = await response.json();
@@ -310,48 +398,67 @@ class CantonService {
   async getPackageIdForTemplate(templateName, adminToken) {
     // First, try to get from config
     const configPackageIds = config.canton.packageIds || {};
-    
+
     // Map template names to config keys
     const templateToConfigKey = {
-      'UserAccount': 'userAccount',
-      'MasterOrderBook': 'masterOrderBook',
+      UserAccount: "userAccount",
+      MasterOrderBook: "masterOrderBook",
       // Prefer the main CLOB package for OrderBook; fall back to legacy if needed.
-      'OrderBook': 'clobExchange',
-      'AssetHolding': 'clobExchange',
-      'Faucet': 'clobExchange',
+      OrderBook: "clobExchange",
+      AssetHolding: "clobExchange",
+      Faucet: "clobExchange",
     };
 
     const configKey = templateToConfigKey[templateName];
     if (configKey && configPackageIds[configKey]) {
-      console.log(`[CantonService] Using package ID from config for ${templateName}: ${configPackageIds[configKey].substring(0, 16)}...`);
+      console.log(
+        `[CantonService] Using package ID from config for ${templateName}: ${configPackageIds[configKey].substring(0, 16)}...`,
+      );
       return configPackageIds[configKey];
     }
-    if (templateName === 'OrderBook' && configPackageIds.masterOrderBook) {
-      console.warn('[CantonService] Falling back to masterOrderBook package ID for OrderBook');
+    if (templateName === "OrderBook" && configPackageIds.masterOrderBook) {
+      console.warn(
+        "[CantonService] Falling back to masterOrderBook package ID for OrderBook",
+      );
       return configPackageIds.masterOrderBook;
     }
 
     // Fallback: try to discover from API
-    console.log(`[CantonService] Discovering package ID for ${templateName} from API...`);
+    console.log(
+      `[CantonService] Discovering package ID for ${templateName} from API...`,
+    );
     try {
       const packagesData = await this.discoverPackages(adminToken);
-      if (packagesData && packagesData.packageIds && packagesData.packageIds.length > 0) {
+      if (
+        packagesData &&
+        packagesData.packageIds &&
+        packagesData.packageIds.length > 0
+      ) {
         // Use the most recent package (last in array)
-        const packageId = packagesData.packageIds[packagesData.packageIds.length - 1];
-        console.log(`[CantonService] Discovered package ID: ${packageId.substring(0, 16)}...`);
+        const packageId =
+          packagesData.packageIds[packagesData.packageIds.length - 1];
+        console.log(
+          `[CantonService] Discovered package ID: ${packageId.substring(0, 16)}...`,
+        );
         return packageId;
       }
     } catch (error) {
-      console.warn(`[CantonService] Failed to discover package ID: ${error.message}`);
+      console.warn(
+        `[CantonService] Failed to discover package ID: ${error.message}`,
+      );
     }
 
     // Last resort: use clobExchange as fallback
     if (configPackageIds.clobExchange) {
-      console.warn(`[CantonService] Using clobExchange package ID as fallback for ${templateName}`);
+      console.warn(
+        `[CantonService] Using clobExchange package ID as fallback for ${templateName}`,
+      );
       return configPackageIds.clobExchange;
     }
 
-    throw new Error(`Could not determine package ID for template ${templateName}. Please configure it in config.canton.packageIds.`);
+    throw new Error(
+      `Could not determine package ID for template ${templateName}. Please configure it in config.canton.packageIds.`,
+    );
   }
 
   /**
@@ -371,7 +478,11 @@ class CantonService {
           totalPackages: packagesData.packageIds.length,
         };
       }
-      return { packageId, isRegistered: false, error: 'Could not fetch packages list' };
+      return {
+        packageId,
+        isRegistered: false,
+        error: "Could not fetch packages list",
+      };
     } catch (error) {
       return { packageId, isRegistered: false, error: error.message };
     }
@@ -384,22 +495,31 @@ class CantonService {
    */
   async getLedgerEndOffset(adminToken) {
     try {
-      const response = await fetch(`${this.cantonApiBase}/v2/state/ledger-end`, {
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${adminToken}`,
-          'Content-Type': 'application/json',
+      const response = await fetch(
+        `${this.cantonApiBase}/v2/state/ledger-end`,
+        {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${adminToken}`,
+            "Content-Type": "application/json",
+          },
         },
-      });
-      
+      );
+
       if (response.ok) {
         const data = await response.json();
         return data.offset || data.ledgerEnd || null;
       }
-      console.warn('[CantonService] Failed to get ledger end:', response.status);
+      console.warn(
+        "[CantonService] Failed to get ledger end:",
+        response.status,
+      );
       return null;
     } catch (error) {
-      console.warn('[CantonService] Error getting ledger end offset:', error.message);
+      console.warn(
+        "[CantonService] Error getting ledger end offset:",
+        error.message,
+      );
       return null;
     }
   }
@@ -415,15 +535,15 @@ class CantonService {
     if (completionOffset !== null && completionOffset !== undefined) {
       return completionOffset.toString();
     }
-    
+
     // Try to get ledger end offset
     const ledgerEnd = await this.getLedgerEndOffset(adminToken);
     if (ledgerEnd) {
       return ledgerEnd.toString();
     }
-    
+
     // Default to '0' which means "current ledger end" in Canton JSON API v2
-    return '0';
+    return "0";
   }
 
   /**
@@ -442,61 +562,76 @@ class CantonService {
 
     // Use provided party or default to operator party
     const queryParty = party || this.operatorPartyId;
-    
+
     // Get package ID for template if needed (if templateId is unqualified)
     let qualifiedTemplateId = templateId;
-    if (!templateId.includes(':')) {
+    if (!templateId.includes(":")) {
       // Unqualified template ID, try to qualify it
       try {
-        const packageId = await this.getPackageIdForTemplate(templateId.split(':')[0] || templateId, adminToken);
+        const packageId = await this.getPackageIdForTemplate(
+          templateId.split(":")[0] || templateId,
+          adminToken,
+        );
         qualifiedTemplateId = `${packageId}:${templateId}`;
       } catch (error) {
-        console.warn(`[CantonService] Could not qualify template ID ${templateId}, using as-is`);
+        console.warn(
+          `[CantonService] Could not qualify template ID ${templateId}, using as-is`,
+        );
       }
     }
 
     // Get active at offset
     const activeAtOffset = await this.getActiveAtOffset(adminToken);
 
-    const response = await fetch(`${this.cantonApiBase}/v2/state/active-contracts`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${adminToken}`,
-      },
-      body: JSON.stringify({
-        readAs: [queryParty],
-        activeAtOffset,
-        verbose: true,
-        filter: {
-          filtersByParty: {
-            [queryParty]: {
-              inclusive: {
-                templateIds: [qualifiedTemplateId],
+    const response = await fetch(
+      `${this.cantonApiBase}/v2/state/active-contracts`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({
+          readAs: [queryParty],
+          activeAtOffset,
+          verbose: true,
+          filter: {
+            filtersByParty: {
+              [queryParty]: {
+                inclusive: {
+                  templateIds: [qualifiedTemplateId],
+                },
               },
             },
           },
-        },
-      }),
-    });
+        }),
+      },
+    );
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`Failed to query contracts: ${response.status} - ${errorText}`);
+      throw new Error(
+        `Failed to query contracts: ${response.status} - ${errorText}`,
+      );
     }
 
     const data = await response.json();
     const contracts = data.activeContracts || [];
 
     // Parse contracts to extract payload
-    return contracts.map(contract => {
-      const contractData = contract.contractEntry?.JsActiveContract?.createdEvent || 
-                          contract.createdEvent || 
-                          contract;
-      
+    return contracts.map((contract) => {
+      const contractData =
+        contract.contractEntry?.JsActiveContract?.createdEvent ||
+        contract.createdEvent ||
+        contract;
+
       return {
         contractId: contractData.contractId || contract.contractId,
-        payload: contractData.createArgument || contractData.argument || contract.payload || contractData,
+        payload:
+          contractData.createArgument ||
+          contractData.argument ||
+          contract.payload ||
+          contractData,
         createdAt: contractData.createdAt || contract.createdAt,
       };
     });
