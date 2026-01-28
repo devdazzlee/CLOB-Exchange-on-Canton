@@ -164,7 +164,17 @@ export default function OrderForm({
         <form onSubmit={(e) => {
           e.preventDefault();
           if (validation.isValid) {
-            onSubmit(e);
+            const orderData = {
+              tradingPair,
+              orderType,
+              orderMode,
+              price: orderMode === 'MARKET' ? null : price,
+              quantity,
+              timeInForce,
+              stopLoss: showAdvanced ? stopLoss : null,
+              takeProfit: showAdvanced ? takeProfit : null
+            };
+            onSubmit(orderData);
           }
         }} className="space-y-5">
           {/* Trading Pair */}

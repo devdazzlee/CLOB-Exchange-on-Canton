@@ -112,6 +112,34 @@ class OrderController {
 
     return success(res, result, 'Order cancelled successfully');
   });
+
+  /**
+   * Get user's active orders
+   */
+  getUserOrders = asyncHandler(async (req, res) => {
+    const { partyId } = req.params;
+
+    if (!partyId) {
+      throw new ValidationError('Missing required param: partyId');
+    }
+
+    // TODO: implement lookup when order storage is available
+    return success(res, [], 'User orders fetched successfully');
+  });
+
+  /**
+   * Cancel order by ID
+   */
+  cancelOrderById = asyncHandler(async (req, res) => {
+    const { orderId } = req.params;
+
+    if (!orderId) {
+      throw new ValidationError('Missing required param: orderId');
+    }
+
+    // TODO: implement cancel by contract ID when order storage is available
+    return success(res, { orderId, cancelled: false }, 'Cancel by ID not implemented');
+  });
 }
 
 module.exports = new OrderController();

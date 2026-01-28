@@ -499,6 +499,7 @@ class CantonService {
         readAs: [queryParty],
         activeAtOffset,
         verbose: true,
+        limit: 50, // Limit results to avoid hitting node limits
         filter: {
           filtersByParty: {
             [queryParty]: {

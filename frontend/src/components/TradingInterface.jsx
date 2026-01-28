@@ -40,6 +40,7 @@ export default function TradingInterface({ partyId }) {
   const [balanceLoading, setBalanceLoading] = useState(false);
   const isMintingRef = useRef(false);
   const lastMintAtRef = useRef(0);
+  const hasLoadedBalanceRef = useRef(false);
   const [orders, setOrders] = useState([]);
   const [orderBook, setOrderBook] = useState({ buys: [], sells: [] });
   const [loading, setLoading] = useState(false);
@@ -56,7 +57,6 @@ export default function TradingInterface({ partyId }) {
   // === PHASE 3: ALL USECALLBACK HOOKS - NO CONDITIONALS ===
   const handleMintTokens = useCallback(async () => {
     console.log('[Mint] Manual mint button clicked!');
-    console.log('[Mint] Current balance before mint:', balance);
     
     try {
       // Try to use backend mint endpoint
@@ -97,7 +97,7 @@ export default function TradingInterface({ partyId }) {
     setBalance(newBalance);
     console.log('[Mint] Local fallback mint successful:', newBalance);
     alert(`Test tokens minted locally!\nBTC: ${newBalance.BTC}\nUSDT: ${newBalance.USDT}\nETH: ${newBalance.ETH}\nSOL: ${newBalance.SOL}`);
-  }, [balance, partyId]);
+  }, [partyId]);
 
   const handlePlaceOrder = useCallback(async (orderData) => {
     try {
@@ -205,6 +205,7 @@ export default function TradingInterface({ partyId }) {
     if (!partyId) return;
 
     let interval = null;
+    let hasLoadedOrderBook = false;
     
     const orderBookCallback = (data) => {
       try {
@@ -213,6 +214,10 @@ export default function TradingInterface({ partyId }) {
             buys: Array.isArray(data.buyOrders) ? data.buyOrders : [],
             sells: Array.isArray(data.sellOrders) ? data.sellOrders : []
           });
+          if (!hasLoadedOrderBook) {
+            setOrderBookLoading(false);
+            hasLoadedOrderBook = true;
+          }
         }
       } catch (err) {
         console.error('[TradingInterface] Error in orderBook callback:', err);
@@ -228,6 +233,30 @@ export default function TradingInterface({ partyId }) {
         console.error('[TradingInterface] Error in trade callback:', err);
       }
     };
+
+    // Initial load
+    const loadInitialOrderBook = async () => {
+      try {
+        const bookData = await getGlobalOrderBook(tradingPair);
+        if (bookData) {
+          setOrderBook({
+            buys: bookData.buyOrders || [],
+            sells: bookData.sellOrders || []
+          });
+          setOrderBookLoading(false);
+          hasLoadedOrderBook = true;
+        }
+      } catch (error) {
+        console.error('[TradingInterface] Failed to load initial order book:', error);
+        setOrderBookLoading(false);
+      }
+    };
+
+    loadInitialOrderBook();
+
+    if (!websocketService.isConnected()) {
+      websocketService.connect();
+    }
 
     websocketService.subscribe(`orderbook:${tradingPair}`, orderBookCallback);
     websocketService.subscribe(`trades:${tradingPair}`, tradeCallback);
@@ -246,7 +275,7 @@ export default function TradingInterface({ partyId }) {
           console.error('[TradingInterface] Failed to poll order book:', error);
         }
       }
-    }, 5000);
+    }, 30000);
 
     return () => {
       if (interval) clearInterval(interval);
@@ -258,9 +287,11 @@ export default function TradingInterface({ partyId }) {
   useEffect(() => {
     if (!partyId) return;
 
-    const loadBalance = async () => {
+    const loadBalance = async (showLoader = false) => {
       try {
-        setBalanceLoading(true);
+        if (showLoader && !hasLoadedBalanceRef.current) {
+          setBalanceLoading(true);
+        }
         console.log('[Balance] Loading balance for party:', partyId);
         
         // Try to load real balance from backend first
@@ -271,6 +302,7 @@ export default function TradingInterface({ partyId }) {
             if (balanceData.success && balanceData.data?.balance) {
               setBalance(balanceData.data.balance);
               console.log('[Balance] Real balance loaded:', balanceData.data.balance);
+              hasLoadedBalanceRef.current = true;
               return;
             }
           }
@@ -288,10 +320,13 @@ export default function TradingInterface({ partyId }) {
         };
         setBalance(fallbackBalance);
         console.log('[Balance] Fallback tokens set:', fallbackBalance);
+        hasLoadedBalanceRef.current = true;
       } catch (error) {
         console.error('[Balance] Failed to load balance:', error);
       } finally {
-        setBalanceLoading(false);
+        if (hasLoadedBalanceRef.current) {
+          setBalanceLoading(false);
+        }
       }
     };
 
@@ -304,15 +339,15 @@ export default function TradingInterface({ partyId }) {
       }
     };
 
-    loadBalance();
-    const balanceInterval = setInterval(loadBalance, 60000); // Reduced from 30s to 60s to avoid spam
+    loadBalance(true);
+    const balanceInterval = setInterval(() => loadBalance(false), 60000); // Reduced from 30s to 60s to avoid spam
     window.addEventListener('keydown', handleKeyPress);
 
     return () => {
       clearInterval(balanceInterval);
       window.removeEventListener('keydown', handleKeyPress);
     };
-  }, [partyId, balance, handleMintTokens]);
+  }, [partyId]);
 
   // === PHASE 4: ALL USEMEMO HOOKS - NO CONDITIONALS ===
   const memoizedModal = useMemo(() => <ModalComponent />, [ModalComponent]);

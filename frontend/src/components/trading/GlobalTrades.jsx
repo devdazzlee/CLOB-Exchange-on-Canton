@@ -53,10 +53,10 @@ export default function GlobalTrades({ tradingPair, limit = 50 }) {
   useEffect(() => {
     loadTrades();
     
-    // Set up polling for new trades (every 5 seconds)
+    // Set up polling for new trades (every 30 seconds)
     const pollInterval = setInterval(() => {
       loadTrades();
-    }, 5000);
+    }, 30000);
 
     return () => {
       clearInterval(pollInterval);
