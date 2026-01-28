@@ -335,24 +335,9 @@ class OnboardingService {
 
       console.log('[OnboardingService] Allocate request (formatted):', JSON.stringify(body, null, 2));
 
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { 
-          Authorization: `Bearer ${token}`, 
-          "Content-Type": "application/json" 
-        },
-        body: JSON.stringify(body),
-      });
+      const result = await this._allocateParty(body, token, synchronizerId);
 
-      const text = await res.text();
-      console.log('[OnboardingService] Allocate response status:', res.status);
-      console.log('[OnboardingService] Allocate response text:', text);
-
-      if (!res.ok) {
-        throw new Error(`Allocate failed ${res.status}: ${text}`);
-      }
-
-      const data = JSON.parse(text);
+      const data = JSON.parse(result.text);
       console.log('[OnboardingService] Allocate response:', JSON.stringify(data, null, 2));
 
       // Extract partyId from response
@@ -369,6 +354,48 @@ class OnboardingService {
       };
     } catch (error) {
       console.error('[OnboardingService] Allocate error:', error);
+      throw error;
+    }
+  }
+
+  async _allocateParty(body, token, synchronizerId, retryCount = 0) {
+    const maxRetries = 3;
+    const baseDelay = 2000; // 2 seconds
+
+    try {
+      const res = await fetch(`${config.canton.jsonApiBase}/v2/parties/external/allocate`, {
+        method: 'POST',
+        headers: { 
+          Authorization: `Bearer ${token}`, 
+          "Content-Type": "application/json" 
+        },
+        body: JSON.stringify(body),
+      });
+
+      const text = await res.text();
+      console.log('[OnboardingService] Allocate response status:', res.status);
+      console.log('[OnboardingService] Allocate response text:', text);
+
+      if (!res.ok) {
+        // If it's a 503 and we haven't exhausted retries, retry with exponential backoff
+        if (res.status === 503 && retryCount < maxRetries) {
+          const delay = baseDelay * Math.pow(2, retryCount);
+          console.log(`[OnboardingService] Allocate failed 503, retrying in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          return this._allocateParty(body, token, synchronizerId, retryCount + 1);
+        }
+        throw new Error(`Allocate failed ${res.status}: ${text}`);
+      }
+
+      return res;
+    } catch (error) {
+      // If it's a network error and we haven't exhausted retries, retry
+      if (error.name === 'TypeError' && retryCount < maxRetries) {
+        const delay = baseDelay * Math.pow(2, retryCount);
+        console.log(`[OnboardingService] Network error, retrying in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        return this._allocateParty(body, token, synchronizerId, retryCount + 1);
+      }
       throw error;
     }
   }

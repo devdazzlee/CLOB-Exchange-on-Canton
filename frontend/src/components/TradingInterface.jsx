@@ -103,14 +103,48 @@ export default function TradingInterface({ partyId }) {
     try {
       setLoading(true);
       console.log('[Place Order] Placing order:', orderData);
-      // Order placement logic would go here
+      
+      const response = await fetch('http://localhost:3001/api/orders/place', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          body: {
+            partyId,
+            tradingPair: orderData.tradingPair,
+            orderType: orderData.orderType,
+            orderMode: orderData.orderMode,
+            price: orderData.price ? parseFloat(orderData.price) : null,
+            quantity: parseFloat(orderData.quantity),
+            timeInForce: orderData.timeInForce || 'GTC'
+          }
+        })
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.message || `Order placement failed: ${response.status}`);
+      }
+
+      const result = await response.json();
+      console.log('[Place Order] Order placed successfully:', result);
+      
+      // Clear form fields on success
+      setPrice('');
+      setQuantity('');
+      
+      // Show success message
+      alert('Order placed successfully!');
+      
     } catch (error) {
       console.error('[Place Order] Failed:', error);
       setError(error.message || 'Failed to place order');
+      alert(`Failed to place order: ${error.message}`);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [partyId]);
 
   const handleCancelOrder = useCallback(async (orderId) => {
     try {
