@@ -237,15 +237,17 @@ template MasterOrderBook
         let updatedSellOrders = if orderType == "SELL" then sellOrders ++ [orderCid] else sellOrders
         let updatedActiveUsers = if owner `elem` activeUsers then activeUsers else activeUsers ++ [owner]
         
-        -- Update the order book
-        _ <- create this with
+        -- Update the order book (creates new contract, archives old one)
+        newBookCid <- create this with
           buyOrders = updatedBuyOrders
           sellOrders = updatedSellOrders
           lastPrice = None
           activeUsers = updatedActiveUsers
         
-        -- Try to match immediately
-        exercise self MatchOrders
+        -- Try to match immediately using the NEW contract
+        -- Note: MatchOrders is controlled by operator, so this must be done externally
+        -- For now, skip auto-match (matching engine should call MatchOrders separately)
+        -- exercise newBookCid MatchOrders -- Cannot do this since controller is operator, not owner
         
         return orderCid
 

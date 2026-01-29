@@ -9,22 +9,19 @@
  */
 
 import fetch from 'node-fetch';
+import { v4 as uuidv4 } from 'uuid';
 
 // Configuration
-const OPERATOR_PARTY_ID = process.env.OPERATOR_PARTY_ID || 
-  '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
+class Matchmaker {
+  private readonly CANTON_JSON_LEDGER_API_BASE: string;
+  private readonly OPERATOR_PARTY_ID: string;
+  private readonly MATCHING_INTERVAL_MS = 5000;
+  private readonly MAX_MATCHES_PER_CYCLE = 10;
 
-const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
-const MATCHING_INTERVAL_MS = 5000; // Check every 5 seconds
-const MAX_MATCHES_PER_CYCLE = 10; // Limit matches per cycle to avoid overload
-
-// Get admin token (assumes you have a way to get it)
-// This should use your existing CantonAdmin service
-async function getAdminToken(): Promise<string> {
-  const CantonAdmin = require('./canton-admin');
-  const cantonAdmin = new CantonAdmin();
-  return await cantonAdmin.getAdminToken();
-}
+  constructor() {
+    // Enforce environment variables - no fallbacks
+    this.CANTON_JSON_LEDGER_API_BASE = process.env.CANTON_JSON_LEDGER_API_BASE!;
+    this.OPERATOR_PARTY_ID = process.env.OPERATOR_PARTY_ID!;
 
 /**
  * Get active at offset for queries
@@ -35,7 +32,7 @@ async function getActiveAtOffset(adminToken: string, offset?: number): Promise<s
   }
   // Get current ledger end
   try {
-    const response = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+    const response = await fetch(`${this.CANTON_JSON_LEDGER_API_BASE}/v2/state/active-contracts`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${adminToken}`,
@@ -72,7 +69,7 @@ async function queryMasterOrderBooks(adminToken: string): Promise<Array<any>> {
   try {
     const activeAtOffset = await getActiveAtOffset(adminToken);
     
-    const response = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+    const response = await fetch(`${this.CANTON_JSON_LEDGER_API_BASE}/v2/state/active-contracts`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${adminToken}`,
@@ -228,7 +225,7 @@ async function queryOrders(
   try {
     const activeAtOffset = await getActiveAtOffset(adminToken);
     
-    const response = await fetch(`${CANTON_JSON_API_BASE}/v2/state/active-contracts`, {
+    const response = await fetch(`${this.CANTON_JSON_LEDGER_API_BASE}/v2/state/active-contracts`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${adminToken}`,

@@ -1,0 +1,520 @@
+/**
+ * Read Model Service
+ * 
+ * Maintains a derived read model from Canton ledger updates.
+ * This replaces the in-memory order book "truth" with a proper cache that:
+ * - Is bootstrapped from ACS on startup
+ * - Is kept up-to-date via WebSocket streaming
+ * - Can be safely rebuilt from ledger at any time
+ * 
+ * IMPORTANT: This is a CACHE, not the source of truth. The ledger is truth.
+ */
+
+const EventEmitter = require('events');
+const WebSocket = require('ws');
+const config = require('../config');
+const tokenProvider = require('./tokenProvider');
+
+class ReadModelService extends EventEmitter {
+    constructor(cantonService) {
+        super();
+        this.cantonService = cantonService;
+
+        // Read model state (derived from ledger)
+        this.orderBooks = new Map();      // pair -> { bids: [], asks: [], lastPrice }
+        this.orders = new Map();          // contractId -> order
+        this.ordersByOrderId = new Map(); // orderId -> contractId
+        this.trades = new Map();          // contractId -> trade
+        this.userOrders = new Map();      // partyId -> Set<contractId>
+
+        // Metadata
+        this.sequence = 0;
+        this.lastOffset = null;
+        this.isInitialized = false;
+        this.ws = null;
+        this.reconnectAttempts = 0;
+        this.maxReconnectAttempts = 10;
+        this.reconnectDelay = 1000;
+
+        // Template IDs
+        this.packageId = config.canton?.packageIds?.clobExchange || '';
+        this.orderTemplateId = `${this.packageId}:Order:Order`;
+        this.tradeTemplateId = `${this.packageId}:Trade:Trade`;
+        this.orderBookTemplateId = `${this.packageId}:MasterOrderBook:MasterOrderBook`;
+    }
+
+    /**
+     * Initialize the read model
+     * 1. Bootstrap from active contracts (one-time)
+     * 2. Start WebSocket streaming for updates
+     */
+    async initialize() {
+        console.log('[ReadModel] Initializing...');
+
+        try {
+            // Update package ID from config
+            this.packageId = config.canton?.packageIds?.clobExchange;
+            if (this.packageId) {
+                this.orderTemplateId = `${this.packageId}:Order:Order`;
+                this.tradeTemplateId = `${this.packageId}:Trade:Trade`;
+                this.orderBookTemplateId = `${this.packageId}:MasterOrderBook:MasterOrderBook`;
+            }
+
+            // Bootstrap from ACS
+            await this.bootstrapFromACS();
+
+            // Start streaming updates
+            await this.startStreaming();
+
+            this.isInitialized = true;
+            console.log('[ReadModel] ✅ Initialization complete');
+            console.log(`[ReadModel] Orders: ${this.orders.size}, Trades: ${this.trades.size}, Order Books: ${this.orderBooks.size}`);
+
+        } catch (error) {
+            console.error('[ReadModel] ❌ Initialization failed:', error.message);
+            throw error;
+        }
+    }
+
+    /**
+     * Bootstrap read model from Canton active contracts
+     * This is a ONE-TIME operation on startup, not for polling!
+     */
+    async bootstrapFromACS() {
+        console.log('[ReadModel] Bootstrapping from active contracts...');
+
+        const token = await tokenProvider.getServiceToken();
+        
+        // Get current ledger end offset first
+        let ledgerEndOffset = 0;
+        try {
+            ledgerEndOffset = await this.cantonService.getLedgerEndOffset(token);
+            console.log(`[ReadModel] Using ledger end offset: ${ledgerEndOffset}`);
+        } catch (error) {
+            console.warn('[ReadModel] Failed to get ledger end offset, using 0:', error.message);
+        }
+
+        // Use operator party for bootstrapping to avoid 413 limit
+        // Only query contracts that belong to the operator party
+        const operatorPartyId = config.canton.operatorPartyId;
+        if (!operatorPartyId) {
+            console.warn('[ReadModel] No operator party ID configured, skipping bootstrap');
+            return;
+        }
+
+        try {
+            const ordersResult = await this.cantonService.queryActiveContracts({
+                party: operatorPartyId, // Use specific party to avoid 413 limit
+                templateIds: [this.orderTemplateId],
+                activeAtOffset: ledgerEndOffset
+            }, token);
+
+            for (const contract of ordersResult) {
+                this.processCreatedOrder(contract);
+            }
+            console.log(`[ReadModel] Bootstrapped ${ordersResult.length} orders`);
+        } catch (error) {
+            if (error.httpStatus === 413) {
+                console.warn('[ReadModel] Too many orders found, skipping bootstrap to avoid 413 limit');
+            } else {
+                console.warn('[ReadModel] Failed to bootstrap orders:', error.message);
+            }
+        }
+
+        // Get all Trade contracts
+        try {
+            const tradesResult = await this.cantonService.queryActiveContracts({
+                party: operatorPartyId, // Use specific party to avoid 413 limit
+                templateIds: [this.tradeTemplateId],
+                activeAtOffset: ledgerEndOffset
+            }, token);
+
+            for (const contract of tradesResult) {
+                this.processCreatedTrade(contract);
+            }
+            console.log(`[ReadModel] Bootstrapped ${tradesResult.length} trades`);
+        } catch (error) {
+            if (error.httpStatus === 413) {
+                console.warn('[ReadModel] Too many trades found, skipping bootstrap to avoid 413 limit');
+            } else {
+                console.warn('[ReadModel] Failed to bootstrap trades:', error.message);
+            }
+        }
+
+        // Get ledger end offset for checkpointing
+        try {
+            this.lastOffset = await this.cantonService.getLedgerEndOffset(token);
+            console.log(`[ReadModel] Ledger end offset: ${this.lastOffset}`);
+        } catch (error) {
+            console.warn('[ReadModel] Failed to get ledger end:', error.message);
+        }
+    }
+
+    /**
+     * Start WebSocket streaming for real-time updates
+     */
+    async startStreaming() {
+        console.log('[ReadModel] WebSocket streaming temporarily disabled to focus on core functionality');
+        // TODO: Fix WebSocket subprotocol issue - server expects specific format
+        return;
+    }
+
+    /**
+     * Stop WebSocket streaming
+     */
+    stopStreaming() {
+        if (this.ws) {
+            this.ws.close();
+            this.ws = null;
+        }
+    }
+
+    /**
+     * Process incoming WebSocket message (disabled for now)
+     */
+    processWebSocketMessage(message) {
+        // Disabled - WebSocket functionality temporarily disabled
+        console.log('[ReadModel] WebSocket message processing disabled');
+    }
+
+            for (const event of tx.events || []) {
+                if (event.createdEvent) {
+                    this.processCreatedEvent(event.createdEvent);
+                } else if (event.archivedEvent) {
+                    this.processArchivedEvent(event.archivedEvent);
+                }
+            }
+
+            // Update offset
+            if (tx.offset) {
+                this.lastOffset = tx.offset;
+            }
+        }
+
+        // Increment sequence for change tracking
+        this.sequence++;
+        this.emit('update', { sequence: this.sequence, offset: this.lastOffset });
+    }
+
+    /**
+     * Process a created event from WebSocket
+     */
+    processCreatedEvent(event) {
+        const templateId = event.templateId || '';
+        const payload = event.createArgument || event.payload;
+
+        if (templateId.includes('Order:Order')) {
+            this.processCreatedOrder({
+                contractId: event.contractId,
+                payload: payload
+            });
+        } else if (templateId.includes('Trade:Trade')) {
+            this.processCreatedTrade({
+                contractId: event.contractId,
+                payload: payload
+            });
+        }
+    }
+
+    /**
+     * Process an archived event from WebSocket
+     */
+    processArchivedEvent(event) {
+        const contractId = event.contractId;
+        const order = this.orders.get(contractId);
+
+        if (order) {
+            this.removeOrderFromOrderBook(order);
+            this.orders.delete(contractId);
+
+            if (order.orderId) {
+                this.ordersByOrderId.delete(order.orderId);
+            }
+
+            // Remove from user orders
+            const userOrderSet = this.userOrders.get(order.owner);
+            if (userOrderSet) {
+                userOrderSet.delete(contractId);
+            }
+
+            console.log(`[ReadModel] Order archived: ${order.orderId || contractId}`);
+        }
+    }
+
+    /**
+     * Process a created order contract
+     */
+    processCreatedOrder(contract) {
+        const payload = contract.payload || {};
+
+        const order = {
+            contractId: contract.contractId,
+            orderId: payload.orderId,
+            owner: payload.owner,
+            tradingPair: payload.tradingPair,
+            orderType: payload.orderType,
+            orderMode: payload.orderMode,
+            price: payload.price?.Some || payload.price,
+            quantity: payload.quantity,
+            filled: payload.filled || '0',
+            remaining: parseFloat(payload.quantity || 0) - parseFloat(payload.filled || 0),
+            status: payload.status || 'OPEN',
+            timestamp: payload.timestamp,
+            operator: payload.operator
+        };
+
+        // Store order
+        this.orders.set(contract.contractId, order);
+
+        if (order.orderId) {
+            this.ordersByOrderId.set(order.orderId, contract.contractId);
+        }
+
+        // Track user orders
+        if (order.owner) {
+            if (!this.userOrders.has(order.owner)) {
+                this.userOrders.set(order.owner, new Set());
+            }
+            this.userOrders.get(order.owner).add(contract.contractId);
+        }
+
+        // Add to order book if open
+        if (order.status === 'OPEN') {
+            this.addOrderToOrderBook(order);
+        }
+    }
+
+    /**
+     * Process a created trade contract
+     */
+    processCreatedTrade(contract) {
+        const payload = contract.payload || {};
+
+        const trade = {
+            contractId: contract.contractId,
+            tradeId: payload.tradeId,
+            tradingPair: payload.tradingPair,
+            price: payload.price,
+            quantity: payload.quantity,
+            buyer: payload.buyer,
+            seller: payload.seller,
+            buyOrderId: payload.buyOrderId,
+            sellOrderId: payload.sellOrderId,
+            timestamp: payload.timestamp
+        };
+
+        this.trades.set(contract.contractId, trade);
+
+        // Update last price in order book
+        if (trade.tradingPair && trade.price) {
+            const book = this.orderBooks.get(trade.tradingPair);
+            if (book) {
+                book.lastPrice = trade.price;
+                book.lastTradeTime = trade.timestamp;
+            }
+        }
+    }
+
+    /**
+     * Add order to order book
+     */
+    addOrderToOrderBook(order) {
+        if (!order.tradingPair) return;
+
+        let book = this.orderBooks.get(order.tradingPair);
+        if (!book) {
+            book = {
+                bids: [],
+                asks: [],
+                lastPrice: null,
+                lastTradeTime: null,
+                updatedAt: new Date().toISOString()
+            };
+            this.orderBooks.set(order.tradingPair, book);
+        }
+
+        if (order.orderType === 'BUY') {
+            book.bids.push(order);
+            book.bids.sort((a, b) => parseFloat(b.price || 0) - parseFloat(a.price || 0));
+        } else {
+            book.asks.push(order);
+            book.asks.sort((a, b) => parseFloat(a.price || 0) - parseFloat(b.price || 0));
+        }
+
+        book.updatedAt = new Date().toISOString();
+    }
+
+    /**
+     * Remove order from order book
+     */
+    removeOrderFromOrderBook(order) {
+        if (!order.tradingPair) return;
+
+        const book = this.orderBooks.get(order.tradingPair);
+        if (!book) return;
+
+        if (order.orderType === 'BUY') {
+            book.bids = book.bids.filter(o => o.contractId !== order.contractId);
+        } else {
+            book.asks = book.asks.filter(o => o.contractId !== order.contractId);
+        }
+
+        book.updatedAt = new Date().toISOString();
+    }
+
+    // ========== Public API ==========
+
+    /**
+     * Get aggregated order book for a trading pair
+     */
+    getOrderBook(pair) {
+        const book = this.orderBooks.get(pair);
+
+        if (!book) {
+            return {
+                pair,
+                bids: [],
+                asks: [],
+                lastPrice: null,
+                sequence: this.sequence,
+                timestamp: new Date().toISOString()
+            };
+        }
+
+        return {
+            pair,
+            bids: this.aggregatePriceLevels(book.bids),
+            asks: this.aggregatePriceLevels(book.asks),
+            lastPrice: book.lastPrice,
+            sequence: this.sequence,
+            timestamp: book.updatedAt
+        };
+    }
+
+    /**
+     * Get all order books
+     */
+    getAllOrderBooks() {
+        return Array.from(this.orderBooks.keys()).map(pair => ({
+            tradingPair: pair,
+            ...this.getOrderBook(pair)
+        }));
+    }
+
+    /**
+     * Get user's orders
+     */
+    getUserOrders(partyId, filter = {}) {
+        const orderIds = this.userOrders.get(partyId) || new Set();
+        let orders = Array.from(orderIds)
+            .map(id => this.orders.get(id))
+            .filter(o => o !== undefined);
+
+        if (filter.status && filter.status !== 'ALL') {
+            orders = orders.filter(o => o.status === filter.status);
+        }
+
+        if (filter.pair) {
+            orders = orders.filter(o => o.tradingPair === filter.pair);
+        }
+
+        return orders.sort((a, b) =>
+            new Date(b.timestamp || 0) - new Date(a.timestamp || 0)
+        );
+    }
+
+    /**
+     * Get order by order ID
+     */
+    getOrderByOrderId(orderId) {
+        const contractId = this.ordersByOrderId.get(orderId);
+        if (!contractId) return null;
+        return this.orders.get(contractId);
+    }
+
+    /**
+     * Get order by contract ID
+     */
+    getOrderByContractId(contractId) {
+        return this.orders.get(contractId);
+    }
+
+    /**
+     * Get recent trades
+     */
+    getRecentTrades(pair = null, limit = 50) {
+        let trades = Array.from(this.trades.values());
+
+        if (pair) {
+            trades = trades.filter(t => t.tradingPair === pair);
+        }
+
+        return trades
+            .sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0))
+            .slice(0, limit);
+    }
+
+    /**
+     * Aggregate orders into price levels
+     */
+    aggregatePriceLevels(orders) {
+        const levels = new Map();
+
+        for (const order of orders) {
+            if (!order.price) continue;
+
+            const price = order.price.toString();
+            const quantity = parseFloat(order.remaining || order.quantity || 0);
+
+            const existing = levels.get(price) || { price, quantity: 0, count: 0 };
+            existing.quantity += quantity;
+            existing.count++;
+            levels.set(price, existing);
+        }
+
+        return Array.from(levels.values()).map(level => ({
+            price: level.price,
+            quantity: level.quantity.toString(),
+            count: level.count
+        }));
+    }
+
+    /**
+     * Shutdown and cleanup
+     */
+    async shutdown() {
+        console.log('[ReadModel] Shutting down...');
+
+        if (this.ws) {
+            this.ws.close();
+            this.ws = null;
+        }
+
+        this.orderBooks.clear();
+        this.orders.clear();
+        this.ordersByOrderId.clear();
+        this.trades.clear();
+        this.userOrders.clear();
+        this.isInitialized = false;
+
+        console.log('[ReadModel] Shutdown complete');
+    }
+}
+
+// Singleton instance
+let instance = null;
+
+/**
+ * Get or create the ReadModelService singleton
+ */
+function getReadModelService(cantonService = null) {
+    if (!instance && cantonService) {
+        instance = new ReadModelService(cantonService);
+    }
+    return instance;
+}
+
+module.exports = {
+    ReadModelService,
+    getReadModelService
+};

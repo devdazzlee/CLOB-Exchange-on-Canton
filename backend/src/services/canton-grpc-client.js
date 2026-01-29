@@ -1,15 +1,27 @@
 /**
  * Canton gRPC Client for UserManagementService
  * Uses gRPC to call UserManagementService.GrantUserRights directly via Ledger API
+ * 
+ * IMPORTANT: Uses centralized config - NO HARDCODED FALLBACKS
  */
 
 const grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');
 const path = require('path');
+const config = require('../config');
 
-const CANTON_LEDGER_API_HOST = process.env.CANTON_LEDGER_API_HOST || '65.108.40.104';
-const CANTON_LEDGER_API_PORT = process.env.CANTON_LEDGER_API_PORT || '31217';
-const CANTON_LEDGER_API_URL = `${CANTON_LEDGER_API_HOST}:${CANTON_LEDGER_API_PORT}`;
+// Get from centralized config - NO HARDCODED FALLBACKS
+const CANTON_LEDGER_API_HOST = config.canton.ledgerHost;
+const CANTON_LEDGER_API_PORT = config.canton.ledgerPort;
+
+// Validate gRPC config
+if (!CANTON_LEDGER_API_HOST || !CANTON_LEDGER_API_PORT) {
+  console.warn('[gRPC] CANTON_LEDGER_API_HOST or CANTON_LEDGER_API_PORT not configured - gRPC operations will fail');
+}
+
+const CANTON_LEDGER_API_URL = CANTON_LEDGER_API_HOST && CANTON_LEDGER_API_PORT
+  ? `${CANTON_LEDGER_API_HOST}:${CANTON_LEDGER_API_PORT}`
+  : null;
 
 class CantonGrpcClient {
   constructor() {
@@ -18,12 +30,12 @@ class CantonGrpcClient {
     this.metadata = null;
   }
 
-/**
-   * Upload DAR file to Canton
-   */
+  /**
+     * Upload DAR file to Canton
+     */
   async uploadDar(darBuffer, adminToken) {
     await this.initialize(adminToken);
-    
+
     return new Promise((resolve, reject) => {
       const packageServiceProto = grpc.loadPackageDefinition(
         protoLoader.loadSync(path.join(__dirname, '..', 'proto', 'package_service.proto'), {
@@ -34,17 +46,17 @@ class CantonGrpcClient {
           oneofs: true
         })
       );
-      
+
       const packageClient = new packageServiceProto.com.daml.ledger.api.v1.admin.PackageService(
         CANTON_LEDGER_API_URL,
         grpc.credentials.createInsecure()
       );
-      
+
       const request = {
         darFile: darBuffer,
         submissionId: `upload-${Date.now()}`
       };
-      
+
       packageClient.uploadDarFile(request, this.metadata, (err, response) => {
         if (err) {
           console.error('[gRPC] Upload DAR error:', err);
@@ -74,7 +86,7 @@ class CantonGrpcClient {
       const protoV1Path = path.join(protoBasePath, 'user_management_service.proto');
       const partyV2Path = path.join(protoBasePath, 'party_management_service_v2.proto');
       console.log('[gRPC] Loading proto files:', { v2: protoV2Path, v1: protoV1Path });
-      
+
       const pkgDefV2 = protoLoader.loadSync(protoV2Path, {
         keepCase: true,
         longs: String,
@@ -102,7 +114,7 @@ class CantonGrpcClient {
       const protoPartyV2 = grpc.loadPackageDefinition(pkgDefPartyV2);
 
       console.log('[gRPC] Connecting to:', CANTON_LEDGER_API_URL);
-      
+
       // Prefer v2 if available, else fallback to v1
       const ServiceV2 = protoV2?.com?.daml?.ledger?.api?.v2?.admin?.UserManagementService;
       const ServiceV1 = protoV1?.com?.daml?.ledger?.api?.v1?.admin?.UserManagementService;
@@ -123,7 +135,7 @@ class CantonGrpcClient {
       } else {
         console.warn('[gRPC] PartyManagementService v2 not found in proto; party allocation via gRPC will be unavailable');
       }
-      
+
       console.log('[gRPC] Client initialized successfully');
     } catch (error) {
       console.error('[gRPC] Initialization error:', error);

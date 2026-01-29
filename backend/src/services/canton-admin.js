@@ -1,424 +1,151 @@
 /**
- * Canton Admin API Service
- * Handles party registration and management via Canton Admin API
+ * Canton Admin Service
+ * 
+ * Facade for Admin operations.
+ * Uses:
+ * 1. gRPC Admin API (30100) for DAR Upload (PackageManagementService)
+ * 2. Standard fetch for JSON API operations (Parties, Packages)
+ * 3. TokenProvider for auth
  */
 
-// Canton Admin API endpoints - Updated to new client endpoints
-const CANTON_ADMIN_HOST = process.env.CANTON_ADMIN_HOST || 'participant.dev.canton.wolfedgelabs.com';
-const CANTON_ADMIN_PORT = process.env.CANTON_ADMIN_PORT || '443';
-const CANTON_ADMIN_BASE = process.env.CANTON_ADMIN_BASE || `https://${CANTON_ADMIN_HOST}:${CANTON_ADMIN_PORT}`;
-const CANTON_JSON_API_HOST = process.env.CANTON_JSON_API_HOST || '65.108.40.104';
-const CANTON_JSON_API_PORT = process.env.CANTON_JSON_API_PORT || '31539';
-const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || `http://${CANTON_JSON_API_HOST}:${CANTON_JSON_API_PORT}`;
-
-// Keycloak token fetch hardening (network timeouts/retries)
-const KEYCLOAK_TOKEN_TIMEOUT_MS = parseInt(process.env.KEYCLOAK_TOKEN_TIMEOUT_MS || '15000', 10);
-const KEYCLOAK_TOKEN_RETRIES = parseInt(process.env.KEYCLOAK_TOKEN_RETRIES || '3', 10);
-const KEYCLOAK_TOKEN_RETRY_BASE_DELAY_MS = parseInt(process.env.KEYCLOAK_TOKEN_RETRY_BASE_DELAY_MS || '400', 10);
-// Optional (only if you *must* bypass TLS issues; keep default false)
-const KEYCLOAK_ALLOW_INSECURE_TLS = (process.env.KEYCLOAK_ALLOW_INSECURE_TLS || '').toLowerCase() === 'true';
-
-let cachedAdminToken = null;
-let cachedAdminTokenExpiry = null;
-
-function clearAdminTokenCache() {
-  console.log('[CantonAdmin] Clearing admin token cache');
-  cachedAdminToken = null;
-  cachedAdminTokenExpiry = null;
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function isRetryableNetworkError(err) {
-  const code = err?.cause?.code || err?.code;
-  return (
-    code === 'ECONNRESET' ||
-    code === 'ETIMEDOUT' ||
-    code === 'UND_ERR_CONNECT_TIMEOUT' ||
-    code === 'UND_ERR_SOCKET' ||
-    code === 'ENOTFOUND' ||
-    code === 'EAI_AGAIN'
-  );
-}
+const config = require('../config');
+const tokenProvider = require('./tokenProvider');
+const fs = require('fs');
+const path = require('path');
+const grpc = require('@grpc/grpc-js');
+const protoLoader = require('@grpc/proto-loader');
 
 class CantonAdminService {
   constructor() {
+    this.jsonApiBase = config.canton.jsonApiBase;
+    this.adminHost = config.canton.adminHost;
+    this.adminPort = config.canton.adminPort;
   }
 
   /**
-   * Get admin authentication token
-   * Uses validator-app service account token which has validator-operator permissions
+   * Get admin token (Service Token)
    */
   async getAdminToken() {
-    // Use provided token directly if available
-    if (process.env.CANTON_ADMIN_TOKEN) {
-      console.log('[CantonAdmin] Using provided admin token');
-      return process.env.CANTON_ADMIN_TOKEN;
-    }
-    
-    if (cachedAdminToken && cachedAdminTokenExpiry && Date.now() < cachedAdminTokenExpiry && cachedAdminToken !== null) {
-      console.log('[CantonAdmin] Using cached admin token');
-      return cachedAdminToken;
-    }
+    return tokenProvider.getServiceToken();
+  }
 
-    // Clear cache if we have a null token
-    if (cachedAdminToken === null) {
-      clearAdminTokenCache();
+  /**
+   * Upload DAR file
+   * Uses gRPC Admin API (usually 30100) with PackageManagementService
+   */
+  async uploadDar(darPath, token) {
+    console.log(`[CantonAdmin] Uploading DAR from ${darPath}...`);
+
+    if (!fs.existsSync(darPath)) {
+      throw new Error(`DAR file not found: ${darPath}`);
     }
 
-    console.log('[CantonAdmin] Fetching new admin token...');
-
-    // Get token from Keycloak using validator-app service account
-    // This token has validator-operator permissions for Canton
-    const KEYCLOAK_BASE_URL = process.env.KEYCLOAK_BASE_URL || 'https://keycloak.wolfedgelabs.com:8443';
-    const KEYCLOAK_REALM = process.env.KEYCLOAK_REALM || 'canton-devnet';
-    const KEYCLOAK_ADMIN_CLIENT_ID = process.env.KEYCLOAK_ADMIN_CLIENT_ID;
-    const KEYCLOAK_ADMIN_CLIENT_SECRET = process.env.KEYCLOAK_ADMIN_CLIENT_SECRET;
-
-    if (!KEYCLOAK_ADMIN_CLIENT_ID || !KEYCLOAK_ADMIN_CLIENT_SECRET) {
-      throw new Error('KEYCLOAK_ADMIN_CLIENT_ID and KEYCLOAK_ADMIN_CLIENT_SECRET must be configured for Canton party registration');
+    if (!this.adminHost || !this.adminPort) {
+      throw new Error('Admin API host/port not configured');
     }
 
-    const tokenUrl = `${KEYCLOAK_BASE_URL}/realms/${KEYCLOAK_REALM}/protocol/openid-connect/token`;
-    
-    const params = new URLSearchParams({
-      grant_type: 'client_credentials',
-      client_id: KEYCLOAK_ADMIN_CLIENT_ID,
-      scope: 'openid profile daml_ledger_api email',
+    const darBuffer = fs.readFileSync(darPath);
+    const adminUrl = `${this.adminHost}:${this.adminPort}`;
+    console.log(`[CantonAdmin] Connecting to Admin API at ${adminUrl}`);
+
+    // Load PackageService proto
+    const protoPath = path.join(__dirname, '..', 'proto', 'package_service.proto');
+    const packageDefinition = protoLoader.loadSync(protoPath, {
+      keepCase: true,
+      longs: String,
+      enums: String,
+      defaults: true,
+      oneofs: true
     });
-    params.append('client_secret', KEYCLOAK_ADMIN_CLIENT_SECRET);
+    const proto = grpc.loadPackageDefinition(packageDefinition);
 
-    // We use undici dispatcher to optionally allow insecure TLS if explicitly enabled.
-    // Default remains secure.
-    let dispatcher;
-    if (KEYCLOAK_ALLOW_INSECURE_TLS) {
-      try {
-        const { Agent } = require('undici');
-        dispatcher = new Agent({ connect: { rejectUnauthorized: false } });
-      } catch {
-        // If undici Agent isn't available, proceed without dispatcher (still secure)
-        dispatcher = undefined;
-      }
+    // Create Client
+    // namespace: com.daml.ledger.api.v1.admin.PackageManagementService
+    const Service = proto.com.daml.ledger.api.v1.admin.PackageManagementService;
+    if (!Service) {
+      throw new Error('PackageManagementService not found in proto definition');
     }
 
-    let lastErr;
-    for (let attempt = 1; attempt <= KEYCLOAK_TOKEN_RETRIES; attempt++) {
-      try {
-        const response = await fetch(tokenUrl, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-          body: params,
-          // Node 18+ supports AbortSignal.timeout
-          signal: AbortSignal.timeout(KEYCLOAK_TOKEN_TIMEOUT_MS),
-          ...(dispatcher ? { dispatcher } : {}),
-        });
+    const client = new Service(adminUrl, grpc.credentials.createInsecure());
 
-        if (!response.ok) {
-          const errorText = await response.text();
-          // Retry only on 5xx/429; other errors are usually config issues.
-          if ((response.status >= 500 || response.status === 429) && attempt < KEYCLOAK_TOKEN_RETRIES) {
-            lastErr = new Error(`Keycloak token endpoint error ${response.status}: ${errorText}`);
-            const backoff = KEYCLOAK_TOKEN_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
-            await sleep(backoff);
-            continue;
-          }
-          throw new Error(`Failed to get validator-app token for Canton: ${errorText}`);
-        }
+    // Create metadata with token
+    const metadata = new grpc.Metadata();
+    metadata.add('authorization', `Bearer ${token}`);
 
-        const data = await response.json();
-        console.log('[CantonAdmin] Token response received, expires_in:', data.expires_in);
-        if (!data || !data.access_token) {
-          throw new Error('Validator-app token response missing access_token');
-        }
-
-        cachedAdminToken = data.access_token;
-        console.log('[CantonAdmin] Admin token fetched successfully');
-        // Cache slightly shorter than exp to avoid edge expiry
-        const expiresIn = Number(data.expires_in || 0);
-        const safetySeconds = 300; // 5 min
-        cachedAdminTokenExpiry = Date.now() + (Math.max(0, expiresIn - safetySeconds) * 1000);
-        return cachedAdminToken;
-      } catch (err) {
-        lastErr = err;
-        // If it's a transient network failure, retry
-        if (attempt < KEYCLOAK_TOKEN_RETRIES && isRetryableNetworkError(err)) {
-          const backoff = KEYCLOAK_TOKEN_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
-          await sleep(backoff);
-          continue;
-        }
-        break;
-      }
-    }
-
-    // Last-resort fallback: if we have a previously cached token, return it (may still work).
-    // This prevents brief Keycloak blips from breaking the whole backend.
-    if (cachedAdminToken) {
-      console.warn('[CantonAdmin] Keycloak token fetch failed; using cached admin token as fallback:', lastErr?.message || lastErr);
-      return cachedAdminToken;
-    }
-
-    throw lastErr || new Error('Failed to get validator-app token for Canton');
-
-  }
-
-  /**
-   * Register a party in Canton using JSON API
-   * JSON API provides HTTP endpoint /v1/parties/allocate which is a proxy for Ledger API's AllocatePartyRequest
-   * This is the correct way to allocate parties via HTTP
-   */
-  async registerParty(partyId, displayName = null) {
-    try {
-      const adminToken = await this.getAdminToken();
-      const grpc = new (require('./canton-grpc-client'))();
-      // Prefer gRPC allocation via PartyManagementService v2
-      try {
-        const resp = await grpc.allocateParty(partyId, displayName || `User-${partyId.slice(0, 8)}`, adminToken);
-        const allocated =
-          resp?.party_details?.party ||
-          resp?.party ||
-          resp?.party_id ||
-          partyId;
-        return {
-          success: true,
-          partyId: allocated,
-          method: 'grpc-v2',
-          requestedPartyId: partyId
-        };
-      } catch (e) {
-        // JSON API allocate endpoints are not exposed on this devnet (we get HttpMethod 404),
-        // so gRPC allocation failing is a hard stop.
-        console.error('[CantonAdmin] gRPC AllocateParty failed:', e.message);
-        throw e;
-      }
-      
-      // Extract party identifier (the part after ::)
-      const partyIdentifier = partyId.includes('::') ? partyId.split('::')[1] : partyId;
-      
-      // Try multiple JSON API endpoint variations
-      // The JSON API endpoint might vary by version or configuration
-      const endpointsToTry = [
-        `${CANTON_JSON_API_BASE}/v1/parties/allocate`,
-        `${CANTON_JSON_API_BASE}/v2/parties/allocate`,
-        `${CANTON_JSON_API_BASE}/parties/allocate`
-      ];
-      
-      // JSON API party allocation MUST succeed before we grant rights.
-      // If allocation endpoints are not available, we must fail fast (no lazy registration),
-      // otherwise GrantUserRights will return NOT_FOUND for a non-existing party.
-      const requestBody = {
-        identifierHint: partyId,
-        displayName: displayName || `User-${partyIdentifier.substring(0, 8)}`
+    // Call UploadDarFile
+    return new Promise((resolve, reject) => {
+      const request = {
+        dar_file: darBuffer,
+        submission_id: `upload-${Date.now()}`
       };
-      
-      let lastError = null;
-      
-      for (const jsonApiUrl of endpointsToTry) {
-        try {
-          const response = await fetch(jsonApiUrl, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${adminToken}`
-            },
-            body: JSON.stringify(requestBody)
-          });
 
-          const responseText = await response.text();
-          
-          if (response.ok) {
-            let result;
-            try {
-              result = JSON.parse(responseText);
-            } catch (e) {
-              result = { result: { identifier: partyId } };
-            }
-            
-            const allocatedPartyId = result.result?.identifier || result.identifier || partyId;
-            
-            return {
-              success: true,
-              partyId: allocatedPartyId,
-              method: 'json-api',
-              requestedPartyId: partyId
-            };
-          }
-
-          // If party already exists or other error, check if it's already registered
-          if (response.status === 409 || response.status === 400) {
-            const checkResult = await this.checkPartyExists(partyId);
-            if (checkResult.exists) {
-              return {
-                success: true,
-                partyId: partyId,
-                method: 'already-registered'
-              };
-            }
-          }
-          
-          lastError = `JSON API returned ${response.status}: ${responseText.substring(0, 200)}`;
-          
-        } catch (error) {
-          lastError = error.message;
-          continue;
+      client.UploadDarFile(request, metadata, (err, response) => {
+        if (err) {
+          console.error('[CantonAdmin] gRPC Upload failed:', err);
+          reject(err);
+        } else {
+          console.log('[CantonAdmin] ✅ DAR Uploaded Successfully');
+          resolve(response);
         }
-      }
+      });
+    });
+  }
 
-      throw new Error(lastError || 'Party allocation failed: neither gRPC nor JSON API allocate endpoint succeeded');
-      
-    } catch (error) {
-      throw error;
-    }
+  // =================================================================
+  // JSON API Wrappers
+  // =================================================================
+
+  /**
+   * List parties
+   */
+  async listParties(token) {
+    const url = `${this.jsonApiBase}/v2/parties`;
+    const res = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    if (!res.ok) throw new Error(`List parties failed: ${res.status}`);
+    const json = await res.json();
+    return json.partyDetails || [];
   }
 
   /**
-   * Check if a party is already registered in Canton
-   * Note: This is a best-effort check. Security errors may indicate party doesn't exist or token lacks permissions.
+   * Get packages
    */
-  async checkPartyExists(partyId) {
-    try {
-      const adminToken = await this.getAdminToken();
-      
-      // Try to list all parties and check if ours is in the list
-      const partiesListUrl = `${CANTON_JSON_API_BASE}/v1/parties`;
-      
-      const response = await fetch(partiesListUrl, {
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${adminToken}`,
-          'Content-Type': 'application/json'
-        }
-      });
-
-      if (response.ok) {
-        try {
-          const responseText = await response.text();
-          const parties = JSON.parse(responseText);
-          
-          let partiesList = [];
-          if (Array.isArray(parties)) {
-            partiesList = parties;
-          } else if (parties.result && Array.isArray(parties.result)) {
-            partiesList = parties.result;
-          } else if (parties.parties && Array.isArray(parties.parties)) {
-            partiesList = parties.parties;
-          }
-          
-          const partyExists = partiesList.some(p => {
-            const partyIdentifier = p.identifier || p.party || p.id || p.partyId || '';
-            return partyIdentifier === partyId;
-          });
-          
-          if (partyExists) {
-            return { exists: true };
-          } else {
-            return { exists: false };
-          }
-        } catch (e) {
-          // Continue to try direct lookup
-        }
-      }
-
-      // If listing doesn't work, try direct party lookup
-      const partyInfoUrl = `${CANTON_JSON_API_BASE}/v2/parties/${encodeURIComponent(partyId)}`;
-      const directResponse = await fetch(partyInfoUrl, {
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${adminToken}`,
-          'Content-Type': 'application/json'
-        }
-      });
-
-      const responseText = await directResponse.text();
-      
-      // Check for security errors FIRST
-      if (responseText.includes('security-sensitive error') || 
-          responseText.includes('grpcCodeValue') || 
-          responseText.includes('UNAUTHENTICATED') ||
-          responseText.includes('"code":"NA"')) {
-        return { exists: false };
-      }
-      
-      if (directResponse.ok) {
-        try {
-          const partyData = JSON.parse(responseText);
-          const partyIdentifier = partyData.identifier || partyData.party || partyData.id || partyData.partyId;
-          if (partyData && partyIdentifier && partyIdentifier === partyId) {
-            return { exists: true };
-          } else if (partyData && partyIdentifier) {
-            return { exists: false };
-          } else if (partyData && !partyIdentifier) {
-            return { exists: false };
-          }
-        } catch (e) {
-          return { exists: false };
-        }
-      }
-
-      if (directResponse.status === 404) {
-        return { exists: false };
-      }
-
-      return { exists: false };
-    } catch (error) {
-      return { exists: false };
-    }
+  async getPackages(token) {
+    const url = `${this.jsonApiBase}/v2/packages`;
+    const res = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    if (!res.ok) throw new Error(`List packages failed: ${res.status}`);
+    const json = await res.json();
+    return json.packageIds || [];
   }
 
   /**
-   * Verify party registration by attempting a query
-   * This is the most reliable way to check if a party is registered
+   * Get package status
    */
-  async verifyPartyRegistration(partyId, token) {
-    try {
-      // Try a simple query to verify the party can access the ledger
-      const queryUrl = `${CANTON_JSON_API_BASE}/v2/state/active-contracts`;
-      
-      const response = await fetch(queryUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
-        body: JSON.stringify({
-          readAs: [partyId],
-          activeAtOffset: "0",
-          verbose: false,
-          filter: {
-            filtersByParty: {
-              [partyId]: {
-                inclusive: {
-                  templateIds: []
-                }
-              }
-            }
-          }
-        })
-      });
+  async getPackage(packageId, token) {
+    const url = `${this.jsonApiBase}/v2/packages/${encodeURIComponent(packageId)}/status`;
+    const res = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    if (!res.ok) throw new Error(`Get package status failed: ${res.status}`);
+    return res.json();
+  }
 
-      // If we get a response (even empty), the party is registered
-      // If we get a security error, the party is not registered
-      if (response.ok || response.status === 200) {
-        return { registered: true, verified: true };
-      }
-
-      if (response.status === 403 || response.status === 401) {
-        const errorData = await response.json().catch(() => ({}));
-        if (errorData.cause && errorData.cause.includes('security')) {
-          return { registered: false, verified: true };
-        }
-      }
-
-      // If we can't determine, assume registered (optimistic)
-      return { registered: true, verified: false };
-    } catch (error) {
-      return { registered: false, verified: false };
-    }
+  /**
+   * Get synchronizers
+   */
+  async getSynchronizers(token) {
+    const url = `${this.jsonApiBase}/v2/synchronizers`;
+    const res = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    // Note: This endpoint might output 404 in some envs; handle gracefully in caller if needed
+    if (!res.ok) throw new Error(`List synchronizers failed: ${res.status}`);
+    const json = await res.json();
+    return json.synchronizers || [];
   }
 }
 
 module.exports = CantonAdminService;
-

@@ -22,6 +22,10 @@ const ledgerRoutes = require('./ledgerRoutes');
 const mintingRoutes = require('./mintingRoutes');
 const balanceRoutes = require('./balanceRoutes');
 
+// NEW: Wallet routes (External Party Onboarding - No Keycloak)
+const walletRoutes = require('./v1/walletRoutes');
+const exchangeRoutes = require('./v1/exchangeRoutes');
+
 // Debug middleware to log all incoming requests to this router
 router.use((req, res, next) => {
   console.log(`[Routes Index] ${req.method} ${req.path} - Original URL: ${req.originalUrl}`);
@@ -46,6 +50,10 @@ router.use('/ledger', ledgerProxyRoutes);
 router.use('/canton', ledgerRoutes);
 router.use('/testnet', mintingRoutes); // Test token minting endpoints
 
+// NEW: v1 API routes (External Party Onboarding + Exchange)
+router.use('/v1/wallets', walletRoutes); // External party onboarding
+router.use('/v1', exchangeRoutes); // Exchange API (orders, trades, etc.)
+
 // Debug: Log all registered routes
 console.log('[Routes] Registered routes:');
 console.log('  POST /api/create-party (legacy)');
@@ -68,5 +76,18 @@ console.log('  ALL  /api/canton/* (legacy proxy)');
 console.log('  POST /api/testnet/mint-tokens');
 console.log('  POST /api/testnet/quick-mint');
 console.log('  GET  /api/testnet/balances/:partyId');
+console.log('');
+console.log('NEW v1 API (External Party Onboarding):');
+console.log('  POST /api/v1/wallets/create - Generate onboarding material');
+console.log('  POST /api/v1/wallets/allocate - Allocate external party');
+console.log('  GET  /api/v1/wallets/:walletId - Get wallet info');
+console.log('  POST /api/v1/wallets/:walletId/challenge - Generate auth challenge');
+console.log('  POST /api/v1/wallets/:walletId/unlock - Unlock wallet with signature');
+console.log('  POST /api/v1/orders - Place order (requires wallet auth)');
+console.log('  GET  /api/v1/orders - List orders (requires wallet auth)');
+console.log('  POST /api/v1/orders/:contractId/cancel - Cancel order (requires wallet auth)');
+console.log('  GET  /api/v1/orderbook/:pair - Get orderbook (public)');
+console.log('  GET  /api/v1/trades - Get trades (public)');
+console.log('  GET  /api/v1/balances/:partyId - Get balances (requires wallet auth)');
 
 module.exports = router;

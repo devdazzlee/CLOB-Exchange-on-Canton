@@ -23,7 +23,8 @@ class WebSocketService {
 
   setupEventHandlers() {
     this.wss.on('connection', (ws, req) => {
-      const clientId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      const { v4: uuidv4 } = require('uuid');
+      const clientId = uuidv4(); // PROPER UUID - no predictable IDs
       this.clients.set(clientId, { ws, subscriptions: new Set() });
 
       console.log(`[WebSocket] Client connected: ${clientId} (Total: ${this.clients.size})`);

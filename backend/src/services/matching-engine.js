@@ -290,9 +290,13 @@ class MatchingEngine {
    * Fetch single contract using correct endpoint
    */
   async fetchContract(contractId, adminToken) {
-    const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
+    // Use centralized config - NO HARDCODED FALLBACKS
+    const cantonApiBase = config.canton.jsonApiBase;
+    if (!cantonApiBase) {
+      throw new Error('CANTON_JSON_LEDGER_API_BASE is required');
+    }
 
-    const response = await fetch(`${CANTON_JSON_API_BASE}/v2/contracts/lookup`, {
+    const response = await fetch(`${cantonApiBase}/v2/contracts/lookup`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

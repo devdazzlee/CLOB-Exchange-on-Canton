@@ -61,24 +61,29 @@ class AdminController {
     const darBuffer = Buffer.from(darFile, 'base64');
     const tempPath = `/tmp/dar-${Date.now()}.dar`;
     require('fs').writeFileSync(tempPath, darBuffer);
-    
+
     try {
       // Use curl to upload to Canton Admin API
       const { execSync } = require('child_process');
-      const cantonAdminHost = process.env.CANTON_ADMIN_HOST || 'participant.dev.canton.wolfedgelabs.com';
-      const cantonAdminPort = process.env.CANTON_ADMIN_PORT || '443';
-      
-      const protocol = cantonAdminPort === '443' ? 'https' : 'http';
-      const command = `curl -X POST ${protocol}://${cantonAdminHost}:${cantonAdminPort}/v1/dars \
-        -H "Authorization: Bearer ${adminToken}" \
+      // Use centralized config - NO HARDCODED FALLBACKS
+      const cantonAdminHost = config.canton.grpc.host;
+      const cantonAdminPort = config.canton.grpc.port;
+
+      if (!cantonAdminHost || !cantonAdminPort) {
+        return error(res, 'CANTON_ADMIN_HOST and CANTON_ADMIN_PORT are required for DAR upload', 400);
+      }
+
+      const protocol = cantonAdminPort === 443 ? 'https' : 'http';
+      const command = `curl -X POST ${protocol}://${cantonAdminHost}:${cantonAdminPort}/v1/dars \\
+        -H "Authorization: Bearer ${adminToken}" \\
         --data-binary @${tempPath}`;
-      
+
       console.log('[Admin] Uploading DAR to Canton:', command);
       const output = execSync(command, { encoding: 'utf8' });
-      
+
       // Clean up temp file
       require('fs').unlinkSync(tempPath);
-      
+
       return success(res, { output }, 'DAR file uploaded successfully', 201);
     } catch (err) {
       // Clean up temp file on error

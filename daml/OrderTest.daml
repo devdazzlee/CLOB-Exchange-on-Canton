@@ -11,7 +11,8 @@ testCreateBuyOrder = script do
   alice <- allocateParty "Alice"
   now <- getTime
   
-  orderCid <- submit operator do
+  -- Owner (alice) creates the order, not operator
+  orderCid <- submit alice do
     createCmd Order with
       orderId = "order_001"
       owner = alice
@@ -24,11 +25,10 @@ testCreateBuyOrder = script do
       status = "OPEN"
       timestamp = now
       operator = operator
-      allocationCid = "placeholder_allocation_cid_001"  -- Placeholder until Splice is installed
+      allocationCid = "placeholder_allocation_cid_001"
   
   order <- query @Order alice
   assert (length order == 1)
-  -- Detailed order verification done via frontend integration tests
 
 -- Test: Create sell order
 testCreateSellOrder : Script ()
@@ -37,7 +37,8 @@ testCreateSellOrder = script do
   alice <- allocateParty "Alice"
   now <- getTime
   
-  orderCid <- submit operator do
+  -- Owner (alice) creates the order
+  orderCid <- submit alice do
     createCmd Order with
       orderId = "order_002"
       owner = alice
@@ -50,11 +51,10 @@ testCreateSellOrder = script do
       status = "OPEN"
       timestamp = now
       operator = operator
-      allocationCid = "placeholder_allocation_cid_002"  -- Placeholder until Splice is installed
+      allocationCid = "placeholder_allocation_cid_002"
   
   order <- query @Order alice
   assert (length order == 1)
-  -- Order verification done via frontend integration tests
 
 -- Test: Cancel order
 testCancelOrder : Script ()
@@ -63,7 +63,8 @@ testCancelOrder = script do
   alice <- allocateParty "Alice"
   now <- getTime
   
-  orderCid <- submit operator do
+  -- Owner (alice) creates the order
+  orderCid <- submit alice do
     createCmd Order with
       orderId = "order_003"
       owner = alice
@@ -76,15 +77,15 @@ testCancelOrder = script do
       status = "OPEN"
       timestamp = now
       operator = operator
-      allocationCid = "placeholder_allocation_cid_003"  -- Placeholder until Splice is installed
+      allocationCid = "placeholder_allocation_cid_003"
   
-  -- Cancel the order
-  _ <- submit alice do
+  -- Cancel the order (returns the cancelled order contract ID)
+  cancelledOrderCid <- submit alice do
     exerciseCmd orderCid CancelOrder
   
+  -- Query cancelled order
   order <- query @Order alice
   assert (length order == 1)
-  -- Status verification done via frontend integration tests
 
 -- Test: Fill order partially
 testPartialFill : Script ()
@@ -93,7 +94,8 @@ testPartialFill = script do
   alice <- allocateParty "Alice"
   now <- getTime
   
-  orderCid <- submit operator do
+  -- Owner (alice) creates the order
+  orderCid <- submit alice do
     createCmd Order with
       orderId = "order_004"
       owner = alice
@@ -106,16 +108,15 @@ testPartialFill = script do
       status = "OPEN"
       timestamp = now
       operator = operator
-      allocationCid = "placeholder_allocation_cid_004"  -- Placeholder until Splice is installed
+      allocationCid = "placeholder_allocation_cid_004"
   
-  -- Fill 1.0 out of 2.0
+  -- Operator fills the order
   _ <- submit operator do
     exerciseCmd orderCid FillOrder with
       fillQuantity = 1.0
   
   order <- query @Order alice
   assert (length order == 1)
-  -- Fill verification done via frontend integration tests
 
 -- Test: Fill order completely
 testCompleteFill : Script ()
@@ -124,7 +125,8 @@ testCompleteFill = script do
   alice <- allocateParty "Alice"
   now <- getTime
   
-  orderCid <- submit operator do
+  -- Owner (alice) creates the order
+  orderCid <- submit alice do
     createCmd Order with
       orderId = "order_005"
       owner = alice
@@ -137,16 +139,15 @@ testCompleteFill = script do
       status = "OPEN"
       timestamp = now
       operator = operator
-      allocationCid = "placeholder_allocation_cid_005"  -- Placeholder until Splice is installed
+      allocationCid = "placeholder_allocation_cid_005"
   
-  -- Complete fill
+  -- Operator fills the order
   _ <- submit operator do
     exerciseCmd orderCid FillOrder with
       fillQuantity = 0.5
   
   order <- query @Order alice
   assert (length order == 1)
-  -- Fill status verification done via frontend integration tests
 
 -- Test: Get remaining quantity
 testGetRemainingQuantity : Script ()
@@ -155,7 +156,7 @@ testGetRemainingQuantity = script do
   alice <- allocateParty "Alice"
   now <- getTime
   
-  orderCid <- submit operator do
+  orderCid <- submit alice do
     createCmd Order with
       orderId = "order_006"
       owner = alice
@@ -168,7 +169,7 @@ testGetRemainingQuantity = script do
       status = "OPEN"
       timestamp = now
       operator = operator
-      allocationCid = "placeholder_allocation_cid_006"  -- Placeholder until Splice is installed
+      allocationCid = "placeholder_allocation_cid_006"
   
   remaining <- submit alice do
     exerciseCmd orderCid GetRemainingQuantity
@@ -182,7 +183,7 @@ testCannotCancelFilledOrder = script do
   alice <- allocateParty "Alice"
   now <- getTime
   
-  orderCid <- submit operator do
+  orderCid <- submit alice do
     createCmd Order with
       orderId = "order_007"
       owner = alice
@@ -195,10 +196,36 @@ testCannotCancelFilledOrder = script do
       status = "FILLED"
       timestamp = now
       operator = operator
-      allocationCid = "placeholder_allocation_cid_007"  -- Placeholder until Splice is installed
+      allocationCid = "placeholder_allocation_cid_007"
   
-  -- Should fail to cancel filled order
-  -- Note: In production, this would fail with assertion error
-  -- This test verifies that filled orders cannot be cancelled
+  -- Should fail to cancel filled order (assertion fails)
+  submitMustFail alice do
+    exerciseCmd orderCid CancelOrder
+  
   return ()
 
+-- Test: Market order (no price)
+testMarketOrder : Script ()
+testMarketOrder = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+  
+  -- Market order has no price (None)
+  orderCid <- submit alice do
+    createCmd Order with
+      orderId = "order_008"
+      owner = alice
+      orderType = "BUY"
+      orderMode = "MARKET"
+      tradingPair = "BTC/USDT"
+      price = None
+      quantity = 0.1
+      filled = 0.0
+      status = "OPEN"
+      timestamp = now
+      operator = operator
+      allocationCid = "placeholder_allocation_cid_008"
+  
+  order <- query @Order alice
+  assert (length order == 1)

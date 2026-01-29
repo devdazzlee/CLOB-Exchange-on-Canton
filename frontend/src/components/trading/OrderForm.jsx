@@ -6,6 +6,7 @@ import { Input } from '../ui/input';
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '../ui/select';
 import { RadioGroup, RadioGroupItem } from '../ui/radio-group';
 import { Label } from '../ui/label';
+import { placeOrder } from '../../services/apiService';
 
 export default function OrderForm({ 
   tradingPair,

@@ -33,7 +33,8 @@ template Order
     observer operator
 
     -- Cancel an open order and release the Allocation
-    choice CancelOrder : ()
+    -- Returns the contract ID of the cancelled order for tracking
+    choice CancelOrder : ContractId Order
       controller owner
       do
         assert (status == "OPEN")
@@ -42,10 +43,9 @@ template Order
         -- When Splice is installed, uncomment and use:
         -- allocation <- fetch allocationCid
         -- _ <- exercise allocationCid Api.Token.AllocationV1.Allocation_Cancel with extraArgs = ()
-        -- For now, just mark order as cancelled
         
-        _ <- create this with status = "CANCELLED"
-        return ()
+        -- Create archived order (the original contract is archived by this choice)
+        create this with status = "CANCELLED"
 
     -- Fill the order (partially or fully)
     -- Note: Actual execution happens in MasterOrderBook:MatchOrders via Allocation_ExecuteTransfer

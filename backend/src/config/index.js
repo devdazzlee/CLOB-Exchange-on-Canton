@@ -1,67 +1,204 @@
 /**
- * Application Configuration
- * Centralized configuration management
+ * Configuration Module - FIXED VERSION
+ * 
+ * Single source of truth for all configuration.
+ * NO FALLBACKS - fail fast if required values are missing.
+ * 
+ * Based on DEVNET configuration:
+ * - JSON Ledger API: http://65.108.40.104:31539
+ * - Scan Proxy: http://65.108.40.104:8088
+ * - Keycloak: https://keycloak.wolfedgelabs.com:8443/realms/canton-devnet
  */
 
-require('dotenv').config();
-
-module.exports = {
-  // Server Configuration
+const config = {
+  // Server
   server: {
-    port: process.env.PORT || 3001,
+    port: parseInt(process.env.PORT || '3001', 10),
     env: process.env.NODE_ENV || 'development',
   },
 
-  // Canton Configuration
-  canton: {
-    jsonApiBase: process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539',
-    operatorPartyId: process.env.OPERATOR_PARTY_ID ||
-      'wolfedgelabs-dev-0::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292',
-    // OAuth configuration for Canton JSON API
-    oauthTokenUrl: process.env.CANTON_OAUTH_TOKEN_URL ||
-      'https://keycloak.wolfedgelabs.com:8443/realms/canton-devnet/protocol/openid-connect/token',
-    oauthClientId: process.env.CANTON_OAUTH_CLIENT_ID ||
-      'Sesnp3u6udkFF983rfprvsBbx3X3mBpw',
-    oauthClientSecret: process.env.CANTON_OAUTH_CLIENT_SECRET || '',
-    // Optional synchronizer ID override (will be discovered if not set)
-    synchronizerId: process.env.CANTON_SYNCHRONIZER_ID || 'global-domain::1220be58c29e65de40bf273be1dc2b266d43a9a002ea5b18955aeef7aac881bb471a',
-    // Package IDs - NEW DAR uploaded 2026-01-22 with all features
-    // The system auto-discovers package IDs, these are fallbacks
-    packageIds: {
-      // NEW DAR with Asset, AssetHolding, OrderV2, MasterOrderBookV2
-      clobExchange: process.env.CLOB_EXCHANGE_PACKAGE_ID ||
-        'f10023e35e41e6c76e2863bca154fbec275d01fdf528012dc3954e5f4a769454',
-      // Legacy fallbacks (for backward compatibility)
-      masterOrderBook: process.env.MASTER_ORDERBOOK_PACKAGE_ID ||
-        'dd500bf887d7e153ee6628b3f6722f234d3d62ce855572ff7ce73b7b3c2afefd',
-      userAccount: process.env.USER_ACCOUNT_PACKAGE_ID ||
-        'f10023e35e41e6c76e2863bca154fbec275d01fdf528012dc3954e5f4a769454',
-    },
-  },
-
-  // Keycloak Configuration
-  keycloak: {
-    baseUrl: process.env.KEYCLOAK_BASE_URL || 'https://keycloak.wolfedgelabs.com:8443',
-    realm: process.env.KEYCLOAK_REALM || 'canton-devnet',
-    clientId: process.env.KEYCLOAK_CLIENT_ID || 'Clob',
-    clientSecret: process.env.KEYCLOAK_CLIENT_SECRET || null,
-  },
-
-  // Party Management
-  party: {
-    dailyQuota: parseInt(process.env.DAILY_PARTY_QUOTA || '5000', 10),
-    weeklyQuota: parseInt(process.env.WEEKLY_PARTY_QUOTA || '35000', 10),
-  },
-
-  // WebSocket Configuration
+  // WebSocket
   websocket: {
-    path: '/ws',
-    perMessageDeflate: false,
+    path: process.env.WEBSOCKET_PATH || '/ws',
+    perMessageDeflate: process.env.WEBSOCKET_PER_MESSAGE_DEFLATE !== 'false',
   },
 
-  // API Configuration
-  api: {
-    timeout: parseInt(process.env.API_TIMEOUT || '30000', 10),
-    batchSize: parseInt(process.env.BATCH_SIZE || '50', 10),
+  // Canton endpoints (NO FALLBACKS)
+  canton: {
+    // JSON Ledger API - PRIMARY for all reads/writes
+    jsonApiBase: process.env.CANTON_JSON_LEDGER_API_BASE,
+
+    // Admin API (gRPC) - for DAR uploads
+    adminHost: process.env.CANTON_ADMIN_API_GRPC_HOST,
+    adminPort: parseInt(process.env.CANTON_ADMIN_API_GRPC_PORT || '0', 10),
+
+    // Ledger API (gRPC)
+    ledgerHost: process.env.CANTON_LEDGER_API_GRPC_HOST,
+    ledgerPort: parseInt(process.env.CANTON_LEDGER_API_GRPC_PORT || '0', 10),
+
+    // Operator party
+    operatorPartyId: process.env.OPERATOR_PARTY_ID,
+
+    // Default synchronizer (REQUIRED for all commands)
+    synchronizerId: process.env.DEFAULT_SYNCHRONIZER_ID,
+
+    // Package name for template IDs (package-name format)
+    packageName: process.env.PACKAGE_NAME || 'clob-exchange',
+
+    // Package ID for template IDs (package-id format) - REQUIRED for UserAccount creation
+    packageId: process.env.CLOB_EXCHANGE_PACKAGE_ID,
+
+    // OAuth configuration (SERVICE TOKEN ONLY)
+    oauth: {
+      tokenUrl: process.env.KEYCLOAK_TOKEN_URL,
+      clientId: process.env.OAUTH_CLIENT_ID,
+      clientSecret: process.env.OAUTH_CLIENT_SECRET,
+      audience: process.env.CANTON_JSON_LEDGER_API_BASE,
+      scope: process.env.OAUTH_SCOPE || 'openid profile email daml_ledger_api',
+    },
+
+    // Add packageIds for validation compatibility
+    get packageIds() {
+      return {
+        clobExchange: this.packageId || this.packageName, // Prefer package-id format
+        userAccount: this.packageId || this.packageName   // Prefer package-id format
+      };
+    },
+
+    // Validation helper for required package ID
+    validatePackageId() {
+      if (!this.packageId) {
+        throw new Error('CLOB_EXCHANGE_PACKAGE_ID environment variable is required for UserAccount creation. Please extract the package ID from your DAR file and set it in the environment.');
+      }
+      return this.packageId;
+    },
+
+    // Add oauth properties for validation compatibility
+    get oauthTokenUrl() { return this.oauth.tokenUrl; },
+    get oauthClientId() { return this.oauth.clientId; },
+    get oauthClientSecret() { return this.oauth.clientSecret; },
+  },
+
+  // Scan API (Token Standard)
+  scan: {
+    proxyBase: process.env.SCAN_PROXY_BASE,
+    apiPrefix: process.env.SCAN_API_PREFIX || '/api/scan',
+
+    // Full scan URL
+    get baseUrl() {
+      return this.proxyBase ? `${this.proxyBase}${this.apiPrefix}` : null;
+    }
+  },
+
+  // Keycloak
+  keycloak: {
+    baseUrl: process.env.KEYCLOAK_BASE_URL,
+    realm: process.env.KEYCLOAK_REALM || 'canton-devnet',
+    tokenUrl: process.env.KEYCLOAK_TOKEN_URL,
+  },
+
+  // Matching engine
+  matchingEngine: {
+    enabled: process.env.MATCHING_ENGINE_ENABLED !== 'false',
+    intervalMs: parseInt(process.env.MATCHING_ENGINE_INTERVAL_MS || '1000', 10),
+  },
+
+  // Logging
+  logging: {
+    level: process.env.LOG_LEVEL || 'info',
+    format: process.env.LOG_FORMAT || 'json',
+  },
+
+  /**
+   * Validate required configuration
+   * Call this at startup - fails fast if required values missing
+   */
+  validate() {
+    const errors = [];
+
+    // Required Canton values
+    if (!this.canton.jsonApiBase) {
+      errors.push('CANTON_JSON_LEDGER_API_BASE is required');
+    }
+    if (!this.canton.synchronizerId) {
+      errors.push('DEFAULT_SYNCHRONIZER_ID is required');
+    }
+    if (!this.canton.operatorPartyId) {
+      errors.push('OPERATOR_PARTY_ID is required');
+    }
+
+    // Required Package ID for UserAccount creation
+    if (!this.canton.packageId) {
+      errors.push('CLOB_EXCHANGE_PACKAGE_ID is required for UserAccount creation. Extract from DAR file and set in environment.');
+    }
+
+    // Required OAuth values
+    if (!this.canton.oauth.tokenUrl) {
+      errors.push('KEYCLOAK_TOKEN_URL is required');
+    }
+    if (!this.canton.oauth.clientId) {
+      errors.push('OAUTH_CLIENT_ID is required');
+    }
+    if (!this.canton.oauth.clientSecret) {
+      errors.push('OAUTH_CLIENT_SECRET is required');
+    }
+
+    if (errors.length > 0) {
+      console.error('='.repeat(60));
+      console.error('CONFIGURATION VALIDATION FAILED');
+      console.error('='.repeat(60));
+      errors.forEach(e => console.error(`  ✗ ${e}`));
+      console.error('='.repeat(60));
+      console.error('Please check your .env file');
+      console.error('='.repeat(60));
+      throw new Error(`Configuration validation failed: ${errors.join(', ')}`);
+    }
+
+    console.log('[Config] ✓ Configuration validated successfully');
+    return true;
+  },
+
+  /**
+   * Get template ID in package-name format
+   * @param {string} templateName - e.g., 'Order:Order', 'Trade:Trade', 'Balance:Balance'
+   */
+  getTemplateId(templateName) {
+    return `${this.canton.packageName}:${templateName}`;
+  },
+
+  /**
+   * Get configuration summary for logging (masks secrets)
+   */
+  getSummary() {
+    const mask = (s) => s ? `${s.slice(0, 16)}...` : '(not set)';
+
+    return {
+      server: {
+        port: this.server.port,
+        env: this.server.env,
+      },
+      canton: {
+        jsonApiBase: this.canton.jsonApiBase || '(not set)',
+        adminHost: this.canton.adminHost || '(not set)',
+        adminPort: this.canton.adminPort || '(not set)',
+        operatorPartyId: mask(this.canton.operatorPartyId),
+        synchronizerId: mask(this.canton.synchronizerId),
+        packageName: this.canton.packageName,
+        oauthConfigured: !!(this.canton.oauth.clientId && this.canton.oauth.clientSecret),
+      },
+      scan: {
+        baseUrl: this.scan.baseUrl || '(not set)',
+      },
+      keycloak: {
+        baseUrl: this.keycloak.baseUrl || '(not set)',
+        realm: this.keycloak.realm,
+      },
+      matchingEngine: {
+        enabled: this.matchingEngine.enabled,
+        intervalMs: this.matchingEngine.intervalMs,
+      },
+    };
   },
 };
+
+module.exports = config;

@@ -1,579 +1,359 @@
 /**
- * OrderBook Service
- * Handles OrderBook-related business logic
+ * Order Book Service - Facade
+ * 
+ * This service acts as a facade that delegates to:
+ * - ReadModelService for read operations (order books, trades)
+ * - CantonService for write operations (place/cancel orders)
+ * 
+ * DEPRECATED: Direct use of this service is deprecated.
+ * Use the ReadModelService and CantonService directly in new code.
  */
 
 const config = require('../config');
 const cantonService = require('./cantonService');
-const InMemoryOrderBookService = require('./inMemoryOrderBookService');
-const { getOrderBookContractId } = require('./canton-api-helpers');
-const tradeStore = require('./trade-store');
-const { NotFoundError } = require('../utils/errors');
-
-const MAX_BATCH_SIZE = 200;
-
-function chunkArray(items, size) {
-  const chunks = [];
-  for (let i = 0; i < items.length; i += size) {
-    chunks.push(items.slice(i, i + size));
-  }
-  return chunks;
-}
+const { getReadModelService } = require('./readModelService');
 
 class OrderBookService {
-  constructor() {
-    this.orderBookCache = new Map();
-    this.useInMemory = true; // Use in-memory service for now
-    this.inMemoryService = new InMemoryOrderBookService();
-  }
-
-  cacheOrderBookId(tradingPair, contractId) {
-    if (tradingPair && contractId) {
-      this.orderBookCache.set(tradingPair, contractId);
-    }
-  }
-
-  getCachedOrderBookId(tradingPair) {
-    return this.orderBookCache.get(tradingPair);
-  }
-
-  extractCreatedContractId(updatePayload) {
-    if (!updatePayload) {
-      return null;
+    constructor() {
+        console.log('[OrderBookService] Initialized as facade for ReadModelService + CantonService');
     }
 
-    const candidateEvents = [
-      updatePayload.events,
-      updatePayload.transaction?.events,
-      updatePayload.update?.events,
-      updatePayload.update?.transaction?.events,
-      updatePayload.transactions?.flatMap(t => t.events || [])
-    ].flat().filter(Boolean);
-
-    const createdEvent = candidateEvents.find(event => event?.created?.contractId);
-    return createdEvent?.created?.contractId || null;
-  }
-
-  async fetchOrderDetails(orderIds, adminToken, activeAtOffset) {
-    if (!Array.isArray(orderIds) || orderIds.length === 0) {
-      return [];
+    /**
+     * Get the ReadModelService singleton
+     */
+    getReadModel() {
+        return getReadModelService();
     }
 
-    const batches = chunkArray(orderIds, MAX_BATCH_SIZE);
-    const results = [];
+    /**
+     * Get order book for a trading pair - queries Canton directly
+     */
+    async getOrderBook(tradingPair) {
+        try {
+            const tokenProvider = require('./tokenProvider');
+            const token = await tokenProvider.getServiceToken();
+            const packageId = config.canton.packageIds.clobExchange;
+            const operatorPartyId = config.canton.operatorPartyId;
 
-    for (const batch of batches) {
-      const response = await fetch(`${config.canton.jsonApiBase}/v2/state/active-contracts?limit=${batch.length}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`,
-        },
-        body: JSON.stringify({
-          readAs: [config.canton.operatorPartyId],
-          activeAtOffset,
-          verbose: true,
-          filter: {
-            filtersByParty: {
-              [config.canton.operatorPartyId]: {
-                inclusive: {
-                  contractIds: batch,
-                },
-              },
-            },
-          },
-        }),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('[OrderBookService] Fetch orders error details:', {
-          status: response.status,
-          statusText: response.statusText,
-          errorText,
-        });
-        throw new Error(`Failed to fetch orders: ${response.status} - ${errorText}`);
-      }
-
-      const data = await response.json();
-      const contracts = data.activeContracts || [];
-      results.push(...contracts.map((entry) => {
-        const contract = entry.contractEntry?.JsActiveContract?.createdEvent ||
-          entry.createdEvent ||
-          entry;
-        const payload = contract.argument || contract.createArgument || {};
-        const quantity = payload.quantity;
-        const filled = payload.filled || 0;
-        const remaining = quantity !== undefined ? Math.max(0, Number(quantity) - Number(filled || 0)) : undefined;
-
-        return {
-          contractId: contract.contractId,
-          owner: payload.owner,
-          price: payload.price,
-          quantity,
-          filled,
-          remaining,
-          timestamp: payload.timestamp,
-          status: payload.status,
-          orderType: payload.orderType,
-          orderMode: payload.orderMode,
-          tradingPair: payload.tradingPair,
-        };
-      }));
-    }
-
-    return results;
-  }
-
-  async discoverSynchronizerId() {
-    try {
-      if (config.canton.synchronizerId) {
-        return config.canton.synchronizerId;
-      }
-
-      const response = await fetch(`${config.canton.jsonApiBase}/v2/state/connected-synchronizers`, {
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${await cantonService.getAdminToken()}`,
-          'Content-Type': 'application/json',
-        },
-      });
-      
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Failed to discover synchronizerId: ${response.status} - ${errorText}`);
-      }
-
-      const data = await response.json().catch(() => ({}));
-      let synchronizerId = null;
-
-      if (data.connectedSynchronizers && Array.isArray(data.connectedSynchronizers) && data.connectedSynchronizers.length > 0) {
-        const synchronizers = data.connectedSynchronizers;
-        const globalSync = synchronizers.find(s =>
-          s.synchronizerAlias === 'global' || s.alias === 'global'
-        );
-        if (globalSync?.synchronizerId) {
-          synchronizerId = globalSync.synchronizerId;
-        } else {
-          const globalDomainSync = synchronizers.find(s =>
-            s.synchronizerId && s.synchronizerId.includes('global-domain')
-          );
-          synchronizerId = globalDomainSync?.synchronizerId || synchronizers[0].synchronizerId || synchronizers[0].id;
-        }
-      } else if (data.synchronizers && Array.isArray(data.synchronizers) && data.synchronizers.length > 0) {
-        const first = data.synchronizers[0];
-        synchronizerId = typeof first === 'string' ? first : (first.synchronizerId || first.id);
-      } else if (data.synchronizerId) {
-        synchronizerId = data.synchronizerId;
-      } else if (Array.isArray(data) && data.length > 0) {
-        const first = data[0];
-        synchronizerId = typeof first === 'string' ? first : (first.synchronizerId || first.id);
-      }
-
-      if (synchronizerId) {
-        return synchronizerId;
-      }
-
-      throw new Error('No synchronizers found');
-    } catch (error) {
-      console.error('[OrderBookService] Failed to discover synchronizer:', error);
-      throw error;
-    }
-  }
-
-  buildTemplateId(moduleName, entityName) {
-    const packageId = config.canton.packageIds?.clobExchange;
-    if (!packageId) {
-      throw new Error(`Missing package ID for ${moduleName}:${entityName}`);
-    }
-    return `${packageId}:${moduleName}:${entityName}`;
-  }
-
-  getMasterOrderBookTemplateId() {
-    return this.buildTemplateId('MasterOrderBook', 'MasterOrderBook');
-  }
-
-  getOrderBookTemplateId() {
-    return this.buildTemplateId('OrderBook', 'OrderBook');
-  }
-
-  getTradeTemplateId() {
-    return this.buildTemplateId('Trade', 'Trade');
-  }
-
-  /**
-   * Get OrderBook contract ID for a trading pair
-   * @param {string} tradingPair - The trading pair
-   * @returns {Promise<string|null>} - Contract ID or null if not found
-   */
-  async getOrderBookContractId(tradingPair) {
-    // Try in-memory service first
-    if (this.useInMemory) {
-      return this.inMemoryService.getOrderBookContractId(tradingPair);
-    }
-
-    // Original DAML code (commented out for now)
-    /*
-    const adminToken = await cantonService.getAdminToken();
-    return await getOrderBookContractId(tradingPair, adminToken, config.canton.jsonApiBase);
-    */
-    return null;
-  }
-
-  /**
-   * Get trades for a trading pair
-   * @param {string} tradingPair - The trading pair
-   * @param {number} limit - Maximum number of trades to return
-   * @returns {Promise<Array>} - Array of trades
-   */
-  async getTrades(tradingPair, limit = 50) {
-    // Use in-memory service
-    if (this.useInMemory) {
-      return this.inMemoryService.getTrades(tradingPair, limit);
-    }
-
-    // Original DAML code (commented out for now)
-    /*
-    const adminToken = await cantonService.getAdminToken();
-    const contractId = await this.getOrderBookContractId(tradingPair);
-    
-    if (!contractId) {
-      throw new NotFoundError(`OrderBook not found for trading pair: ${tradingPair}`);
-    }
-
-    // Query trades from the ledger
-    const response = await fetch(`${config.canton.jsonApiBase}/v2/state/active-contracts`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${adminToken}`
-      },
-      body: JSON.stringify({
-        activeAtOffset: "0",
-        verbose: true,
-        filter: {
-          filtersForAnyParty: {
-            inclusive: {
-              templateIds: [this.getTradeTemplateId()]
+            if (!packageId) {
+                throw new Error('CLOB_EXCHANGE_PACKAGE_ID is not configured');
             }
-          }
+
+            // Query MasterOrderBookV2 contracts
+            const templateId = `${packageId}:MasterOrderBookV2:MasterOrderBookV2`;
+            const contracts = await cantonService.queryActiveContracts({
+                party: operatorPartyId,
+                templateIds: [templateId]
+            }, token);
+
+            // Find the order book for this trading pair
+            let orderBookContract = null;
+            if (Array.isArray(contracts)) {
+                orderBookContract = contracts.find(c => {
+                    const payload = c.payload || c.contractEntry?.JsActiveContract?.createdEvent?.createArgument || {};
+                    return payload.tradingPair === tradingPair;
+                });
+            } else if (contracts.activeContracts) {
+                orderBookContract = contracts.activeContracts.find(c => {
+                    const payload = c.payload || c.contractEntry?.JsActiveContract?.createdEvent?.createArgument || {};
+                    return payload.tradingPair === tradingPair;
+                });
+            }
+
+            if (!orderBookContract) {
+                // Return empty order book if not found
+                return {
+                    tradingPair,
+                    buyOrders: [],
+                    sellOrders: [],
+                    lastPrice: null,
+                    timestamp: new Date().toISOString()
+                };
+            }
+
+            // Extract order book data
+            const payload = orderBookContract.payload || 
+                          orderBookContract.contractEntry?.JsActiveContract?.createdEvent?.createArgument ||
+                          orderBookContract.createArgument ||
+                          {};
+
+            const buyOrderCids = payload.buyOrders || [];
+            const sellOrderCids = payload.sellOrders || [];
+            const lastPrice = payload.lastPrice?.Some || payload.lastPrice || null;
+
+            // Query actual order contracts
+            const buyOrders = await this.queryOrders(buyOrderCids, token);
+            const sellOrders = await this.queryOrders(sellOrderCids, token);
+
+            return {
+                tradingPair,
+                buyOrders: buyOrders.filter(o => o.status === 'OPEN').map(o => ({
+                    price: o.price?.Some || o.price || null,
+                    quantity: o.quantity,
+                    remaining: (parseFloat(o.quantity) - parseFloat(o.filled || 0)).toString(),
+                    orderId: o.orderId,
+                    owner: o.owner,
+                    contractId: o.contractId
+                })),
+                sellOrders: sellOrders.filter(o => o.status === 'OPEN').map(o => ({
+                    price: o.price?.Some || o.price || null,
+                    quantity: o.quantity,
+                    remaining: (parseFloat(o.quantity) - parseFloat(o.filled || 0)).toString(),
+                    orderId: o.orderId,
+                    owner: o.owner,
+                    contractId: o.contractId
+                })),
+                lastPrice,
+                timestamp: new Date().toISOString()
+            };
+        } catch (error) {
+            console.error(`[OrderBookService] Error getting order book for ${tradingPair}:`, error);
+            // Return empty order book on error
+            return {
+                tradingPair,
+                buyOrders: [],
+                sellOrders: [],
+                lastPrice: null,
+                timestamp: new Date().toISOString()
+            };
         }
-      })
-    });
-
-    if (!response.ok) {
-      throw new Error(`Failed to fetch trades: ${response.statusText}`);
     }
 
-    const data = await response.json();
-    const trades = data.activeContracts || [];
-    
-    // Filter trades for this trading pair and sort by timestamp
-    return trades
-      .map(trade => {
-        const contractData = trade.contractEntry?.JsActiveContract?.createdEvent || trade.createdEvent || trade;
-        return {
-          tradeId: contractData.createArgument?.tradeId || contractData.argument?.tradeId,
-          buyer: contractData.createArgument?.buyer || contractData.argument?.buyer,
-          seller: contractData.createArgument?.seller || contractData.argument?.seller,
-          tradingPair: contractData.createArgument?.tradingPair || contractData.argument?.tradingPair,
-          price: contractData.createArgument?.price || contractData.argument?.price,
-          quantity: contractData.createArgument?.quantity || contractData.argument?.quantity,
-          timestamp: contractData.createArgument?.timestamp || contractData.argument?.timestamp,
-          buyOrderId: contractData.createArgument?.buyOrderId || contractData.argument?.buyOrderId,
-          sellOrderId: contractData.createArgument?.sellOrderId || contractData.argument?.sellOrderId
-        };
-      })
-      .filter(trade => trade.tradingPair === tradingPair)
-      .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
-      .slice(0, limit);
-    */
-    return [];
-  }
-  async getOrderBook(tradingPair) {
-    // Use in-memory service if available
-    if (this.useInMemory) {
-      console.log(`[OrderBook] Getting OrderBook ${tradingPair} from in-memory service`);
-      const orderBook = this.inMemoryService.getOrderBookWithOrders(tradingPair);
-      if (!orderBook) {
-        throw new NotFoundError(`OrderBook not found for trading pair: ${tradingPair}`);
-      }
-      return orderBook;
+    /**
+     * Query order contracts by contract IDs
+     */
+    async queryOrders(orderCids, token) {
+        if (!orderCids || orderCids.length === 0) {
+            return [];
+        }
+
+        try {
+            const packageId = config.canton.packageIds.clobExchange;
+            const templateId = `${packageId}:Order:Order`;
+
+            const contracts = await cantonService.queryActiveContracts({
+                templateIds: [templateId]
+            }, token);
+
+            // Filter to only the requested contract IDs
+            const orders = [];
+            const cidSet = new Set(orderCids);
+            
+            const contractArray = Array.isArray(contracts) ? contracts : (contracts.activeContracts || []);
+            
+            for (const contract of contractArray) {
+                const contractId = contract.contractId || 
+                                 contract.contractEntry?.JsActiveContract?.createdEvent?.contractId;
+                
+                if (cidSet.has(contractId)) {
+                    const payload = contract.payload || 
+                                  contract.contractEntry?.JsActiveContract?.createdEvent?.createArgument ||
+                                  contract.createArgument ||
+                                  {};
+                    
+                    orders.push({
+                        contractId,
+                        orderId: payload.orderId,
+                        owner: payload.owner,
+                        orderType: payload.orderType,
+                        orderMode: payload.orderMode,
+                        tradingPair: payload.tradingPair,
+                        price: payload.price,
+                        quantity: payload.quantity,
+                        filled: payload.filled || '0',
+                        status: payload.status,
+                        timestamp: payload.timestamp
+                    });
+                }
+            }
+
+            return orders;
+        } catch (error) {
+            console.error('[OrderBookService] Error querying orders:', error);
+            return [];
+        }
     }
 
-    // Original Canton ledger code (commented out for now)
-    const contractId = await this.getOrderBookContractId(tradingPair);
-    
-    if (!contractId) {
-      throw new NotFoundError(`OrderBook not found for trading pair: ${tradingPair}`);
+    /**
+     * Get all order books
+     * @deprecated Use ReadModelService.getAllOrderBooks() directly
+     */
+    getAllOrderBooks() {
+        const readModel = this.getReadModel();
+        if (!readModel) {
+            return [];
+        }
+
+        return readModel.getAllOrderBooks().map(book => ({
+            tradingPair: book.pair,
+            buyOrders: book.bids || [],
+            sellOrders: book.asks || [],
+            lastPrice: book.lastPrice,
+            timestamp: book.timestamp || new Date().toISOString()
+        }));
     }
 
-    if (contractId.startsWith('pending-')) {
-      return {
-        contractId,
-        tradingPair,
-        operator: null,
-        buyOrders: [],
-        sellOrders: [],
-        lastPrice: null,
-        userAccounts: {},
-      };
+    /**
+     * Get trades for a trading pair
+     * @deprecated Use ReadModelService.getRecentTrades() directly
+     */
+    getTrades(tradingPair, limit = 50) {
+        const readModel = this.getReadModel();
+        if (!readModel) {
+            return [];
+        }
+
+        return readModel.getRecentTrades(tradingPair, limit);
     }
 
-    return null; // Not implemented for in-memory mode
-    /*
-    const adminToken = await cantonService.getAdminToken();
-    const activeAtOffset = await cantonService.getActiveAtOffset(adminToken);
+    /**
+     * Place an order on Canton ledger
+     * @deprecated Use CantonService.createContractWithTransaction() directly
+     */
+    async placeOrder(orderData) {
+        const {
+            tradingPair,
+            orderType, // BUY or SELL
+            orderMode, // LIMIT or MARKET
+            price,
+            quantity,
+            partyId
+        } = orderData;
 
-    const response = await fetch(`${config.canton.jsonApiBase}/v2/state/active-contracts?limit=10`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-              inclusive: {
-                contractIds: [contractId],
-              },
+        if (!partyId) {
+            throw new Error('placeOrder: partyId is required');
+        }
+
+        const tokenProvider = require('./tokenProvider');
+        const token = await tokenProvider.getServiceToken();
+        const packageId = config.canton.packageIds.clobExchange;
+
+        if (!packageId) {
+            throw new Error('CLOB_EXCHANGE_PACKAGE_ID is not configured');
+        }
+
+        const orderId = `O-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
+
+        const result = await cantonService.createContractWithTransaction({
+            token,
+            actAsParty: partyId,
+            templateId: `${packageId}:Order:Order`,
+            createArguments: {
+                orderId,
+                owner: partyId,
+                orderType: orderType.toUpperCase(),
+                orderMode: orderMode.toUpperCase(),
+                tradingPair,
+                price: orderMode.toUpperCase() === 'LIMIT' && price ? { Some: price.toString() } : { None: null },
+                quantity: quantity.toString(),
+                filled: "0.0",
+                status: "OPEN",
+                timestamp: new Date().toISOString(),
+                operator: config.canton.operatorPartyId,
+                allocationCid: ""
             },
-          },
-        }),
-      });
-    /*
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('[OrderBookService] GetOrderBook error details:', {
-        status: response.status,
-        statusText: response.statusText,
-        errorText: errorText,
-        contractId: contractId,
-        operatorPartyId: config.canton.operatorPartyId
-      });
-      throw new Error(`Failed to fetch OrderBook: ${response.status} - ${errorText}`);
-    }
-
-    const data = await response.json();
-    const contracts = data.activeContracts || [];
-    
-    if (contracts.length === 0) {
-      return {
-        contractId,
-        tradingPair,
-        operator: null,
-        buyOrders: [],
-        sellOrders: [],
-        lastPrice: null,
-        userAccounts: {},
-      };
-    }
-
-    const contract = contracts[0].contractEntry?.JsActiveContract?.createdEvent ||
-      contracts[0].createdEvent ||
-      contracts[0];
-    const args = contract.argument || contract.createArgument || {};
-    const buyOrderIds = args.buyOrders || [];
-    const sellOrderIds = args.sellOrders || [];
-
-    const orderDetails = await this.fetchOrderDetails(
-      [...buyOrderIds, ...sellOrderIds],
-      adminToken,
-      activeAtOffset
-    );
-    const orderById = new Map(orderDetails.map((o) => [o.contractId, o]));
-    const buyOrders = buyOrderIds.map((cid) => orderById.get(cid)).filter(Boolean);
-    const sellOrders = sellOrderIds.map((cid) => orderById.get(cid)).filter(Boolean);
-
-    return {
-      contractId: contract.contractId,
-      tradingPair: args.tradingPair,
-      operator: args.operator,
-      buyOrders,
-      sellOrders,
-      lastPrice: args.lastPrice,
-      userAccounts: args.userAccounts || {},
-    };
-    */
-  }
-
-  /**
-   * Get all OrderBooks with working filter structure
-   */
-  async getAllOrderBooks() {
-    // Use in-memory service if available
-    if (this.useInMemory) {
-      console.log('[OrderBook] Getting all OrderBooks from in-memory service');
-      const orderBooks = [];
-      for (const [tradingPair, orderBook] of this.inMemoryService.orderBooks) {
-        orderBooks.push({
-          contractId: orderBook.contractId,
-          tradingPair: orderBook.tradingPair,
-          operator: orderBook.operator,
-          buyOrders: orderBook.buyOrders,
-          sellOrders: orderBook.sellOrders,
-          lastPrice: orderBook.lastPrice,
-          userAccounts: orderBook.userAccounts,
-          createdAt: orderBook.createdAt,
-          updatedAt: orderBook.updatedAt
+            readAs: [config.canton.operatorPartyId]
         });
-      }
-      return orderBooks;
+
+        // Extract contract ID
+        const createdEvent = result.transaction?.events?.find(e => e.created || e.CreatedEvent);
+        const contractId = createdEvent?.created?.contractId ||
+            createdEvent?.CreatedEvent?.contractId ||
+            result.updateId;
+
+        return {
+            contractId,
+            orderId,
+            status: 'OPEN'
+        };
     }
 
-    // Original Canton ledger code (commented out for now)
-    return [];
-    /*
-    const adminToken = await cantonService.getAdminToken();
-    const activeAtOffset = await cantonService.getActiveAtOffset(adminToken);
+    /**
+     * Cancel an order on Canton ledger
+     * @deprecated Use CantonService.exerciseChoice() directly
+     */
+    async cancelOrder(orderId, partyId) {
+        if (!orderId) {
+            throw new Error('cancelOrder: orderId is required');
+        }
+        if (!partyId) {
+            throw new Error('cancelOrder: partyId is required');
+        }
 
-    const response = await fetch(`${config.canton.jsonApiBase}/v2/state/active-contracts?limit=20`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${adminToken}`,
-      },
-      body: JSON.stringify({
-        readAs: [config.canton.operatorPartyId],
-        activeAtOffset,
-        verbose: false,
-        filter: {
-          filtersByParty: {
-            [config.canton.operatorPartyId]: {
-              inclusive: {
-                templateIds: [this.getOrderBookTemplateId()],
-              },
+        const readModel = this.getReadModel();
+        const order = readModel?.getOrderByOrderId(orderId);
+
+        if (!order) {
+            throw new Error(`Order not found: ${orderId}`);
+        }
+
+        const tokenProvider = require('./tokenProvider');
+        const token = await tokenProvider.getServiceToken();
+        const packageId = config.canton.packageIds.clobExchange;
+
+        await cantonService.exerciseChoice({
+            token,
+            actAsParty: partyId,
+            templateId: `${packageId}:Order:Order`,
+            contractId: order.contractId,
+            choice: 'CancelOrder',
+            choiceArgument: {},
+            readAs: [config.canton.operatorPartyId]
+        });
+
+        return { status: 'CANCELLED' };
+    }
+
+    /**
+     * Create an order book (creates MasterOrderBook contract)
+     * @deprecated This should be an admin operation
+     */
+    async createOrderBook(tradingPair) {
+        const tokenProvider = require('./tokenProvider');
+        const token = await tokenProvider.getServiceToken();
+        const packageId = config.canton.packageIds.clobExchange;
+        const operatorPartyId = config.canton.operatorPartyId;
+
+        // Check if order book already exists
+        const readModel = this.getReadModel();
+        const existingBook = readModel?.getOrderBook(tradingPair);
+
+        if (existingBook && (existingBook.bids.length > 0 || existingBook.asks.length > 0)) {
+            return {
+                alreadyExists: true,
+                tradingPair
+            };
+        }
+
+        // Create MasterOrderBook contract
+        const result = await cantonService.createContractWithTransaction({
+            token,
+            actAsParty: operatorPartyId,
+            templateId: `${packageId}:MasterOrderBook:MasterOrderBook`,
+            createArguments: {
+                tradingPair,
+                buyOrders: [],
+                sellOrders: [],
+                lastPrice: { None: null },
+                operator: operatorPartyId,
+                publicObserver: operatorPartyId,
+                activeUsers: []
             },
-          },
-        },
-      }),
-    });
+            readAs: [operatorPartyId]
+        });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('[OrderBookService] Query error details:', {
-        status: response.status,
-        statusText: response.statusText,
-        errorText: errorText,
-        operatorPartyId: config.canton.operatorPartyId
-      });
-      throw new Error(`Failed to fetch OrderBooks: ${response.status} - ${errorText}`);
+        const createdEvent = result.transaction?.events?.find(e => e.created || e.CreatedEvent);
+        const contractId = createdEvent?.created?.contractId ||
+            createdEvent?.CreatedEvent?.contractId;
+
+        return {
+            contractId,
+            masterOrderBookContractId: contractId,
+            tradingPair,
+            alreadyExists: false
+        };
     }
-
-    const data = await response.json();
-    const contracts = data.activeContracts || [];
-
-    return contracts.map(entry => {
-      const contract = entry.contractEntry?.JsActiveContract?.createdEvent || 
-                       entry.createdEvent || 
-                       entry;
-      const args = contract.argument || contract.createArgument || {};
-      
-      return {
-        contractId: contract.contractId,
-        tradingPair: args.tradingPair,
-        operator: args.operator,
-        buyOrdersCount: (args.buyOrders || []).length,
-        sellOrdersCount: (args.sellOrders || []).length,
-        lastPrice: args.lastPrice,
-      };
-    });
-    */
-  }
-
-  /**
-   * Create a new OrderBook for a trading pair
-   * @param {string} tradingPair - The trading pair (e.g., "BTC/USDT")
-   * @returns {Promise<Object>} - Result with OrderBook contract ID
-   */
-  async createOrderBook(tradingPair) {
-    console.log(`[OrderBook] Creating OrderBook for ${tradingPair}`);
-    
-    // Check if OrderBook already exists (in-memory)
-    const existingContractId = await this.getOrderBookContractId(tradingPair);
-    if (existingContractId) {
-      console.log(`[OrderBook] OrderBook already exists: ${existingContractId}`);
-      return {
-        success: true,
-        message: 'OrderBook already exists',
-        data: {
-          contractId: existingContractId,
-          masterOrderBookContractId: null,
-          tradingPair: tradingPair,
-          alreadyExists: true,
-        },
-      };
-    }
-
-    // Use in-memory service for now
-    if (this.useInMemory) {
-      console.log('[OrderBook] Using in-memory OrderBook service');
-      return this.inMemoryService.createOrderBook(tradingPair, config.canton.operatorPartyId);
-    }
-
-    // Original DAML code (commented out for now)
-    /*
-    const adminToken = await cantonService.getAdminToken();
-    
-    // Parse trading pair
-    const [base, quote] = tradingPair.split('/');
-    if (!base || !quote) {
-      throw new Error('Invalid trading pair format. Expected BASE/QUOTE');
-    }
-
-    // Get package ID for MasterOrderBookV2 template
-    const orderBookPackageId = await cantonService.getPackageIdForTemplate('MasterOrderBookV2', adminToken);
-
-    // Create OrderBook contract
-    let orderBookResult;
-    try {
-      console.log('[OrderBook] Starting contract creation with templateId:', `${orderBookPackageId}:MasterOrderBookV2:MasterOrderBookV2`);
-      
-      orderBookResult = await cantonService.createContract({
-        token: adminToken,
-        actAsParty: config.canton.operatorPartyId,
-        templateId: `${orderBookPackageId}:MasterOrderBookV2:MasterOrderBookV2`,
-        createArguments: {
-          tradingPair,
-          buyOrders: [],
-          sellOrders: [],
-          lastPrice: null,
-          operator: config.canton.operatorPartyId,
-          publicObserver: config.canton.operatorPartyId,
-          activeUsers: [],
-          userAccounts: null
-        },
-        readAs: [config.canton.operatorPartyId],
-        synchronizerId: null
-      });
-    } catch (syncError) {
-      // Retry with synchronizer
-      orderBookResult = await cantonService.createContract({
-        token: adminToken,
-        actAsParty: config.canton.operatorPartyId,
-        templateId: `${orderBookPackageId}:MasterOrderBookV2:MasterOrderBookV2`,
-        createArguments: {
-          tradingPair,
-          buyOrders: [],
-          sellOrders: [],
-          lastPrice: null,
-          operator: config.canton.operatorPartyId,
-          publicObserver: config.canton.operatorPartyId,
-          activeUsers: [],
-          userAccounts: null
-        },
-        readAs: [config.canton.operatorPartyId],
-        synchronizerId: config.canton.synchronizerId
-      });
-    }
-
-    const orderBookContractId = orderBookResult.transaction?.events?.[0]?.created?.contractId;
-
-    // Wait for OrderBook to become visible and cache it
-    await this.waitForOrderBookVisibility(tradingPair, orderBookContractId, adminToken);
-
-    return {
-      contractId: orderBookContractId,
-      masterOrderBookContractId: null,
-      alreadyExists: false,
-    };
-    */
-  }
 }
 
+// Singleton instance
 module.exports = new OrderBookService();

@@ -16,6 +16,9 @@ class OnboardingService {
     this.synchronizerCacheExpiry = null;
     this.cachedToken = null;
     this.tokenExpiry = null;
+    // Track in-flight allocations to prevent duplicates
+    // Maps partyHint -> { promise, timestamp }
+    this.inFlightAllocations = new Map();
   }
 
   /**
@@ -307,14 +310,14 @@ class OnboardingService {
    * - Constructs publicKey object in backend (never trust frontend)
    * - Uses topologyTransactions from step 1 (DO NOT regenerate)
    * - Proper error handling with cause details
+   * - Prevents duplicate allocations for the same partyHint
+   * - Handles 409 REQUEST_ALREADY_IN_FLIGHT gracefully
    */
-  async allocateParty(publicKeyBase64, signatureBase64, topologyTransactions, publicKeyFingerprint) {
+  async allocateParty(publicKeyBase64, signatureBase64, topologyTransactions, publicKeyFingerprint, partyHint = null) {
     try {
       const token = await this.getCantonToken();
       const synchronizerId = await this.discoverSynchronizerId();
       const identityProviderId = await this.discoverIdentityProviderId();
-
-      const url = `${config.canton.jsonApiBase}/v2/parties/external/allocate`;
 
       // IMPORTANT: allocate expects onboardingTransactions = [{ transaction }]
       const onboardingTransactions = topologyTransactions.map((t) => ({ transaction: t }));
@@ -333,11 +336,50 @@ class OnboardingService {
         ]
       };
 
+      // Create a deduplication key from partyHint or first transaction
+      const dedupKey = partyHint || this._extractPartyHintFromTransaction(onboardingTransactions[0]?.transaction);
+      
+      // Check if allocation is already in flight for this party
+      if (dedupKey && this.inFlightAllocations.has(dedupKey)) {
+        const inFlight = this.inFlightAllocations.get(dedupKey);
+        const age = Date.now() - inFlight.timestamp;
+        
+        // If it's been more than 5 minutes, consider it stale and allow retry
+        if (age > 5 * 60 * 1000) {
+          console.log(`[OnboardingService] Clearing stale in-flight allocation for ${dedupKey}`);
+          this.inFlightAllocations.delete(dedupKey);
+        } else {
+          // Wait for the existing allocation to complete
+          console.log(`[OnboardingService] Allocation already in flight for ${dedupKey}, waiting...`);
+          try {
+            const result = await inFlight.promise;        
+            return {
+              step: 'ALLOCATED',
+              partyId: result.partyId || result.party || result.identifier,
+              synchronizerId,
+            };
+          } catch (error) {
+            // If the existing allocation failed, we can try again
+            console.log(`[OnboardingService] Previous allocation failed, retrying...`);
+            this.inFlightAllocations.delete(dedupKey);
+          }
+        }
+      }
+
+      // Create a promise for this allocation and track it
+      const allocationPromise = this._allocateParty(body, token, synchronizerId);
+      
+      if (dedupKey) {
+        this.inFlightAllocations.set(dedupKey, {
+          promise: allocationPromise,
+          timestamp: Date.now()
+        });
+      }
+
       console.log('[OnboardingService] Allocate request (formatted):', JSON.stringify(body, null, 2));
 
-      const result = await this._allocateParty(body, token, synchronizerId);
-
-      const data = JSON.parse(result.text);
+      const result = await allocationPromise;
+      const data = result; // _allocateParty now returns parsed JSON directly
       console.log('[OnboardingService] Allocate response:', JSON.stringify(data, null, 2));
 
       // Extract partyId from response
@@ -358,9 +400,20 @@ class OnboardingService {
     }
   }
 
+  /**
+   * Allocate party with proper retry handling for 503 (timeout) and 409 (already in flight)
+   * 
+   * Handles:
+   * - 503: HTTP timeout (allocation may still be processing on participant)
+   * - 409 REQUEST_ALREADY_IN_FLIGHT: Allocation is in progress, retry after delay
+   * - Network errors: Retry with exponential backoff
+   * 
+   * Uses Canton's retryInfo when available for optimal retry timing.
+   */
   async _allocateParty(body, token, synchronizerId, retryCount = 0) {
-    const maxRetries = 3;
-    const baseDelay = 2000; // 2 seconds
+    const maxRetries = 10; // Increased for 409 handling
+    const baseDelay = 1000; // 1 second base
+    const maxDelay = 10000; // 10 seconds max
 
     try {
       const res = await fetch(`${config.canton.jsonApiBase}/v2/parties/external/allocate`, {
@@ -377,45 +430,152 @@ class OnboardingService {
       console.log('[OnboardingService] Allocate response text:', text);
 
       if (!res.ok) {
-        // If it's a 503 and we haven't exhausted retries, retry with exponential backoff
+        // Handle 409 REQUEST_ALREADY_IN_FLIGHT - allocation is in progress
+        if (res.status === 409) {
+          try {
+            const errorData = JSON.parse(text);
+            
+            // Check if it's REQUEST_ALREADY_IN_FLIGHT (retryable)
+            if (errorData.code === 'REQUEST_ALREADY_IN_FLIGHT' && retryCount < maxRetries) {
+              // Use Canton's retryInfo if available, otherwise use exponential backoff
+              let delay = baseDelay;
+              
+              if (errorData.retryInfo) {
+                // Parse retryInfo (e.g., "1 second" or "2 seconds")
+                const retryMatch = errorData.retryInfo.match(/(\d+)\s*(second|seconds?)/i);
+                if (retryMatch) {
+                  delay = parseInt(retryMatch[1]) * 1000;
+                }
+              } else {
+                // Exponential backoff with jitter
+                delay = Math.min(
+                  baseDelay * Math.pow(2, retryCount) + Math.random() * 1000,
+                  maxDelay
+                );
+              }
+              
+              console.log(`[OnboardingService] Allocation in progress (409), retrying in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})`);
+              await new Promise(resolve => setTimeout(resolve, delay));
+              return this._allocateParty(body, token, synchronizerId, retryCount + 1);
+            }
+            
+            // Other 409 errors - don't retry
+            throw new Error(`Allocate failed 409: ${text}`);
+          } catch (parseError) {
+            // If we can't parse the error, treat as non-retryable
+            throw new Error(`Allocate failed 409 (unparseable): ${text}`);
+          }
+        }
+        
+        // Handle 503 (timeout) - allocation may still be processing
         if (res.status === 503 && retryCount < maxRetries) {
-          const delay = baseDelay * Math.pow(2, retryCount);
-          console.log(`[OnboardingService] Allocate failed 503, retrying in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})`);
+          // Exponential backoff with jitter
+          const delay = Math.min(
+            baseDelay * Math.pow(2, retryCount) + Math.random() * 1000,
+            maxDelay
+          );
+          console.log(`[OnboardingService] Allocate timeout (503), retrying in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})`);
           await new Promise(resolve => setTimeout(resolve, delay));
           return this._allocateParty(body, token, synchronizerId, retryCount + 1);
         }
+        
+        // Other errors - don't retry
         throw new Error(`Allocate failed ${res.status}: ${text}`);
       }
 
-      return res;
+      // Success - parse and return the JSON data
+      const result = JSON.parse(text);
+      
+      // Clear in-flight tracking on success
+      const partyHint = body.onboardingTransactions?.[0]?.transaction 
+        ? this._extractPartyHintFromTransaction(body.onboardingTransactions[0].transaction)
+        : null;
+      if (partyHint) {
+        this.inFlightAllocations.delete(partyHint);
+      }
+      
+      return result;
     } catch (error) {
-      // If it's a network error and we haven't exhausted retries, retry
+      // Network errors - retry if we haven't exhausted retries
       if (error.name === 'TypeError' && retryCount < maxRetries) {
-        const delay = baseDelay * Math.pow(2, retryCount);
+        const delay = Math.min(
+          baseDelay * Math.pow(2, retryCount) + Math.random() * 1000,
+          maxDelay
+        );
         console.log(`[OnboardingService] Network error, retrying in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})`);
         await new Promise(resolve => setTimeout(resolve, delay));
         return this._allocateParty(body, token, synchronizerId, retryCount + 1);
       }
+      
+      // Clear in-flight tracking on final error
+      const partyHint = body.onboardingTransactions?.[0]?.transaction 
+        ? this._extractPartyHintFromTransaction(body.onboardingTransactions[0].transaction)
+        : null;
+      if (partyHint) {
+        this.inFlightAllocations.delete(partyHint);
+      }
+      
       throw error;
+    }
+  }
+
+  /**
+   * Extract partyHint from base64-encoded transaction (for tracking)
+   * This is a best-effort extraction for deduplication
+   */
+  _extractPartyHintFromTransaction(transactionBase64) {
+    try {
+      // Transaction contains partyHint in the encoded data
+      // We use a simple hash of the transaction as the key
+      const crypto = require('crypto');
+      return crypto.createHash('sha256').update(transactionBase64).digest('hex').substring(0, 16);
+    } catch (e) {
+      return null;
     }
   }
 
   /**
    * Complete onboarding flow - allocate party and create UserAccount with tokens
    */
-  async completeOnboarding(publicKeyBase64, signatureBase64, topologyTransactions, publicKeyFingerprint) {
+  /**
+   * Complete onboarding flow - allocate party and create UserAccount with tokens
+   * 
+   * Handles retries gracefully - if allocation is in progress (409), waits and retries
+   */
+  async completeOnboarding(publicKeyBase64, signatureBase64, topologyTransactions, publicKeyFingerprint, partyHint = null) {
     try {
-      // Step 1: Allocate party
+      // Step 1: Allocate party (with proper retry handling for 409/503)
       const allocationResult = await this.allocateParty(
         publicKeyBase64,
         signatureBase64,
         topologyTransactions,
-        publicKeyFingerprint
+        publicKeyFingerprint,
+        partyHint
       );
 
       console.log('[Onboarding] Party allocated successfully:', allocationResult.partyId);
 
+      // Step 1.5: Grant operator rights for the new party (if gRPC available)
+      // This ensures the operator can create contracts for the newly allocated party
+      try {
+        await this.grantOperatorRightsForParty(allocationResult.partyId);
+        // Invalidate token cache to force refresh with new permissions
+        const tokenProvider = require('./tokenProvider');
+        tokenProvider.invalidate('service');
+        console.log('[Onboarding] Token cache invalidated after rights grant');
+        
+        // Longer delay to allow rights to propagate through Canton's system
+        console.log('[Onboarding] Waiting for rights to propagate...');
+        await new Promise(resolve => setTimeout(resolve, 3000)); // Increased to 3 seconds
+      } catch (rightsError) {
+        console.warn('[Onboarding] Failed to grant operator rights (may not be required):', rightsError.message);
+        // Continue anyway - some setups may not require explicit rights granting
+        // Still add a delay for rights propagation
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      }
+
       // Step 2: Create UserAccount and mint tokens
+      // Use the same token that was used for gRPC rights grant (validator-app token)
       const tokenResult = await this.createUserAccountAndMintTokens(allocationResult.partyId);
 
       return {
@@ -424,6 +584,15 @@ class OnboardingService {
       };
     } catch (error) {
       console.error('[Onboarding] Complete onboarding failed:', error);
+      
+      // Provide more helpful error messages
+      if (error.message && error.message.includes('REQUEST_ALREADY_IN_FLIGHT')) {
+        throw new Error(
+          'Party allocation is already in progress. Please wait a moment and check wallet status. ' +
+          'The allocation will complete automatically.'
+        );
+      }
+      
       throw error;
     }
   }
@@ -434,37 +603,101 @@ class OnboardingService {
    */
   async createUserAccountAndMintTokens(partyId) {
     try {
-      const adminToken = await this.getCantonToken();
+      // Use the same token source as gRPC calls (validator-app token via tokenProvider)
+      // This ensures consistent permissions across all Canton operations
+      const tokenProvider = require('./tokenProvider');
+      const adminToken = await tokenProvider.getServiceToken();
       const operatorPartyId = config.canton.operatorPartyId;
 
-      console.log('[Onboarding] Creating UserAccount for party:', partyId);
+      // Debug: Extract and log user ID from token for rights verification
+      let userId = null;
+      try {
+        const tokenPayload = JSON.parse(Buffer.from(adminToken.split('.')[1], 'base64').toString());
+        userId = tokenPayload.sub;
+        console.log('[Onboarding] Token user ID (sub):', userId);
+        console.log('[Onboarding] Creating UserAccount for party:', partyId);
+        console.log('[Onboarding] Using operator party:', operatorPartyId);
+        
+        // CRITICAL: Verify and grant rights via JSON API v2 before creating contract
+        // This ensures the user has canActAs for both parties
+        try {
+          console.log('[Onboarding] Checking user rights via JSON API v2...');
+          const currentRights = await cantonService.getUserRights(adminToken, userId);
+          console.log('[Onboarding] Current user rights:', JSON.stringify(currentRights, null, 2));
+          
+          // Check if user has canActAs for operator party (signatory)
+          // UserAccount has signatory operator, observer party - so we only need operator in actAs
+          const hasOperatorRights = currentRights.rights?.some(r => 
+            r.canActAs?.party === operatorPartyId
+          );
+          
+          console.log('[Onboarding] Has operator party rights (canActAs):', hasOperatorRights);
+          
+          // Grant rights for operator party if missing
+          // Note: Operator party is a domain party, may not be grantable via JSON API
+          // But we'll try anyway - the validator-operator user should already have these rights
+          const partiesToGrant = [];
+          if (!hasOperatorRights) {
+            partiesToGrant.push(operatorPartyId);
+            console.log('[Onboarding] Will grant rights for operator party:', operatorPartyId);
+          }
+          
+          // Also ensure we have readAs for the new party (for visibility)
+          // This is less critical but helps with querying
+          const hasNewPartyReadRights = currentRights.rights?.some(r => 
+            r.canReadAs?.party === partyId
+          );
+          if (!hasNewPartyReadRights) {
+            // Grant readAs for new party (already done via gRPC, but ensure via JSON API too)
+            partiesToGrant.push(partyId);
+            console.log('[Onboarding] Will grant readAs rights for new party:', partyId);
+          }
+          
+          if (partiesToGrant.length > 0) {
+            console.log('[Onboarding] Granting missing rights via JSON API v2...');
+            await cantonService.grantUserRights(adminToken, userId, partiesToGrant);
+            console.log('[Onboarding] Rights granted successfully');
+            // Wait a bit for rights to propagate
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          } else {
+            console.log('[Onboarding] User already has required rights');
+          }
+        } catch (rightsError) {
+          console.warn('[Onboarding] Could not verify/grant rights via JSON API (may not be available):', rightsError.message);
+          // Continue anyway - gRPC rights grant may be sufficient
+        }
+      } catch (tokenError) {
+        console.warn('[Onboarding] Could not decode token for user ID:', tokenError.message);
+        console.log('[Onboarding] Creating UserAccount for party:', partyId);
+      }
       
-      // ✅ Use package-id format: "<packageId>:Module:Entity" (NOT package-name format)
-      // This avoids package selection/vetting issues
-      const packageId = await cantonService.getPackageIdForTemplate('UserAccount', adminToken);
-      const templateId = `${packageId}:UserAccount:UserAccount`;
+      // ✅ Use template helper with package-id format (NOT package-name format)
+      // This avoids package selection/vetting issues and runtime discovery
+      const { userAccountTemplateId } = require('../utils/templateId');
+      const templateId = userAccountTemplateId();
       
       console.log('[Onboarding] Using templateId:', templateId.substring(0, 50) + '...');
 
       const createArguments = {
         party: partyId,
         operator: operatorPartyId,
-        // DA.Map.Map Text Decimal => array of [key, value] pairs
+        // DA.Map.Map Text Decimal => encoded as JSON array of [key, value] pairs
+        // NOT { map: [...] } - Canton expects direct array: [["USDT", "10000.0"]]
         balances: [
-          ["USDT", "10000.0"],
+          ["USDT", "10000.0"]
         ],
       };
 
-      // Get synchronizer ID for command submission
-      const synchronizerId = await this.discoverSynchronizerId();
-
+      // NOTE: synchronizerId is NOT used in submit-and-wait-for-transaction
+      // It's only used in external party allocation endpoints
+      // CRITICAL: UserAccount template has signatory operator, observer party
+      // Therefore actAs MUST be operator only (signatory), party goes in readAs (observer)
       const result = await cantonService.createContract({
         token: adminToken,
-        actAsParty: operatorPartyId, // because signatory is operator
+        actAsParty: operatorPartyId, // Only operator is signatory
         templateId,
         createArguments,
-        readAs: [operatorPartyId],
-        synchronizerId, // Required for NO_SYNCHRONIZER error
+        readAs: [operatorPartyId, partyId] // Include both for visibility (operator + observer)
       });
 
       console.log('[Onboarding] UserAccount created successfully:', result);
@@ -503,10 +736,10 @@ class OnboardingService {
     const templateId = `${packageId}:Faucet:Faucet`;
     
     // First, we need to find the Faucet contract ID
-    const faucetContracts = await cantonService.queryActiveContracts(adminToken, {
-      templateIds: [templateId],
-      readAs: [config.canton.operatorPartyId]
-    });
+    const faucetContracts = await cantonService.queryActiveContracts({
+      party: config.canton.operatorPartyId,
+      templateIds: [templateId]
+    }, adminToken);
     
     if (!faucetContracts.activeContracts || faucetContracts.activeContracts.length === 0) {
       throw new Error('Faucet contract not found');
@@ -527,15 +760,67 @@ class OnboardingService {
   }
 
   /**
+   * Grant operator rights for a newly allocated party via gRPC
+   * This ensures the operator can create contracts for the new party
+   */
+  async grantOperatorRightsForParty(partyId) {
+    try {
+      const adminToken = await this.getCantonToken();
+      
+      // Extract user ID from token (JWT 'sub' claim)
+      const tokenPayload = JSON.parse(Buffer.from(adminToken.split('.')[1], 'base64').toString());
+      const userId = tokenPayload.sub;
+      
+      if (!userId) {
+        throw new Error('Could not extract user ID from token');
+      }
+
+      // Use gRPC to grant rights
+      const CantonGrpcClient = require('./canton-grpc-client');
+      const grpcClient = new CantonGrpcClient();
+      
+      // Grant rights for the new party (for visibility)
+      await grpcClient.grantUserRights(userId, partyId, adminToken);
+      console.log('[Onboarding] Granted rights for new party:', partyId);
+      
+      // CRITICAL: Also grant rights for operator party
+      // This is needed because UserAccount has operator as signatory
+      // NOTE: Operator party may not be in the same identity provider (domain parties vs user parties)
+      // If gRPC fails with NOT_FOUND, the operator party is likely a domain party and rights
+      // are managed differently. We'll skip it and rely on the token having inherent operator rights.
+      const operatorPartyId = config.canton.operatorPartyId;
+      if (operatorPartyId && operatorPartyId !== partyId) {
+        try {
+          await grpcClient.grantUserRights(userId, operatorPartyId, adminToken);
+          console.log('[Onboarding] Granted rights for operator party:', operatorPartyId);
+        } catch (opError) {
+          // Operator party is likely a domain party (not in user IDP) - this is expected
+          // The validator-operator user should already have inherent rights for domain parties
+          if (opError.message && opError.message.includes('NOT_FOUND') && opError.message.includes('PARTIES')) {
+            console.log('[Onboarding] Operator party is a domain party (not in user IDP) - skipping rights grant (expected)');
+          } else {
+            console.warn(`[Onboarding] Could not grant operator party rights: ${opError.message}`);
+          }
+        }
+      }
+      
+      return { success: true };
+    } catch (error) {
+      console.warn('[Onboarding] Failed to grant operator rights via gRPC:', error.message);
+      // Don't throw - this might not be available in all setups
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
    * Ensure rights for party (optional - may be NO-OP)
    * Canton validator token should already have actAs rights
    * This is for compatibility and should not hard fail
    */
   async ensureRights(partyId) {
     console.log('[OnboardingService] Ensure-rights called for party:', partyId);
-    // NO-OP for now - validator token already has rights
-    // If needed in future, implement via gRPC UserManagementService
-    return { success: true, message: 'Rights verification skipped (validator token has actAs)' };
+    // Try to grant rights via gRPC
+    return await this.grantOperatorRightsForParty(partyId);
   }
 
   /**

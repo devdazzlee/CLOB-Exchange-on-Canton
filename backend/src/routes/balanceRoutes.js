@@ -1,63 +1,113 @@
 /**
- * Balance Routes
- * Provides balance endpoints for testing
+ * Balance Routes - REAL Canton integration ONLY
+ * No mock data or in-memory fallbacks
  */
 
 const express = require('express');
 const router = express.Router();
+const { success, error } = require('../utils/response');
+const asyncHandler = require('../middleware/asyncHandler');
+const { ValidationError } = require('../utils/errors');
+const CantonLedgerClient = require('../services/cantonLedgerClient');
 
-// Mock balance data for testing
-const mockBalances = {
-  'default': {
-    BTC: '10.0',
-    USDT: '100000.0',
-    ETH: '100.0',
-    SOL: '1000.0'
-  }
-};
+const cantonClient = new CantonLedgerClient();
 
 /**
  * GET /api/balance/:partyId
- * Get balance for a specific party
+ * Get REAL balance from Canton UserAccount contracts
  */
-router.get('/:partyId', (req, res) => {
+router.get('/:partyId', asyncHandler(async (req, res) => {
   const { partyId } = req.params;
   
-  console.log(`[Balance] Getting balance for party: ${partyId}`);
+  if (!partyId) {
+    throw new ValidationError('Party ID is required');
+  }
+
+  console.log(`[Balance] Getting REAL balance for party: ${partyId}`);
   
-  // For testing, return mock balance for any party
-  const balance = mockBalances.default;
-  
-  res.json({
-    success: true,
-    data: {
-      partyId,
-      balance
-    }
+  // Query UserAccount contracts from Canton
+  const activeContracts = await cantonClient.getActiveContracts({
+    parties: [partyId],
+    templateIds: ['UserAccount:UserAccount']
   });
-});
+
+  if (!activeContracts.contractEntry || activeContracts.contractEntry.length === 0) {
+    return error(res, 'User account not found', 404);
+  }
+
+  // Extract balance from UserAccount contract
+  const userAccount = activeContracts.contractEntry[0].JsActiveContract.createdEvent;
+  const balances = userAccount.argument.balances || [];
+
+  // Convert balance array to object
+  const availableBalances = {};
+  const lockedBalances = {};
+
+  balances.forEach(([token, amount]) => {
+    availableBalances[token] = amount;
+    lockedBalances[token] = '0'; // Would calculate from locked allocations
+  });
+
+  return success(res, {
+    partyId,
+    available: availableBalances,
+    locked: lockedBalances,
+    total: availableBalances // Same for now, would calculate real totals
+  }, 'Real balances retrieved from Canton');
+}));
 
 /**
- * POST /api/balance/:partyId/mint
- * Mint additional tokens for testing
+ * POST /api/balance/mint
+ * Mint tokens by creating UserAccount with initial balance
+ * NO MOCK MINTING - Real Canton contract creation
  */
-router.post('/:partyId/mint', (req, res) => {
-  const { partyId } = req.params;
-  const { tokens } = req.body || {};
+router.post('/mint', asyncHandler(async (req, res) => {
+  const { partyId, tokens } = req.body;
   
-  console.log(`[Balance] Minting tokens for party: ${partyId}`, tokens);
-  
-  // Return minted tokens
-  const mintedBalance = tokens || mockBalances.default;
-  
-  res.json({
-    success: true,
-    data: {
-      partyId,
-      balance: mintedBalance,
-      message: 'Tokens minted successfully'
+  if (!partyId) {
+    throw new ValidationError('Party ID is required');
+  }
+
+  if (!tokens || !Array.isArray(tokens)) {
+    throw new ValidationError('Tokens array is required');
+  }
+
+  console.log(`[Balance] Minting REAL tokens for party: ${partyId}`, tokens);
+
+  // Create UserAccount contract with initial balance
+  const command = {
+    templateId: 'UserAccount:UserAccount',
+    createArguments: {
+      party: partyId,
+      operator: config.canton.operatorPartyId,
+      balances: tokens.map(token => [token.symbol, token.amount.toString()])
     }
+  };
+
+  const result = await cantonClient.submitAndWaitForTransaction({
+    command,
+    actAs: config.canton.operatorPartyId,
+    readAs: [partyId]
   });
-});
+
+  // Extract created UserAccount contract ID
+  const userAccountEvent = result.transaction.events.find(e => 
+    e.CreatedEvent?.templateId.includes('UserAccount')
+  );
+
+  if (!userAccountEvent) {
+    throw new Error('Token minting failed - no UserAccount contract created');
+  }
+
+  const contractId = userAccountEvent.CreatedEvent.contractId;
+  console.log(`[Balance] Tokens minted successfully: ${contractId}`);
+
+  return success(res, {
+    partyId,
+    contractId,
+    tokens,
+    status: 'minted'
+  }, 'Tokens minted successfully on Canton', 201);
+}));
 
 module.exports = router;

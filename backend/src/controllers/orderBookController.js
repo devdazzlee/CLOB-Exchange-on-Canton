@@ -7,6 +7,7 @@ const orderBookService = require('../services/orderBookService');
 const { success, error } = require('../utils/response');
 const asyncHandler = require('../middleware/asyncHandler');
 const { NotFoundError } = require('../utils/errors');
+const { formatOrderBook } = require('../utils/orderBookAggregator');
 
 class OrderBookController {
   /**
@@ -23,10 +24,23 @@ class OrderBookController {
   getByTradingPair = asyncHandler(async (req, res) => {
     const { tradingPair } = req.params;
     const decodedTradingPair = decodeURIComponent(tradingPair);
+    const { aggregate = 'true', precision = '2', depth = '50' } = req.query;
 
     try {
+      // getOrderBook is now async - queries Canton directly
       const orderBook = await orderBookService.getOrderBook(decodedTradingPair);
-      return success(res, { orderBook }, 'OrderBook retrieved successfully');
+      
+      // Milestone 3: Aggregate price levels for professional UI
+      const aggregated = formatOrderBook(orderBook, {
+        aggregate: aggregate === 'true',
+        precision: parseInt(precision),
+        depth: parseInt(depth)
+      });
+
+      return success(res, { 
+        orderBook: aggregated,
+        raw: orderBook // Include raw data for backward compatibility
+      }, 'OrderBook retrieved successfully');
     } catch (err) {
       if (err instanceof NotFoundError) {
         // Auto-create the order book when missing to unblock UX
@@ -35,6 +49,8 @@ class OrderBookController {
           // Try to fetch it immediately (may still be pending; return what we have)
           let orderBook = null;
           try {
+            // Wait a bit for contract to be available
+            await new Promise(resolve => setTimeout(resolve, 500));
             orderBook = await orderBookService.getOrderBook(decodedTradingPair);
           } catch (_) {
             // ignore; return minimal info

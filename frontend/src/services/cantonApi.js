@@ -155,15 +155,29 @@ export async function getAvailableTradingPairs(_party = null) {
 }
 
 export async function getGlobalOrderBook(tradingPair) {
-  const res = await fetch(`${API_BASE_URL}/orderbooks/${encodeURIComponent(tradingPair)}`, { method: 'GET' });
+  // Use aggregated order book endpoint (Milestone 3)
+  const res = await fetch(`${API_BASE_URL}/orderbooks/${encodeURIComponent(tradingPair)}?aggregate=true&precision=2&depth=50`, { 
+    method: 'GET' 
+  });
   const json = await res.json().catch(() => ({}));
   const data = json?.data ?? json;
   const ob = data?.orderBook || null;
   if (!ob) return null;
+  
+  // Handle both aggregated and raw formats
+  // Aggregated format has bids/asks with cumulative depth
+  // Raw format has buyOrders/sellOrders
+  const buyOrders = ob.bids || ob.buyOrders || [];
+  const sellOrders = ob.asks || ob.sellOrders || [];
+  
   return {
     ...ob,
-    buyOrdersCount: (ob.buyOrders || []).length,
-    sellOrdersCount: (ob.sellOrders || []).length,
+    buyOrders: buyOrders,
+    sellOrders: sellOrders,
+    buys: buyOrders, // Alias for compatibility
+    sells: sellOrders, // Alias for compatibility
+    buyOrdersCount: buyOrders.length,
+    sellOrdersCount: sellOrders.length,
   };
 }
 

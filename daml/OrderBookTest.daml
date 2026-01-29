@@ -1,150 +1,228 @@
 module OrderBookTest where
 
 import Daml.Script
-import OrderBook
+import MasterOrderBook
 import Order
-import DA.Time
-import qualified DA.Map as Map
+import DA.Time()
 
 -- Test: Create order book
 testCreateOrderBook : Script ()
 testCreateOrderBook = script do
   operator <- allocateParty "Operator"
+  public <- allocateParty "Public"
   
   obCid <- submit operator do
-    createCmd OrderBook with
+    createCmd MasterOrderBook with
       tradingPair = "BTC/USDT"
       buyOrders = []
       sellOrders = []
       lastPrice = None
       operator = operator
+      publicObserver = public
       activeUsers = []
-      userAccounts = Some Map.empty
   
-  ob <- query @OrderBook operator
+  ob <- query @MasterOrderBook operator
   assert (length ob == 1)
-  -- OrderBook verification done via frontend integration tests
 
--- Test: Add buy order to book
+-- Test: Add buy order to book (simplified - exercises consuming choice)
 testAddBuyOrder : Script ()
 testAddBuyOrder = script do
   operator <- allocateParty "Operator"
+  public <- allocateParty "Public"
   alice <- allocateParty "Alice"
-  now <- getTime
   
-  -- Create order
-  orderCid <- submit operator do
-    createCmd Order with
-      orderId = "order_008"
-      owner = alice
-      orderType = "BUY"
-      orderMode = "LIMIT"
-      tradingPair = "BTC/USDT"
-      price = Some 42000.0
-      quantity = 0.5
-      filled = 0.0
-      status = "OPEN"
-      timestamp = now
-      operator = operator
-      allocationCid = "placeholder_allocation_cid_008"  -- Placeholder until Splice is installed
-  
-  -- Create order book
+  -- Create order book with alice as active user
   obCid <- submit operator do
-    createCmd OrderBook with
+    createCmd MasterOrderBook with
       tradingPair = "BTC/USDT"
       buyOrders = []
       sellOrders = []
       lastPrice = None
       operator = operator
-      activeUsers = []
-      userAccounts = Some Map.empty
+      publicObserver = public
+      activeUsers = [alice]
   
-  -- Add order to book
-  _ <- submit alice do
+  -- Alice adds a buy order (the AddOrder choice creates Order and updates book)
+  orderCid <- submit alice do
     exerciseCmd obCid AddOrder with
-      orderId = "order_008"
+      orderId = "order_buy_test"
       owner = alice
       orderType = "BUY"
       orderMode = "LIMIT"
       price = Some 42000.0
       quantity = 0.5
+      allocationCid = "placeholder_allocation"
   
-  ob <- query @OrderBook operator
-  assert (length ob == 1)
-  -- Buy order verification done via frontend integration tests
+  -- The order should exist
+  orders <- query @Order alice
+  assert (length orders == 1)
+  
+  -- The updated order book should exist (with the order added)
+  books <- query @MasterOrderBook operator
+  assert (length books == 1)
 
 -- Test: Add sell order to book
 testAddSellOrder : Script ()
 testAddSellOrder = script do
   operator <- allocateParty "Operator"
+  public <- allocateParty "Public"
   alice <- allocateParty "Alice"
-  now <- getTime
   
-  -- Create order book
+  -- Create order book with alice as active user
   obCid <- submit operator do
-    createCmd OrderBook with
+    createCmd MasterOrderBook with
       tradingPair = "BTC/USDT"
       buyOrders = []
       sellOrders = []
       lastPrice = None
       operator = operator
-      activeUsers = []
-      userAccounts = Some Map.empty
+      publicObserver = public
+      activeUsers = [alice]
   
-  -- Add sell order
-  _ <- submit alice do
+  -- Alice adds a sell order
+  orderCid <- submit alice do
     exerciseCmd obCid AddOrder with
-      orderId = "order_009"
+      orderId = "order_sell_test"
       owner = alice
       orderType = "SELL"
       orderMode = "LIMIT"
       price = Some 43000.0
       quantity = 1.0
+      allocationCid = "placeholder_allocation"
   
-  ob <- query @OrderBook operator
-  assert (length ob == 1)
-  -- Sell order verification done via frontend integration tests
+  -- The order should exist
+  orders <- query @Order alice
+  assert (length orders == 1)
+  
+  -- The updated order book should exist
+  books <- query @MasterOrderBook operator
+  assert (length books == 1)
 
--- Test: Remove order from book
-testRemoveOrder : Script ()
-testRemoveOrder = script do
+-- Test: Cancel order from book
+testCancelOrderFromBook : Script ()
+testCancelOrderFromBook = script do
   operator <- allocateParty "Operator"
+  public <- allocateParty "Public"
   alice <- allocateParty "Alice"
-  now <- getTime
   
-  -- Create order
-  orderCid <- submit operator do
-    createCmd Order with
-      orderId = "order_010"
-      owner = alice
-      orderType = "SELL"
-      orderMode = "LIMIT"
-      tradingPair = "BTC/USDT"
-      price = Some 43000.0
-      quantity = 1.0
-      filled = 1.0
-      status = "FILLED"
-      timestamp = now
-      operator = operator
-      allocationCid = "placeholder_allocation_cid_010"  -- Placeholder until Splice is installed
-  
-  -- Create order book with order
+  -- Create order book
   obCid <- submit operator do
-    createCmd OrderBook with
+    createCmd MasterOrderBook with
       tradingPair = "BTC/USDT"
       buyOrders = []
-      sellOrders = [orderCid]
+      sellOrders = []
       lastPrice = None
       operator = operator
-      activeUsers = []
-      userAccounts = Some Map.empty
+      publicObserver = public
+      activeUsers = [alice]
   
-  -- Remove order
-  _ <- submit operator do
-    exerciseCmd obCid RemoveOrder with
+  -- Alice adds order
+  orderCid <- submit alice do
+    exerciseCmd obCid AddOrder with
+      orderId = "order_cancel_test"
+      owner = alice
+      orderType = "BUY"
+      orderMode = "LIMIT"
+      price = Some 42000.0
+      quantity = 0.5
+      allocationCid = "placeholder_allocation"
+  
+  -- Query for the updated order book (since AddOrder consumes the original)
+  [(obCid2, _)] <- query @MasterOrderBook operator
+  
+  -- Alice cancels order from book
+  _ <- submit alice do
+    exerciseCmd obCid2 CancelOrderFromBook with
       orderCid = orderCid
+      orderOwner = alice
   
-  ob <- query @OrderBook operator
-  assert (length ob == 1)
-  -- Order removal verification done via frontend integration tests
+  -- The cancelled order should be archived and a new one created
+  orders <- query @Order alice
+  assert (length orders == 1)
 
+-- Test: Multiple orders from different users
+testMultipleOrders : Script ()
+testMultipleOrders = script do
+  operator <- allocateParty "Operator"
+  public <- allocateParty "Public"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  
+  -- Create order book with both users
+  obCid <- submit operator do
+    createCmd MasterOrderBook with
+      tradingPair = "ETH/USDT"
+      buyOrders = []
+      sellOrders = []
+      lastPrice = None
+      operator = operator
+      publicObserver = public
+      activeUsers = [alice, bob]
+  
+  -- Alice adds buy order
+  orderCid1 <- submit alice do
+    exerciseCmd obCid AddOrder with
+      orderId = "order_multi_1"
+      owner = alice
+      orderType = "BUY"
+      orderMode = "LIMIT"
+      price = Some 2500.0
+      quantity = 1.0
+      allocationCid = "placeholder_1"
+  
+  -- Query for the updated order book
+  [(obCid2, _)] <- query @MasterOrderBook operator
+  
+  -- Bob adds sell order to the updated book
+  orderCid2 <- submit bob do
+    exerciseCmd obCid2 AddOrder with
+      orderId = "order_multi_2"
+      owner = bob
+      orderType = "SELL"
+      orderMode = "LIMIT"
+      price = Some 2600.0
+      quantity = 2.0
+      allocationCid = "placeholder_2"
+  
+  -- Both orders should exist
+  aliceOrders <- query @Order alice
+  bobOrders <- query @Order bob
+  assert (length aliceOrders == 1)
+  assert (length bobOrders == 1)
+  
+  -- Final order book should have both orders
+  finalBooks <- query @MasterOrderBook operator
+  assert (length finalBooks == 1)
+
+-- Test: Market order (no price)
+testMarketOrder : Script ()
+testMarketOrder = script do
+  operator <- allocateParty "Operator"
+  public <- allocateParty "Public"
+  alice <- allocateParty "Alice"
+  
+  -- Create order book
+  obCid <- submit operator do
+    createCmd MasterOrderBook with
+      tradingPair = "BTC/USDT"
+      buyOrders = []
+      sellOrders = []
+      lastPrice = None
+      operator = operator
+      publicObserver = public
+      activeUsers = [alice]
+  
+  -- Market order has None for price
+  orderCid <- submit alice do
+    exerciseCmd obCid AddOrder with
+      orderId = "order_market"
+      owner = alice
+      orderType = "BUY"
+      orderMode = "MARKET"
+      price = None
+      quantity = 0.1
+      allocationCid = "placeholder_market"
+  
+  -- Order should be created
+  orders <- query @Order alice
+  assert (length orders == 1)

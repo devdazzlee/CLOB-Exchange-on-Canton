@@ -21,7 +21,7 @@ const KEYCLOAK_ADMIN_CLIENT_SECRET = process.env.KEYCLOAK_ADMIN_CLIENT_SECRET ||
 const CANTON_ADMIN_BASE = process.env.CANTON_ADMIN_BASE || 'https://participant.dev.canton.wolfedgelabs.com';
 const CANTON_ADMIN_HOST = process.env.CANTON_ADMIN_HOST || '65.108.40.104';
 const CANTON_ADMIN_PORT = process.env.CANTON_ADMIN_PORT || '30100';
-const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
+const CANTON_JSON_API_BASE = process.env.CANTON_JSON_LEDGER_API_BASE || 'http://65.108.40.104:31539';
 
 // Quota configuration
 const DAILY_QUOTA = parseInt(process.env.DAILY_PARTY_QUOTA || '5000');
@@ -299,7 +299,25 @@ class PartyService {
       const userId = this.getValidatorOperatorUserIdFromToken(adminToken);
 
       const grpcClient = new CantonGrpcClient();
+      
+      // Grant rights for the new party (for visibility)
       await grpcClient.grantUserRights(userId, partyId, adminToken);
+      console.log(`[PartyService] Granted rights for new party: ${partyId}`);
+      
+      // Also ensure validator-operator has rights for operator party (if not already granted)
+      // This is needed because UserAccount has operator as signatory
+      const config = require('../config');
+      const operatorPartyId = config.canton.operatorPartyId;
+      if (operatorPartyId && operatorPartyId !== partyId) {
+        try {
+          await grpcClient.grantUserRights(userId, operatorPartyId, adminToken);
+          console.log(`[PartyService] Granted rights for operator party: ${operatorPartyId}`);
+        } catch (opError) {
+          // Operator party rights might already exist, log but don't fail
+          console.warn(`[PartyService] Could not grant operator party rights (may already exist): ${opError.message}`);
+        }
+      }
+      
       return { success: true };
     } catch (error) {
       console.error('[PartyService] Failed to grant Canton user rights via gRPC:', error.message);

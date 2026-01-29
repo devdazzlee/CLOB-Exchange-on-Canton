@@ -104,30 +104,19 @@ export default function TradingInterface({ partyId }) {
       setLoading(true);
       console.log('[Place Order] Placing order:', orderData);
       
-      const response = await fetch('http://localhost:3001/api/orders/place', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          body: {
-            partyId,
-            tradingPair: orderData.tradingPair,
-            orderType: orderData.orderType,
-            orderMode: orderData.orderMode,
-            price: orderData.price ? parseFloat(orderData.price) : null,
-            quantity: parseFloat(orderData.quantity),
-            timeInForce: orderData.timeInForce || 'GTC'
-          }
-        })
+      // Use apiService for proper authentication and error handling
+      const { placeOrder } = await import('../services/apiService');
+      
+      const result = await placeOrder({
+        tradingPair: orderData.tradingPair,
+        orderType: orderData.orderType,
+        orderMode: orderData.orderMode,
+        price: orderData.price,
+        quantity: orderData.quantity,
+        timeInForce: orderData.timeInForce || 'GTC',
+        stopLoss: orderData.stopLoss || null
       });
 
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.message || `Order placement failed: ${response.status}`);
-      }
-
-      const result = await response.json();
       console.log('[Place Order] Order placed successfully:', result);
       
       // Clear form fields on success
@@ -340,21 +329,10 @@ export default function TradingInterface({ partyId }) {
               return;
             }
           }
-        } catch (err) {
-          console.log('[Balance] Backend balance fetch failed, using fallback');
+        } catch (balanceError) {
+          console.error('[Balance] Backend balance fetch failed:', balanceError);
+          throw new Error('Failed to fetch balances - please check your connection');
         }
-        
-        // Fallback: Set dummy tokens if backend fails
-        console.log('[Balance] Using fallback dummy tokens for testing...');
-        const fallbackBalance = {
-          BTC: '10.0',
-          USDT: '100000.0',
-          ETH: '100.0',
-          SOL: '1000.0'
-        };
-        setBalance(fallbackBalance);
-        console.log('[Balance] Fallback tokens set:', fallbackBalance);
-        hasLoadedBalanceRef.current = true;
       } catch (error) {
         console.error('[Balance] Failed to load balance:', error);
       } finally {

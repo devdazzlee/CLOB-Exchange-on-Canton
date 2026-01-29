@@ -93,11 +93,16 @@ class OnboardingController {
         // Quota enforcement BEFORE completing allocation
         quota.assertAvailable();
 
+        // Extract partyHint from topology transaction if available (for deduplication)
+        // The partyHint helps prevent duplicate allocations
+        const partyHint = req.body.partyHint || null;
+
         const result = await this.onboardingService.completeOnboarding(
           publicKeyBase64,
           signatureBase64,
           txs,
-          publicKeyFingerprint
+          publicKeyFingerprint,
+          partyHint
         );
 
         // Increment quota only after successful allocation+onboarding

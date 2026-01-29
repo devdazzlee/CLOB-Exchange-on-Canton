@@ -1,0 +1,197 @@
+-- | Balance module - Simplified balance management
+-- | This replaces the complex UTXO handling with single balance contracts per (party, asset)
+-- | No fragmentation, no merge logic required in JavaScript
+module Balance where
+
+import DA.Time
+
+-- | Single balance contract per (party, asset)
+-- | This eliminates the need for 400+ lines of UTXO merging code
+template Balance
+  with
+    owner : Party           -- The owner of this balance
+    asset : Text            -- Asset symbol (BTC, USDT, ETH, etc.)
+    available : Decimal     -- Available (unlocked) balance
+    locked : Decimal        -- Balance locked in open orders
+    operator : Party        -- Exchange operator with observer rights
+    lastUpdated : Time      -- Last modification timestamp
+  where
+    signatory owner
+    observer operator
+    
+    -- Ensure balances are never negative
+    ensure available >= 0.0 && locked >= 0.0
+    
+    -- | Reserve funds for an order
+    -- | Moves amount from available to locked
+    choice Reserve : ContractId Balance
+      with
+        amount : Decimal
+        orderId : Text  -- For audit trail
+      controller owner
+      do
+        assertMsg ("Insufficient available balance: need " <> show amount <> ", have " <> show available) 
+          (available >= amount)
+        now <- getTime
+        create this with
+          available = available - amount
+          locked = locked + amount
+          lastUpdated = now
+    
+    -- | Release locked funds (order cancelled or expired)
+    -- | Moves amount from locked back to available
+    choice Release : ContractId Balance
+      with
+        amount : Decimal
+        orderId : Text  -- For audit trail
+      controller owner
+      do
+        assertMsg ("Insufficient locked balance: need " <> show amount <> ", have " <> show locked)
+          (locked >= amount)
+        now <- getTime
+        create this with
+          available = available + amount
+          locked = locked - amount
+          lastUpdated = now
+    
+    -- | Settle trade - transfer locked funds to another party
+    -- | Called by operator when a trade is executed
+    -- | Deducts from sender's locked balance, adds to recipient's available
+    choice SettleTrade : ContractId Balance
+      with
+        amount : Decimal
+        recipient : Party
+        tradeId : Text  -- For audit trail
+      controller operator
+      do
+        assertMsg ("Insufficient locked balance for settlement: need " <> show amount <> ", have " <> show locked)
+          (locked >= amount)
+        now <- getTime
+        
+        -- Update sender's balance (this contract is archived, new one created)
+        -- The recipient's balance will be updated separately
+        create this with
+          locked = locked - amount
+          lastUpdated = now
+    
+    -- | Receive funds from a trade settlement
+    -- | Called when this party is the recipient of a trade
+    choice ReceiveSettlement : ContractId Balance
+      with
+        amount : Decimal
+        sender : Party
+        tradeId : Text  -- For audit trail
+      controller operator
+      do
+        assertMsg "Settlement amount must be positive" (amount > 0.0)
+        now <- getTime
+        create this with
+          available = available + amount
+          lastUpdated = now
+    
+    -- | Deposit funds (mint/external deposit)
+    -- | Only the operator can deposit funds (representing external transfers)
+    choice Deposit : ContractId Balance
+      with
+        amount : Decimal
+        depositId : Text  -- External reference for audit
+      controller operator
+      do
+        assertMsg "Deposit amount must be positive" (amount > 0.0)
+        now <- getTime
+        create this with
+          available = available + amount
+          lastUpdated = now
+    
+    -- | Withdraw funds (burn/external withdrawal)
+    -- | Only the owner can initiate, but processed by operator
+    choice Withdraw : ContractId Balance
+      with
+        amount : Decimal
+        withdrawalId : Text  -- External reference for audit
+      controller owner
+      do
+        assertMsg ("Insufficient available balance for withdrawal: need " <> show amount <> ", have " <> show available)
+          (available >= amount)
+        now <- getTime
+        create this with
+          available = available - amount
+          lastUpdated = now
+
+
+-- | Balance creation helper
+-- | Used when a new user is onboarded or receives their first tokens
+template BalanceRequest
+  with
+    requester : Party
+    asset : Text
+    initialAmount : Decimal
+    operator : Party
+  where
+    signatory requester
+    observer operator
+    
+    -- | Operator approves and creates the balance
+    choice ApproveBalance : ContractId Balance
+      controller operator
+      do
+        now <- getTime
+        create Balance with
+          owner = requester
+          asset = asset
+          available = initialAmount
+          locked = 0.0
+          operator = operator
+          lastUpdated = now
+
+
+-- | Atomic trade settlement between two parties
+-- | Ensures both sides of a DvP (Delivery vs Payment) happen atomically
+template TradeSettlement
+  with
+    buyer : Party
+    seller : Party
+    baseAsset : Text          -- What the seller gives (e.g., BTC)
+    quoteAsset : Text         -- What the buyer gives (e.g., USDT)
+    baseAmount : Decimal      -- Amount of base asset
+    quoteAmount : Decimal     -- Amount of quote asset
+    buyerBalanceBaseCid : ContractId Balance   -- Buyer's base asset balance
+    buyerBalanceQuoteCid : ContractId Balance  -- Buyer's quote asset balance
+    sellerBalanceBaseCid : ContractId Balance  -- Seller's base asset balance
+    sellerBalanceQuoteCid : ContractId Balance -- Seller's quote asset balance
+    operator : Party
+    tradeId : Text
+  where
+    signatory operator
+    observer buyer, seller
+    
+    -- | Execute the atomic settlement
+    -- | Both transfers happen in a single transaction
+    choice ExecuteSettlement : (ContractId Balance, ContractId Balance, ContractId Balance, ContractId Balance)
+      controller operator
+      do
+        -- Seller sends base asset to buyer (from seller's locked)
+        newSellerBase <- exercise sellerBalanceBaseCid SettleTrade with
+          amount = baseAmount
+          recipient = buyer
+          tradeId = tradeId
+        
+        -- Buyer receives base asset
+        newBuyerBase <- exercise buyerBalanceBaseCid ReceiveSettlement with
+          amount = baseAmount
+          sender = seller
+          tradeId = tradeId
+        
+        -- Buyer sends quote asset to seller (from buyer's locked)
+        newBuyerQuote <- exercise buyerBalanceQuoteCid SettleTrade with
+          amount = quoteAmount
+          recipient = seller
+          tradeId = tradeId
+        
+        -- Seller receives quote asset
+        newSellerQuote <- exercise sellerBalanceQuoteCid ReceiveSettlement with
+          amount = quoteAmount
+          sender = buyer
+          tradeId = tradeId
+        
+        return (newBuyerBase, newBuyerQuote, newSellerBase, newSellerQuote)
