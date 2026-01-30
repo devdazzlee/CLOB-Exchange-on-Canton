@@ -16,6 +16,7 @@ const CantonAdmin = require('./canton-admin');
 const cantonService = require('./cantonService');
 const config = require('../config');
 const tradeStore = require('./trade-store');
+const { getUpdateStream } = require('./cantonUpdateStream');
 const { extractTradesFromEvents } = require('./trade-utils');
 
 function recordTradesFromResult(result) {
@@ -23,7 +24,15 @@ function recordTradesFromResult(result) {
   if (trades.length === 0) return [];
 
   trades.forEach((trade) => {
+    // Add to UpdateStream for persistence
+    const updateStream = getUpdateStream();
+    if (updateStream) {
+      updateStream.addTrade(trade);
+    }
+    
+    // Also add to in-memory store
     tradeStore.addTrade(trade);
+    
     if (global.broadcastWebSocket) {
       global.broadcastWebSocket(`trades:${trade.tradingPair}`, {
         type: 'NEW_TRADE',
@@ -120,7 +129,25 @@ class MatchingEngine {
       // Get admin token
       const adminToken = await this.getAdminToken();
 
-      // First try to use ReadModel cache to avoid 200+ limit
+      // Use UpdateStream for persistent order data (handles Canton's 200+ limit)
+      const updateStream = getUpdateStream();
+      
+      if (updateStream && updateStream.initialized) {
+        // Get all trading pairs from UpdateStream
+        const tradingPairs = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']; // Common pairs
+        
+        for (const pair of tradingPairs) {
+          const { buyOrders, sellOrders } = updateStream.getOrdersForPair(pair);
+          
+          if (buyOrders.length > 0 || sellOrders.length > 0) {
+            console.log(`[MatchingEngine] Using UpdateStream: ${pair} (${buyOrders.length} buys, ${sellOrders.length} sells)`);
+            await this.processOrderBookFromUpdateStream(pair, buyOrders, sellOrders, adminToken);
+          }
+        }
+        return;
+      }
+
+      // Fallback: try ReadModel cache
       const { getReadModelService } = require('./readModelService');
       const readModel = getReadModelService();
       
@@ -152,6 +179,60 @@ class MatchingEngine {
     }
   }
   
+  /**
+   * Process order book from UpdateStream (persistent storage)
+   */
+  async processOrderBookFromUpdateStream(tradingPair, buyOrders, sellOrders, adminToken) {
+    try {
+      if (buyOrders.length === 0 || sellOrders.length === 0) {
+        return; // No matches possible
+      }
+      
+      // Sort orders by price-time priority
+      const sortedBuys = this.sortBuyOrders(buyOrders.map(o => ({
+        contractId: o.contractId,
+        orderId: o.orderId,
+        owner: o.owner,
+        orderType: 'BUY',
+        orderMode: o.orderMode || 'LIMIT',
+        price: o.price,
+        quantity: parseFloat(o.quantity) || 0,
+        filled: parseFloat(o.filled) || 0,
+        status: o.status || 'OPEN',
+        timestamp: o.timestamp
+      })));
+      
+      const sortedSells = this.sortSellOrders(sellOrders.map(o => ({
+        contractId: o.contractId,
+        orderId: o.orderId,
+        owner: o.owner,
+        orderType: 'SELL',
+        orderMode: o.orderMode || 'LIMIT',
+        price: o.price,
+        quantity: parseFloat(o.quantity) || 0,
+        filled: parseFloat(o.filled) || 0,
+        status: o.status || 'OPEN',
+        timestamp: o.timestamp
+      })));
+      
+      // Find matches
+      const matches = this.findMatches(sortedBuys, sortedSells);
+      
+      if (matches.length === 0) {
+        return;
+      }
+      
+      console.log(`[MatchingEngine] Found ${matches.length} potential matches for ${tradingPair}`);
+      
+      // Execute each match
+      for (const match of matches) {
+        await this.executeMatchDirect(match, tradingPair, adminToken);
+      }
+    } catch (error) {
+      console.error(`[MatchingEngine] Error processing UpdateStream order book:`, error.message);
+    }
+  }
+
   /**
    * Process order book from ReadModel cache
    */
@@ -242,11 +323,9 @@ class MatchingEngine {
       const { getReadModelService } = require('./readModelService');
       const readModel = getReadModelService();
       
-      // Add trade to trade store
-      const tradeStore = require('./trade-store');
+      // Add trade to UpdateStream for persistence AND in-memory store
       const tradeId = `trade-${Date.now()}-${Math.random().toString(36).substring(7)}`;
-      
-      tradeStore.addTrade({
+      const tradeData = {
         tradeId,
         tradingPair,
         buyer: buyOrder.owner,
@@ -256,12 +335,40 @@ class MatchingEngine {
         buyOrderId: buyOrder.orderId || buyOrder.contractId,
         sellOrderId: sellOrder.orderId || sellOrder.contractId,
         timestamp: new Date().toISOString()
-      });
+      };
+      
+      // Add to UpdateStream (persistent)
+      const updateStream = getUpdateStream();
+      if (updateStream) {
+        updateStream.addTrade(tradeData);
+      }
+      
+      // Add to in-memory store
+      tradeStore.addTrade(tradeData);
       
       console.log(`[MatchingEngine] ✅ Trade recorded: ${tradeId}`);
       
-      // TODO: Execute actual DAML choice to update contracts on ledger
-      // For now, just update the cache
+      // Broadcast trade via WebSocket for real-time UI updates
+      if (global.broadcastWebSocket) {
+        const tradeData = {
+          type: 'NEW_TRADE',
+          tradeId,
+          tradingPair,
+          buyer: buyOrder.owner,
+          seller: sellOrder.owner,
+          price: matchPrice.toString(),
+          quantity: matchQuantity.toString(),
+          buyOrderId: buyOrder.orderId || buyOrder.contractId,
+          sellOrderId: sellOrder.orderId || sellOrder.contractId,
+          timestamp: new Date().toISOString()
+        };
+        
+        global.broadcastWebSocket(`trades:${tradingPair}`, tradeData);
+        global.broadcastWebSocket('trades:all', tradeData);
+        console.log(`[MatchingEngine] 📡 Trade broadcasted via WebSocket`);
+      }
+      
+      // Update ReadModel cache
       if (readModel) {
         // Mark orders as filled/partially filled in cache
         const buyFilled = (parseFloat(buyOrder.filled) || 0) + matchQuantity;

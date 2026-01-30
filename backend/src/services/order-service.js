@@ -19,6 +19,7 @@ const tokenProvider = require('./tokenProvider');
 const { ValidationError, NotFoundError } = require('../utils/errors');
 const { v4: uuidv4 } = require('uuid');
 const { getReadModelService } = require('./readModelService');
+const { getUpdateStream } = require('./cantonUpdateStream');
 
 class OrderService {
   constructor() {
@@ -167,7 +168,27 @@ class OrderService {
 
     console.log(`[OrderService] ✅ Order placed: ${orderId} (${contractId.substring(0, 20)}...)`);
 
-    // Add to ReadModel cache for immediate UI update
+    // Add to UpdateStream for persistent storage and real-time updates
+    const orderRecord = {
+      contractId,
+      orderId,
+      owner: partyId,
+      tradingPair,
+      orderType: orderType.toUpperCase(),
+      orderMode: orderMode.toUpperCase(),
+      price: orderMode.toUpperCase() === 'LIMIT' && price ? price.toString() : null,
+      quantity: quantity.toString(),
+      filled: '0',
+      status: 'OPEN',
+      timestamp: timestamp
+    };
+    
+    const updateStream = getUpdateStream();
+    if (updateStream) {
+      updateStream.addOrder(orderRecord);
+    }
+
+    // Also add to ReadModel for backward compatibility
     const readModel = getReadModelService();
     if (readModel) {
       readModel.addOrder({
@@ -319,6 +340,13 @@ class OrderService {
 
     console.log(`[OrderService] ✅ Order cancelled: ${orderContractId}`);
 
+    // Remove from UpdateStream (persistent storage)
+    const updateStream = getUpdateStream();
+    if (updateStream) {
+      updateStream.removeOrder(orderContractId);
+      console.log(`[OrderService] Order removed from UpdateStream`);
+    }
+
     // Remove from ReadModel cache
     const readModel = getReadModelService();
     if (readModel) {
@@ -389,55 +417,38 @@ class OrderService {
   }
 
   /**
-   * Get user's orders from ReadModel cache (much faster than Canton query)
-   * Falls back to Canton query if ReadModel unavailable
+   * Get user's orders DIRECTLY from Canton API
+   * NO CACHE - always queries Canton
+   * Queries as the USER's party (not operator) to avoid 200+ limit
    */
   async getUserOrders(partyId, status = 'OPEN', limit = 100) {
     if (!partyId) {
       throw new ValidationError('Party ID is required');
     }
 
-    console.log(`[OrderService] Getting orders for party: ${partyId.substring(0, 30)}...`);
-
-    // First try ReadModel cache
-    try {
-      const { getReadModelService } = require('./readModelService');
-      const readModel = getReadModelService();
-      
-      if (readModel) {
-        const orders = readModel.getUserOrders(partyId, { 
-          status: status === 'ALL' ? undefined : status,
-          limit 
-        });
-        console.log(`[OrderService] Found ${orders.length} orders for user from ReadModel cache`);
-        return orders;
-      }
-    } catch (cacheError) {
-      console.log('[OrderService] ReadModel unavailable, falling back to Canton query');
-    }
-
-    // Fallback to Canton query
+    console.log(`[OrderService] Querying Canton DIRECTLY for party: ${partyId.substring(0, 30)}...`);
+    
     const token = await tokenProvider.getServiceToken();
     const packageId = config.canton.packageIds.clobExchange;
-    const operatorPartyId = config.canton.operatorPartyId;
 
     if (!packageId) {
       throw new Error('CLOB_EXCHANGE_PACKAGE_ID is not configured');
     }
 
     try {
+      // Query as the USER's party - this returns only THEIR contracts
+      // Each user has < 200 contracts, so no limit issue
       const contracts = await cantonService.queryActiveContracts({
-        party: operatorPartyId,
+        party: partyId,  // Query as USER, not operator
         templateIds: [`${packageId}:Order:Order`],
         pageSize: limit
       }, token);
 
-      // Filter by owner and status
       const orders = (Array.isArray(contracts) ? contracts : [])
         .filter(c => {
           const payload = c.payload || c.createArgument || {};
-          return payload.owner === partyId && 
-                 (status === 'ALL' || payload.status === status);
+          if (payload.owner !== partyId) return false;
+          return status === 'ALL' || payload.status === status;
         })
         .map(c => {
           const payload = c.payload || c.createArgument || {};
@@ -456,10 +467,49 @@ class OrderService {
           };
         });
 
-      console.log(`[OrderService] Found ${orders.length} orders for ${partyId}`);
+      console.log(`[OrderService] Found ${orders.length} orders from Canton for ${partyId.substring(0, 30)}...`);
       return orders;
     } catch (error) {
-      console.error('[OrderService] Error getting user orders:', error.message);
+      // Handle 200+ limit gracefully
+      if (error.message?.includes('200') || error.message?.includes('MAXIMUM_LIST')) {
+        console.log('[OrderService] 200+ contracts, using operator party query');
+        // Fallback: query as operator and filter
+        try {
+          const contracts = await cantonService.queryActiveContracts({
+            party: operatorPartyId,
+            templateIds: [`${packageId}:Order:Order`],
+            pageSize: 50 // Smaller page
+          }, token);
+          
+          const orders = (Array.isArray(contracts) ? contracts : [])
+            .filter(c => {
+              const payload = c.payload || c.createArgument || {};
+              return payload.owner === partyId && 
+                     (status === 'ALL' || payload.status === status);
+            })
+            .map(c => {
+              const payload = c.payload || c.createArgument || {};
+              return {
+                contractId: c.contractId,
+                orderId: payload.orderId,
+                owner: payload.owner,
+                tradingPair: payload.tradingPair,
+                orderType: payload.orderType,
+                orderMode: payload.orderMode,
+                price: payload.price?.Some || payload.price,
+                quantity: payload.quantity,
+                filled: payload.filled || '0',
+                status: payload.status,
+                timestamp: payload.timestamp
+              };
+            });
+          return orders;
+        } catch (fallbackError) {
+          console.error('[OrderService] Fallback query also failed:', fallbackError.message);
+          return [];
+        }
+      }
+      console.error('[OrderService] Error getting user orders from Canton:', error.message);
       return [];
     }
   }

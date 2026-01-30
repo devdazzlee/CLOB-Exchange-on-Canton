@@ -3,11 +3,14 @@
  * Handles OrderBook-related HTTP requests
  */
 
-const orderBookService = require('../services/orderBookService');
+const { getOrderBookService } = require('../services/orderBookService');
 const { success, error } = require('../utils/response');
 const asyncHandler = require('../middleware/asyncHandler');
 const { NotFoundError } = require('../utils/errors');
 const { formatOrderBook } = require('../utils/orderBookAggregator');
+
+// Get singleton instance
+const orderBookService = getOrderBookService();
 
 class OrderBookController {
   /**

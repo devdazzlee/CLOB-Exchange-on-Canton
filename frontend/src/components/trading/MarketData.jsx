@@ -52,12 +52,13 @@ export default function MarketData({ tradingPair, orderBook, trades = [] }) {
   const stats = calculate24hStats();
   const isPositive = stats.change >= 0;
 
-  // Get current price from order book
+  // Get current price from order book or latest trade - REAL DATA ONLY
   const bestBid = orderBook?.buys?.[0]?.price || null;
   const bestAsk = orderBook?.sells?.[0]?.price || null;
+  
   const currentPrice = bestBid && bestAsk 
     ? (parseFloat(bestBid) + parseFloat(bestAsk)) / 2 
-    : bestBid || bestAsk || stats.lastPrice || 0;
+    : parseFloat(bestBid) || parseFloat(bestAsk) || stats.lastPrice || 0;
 
   const formatPrice = (price) => {
     if (!price || price === 0) return '0.00';

@@ -36,10 +36,13 @@ export default function OrderForm({
   const baseBalance = parseFloat(balance[baseToken] || 0);
   const quoteBalance = parseFloat(balance[quoteToken] || 0);
 
-  // Get best bid/ask prices
+  // Get best bid/ask prices - REAL DATA ONLY
   const bestBid = orderBook.buys?.[0]?.price || null;
   const bestAsk = orderBook.sells?.[0]?.price || null;
-  const marketPrice = bestBid && bestAsk ? (parseFloat(bestBid) + parseFloat(bestAsk)) / 2 : bestBid || bestAsk || null;
+  
+  const marketPrice = bestBid && bestAsk 
+    ? (parseFloat(bestBid) + parseFloat(bestAsk)) / 2 
+    : parseFloat(bestBid) || parseFloat(bestAsk) || null;
 
   // Calculate estimated cost/value
   const estimatedCost = useMemo(() => {

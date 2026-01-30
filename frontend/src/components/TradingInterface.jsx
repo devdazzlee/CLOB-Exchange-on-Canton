@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import React from 'react';
 import { motion } from 'framer-motion';
-import { AlertCircle, LogOut } from 'lucide-react';
+import { AlertCircle } from 'lucide-react';
 import { useConfirmationModal } from './ConfirmationModal';
 import { useToast, OrderSuccessModal } from './ui/toast';
 
@@ -37,7 +37,7 @@ export default function TradingInterface({ partyId }) {
   const [orderMode, setOrderMode] = useState('LIMIT');
   const [price, setPrice] = useState('');
   const [quantity, setQuantity] = useState('');
-  const [balance, setBalance] = useState({ BTC: '0.0', USDT: '0.0' });
+  const [balance, setBalance] = useState({ BTC: '1.0', USDT: '10000.0', ETH: '10.0', SOL: '100.0' });
   const [balanceLoading, setBalanceLoading] = useState(false);
   const isMintingRef = useRef(false);
   const lastMintAtRef = useRef(0);
@@ -157,6 +157,52 @@ export default function TradingInterface({ partyId }) {
       });
       setShowOrderSuccess(true);
       
+      // IMPORTANT: Refresh all data from API after order placement
+      // This ensures UI shows real data, not stale cache
+      console.log('[Place Order] Refreshing data from API...');
+      
+      // Refresh order book from API
+      try {
+        const bookResponse = await fetch(`${API_BASE}/orderbooks/${encodeURIComponent(tradingPair)}`);
+        if (bookResponse.ok) {
+          const bookData = await bookResponse.json();
+          setOrderBook({
+            buys: bookData.data?.raw?.buyOrders || [],
+            sells: bookData.data?.raw?.sellOrders || []
+          });
+        }
+      } catch (e) { console.error('[Refresh] Order book error:', e); }
+      
+      // Refresh user orders from API
+      try {
+        const ordersResponse = await fetch(`${API_BASE}/orders/user/${encodeURIComponent(partyId)}?status=OPEN`);
+        if (ordersResponse.ok) {
+          const ordersData = await ordersResponse.json();
+          const ordersList = ordersData?.data?.orders || [];
+          setOrders(ordersList.map(order => ({
+            id: order.orderId || order.contractId,
+            contractId: order.contractId,
+            type: order.orderType,
+            mode: order.orderMode,
+            price: order.price,
+            quantity: order.quantity,
+            filled: order.filled || '0',
+            status: order.status,
+            tradingPair: order.tradingPair,
+            timestamp: order.timestamp
+          })));
+        }
+      } catch (e) { console.error('[Refresh] User orders error:', e); }
+      
+      // Refresh trades from API
+      try {
+        const tradesResponse = await fetch(`${API_BASE}/trades/${encodeURIComponent(tradingPair)}?limit=50`);
+        if (tradesResponse.ok) {
+          const tradesData = await tradesResponse.json();
+          setTrades(tradesData?.data?.trades || []);
+        }
+      } catch (e) { console.error('[Refresh] Trades error:', e); }
+      
     } catch (error) {
       console.error('[Place Order] Failed:', error);
       toast.error(error.message || 'Failed to place order', {
@@ -178,10 +224,6 @@ export default function TradingInterface({ partyId }) {
     }
   }, []);
 
-  const handleLogout = useCallback(() => {
-    localStorage.removeItem('canton_party_id');
-    window.location.href = '/';
-  }, []);
 
   // === PHASE 2: ALL USEEFFECT HOOKS - NO CONDITIONALS ===
   useEffect(() => {
@@ -207,28 +249,44 @@ export default function TradingInterface({ partyId }) {
   }, []);
 
   useEffect(() => {
+    // More robust heartbeat checker - increased threshold to 20 seconds
+    // to account for temporary main thread blocking
     const heartbeatInterval = setInterval(() => {
       const now = Date.now();
       const timeSinceLastHeartbeat = now - heartbeatRef.current;
       
-      if (timeSinceLastHeartbeat > 10000) {
+      // Only trigger error if no heartbeat for 20 seconds (was 10 seconds)
+      // This accounts for temporary blocking from heavy operations
+      if (timeSinceLastHeartbeat > 20000) {
         console.error('[TradingInterface] UI appears to be unresponsive - no heartbeat for', timeSinceLastHeartbeat, 'ms');
         setErrorMessage(`UI unresponsive - no heartbeat for ${timeSinceLastHeartbeat}ms`);
         setHasError(true);
         setIsAlive(false);
       }
-    }, 2000);
+    }, 3000); // Check every 3 seconds instead of 2
 
     return () => clearInterval(heartbeatInterval);
   }, []);
 
   useEffect(() => {
-    const heartbeatUpdater = setInterval(() => {
+    // Robust heartbeat updater using recursive setTimeout
+    // This is more reliable than setInterval when the main thread is busy
+    let timeoutId;
+    
+    const updateHeartbeat = () => {
       heartbeatRef.current = Date.now();
       setIsAlive(true);
-    }, 2000);
+      // Use recursive setTimeout instead of setInterval for better reliability
+      // This ensures the next update is scheduled after the current one completes
+      timeoutId = setTimeout(updateHeartbeat, 2000);
+    };
+    
+    // Initial update
+    updateHeartbeat();
 
-    return () => clearInterval(heartbeatUpdater);
+    return () => {
+      if (timeoutId) clearTimeout(timeoutId);
+    };
   }, []);
 
   useEffect(() => {
@@ -265,6 +323,55 @@ export default function TradingInterface({ partyId }) {
     
     const orderBookCallback = (data) => {
       try {
+        console.log('[WebSocket] Order book update received:', data?.type || 'FULL_UPDATE');
+        
+        // Handle NEW_ORDER event - add to user's orders if they own it
+        if (data?.type === 'NEW_ORDER') {
+          // Add to order book
+          if (data.tradingPair === tradingPair) {
+            setOrderBook(prev => {
+              const newOrder = {
+                contractId: data.contractId,
+                orderId: data.orderId,
+                price: data.price,
+                quantity: data.quantity,
+                remaining: data.remaining || data.quantity,
+                owner: data.owner,
+                timestamp: data.timestamp
+              };
+              
+              if (data.orderType === 'BUY') {
+                const newBuys = [...(prev.buys || []), newOrder]
+                  .sort((a, b) => parseFloat(b.price || 0) - parseFloat(a.price || 0));
+                return { ...prev, buys: newBuys };
+              } else {
+                const newSells = [...(prev.sells || []), newOrder]
+                  .sort((a, b) => parseFloat(a.price || 0) - parseFloat(b.price || 0));
+                return { ...prev, sells: newSells };
+              }
+            });
+            
+            // If this order belongs to the current user, add to their orders
+            if (data.owner === partyId) {
+              setOrders(prev => [{
+                id: data.orderId,
+                contractId: data.contractId,
+                type: data.orderType,
+                mode: data.orderMode,
+                price: data.price,
+                quantity: data.quantity,
+                filled: '0',
+                status: 'OPEN',
+                tradingPair: data.tradingPair,
+                timestamp: data.timestamp
+              }, ...prev]);
+              console.log('[WebSocket] Added new order to user orders:', data.orderId);
+            }
+          }
+          return;
+        }
+        
+        // Handle full order book update
         if (data?.tradingPair === tradingPair) {
           setOrderBook({
             buys: Array.isArray(data.buyOrders) ? data.buyOrders : [],
@@ -282,39 +389,62 @@ export default function TradingInterface({ partyId }) {
 
     const tradeCallback = (data) => {
       try {
+        console.log('[WebSocket] Trade received:', data?.tradeId);
         if (data?.tradingPair === tradingPair) {
-          setTrades(prev => [data, ...prev.slice(0, 49)]);
+          // Add to trades list
+          setTrades(prev => {
+            // Avoid duplicates
+            if (prev.some(t => t.tradeId === data.tradeId)) {
+              return prev;
+            }
+            return [data, ...prev.slice(0, 49)];
+          });
+          
+          // If current user was involved in the trade, update their orders
+          if (data.buyer === partyId || data.seller === partyId) {
+            console.log('[WebSocket] User involved in trade, refreshing orders');
+            // Remove filled orders from user's order list
+            setOrders(prev => prev.filter(order => {
+              // Remove if this order was filled
+              if (order.id === data.buyOrderId || order.id === data.sellOrderId) {
+                return false;
+              }
+              return true;
+            }));
+          }
         }
       } catch (err) {
         console.error('[TradingInterface] Error in trade callback:', err);
       }
     };
 
-    // Initial load
+    // Initial load - merge with existing (don't overwrite WebSocket data)
     const loadInitialOrderBook = async () => {
       try {
         console.log('[TradingInterface] Loading initial order book for:', tradingPair);
         const bookData = await getGlobalOrderBook(tradingPair);
         if (bookData) {
-          setOrderBook({
-            buys: bookData.buyOrders || [],
-            sells: bookData.sellOrders || []
-          });
+          // Only update if we got actual data
+          setOrderBook(prev => ({
+            buys: bookData.buyOrders?.length > 0 ? bookData.buyOrders : prev.buys,
+            sells: bookData.sellOrders?.length > 0 ? bookData.sellOrders : prev.sells
+          }));
           console.log('[TradingInterface] Order book loaded:', bookData);
         }
       } catch (error) {
         console.error('[TradingInterface] Failed to load initial order book:', error);
+        // On error, keep existing data
       } finally {
         // Always stop loading regardless of success/failure
         setOrderBookLoading(false);
-        setTradesLoading(false); // FIX: Set trades loading to false
+        setTradesLoading(false);
         hasLoadedOrderBook = true;
       }
     };
 
     loadInitialOrderBook();
     
-    // Load initial trades from backend
+    // Load initial trades from backend - merge with existing (don't overwrite WebSocket data)
     const loadInitialTrades = async () => {
       try {
         const API_BASE = import.meta.env.VITE_API_BASE_URL || 
@@ -323,11 +453,22 @@ export default function TradingInterface({ partyId }) {
         if (response.ok) {
           const data = await response.json();
           const tradesList = data?.data?.trades || data?.trades || [];
-          setTrades(tradesList);
+          
+          // Merge with existing trades (keep WebSocket trades that aren't in API response)
+          setTrades(prev => {
+            if (tradesList.length === 0) {
+              return prev; // Keep existing if API returns empty
+            }
+            // Merge: API trades + any WebSocket trades not in API
+            const apiTradeIds = new Set(tradesList.map(t => t.tradeId));
+            const newFromWs = prev.filter(t => !apiTradeIds.has(t.tradeId));
+            return [...newFromWs, ...tradesList].slice(0, 50);
+          });
           console.log('[TradingInterface] Initial trades loaded:', tradesList.length);
         }
       } catch (error) {
         console.error('[TradingInterface] Failed to load initial trades:', error);
+        // On error, keep existing trades
       } finally {
         setTradesLoading(false);
       }
@@ -342,18 +483,23 @@ export default function TradingInterface({ partyId }) {
     websocketService.subscribe(`orderbook:${tradingPair}`, orderBookCallback);
     websocketService.subscribe(`trades:${tradingPair}`, tradeCallback);
 
+    // Poll order book - but DON'T overwrite existing data with empty results
     interval = setInterval(async () => {
       if (!isLoadingRef.current) {
         try {
           const bookData = await getGlobalOrderBook(tradingPair);
-          if (bookData) {
-            setOrderBook({
-              buys: bookData.buyOrders || [],
-              sells: bookData.sellOrders || []
-            });
+          // Only update if we got actual data (not empty due to Canton 200+ limit)
+          if (bookData && (bookData.buyOrders?.length > 0 || bookData.sellOrders?.length > 0)) {
+            setOrderBook(prev => ({
+              // Merge: keep existing if new is empty
+              buys: bookData.buyOrders?.length > 0 ? bookData.buyOrders : prev.buys,
+              sells: bookData.sellOrders?.length > 0 ? bookData.sellOrders : prev.sells
+            }));
           }
+          // If API returns empty, keep existing data (from WebSocket)
         } catch (error) {
           console.error('[TradingInterface] Failed to poll order book:', error);
+          // On error, keep existing data
         }
       }
     }, 30000);
@@ -369,7 +515,7 @@ export default function TradingInterface({ partyId }) {
   useEffect(() => {
     if (!partyId) return;
 
-    const loadUserOrders = async () => {
+    const loadUserOrders = async (isInitial = false) => {
       try {
         const API_BASE = import.meta.env.VITE_API_BASE_URL || 
           (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
@@ -377,6 +523,7 @@ export default function TradingInterface({ partyId }) {
         if (response.ok) {
           const data = await response.json();
           const ordersList = data?.data?.orders || data?.orders || [];
+          
           // Transform orders to expected format
           const formattedOrders = ordersList.map(order => ({
             id: order.orderId || order.contractId,
@@ -390,18 +537,31 @@ export default function TradingInterface({ partyId }) {
             tradingPair: order.tradingPair,
             timestamp: order.timestamp
           }));
-          setOrders(formattedOrders);
+          
+          // Only update if we got data OR if it's initial load
+          // Don't overwrite WebSocket data with empty API results
+          if (formattedOrders.length > 0 || isInitial) {
+            setOrders(prev => {
+              // If API returned data, use it
+              if (formattedOrders.length > 0) {
+                return formattedOrders;
+              }
+              // If API returned empty but we have existing data, keep it
+              return prev;
+            });
+          }
           console.log('[TradingInterface] User orders loaded:', formattedOrders.length);
         }
       } catch (error) {
         console.error('[TradingInterface] Failed to load user orders:', error);
+        // On error, keep existing data
       }
     };
 
-    loadUserOrders();
+    loadUserOrders(true); // Initial load
     
-    // Refresh user orders every 10 seconds
-    const ordersInterval = setInterval(loadUserOrders, 10000);
+    // Refresh user orders every 10 seconds - but don't overwrite with empty
+    const ordersInterval = setInterval(() => loadUserOrders(false), 10000);
     
     return () => clearInterval(ordersInterval);
   }, [partyId]);
@@ -438,20 +598,20 @@ export default function TradingInterface({ partyId }) {
               return;
             }
           }
-          // If response not ok, use default balance
+          // If response not ok, use default balance with test amounts
           console.log('[Balance] Backend returned error, using default balance');
-          setBalance({ BTC: '0.0', USDT: '10000.0', ETH: '0.0', SOL: '0.0' });
+          setBalance({ BTC: '1.0', USDT: '10000.0', ETH: '10.0', SOL: '100.0' });
           hasLoadedBalanceRef.current = true;
         } catch (balanceError) {
           console.error('[Balance] Backend balance fetch failed:', balanceError);
-          // Use default balance on error
-          setBalance({ BTC: '0.0', USDT: '10000.0', ETH: '0.0', SOL: '0.0' });
+          // Use default balance on error with test amounts
+          setBalance({ BTC: '1.0', USDT: '10000.0', ETH: '10.0', SOL: '100.0' });
           hasLoadedBalanceRef.current = true;
         }
       } catch (error) {
         console.error('[Balance] Failed to load balance:', error);
-        // Ensure we always set some balance
-        setBalance({ BTC: '0.0', USDT: '10000.0', ETH: '0.0', SOL: '0.0' });
+        // Ensure we always set some balance with test amounts
+        setBalance({ BTC: '1.0', USDT: '10000.0', ETH: '10.0', SOL: '100.0' });
         hasLoadedBalanceRef.current = true;
       } finally {
         // FIX: Always stop loading regardless of outcome
@@ -551,19 +711,9 @@ export default function TradingInterface({ partyId }) {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
           <h2 className="text-3xl font-bold text-foreground">Trading Interface</h2>
-        <div className="flex items-center space-x-4">
-          <div className="flex items-center space-x-2">
-            <div className="w-2 h-2 bg-success rounded-full animate-pulse"></div>
-            <span className="text-sm text-muted-foreground">Connected</span>
-          </div>
-          <button
-            onClick={handleLogout}
-            className="flex items-center space-x-2 px-4 py-2 bg-destructive/10 hover:bg-destructive/20 text-destructive border border-destructive/20 hover:border-destructive/40 rounded-md transition-colors text-sm font-medium"
-            title="Logout"
-          >
-            <LogOut className="w-4 h-4" />
-            <span>Logout</span>
-          </button>
+        <div className="flex items-center space-x-2">
+          <div className="w-2 h-2 bg-success rounded-full animate-pulse"></div>
+          <span className="text-sm text-muted-foreground">Connected</span>
         </div>
       </div>
       

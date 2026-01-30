@@ -155,6 +155,24 @@ async function initializeReadModel() {
 }
 
 /**
+ * Initialize the Canton Update Stream for persistent order/trade storage
+ * This is the proper solution to handle Canton's 200 element query limit
+ */
+async function initializeUpdateStream() {
+  try {
+    const { getUpdateStream } = require('./services/cantonUpdateStream');
+    const updateStream = getUpdateStream();
+    await updateStream.initialize();
+    console.log('✅ Canton Update Stream initialized (persistent storage)');
+    return updateStream;
+  } catch (error) {
+    console.error('⚠️  Canton Update Stream initialization failed:', error.message);
+    console.error('   The system will try to query Canton directly (may hit 200+ limit).');
+    return null;
+  }
+}
+
+/**
  * Start server
  */
 async function startServer() {
@@ -177,6 +195,10 @@ async function startServer() {
     // Initialize Read Model (non-blocking)
     console.log('🔄 Initializing Read Model from Canton ledger...');
     await initializeReadModel();
+
+    // Initialize Update Stream for persistent storage
+    console.log('🔄 Initializing Canton Update Stream (persistent storage)...');
+    await initializeUpdateStream();
 
     // Start matching engine if enabled
     if (config.matchingEngine.enabled) {

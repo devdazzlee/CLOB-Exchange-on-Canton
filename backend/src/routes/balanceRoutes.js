@@ -36,16 +36,16 @@ router.get('/:partyId', asyncHandler(async (req, res) => {
     const contracts = activeContracts.contractEntry || activeContracts.activeContracts || [];
     
     if (!contracts || contracts.length === 0) {
-      // Return default balance for new users (they can still trade after onboarding creates UserAccount)
-      console.log(`[Balance] No UserAccount found for ${partyId}, returning default balance`);
+      // Return default balance for new users with test amounts for both BTC and USDT
+      console.log(`[Balance] No UserAccount found for ${partyId}, returning default test balance`);
       return success(res, {
         partyId,
-        balance: { USDT: '10000.0', BTC: '0.0', ETH: '0.0', SOL: '0.0' },
-        available: { USDT: '10000.0', BTC: '0.0', ETH: '0.0', SOL: '0.0' },
+        balance: { USDT: '10000.0', BTC: '1.0', ETH: '10.0', SOL: '100.0' },
+        available: { USDT: '10000.0', BTC: '1.0', ETH: '10.0', SOL: '100.0' },
         locked: { USDT: '0', BTC: '0', ETH: '0', SOL: '0' },
-        total: { USDT: '10000.0', BTC: '0.0', ETH: '0.0', SOL: '0.0' },
+        total: { USDT: '10000.0', BTC: '1.0', ETH: '10.0', SOL: '100.0' },
         source: 'default'
-      }, 'Default balance (no UserAccount found)');
+      }, 'Default test balance (no UserAccount found)');
     }
 
     // Extract balance from UserAccount contract - handle different response formats
@@ -82,15 +82,15 @@ router.get('/:partyId', asyncHandler(async (req, res) => {
     }, 'Real balances retrieved from Canton');
   } catch (err) {
     console.error(`[Balance] Error fetching balance for ${partyId}:`, err.message);
-    // Return default balance on error
+    // Return default test balance on error
     return success(res, {
       partyId,
-      balance: { USDT: '10000.0', BTC: '0.0', ETH: '0.0', SOL: '0.0' },
-      available: { USDT: '10000.0', BTC: '0.0', ETH: '0.0', SOL: '0.0' },
+      balance: { USDT: '10000.0', BTC: '1.0', ETH: '10.0', SOL: '100.0' },
+      available: { USDT: '10000.0', BTC: '1.0', ETH: '10.0', SOL: '100.0' },
       locked: { USDT: '0', BTC: '0', ETH: '0', SOL: '0' },
-      total: { USDT: '10000.0', BTC: '0.0', ETH: '0.0', SOL: '0.0' },
+      total: { USDT: '10000.0', BTC: '1.0', ETH: '10.0', SOL: '100.0' },
       source: 'default'
-    }, 'Default balance (error fetching from Canton)');
+    }, 'Default test balance (error fetching from Canton)');
   }
 }));
 
