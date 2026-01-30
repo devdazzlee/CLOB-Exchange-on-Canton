@@ -15,6 +15,25 @@ class TradeController {
     return success(res, { trades }, 'Trades retrieved successfully');
   });
 
+  // GET /api/trades/:pair - Get trades by trading pair
+  getByPair = asyncHandler(async (req, res) => {
+    const { pair } = req.params;
+    const limitInput = req.query?.limit;
+    const limit = Number.isFinite(Number(limitInput)) ? Number(limitInput) : 50;
+    
+    // Decode the trading pair (e.g., BTC%2FUSDT -> BTC/USDT)
+    const tradingPair = decodeURIComponent(pair);
+    
+    console.log(`[TradeController] Getting trades for pair: ${tradingPair}`);
+    
+    const trades = tradeStore.getTrades(tradingPair, limit);
+    return success(res, { 
+      tradingPair, 
+      trades,
+      count: trades.length
+    }, 'Trades retrieved successfully');
+  });
+
   getForParty = asyncHandler(async (req, res) => {
     const { partyId } = req.params;
     const limitInput = req.query?.limit;

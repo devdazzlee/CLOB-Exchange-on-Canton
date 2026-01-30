@@ -1,10 +1,13 @@
 /**
  * Order Controller
  * Handles order-related HTTP requests
+ * 
+ * Uses Canton JSON Ledger API v2:
+ * - POST /v2/commands/submit-and-wait-for-transaction - Place/Cancel orders
+ * - POST /v2/state/active-contracts - Query orders
  */
 
 const OrderService = require('../services/order-service');
-const orderBookService = require('../services/orderBookService');
 const { success } = require('../utils/response');
 const asyncHandler = require('../middleware/asyncHandler');
 const { ValidationError } = require('../utils/errors');
@@ -16,6 +19,9 @@ class OrderController {
 
   /**
    * Place an order
+   * POST /api/orders/place
+   * 
+   * Creates an Order contract on Canton ledger
    */
   place = asyncHandler(async (req, res) => {
     const {
@@ -24,121 +30,130 @@ class OrderController {
       orderMode,
       price,
       quantity,
-      partyId,
-      orderBookContractId,
-      userAccountContractId,
-      allocationCid
+      partyId
     } = req.body;
 
-    if (!tradingPair || !orderType || !orderMode || !quantity || !partyId) {
-      throw new ValidationError('Missing required fields: tradingPair, orderType, orderMode, quantity, partyId');
+    // Get partyId from request body or header
+    const effectivePartyId = partyId || req.headers['x-user-id'] || req.headers['x-party-id'];
+
+    if (!tradingPair || !orderType || !orderMode || !quantity) {
+      throw new ValidationError('Missing required fields: tradingPair, orderType, orderMode, quantity');
     }
 
-    if (orderMode === 'LIMIT' && !price) {
+    if (!effectivePartyId) {
+      throw new ValidationError('Missing partyId. Provide in request body or x-user-id header');
+    }
+
+    if (orderMode.toUpperCase() === 'LIMIT' && !price) {
       throw new ValidationError('Price is required for LIMIT orders');
     }
 
     const decodedTradingPair = decodeURIComponent(tradingPair);
 
-    let resolvedOrderBookContractId = orderBookContractId;
-    if (!resolvedOrderBookContractId) {
-      console.log(`[OrderController] Getting OrderBook contract ID for ${decodedTradingPair}`);
-      resolvedOrderBookContractId = await orderBookService.getOrderBookContractId(decodedTradingPair);
-    }
-    if (!resolvedOrderBookContractId) {
-      console.log(`[OrderController] OrderBook not found, creating new one for ${decodedTradingPair}`);
-      const created = await orderBookService.createOrderBook(decodedTradingPair);
-      // Handle both old and new response structures
-      resolvedOrderBookContractId = created.contractId || created.data?.contractId;
-      console.log(`[OrderController] OrderBook created with ID: ${resolvedOrderBookContractId?.substring(0, 30)}...`);
-    } else {
-      console.log(`[OrderController] Using existing OrderBook: ${resolvedOrderBookContractId.substring(0, 30)}...`);
-    }
+    console.log(`[OrderController] Placing order:`, {
+      tradingPair: decodedTradingPair,
+      orderType,
+      orderMode,
+      price,
+      quantity,
+      partyId: effectivePartyId.substring(0, 30) + '...'
+    });
 
-    let result;
-    if (allocationCid) {
-      result = await this.orderService.placeOrderWithAllocation(
-        partyId,
-        decodedTradingPair,
-        orderType,
-        orderMode,
-        quantity,
-        price,
-        resolvedOrderBookContractId,
-        allocationCid
-      );
-    } else {
-      result = await this.orderService.placeOrderWithUTXOHandling(
-        partyId,
-        decodedTradingPair,
-        orderType,
-        orderMode,
-        quantity,
-        price,
-        resolvedOrderBookContractId,
-        userAccountContractId
-      );
-    }
+    // Place order directly using OrderService
+    const result = await this.orderService.placeOrder({
+      partyId: effectivePartyId,
+      tradingPair: decodedTradingPair,
+      orderType: orderType.toUpperCase(),
+      orderMode: orderMode.toUpperCase(),
+      price,
+      quantity
+    });
+
+    console.log(`[OrderController] ✅ Order placed: ${result.orderId}`);
 
     return success(res, result, 'Order placed successfully', 201);
   });
 
   /**
    * Cancel an order
+   * POST /api/orders/cancel
+   * 
+   * Exercises CancelOrder choice on Order contract
    */
   cancel = asyncHandler(async (req, res) => {
     const {
       orderContractId,
       partyId,
-      tradingPair,
-      orderType,
-      orderBookContractId,
-      userAccountContractId
+      tradingPair
     } = req.body;
 
-    if (!orderContractId || !partyId || !tradingPair || !orderType) {
-      throw new ValidationError('Missing required fields: orderContractId, partyId, tradingPair, orderType');
+    // Get partyId from request body or header
+    const effectivePartyId = partyId || req.headers['x-user-id'] || req.headers['x-party-id'];
+
+    if (!orderContractId) {
+      throw new ValidationError('Missing required field: orderContractId');
     }
 
-    const decodedTradingPair = decodeURIComponent(tradingPair);
-    const result = await this.orderService.cancelOrderWithUTXOHandling(
-      partyId,
-      decodedTradingPair,
-      orderType,
+    if (!effectivePartyId) {
+      throw new ValidationError('Missing partyId. Provide in request body or x-user-id header');
+    }
+
+    console.log(`[OrderController] Cancelling order: ${orderContractId.substring(0, 30)}...`);
+
+    const result = await this.orderService.cancelOrder(
       orderContractId,
-      orderBookContractId,
-      userAccountContractId
+      effectivePartyId,
+      tradingPair
     );
+
+    console.log(`[OrderController] ✅ Order cancelled`);
 
     return success(res, result, 'Order cancelled successfully');
   });
 
   /**
    * Get user's active orders
+   * GET /api/orders/user/:partyId
    */
   getUserOrders = asyncHandler(async (req, res) => {
     const { partyId } = req.params;
+    const { status = 'OPEN', limit = 100 } = req.query;
 
     if (!partyId) {
       throw new ValidationError('Missing required param: partyId');
     }
 
-    // TODO: implement lookup when order storage is available
-    return success(res, [], 'User orders fetched successfully');
+    console.log(`[OrderController] Getting orders for party: ${partyId.substring(0, 30)}...`);
+
+    const orders = await this.orderService.getUserOrders(partyId, status, parseInt(limit));
+
+    console.log(`[OrderController] Found ${orders.length} orders`);
+
+    return success(res, { orders }, 'User orders fetched successfully');
   });
 
   /**
    * Cancel order by ID
+   * POST /api/orders/:orderId/cancel
    */
   cancelOrderById = asyncHandler(async (req, res) => {
     const { orderId } = req.params;
+    const partyId = req.headers['x-user-id'] || req.headers['x-party-id'] || req.body?.partyId;
 
     if (!orderId) {
       throw new ValidationError('Missing required param: orderId');
     }
 
-    // TODO: implement cancel by contract ID when order storage is available
-    return success(res, { orderId, cancelled: false }, 'Cancel by ID not implemented');
+    if (!partyId) {
+      throw new ValidationError('Missing partyId. Provide x-user-id header or partyId in body');
+    }
+
+    console.log(`[OrderController] Cancelling order by ID: ${orderId}`);
+
+    // orderId might be a contract ID or order ID - try both
+    const result = await this.orderService.cancelOrder(orderId, partyId);
+
+    return success(res, result, 'Order cancelled successfully');
   });
 }
 

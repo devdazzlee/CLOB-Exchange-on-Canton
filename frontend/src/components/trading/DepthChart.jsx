@@ -6,9 +6,13 @@ import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
  * Depth Chart Component - Visualizes order book depth
  * Shows cumulative buy and sell orders as a depth chart
  */
-export default function DepthChart({ buyOrders, sellOrders, tradingPair }) {
+export default function DepthChart({ orderBook, buyOrders: propBuyOrders, sellOrders: propSellOrders, tradingPair, loading }) {
+  // Support both orderBook object OR separate buyOrders/sellOrders props
+  const buyOrders = propBuyOrders || orderBook?.buys || orderBook?.buyOrders || [];
+  const sellOrders = propSellOrders || orderBook?.sells || orderBook?.sellOrders || [];
+  
   const chartData = useMemo(() => {
-    if (!buyOrders || !sellOrders) return { buyData: [], sellData: [], maxDepth: 0 };
+    if (!buyOrders?.length && !sellOrders?.length) return { buyData: [], sellData: [], maxDepth: 0 };
 
     // Process buy orders (cumulative from lowest to highest price)
     let buyCumulative = 0;
@@ -48,15 +52,31 @@ export default function DepthChart({ buyOrders, sellOrders, tradingPair }) {
 
   const { buyData, sellData, maxDepth } = chartData;
 
-  if (maxDepth === 0) {
+  if (loading) {
     return (
       <Card>
         <CardHeader>
           <CardTitle>Depth Chart - {tradingPair}</CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="flex items-center justify-center h-64 text-muted-foreground">
-            No order book data available
+          <div className="flex items-center justify-center h-64">
+            <div className="animate-pulse text-muted-foreground">Loading depth chart...</div>
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (maxDepth === 0 || (!buyOrders.length && !sellOrders.length)) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Depth Chart - {tradingPair}</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="flex flex-col items-center justify-center h-64 text-muted-foreground space-y-2">
+            <span>No order book data available</span>
+            <span className="text-xs opacity-60">Place orders to see the depth chart</span>
           </div>
         </CardContent>
       </Card>

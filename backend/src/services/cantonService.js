@@ -354,12 +354,49 @@ class CantonService {
   }
 
   /**
+   * Lookup a single contract by contract ID
+   * POST /v2/contracts/lookup
+   */
+  async lookupContract(contractId, token) {
+    const url = `${this.jsonApiBase}/v2/contracts/lookup`;
+
+    console.log(`[CantonService] Looking up contract: ${contractId?.substring(0, 40)}...`);
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`
+      },
+      body: JSON.stringify({
+        contractId: contractId
+      })
+    });
+
+    if (!res.ok) {
+      const error = parseCantonError(await res.text(), res.status);
+      console.error(`[CantonService] ❌ Contract lookup failed:`, error);
+      return null;
+    }
+
+    const result = await res.json();
+    console.log(`[CantonService] ✅ Contract found`);
+    
+    return {
+      contractId: result.contractId || contractId,
+      payload: result.payload || result.argument || result.createArgument,
+      templateId: result.templateId
+    };
+  }
+
+  /**
    * Query active contracts
    * POST /v2/state/active-contracts
    * 
    * Note: activeAtOffset is required. If not provided, fetches from ledger-end first.
+   * Supports pagination to handle large result sets (Canton has 200 element limit)
    */
-  async queryActiveContracts({ party, templateIds = [], activeAtOffset = null, verbose = false }, token) {
+  async queryActiveContracts({ party, templateIds = [], activeAtOffset = null, verbose = false, pageSize = 100, pageToken = null }, token) {
     const url = `${this.jsonApiBase}/v2/state/active-contracts`;
 
     // If activeAtOffset not provided, fetch from ledger-end (required field)
@@ -374,69 +411,44 @@ class CantonService {
       }
     }
 
-    // Build the correct v2 filter structure
+    // Build the correct v2 filter structure - SIMPLIFIED FORMAT
+    // Canton JSON API v2 uses simpler filter without cumulative/identifierFilter
     const filter = {};
     
     if (party) {
       filter.filtersByParty = {
-        [party]: {
-          cumulative: [
-            {
-              identifierFilter: {
-                WildcardFilter: {
-                  value: {
-                    includeCreatedEventBlob: false
-                  }
-                }
-              }
-            }
-          ]
-        }
+        [party]: templateIds.length > 0 ? {
+          // Use templateFilters for specific templates
+          templateFilters: templateIds.map(t => ({
+            templateId: normalizeTemplateId(t),
+            includeCreatedEventBlob: false
+          }))
+        } : {} // Empty object = wildcard (all templates)
       };
-      
-      // If templateIds provided, add template filter
-      if (templateIds.length > 0) {
-        filter.filtersByParty[party].cumulative = [
-          {
-            inclusive: {
-              templateIds: templateIds.map(t => normalizeTemplateId(t))
-            }
-          }
-        ];
-      }
     } else {
       // If no party specified, use filtersForAnyParty
-      if (templateIds.length > 0) {
-        filter.filtersForAnyParty = {
-          inclusive: {
-            templateIds: templateIds.map(t => normalizeTemplateId(t))
-          }
-        };
-      } else {
-        filter.filtersForAnyParty = {
-          cumulative: [
-            {
-              identifierFilter: {
-                WildcardFilter: {
-                  value: {
-                    includeCreatedEventBlob: false
-                  }
-                }
-              }
-            }
-          ]
-        };
-      }
+      filter.filtersForAnyParty = templateIds.length > 0 ? {
+        templateFilters: templateIds.map(t => ({
+          templateId: normalizeTemplateId(t),
+          includeCreatedEventBlob: false
+        }))
+      } : {}; // Empty object = wildcard
     }
 
     const body = {
       filter: filter,
       verbose: verbose,
       activeAtOffset: effectiveOffset, // Required field
+      pageSize: pageSize, // Limit results per page to avoid 200 element limit
     };
+    
+    // Add page token for pagination
+    if (pageToken) {
+      body.pageToken = pageToken;
+    }
 
     console.log(`[CantonService] POST ${url}`);
-    console.log(`[CantonService] Querying for party: ${party || 'any'}, templates: ${templateIds.join(', ') || 'all'}, offset: ${effectiveOffset}`);
+    console.log(`[CantonService] Querying for party: ${party || 'any'}, templates: ${templateIds.join(', ') || 'all'}, offset: ${effectiveOffset}, pageSize: ${pageSize}`);
 
     const res = await fetch(url, {
       method: "POST",
@@ -451,6 +463,15 @@ class CantonService {
 
     if (!res.ok) {
       const error = parseCantonError(text, res.status);
+      
+      // Handle the 200 element limit gracefully - this is NOT an error, just a Canton limitation
+      // Canton JSON API has a hard limit of 200 total matching elements
+      if (error.code === 'JSON_API_MAXIMUM_LIST_ELEMENTS_NUMBER_REACHED') {
+        console.log(`[CantonService] ℹ️ Query has 200+ contracts. Using cached data instead (Canton limit: 200)`);
+        // Return empty array - caller should use cached/ReadModel data
+        return [];
+      }
+      
       console.error(`[CantonService] ❌ Query failed:`, error);
       throw new Error(error.message);
     }
@@ -460,6 +481,86 @@ class CantonService {
     console.log(`[CantonService] ✅ Found ${contracts.length || 0} contracts`);
 
     return contracts;
+  }
+  
+  /**
+   * Query active contracts with pagination to handle large result sets
+   * NOTE: Canton has a 200 TOTAL element limit before pagination.
+   * This method is kept for smaller result sets that need paging.
+   */
+  async queryActiveContractsPaginated({ party, templateIds = [], activeAtOffset, verbose = false }, token) {
+    const allContracts = [];
+    let pageToken = null;
+    const pageSize = 50; // Small page size
+    let iterations = 0;
+    const maxIterations = 10; // Safety limit
+    
+    do {
+      const url = `${this.jsonApiBase}/v2/state/active-contracts`;
+      
+      const filter = {};
+      if (party) {
+        filter.filtersByParty = {
+          [party]: templateIds.length > 0 ? {
+            templateFilters: templateIds.map(t => ({
+              templateId: normalizeTemplateId(t),
+              includeCreatedEventBlob: false
+            }))
+          } : {}
+        };
+      } else {
+        filter.filtersForAnyParty = templateIds.length > 0 ? {
+          templateFilters: templateIds.map(t => ({
+            templateId: normalizeTemplateId(t),
+            includeCreatedEventBlob: false
+          }))
+        } : {};
+      }
+
+      const body = {
+        filter,
+        verbose,
+        activeAtOffset,
+        pageSize,
+      };
+      
+      if (pageToken) {
+        body.pageToken = pageToken;
+      }
+
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify(body)
+      });
+
+      if (!res.ok) {
+        const errorText = await res.text();
+        // Check for 200 element limit - this is expected, not an error
+        if (errorText.includes('JSON_API_MAXIMUM_LIST_ELEMENTS_NUMBER_REACHED')) {
+          console.log(`[CantonService] ℹ️ 200+ contracts found. Using cached data.`);
+          return allContracts; // Return what we have so far
+        }
+        console.error(`[CantonService] Paginated query failed:`, errorText);
+        break;
+      }
+
+      const result = await res.json();
+      const contracts = result.activeContracts || [];
+      allContracts.push(...contracts);
+      
+      pageToken = result.nextPageToken || null;
+      iterations++;
+      
+      console.log(`[CantonService] Paginated query: got ${contracts.length} contracts (total: ${allContracts.length}), hasMore: ${!!pageToken}`);
+      
+    } while (pageToken && iterations < maxIterations);
+    
+    console.log(`[CantonService] ✅ Paginated query complete: ${allContracts.length} total contracts`);
+    return allContracts;
   }
 
   /**

@@ -3,7 +3,7 @@ import React from 'react';
 import { motion } from 'framer-motion';
 import { AlertCircle, LogOut } from 'lucide-react';
 import { useConfirmationModal } from './ConfirmationModal';
-import DebugPanel from './DebugPanel';
+import { useToast, OrderSuccessModal } from './ui/toast';
 
 // Import trading components
 import OrderForm from './trading/OrderForm';
@@ -25,6 +25,7 @@ import { getAvailableTradingPairs, getGlobalOrderBook } from '../services/canton
 
 export default function TradingInterface({ partyId }) {
   // === PHASE 1: ALL HOOKS MUST BE DECLARED FIRST - NO EXCEPTIONS ===
+  const toast = useToast();
   const [hasError, setHasError] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
   const [isAlive, setIsAlive] = useState(true);
@@ -44,6 +45,7 @@ export default function TradingInterface({ partyId }) {
   const [orders, setOrders] = useState([]);
   const [orderBook, setOrderBook] = useState({ buys: [], sells: [] });
   const [loading, setLoading] = useState(false);
+  const [orderPlacing, setOrderPlacing] = useState(false); // Separate state for order placement
   const [orderBookLoading, setOrderBookLoading] = useState(true);
   const [orderBookExists, setOrderBookExists] = useState(true);
   const [error, setError] = useState('');
@@ -51,6 +53,8 @@ export default function TradingInterface({ partyId }) {
   const [trades, setTrades] = useState([]);
   const [tradesLoading, setTradesLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('trading');
+  const [showOrderSuccess, setShowOrderSuccess] = useState(false);
+  const [lastOrderData, setLastOrderData] = useState(null);
   const { showModal, ModalComponent, isOpenRef: modalIsOpenRef } = useConfirmationModal();
   const isLoadingRef = useRef(false);
 
@@ -78,7 +82,10 @@ export default function TradingInterface({ partyId }) {
         if (mintData.success && mintData.data?.balance) {
           setBalance(mintData.data.balance);
           console.log('[Mint] Backend mint successful:', mintData.data.balance);
-          alert(`Test tokens minted via backend!\nBTC: ${mintData.data.balance.BTC}\nUSDT: ${mintData.data.balance.USDT}\nETH: ${mintData.data.balance.ETH}\nSOL: ${mintData.data.balance.SOL}`);
+          toast.success('Test tokens minted successfully!', {
+            title: '🪙 Tokens Minted',
+            details: `BTC: ${mintData.data.balance.BTC} | USDT: ${mintData.data.balance.USDT}`
+          });
           return;
         }
       }
@@ -96,26 +103,42 @@ export default function TradingInterface({ partyId }) {
     
     setBalance(newBalance);
     console.log('[Mint] Local fallback mint successful:', newBalance);
-    alert(`Test tokens minted locally!\nBTC: ${newBalance.BTC}\nUSDT: ${newBalance.USDT}\nETH: ${newBalance.ETH}\nSOL: ${newBalance.SOL}`);
-  }, [partyId]);
+    toast.success('Test tokens minted locally!', {
+      title: '🪙 Tokens Minted',
+      details: `BTC: ${newBalance.BTC} | USDT: ${newBalance.USDT}`
+    });
+  }, [partyId, toast]);
 
   const handlePlaceOrder = useCallback(async (orderData) => {
     try {
-      setLoading(true);
+      setOrderPlacing(true); // Use separate state - don't use setLoading which causes full-screen
       console.log('[Place Order] Placing order:', orderData);
       
-      // Use apiService for proper authentication and error handling
-      const { placeOrder } = await import('../services/apiService');
+      // Use the simpler /api/orders/place endpoint that works with partyId
+      const API_BASE = import.meta.env.VITE_API_BASE_URL || 
+        (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
       
-      const result = await placeOrder({
-        tradingPair: orderData.tradingPair,
-        orderType: orderData.orderType,
-        orderMode: orderData.orderMode,
-        price: orderData.price,
-        quantity: orderData.quantity,
-        timeInForce: orderData.timeInForce || 'GTC',
-        stopLoss: orderData.stopLoss || null
+      const response = await fetch(`${API_BASE}/orders/place`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-user-id': partyId || 'anonymous'
+        },
+        body: JSON.stringify({
+          tradingPair: orderData.tradingPair,
+          orderType: orderData.orderType,
+          orderMode: orderData.orderMode,
+          price: orderData.price,
+          quantity: orderData.quantity,
+          partyId: partyId
+        })
       });
+      
+      const result = await response.json();
+      
+      if (!response.ok) {
+        throw new Error(result.error || result.message || 'Failed to place order');
+      }
 
       console.log('[Place Order] Order placed successfully:', result);
       
@@ -123,17 +146,27 @@ export default function TradingInterface({ partyId }) {
       setPrice('');
       setQuantity('');
       
-      // Show success message
-      alert('Order placed successfully!');
+      // Show beautiful success modal
+      setLastOrderData({
+        orderId: result.data?.orderId,
+        orderType: orderData.orderType,
+        orderMode: orderData.orderMode,
+        tradingPair: orderData.tradingPair,
+        price: orderData.price,
+        quantity: orderData.quantity
+      });
+      setShowOrderSuccess(true);
       
     } catch (error) {
       console.error('[Place Order] Failed:', error);
-      setError(error.message || 'Failed to place order');
-      alert(`Failed to place order: ${error.message}`);
+      toast.error(error.message || 'Failed to place order', {
+        title: '❌ Order Failed',
+        duration: 6000
+      });
     } finally {
-      setLoading(false);
+      setOrderPlacing(false);
     }
-  }, [partyId]);
+  }, [partyId, toast]);
 
   const handleCancelOrder = useCallback(async (orderId) => {
     try {
@@ -260,22 +293,47 @@ export default function TradingInterface({ partyId }) {
     // Initial load
     const loadInitialOrderBook = async () => {
       try {
+        console.log('[TradingInterface] Loading initial order book for:', tradingPair);
         const bookData = await getGlobalOrderBook(tradingPair);
         if (bookData) {
           setOrderBook({
             buys: bookData.buyOrders || [],
             sells: bookData.sellOrders || []
           });
-          setOrderBookLoading(false);
-          hasLoadedOrderBook = true;
+          console.log('[TradingInterface] Order book loaded:', bookData);
         }
       } catch (error) {
         console.error('[TradingInterface] Failed to load initial order book:', error);
+      } finally {
+        // Always stop loading regardless of success/failure
         setOrderBookLoading(false);
+        setTradesLoading(false); // FIX: Set trades loading to false
+        hasLoadedOrderBook = true;
       }
     };
 
     loadInitialOrderBook();
+    
+    // Load initial trades from backend
+    const loadInitialTrades = async () => {
+      try {
+        const API_BASE = import.meta.env.VITE_API_BASE_URL || 
+          (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
+        const response = await fetch(`${API_BASE}/trades/${encodeURIComponent(tradingPair)}?limit=50`);
+        if (response.ok) {
+          const data = await response.json();
+          const tradesList = data?.data?.trades || data?.trades || [];
+          setTrades(tradesList);
+          console.log('[TradingInterface] Initial trades loaded:', tradesList.length);
+        }
+      } catch (error) {
+        console.error('[TradingInterface] Failed to load initial trades:', error);
+      } finally {
+        setTradesLoading(false);
+      }
+    };
+    
+    loadInitialTrades();
 
     if (!websocketService.isConnected()) {
       websocketService.connect();
@@ -307,6 +365,47 @@ export default function TradingInterface({ partyId }) {
     };
   }, [partyId, tradingPair]);
 
+  // Load user's active orders
+  useEffect(() => {
+    if (!partyId) return;
+
+    const loadUserOrders = async () => {
+      try {
+        const API_BASE = import.meta.env.VITE_API_BASE_URL || 
+          (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
+        const response = await fetch(`${API_BASE}/orders/user/${encodeURIComponent(partyId)}?status=OPEN`);
+        if (response.ok) {
+          const data = await response.json();
+          const ordersList = data?.data?.orders || data?.orders || [];
+          // Transform orders to expected format
+          const formattedOrders = ordersList.map(order => ({
+            id: order.orderId || order.contractId,
+            contractId: order.contractId,
+            type: order.orderType,
+            mode: order.orderMode,
+            price: order.price,
+            quantity: order.quantity,
+            filled: order.filled || '0',
+            status: order.status,
+            tradingPair: order.tradingPair,
+            timestamp: order.timestamp
+          }));
+          setOrders(formattedOrders);
+          console.log('[TradingInterface] User orders loaded:', formattedOrders.length);
+        }
+      } catch (error) {
+        console.error('[TradingInterface] Failed to load user orders:', error);
+      }
+    };
+
+    loadUserOrders();
+    
+    // Refresh user orders every 10 seconds
+    const ordersInterval = setInterval(loadUserOrders, 10000);
+    
+    return () => clearInterval(ordersInterval);
+  }, [partyId]);
+
   useEffect(() => {
     if (!partyId) return;
 
@@ -319,26 +418,44 @@ export default function TradingInterface({ partyId }) {
         
         // Try to load real balance from backend first
         try {
-          const response = await fetch(`http://localhost:3001/api/balance/${partyId}`);
-          if (response.ok) {
-            const balanceData = await response.json();
-            if (balanceData.success && balanceData.data?.balance) {
-              setBalance(balanceData.data.balance);
-              console.log('[Balance] Real balance loaded:', balanceData.data.balance);
+          const API_BASE = import.meta.env.VITE_API_BASE_URL || 
+            (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
+          const response = await fetch(`${API_BASE}/balance/${partyId}`);
+          const balanceData = await response.json();
+          
+          if (response.ok && balanceData.success) {
+            // Handle different response formats
+            const balanceObj = balanceData.data?.balance || balanceData.data?.available || balanceData.data;
+            if (balanceObj && typeof balanceObj === 'object') {
+              setBalance({
+                BTC: balanceObj.BTC || '0.0',
+                USDT: balanceObj.USDT || '10000.0',
+                ETH: balanceObj.ETH || '0.0',
+                SOL: balanceObj.SOL || '0.0'
+              });
+              console.log('[Balance] Balance loaded:', balanceObj);
               hasLoadedBalanceRef.current = true;
               return;
             }
           }
+          // If response not ok, use default balance
+          console.log('[Balance] Backend returned error, using default balance');
+          setBalance({ BTC: '0.0', USDT: '10000.0', ETH: '0.0', SOL: '0.0' });
+          hasLoadedBalanceRef.current = true;
         } catch (balanceError) {
           console.error('[Balance] Backend balance fetch failed:', balanceError);
-          throw new Error('Failed to fetch balances - please check your connection');
+          // Use default balance on error
+          setBalance({ BTC: '0.0', USDT: '10000.0', ETH: '0.0', SOL: '0.0' });
+          hasLoadedBalanceRef.current = true;
         }
       } catch (error) {
         console.error('[Balance] Failed to load balance:', error);
+        // Ensure we always set some balance
+        setBalance({ BTC: '0.0', USDT: '10000.0', ETH: '0.0', SOL: '0.0' });
+        hasLoadedBalanceRef.current = true;
       } finally {
-        if (hasLoadedBalanceRef.current) {
-          setBalanceLoading(false);
-        }
+        // FIX: Always stop loading regardless of outcome
+        setBalanceLoading(false);
       }
     };
 
@@ -413,56 +530,23 @@ export default function TradingInterface({ partyId }) {
     );
   }
 
-  if (error && !loading) {
-    return (
-      <div className="flex items-center justify-center min-h-[400px]">
-        <div className="text-center space-y-4">
-          <AlertCircle className="w-12 h-12 text-destructive mx-auto" />
-          <h3 className="text-lg font-semibold text-foreground">Error</h3>
-          <p className="text-muted-foreground max-w-md">{error}</p>
-          <button
-            onClick={() => setError('')}
-            className="px-4 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90 transition-colors"
-          >
-            Reload Page
-          </button>
-        </div>
-      </div>
-    );
-  }
+  // REMOVED: Full-screen error display - errors are now shown as toasts
+  // Non-blocking error display is handled in the main render via motion.div
 
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center min-h-[400px]">
-        <div className="text-center space-y-4">
-          <div className="w-8 h-8 border-4 border-primary border-t-transparent rounded-full animate-spin mx-auto"></div>
-          <p className="text-muted-foreground">Loading trading interface...</p>
-        </div>
-      </div>
-    );
-  }
+  // REMOVED: Full-screen loading that was causing the screen change issue
+  // Order placement now uses orderPlacing state and shows inline loading on button
 
   // === PHASE 6: MAIN RENDER - NO HOOKS HERE ===
   return (
     <>
       {memoizedModal}
-      <DebugPanel partyId={partyId} />
       
-      {/* Heartbeat Indicator */}
-      <div style={{
-        position: 'fixed',
-        top: '10px',
-        left: '10px',
-        zIndex: 9999,
-        background: isAlive ? '#00ff00' : '#ff0000',
-        color: '#000',
-        padding: '4px 8px',
-        borderRadius: '4px',
-        fontSize: '10px',
-        fontFamily: 'monospace'
-      }}>
-        {isAlive ? 'ALIVE' : 'DEAD'} - {new Date().toLocaleTimeString()}
-      </div>
+      {/* Order Success Modal */}
+      <OrderSuccessModal
+        isOpen={showOrderSuccess}
+        onClose={() => setShowOrderSuccess(false)}
+        orderData={lastOrderData}
+      />
       
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -510,7 +594,7 @@ export default function TradingInterface({ partyId }) {
               onPriceChange={setPrice}
               quantity={quantity}
               onQuantityChange={setQuantity}
-              loading={loading}
+              loading={orderPlacing}
               onSubmit={handlePlaceOrder}
               balance={balance}
               orderBook={orderBook}

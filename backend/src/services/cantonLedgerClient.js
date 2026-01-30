@@ -102,43 +102,55 @@ class CantonLedgerClient extends EventEmitter {
   async getActiveContracts({ parties, templateIds = [], activeAtOffset = null }) {
     const token = await this.getToken();
     
-    // Build the correct v2 filter structure based on OpenAPI schema
+    // Get ledger end if no offset provided
+    let offset = activeAtOffset;
+    if (offset === null || offset === undefined) {
+      try {
+        offset = await this.getLedgerEnd();
+      } catch (e) {
+        offset = 0;
+      }
+    }
+    
+    // Build the correct v2 filter structure - SIMPLIFIED
+    // Canton v2 API uses simpler filter format
     const filter = {};
     
     if (parties && parties.length > 0) {
       filter.filtersByParty = {};
       parties.forEach(party => {
-        filter.filtersByParty[party] = {
-          cumulative: [{
-            identifierFilter: {
-              WildcardFilter: {
-                value: {
-                  includeCreatedEventBlob: false
-                }
-              }
-            }
-          }]
-        };
+        // Empty object = all templates (wildcard)
+        // Or use templateFilters array for specific templates
+        if (templateIds && templateIds.length > 0) {
+          filter.filtersByParty[party] = {
+            templateFilters: templateIds.map(tid => ({
+              templateId: typeof tid === 'string' ? tid : `${tid.packageId}:${tid.moduleName}:${tid.entityName}`,
+              includeCreatedEventBlob: false
+            }))
+          };
+        } else {
+          // Wildcard - get all contracts for party
+          filter.filtersByParty[party] = {};
+        }
       });
     } else {
       // If no parties specified, use filtersForAnyParty
-      filter.filtersForAnyParty = {
-        cumulative: [{
-          identifierFilter: {
-            WildcardFilter: {
-              value: {
-                includeCreatedEventBlob: false
-              }
-            }
-          }
-        }]
-      };
+      if (templateIds && templateIds.length > 0) {
+        filter.filtersForAnyParty = {
+          templateFilters: templateIds.map(tid => ({
+            templateId: typeof tid === 'string' ? tid : `${tid.packageId}:${tid.moduleName}:${tid.entityName}`,
+            includeCreatedEventBlob: false
+          }))
+        };
+      } else {
+        filter.filtersForAnyParty = {};
+      }
     }
     
     const requestBody = {
       filter: filter,
       verbose: false,
-      activeAtOffset: activeAtOffset || 0, // 0 = ledger begin
+      activeAtOffset: offset,
     };
 
     console.log('[CantonClient] Request body:', JSON.stringify(requestBody, null, 2));
@@ -154,6 +166,7 @@ class CantonLedgerClient extends EventEmitter {
 
     if (!response.ok) {
       const errorText = await response.text();
+      console.error('[CantonClient] Active contracts query failed:', errorText);
       throw new Error(`Active contracts query failed: ${response.status} - ${errorText}`);
     }
 
@@ -194,27 +207,15 @@ class CantonLedgerClient extends EventEmitter {
     const token = await this.getToken();
     const wsUrl = this.cantonApiBase.replace('http://', 'ws://').replace('https://', 'wss://');
     
-    // Build filter for WebSocket
+    // Build filter for WebSocket - SIMPLIFIED FORMAT (v2 API)
     const filter = {
       filtersByParty: parties.reduce((acc, party) => {
-        acc[party] = {
-          cumulative: templateIds.length > 0 ? [{
-            identifierFilter: {
-              TemplateFilter: {
-                value: {
-                  templateId: templateIds[0],
-                  includeCreatedEventBlob: false
-                }
-              }
-            }
-          }] : [{
-            identifierFilter: {
-              WildcardFilter: {
-                value: { includeCreatedEventBlob: false }
-              }
-            }
-          }]
-        };
+        acc[party] = templateIds.length > 0 ? {
+          templateFilters: templateIds.map(tid => ({
+            templateId: tid,
+            includeCreatedEventBlob: false
+          }))
+        } : {}; // Empty = wildcard
         return acc;
       }, {})
     };

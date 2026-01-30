@@ -129,10 +129,10 @@ export default function OrderForm({
       }
     }
 
-    // Minimum order size check
-    if (estimatedCost && estimatedCost < 10) {
-      warnings.push('Order size is below minimum (10 USDT)');
-    }
+    // Minimum order size check - removed 10 USDT minimum
+    // if (estimatedCost && estimatedCost < 10) {
+    //   warnings.push('Order size is below minimum (10 USDT)');
+    // }
 
     return { errors, warnings, isValid: errors.length === 0 };
   }, [orderType, orderMode, price, quantity, estimatedCost, baseBalance, quoteBalance, baseToken, quoteToken, bestBid, bestAsk]);

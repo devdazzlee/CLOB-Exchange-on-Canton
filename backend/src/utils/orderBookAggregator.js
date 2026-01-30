@@ -149,8 +149,8 @@ function formatOrderBook(orderBook, options = {}) {
     depth = 50, // Maximum number of levels to return
   } = options;
 
-  let bids = orderBook.buys || orderBook.bids || [];
-  let asks = orderBook.sells || orderBook.asks || [];
+  let bids = orderBook.buyOrders || orderBook.buys || orderBook.bids || [];
+  let asks = orderBook.sellOrders || orderBook.sells || orderBook.asks || [];
 
   if (aggregate) {
     bids = aggregateBids(bids, { precision, minQuantity: 0 });

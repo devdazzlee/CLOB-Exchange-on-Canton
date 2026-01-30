@@ -6,6 +6,7 @@ import TradingTest from './components/TradingTest';
 import AdminPanel from './components/AdminPanel';
 import AuthGuard from './components/AuthGuard';
 import ErrorBoundary from './components/ErrorBoundary';
+import { ToastProvider } from './components/ui/toast';
 import { loadWallet, clearWallet, bytesToBase64 } from './wallet/keyManager';
 import { getOrCreateUserId } from './services/userId';
 import './index.css';
@@ -91,6 +92,7 @@ function App() {
   };
 
   return (
+    <ToastProvider>
     <Router future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
       <div className="min-h-screen bg-[#0B0E11]">
         {/* Header */}
@@ -225,6 +227,7 @@ function App() {
         </footer>
       </div>
     </Router>
+    </ToastProvider>
   );
 }
 

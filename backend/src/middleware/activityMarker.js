@@ -12,7 +12,33 @@
 function generateActivityMarker(req, operation) {
   const timestamp = Date.now();
   const service = 'clob-exchange-backend';
-  const partyId = req.partyId || req.walletId || 'anonymous';
+  
+  // Try to get partyId from multiple sources
+  let partyId = req.partyId || req.walletId;
+  
+  // Extract from URL params (e.g., /api/balance/:partyId)
+  if (!partyId && req.params?.partyId) {
+    partyId = req.params.partyId;
+  }
+  
+  // Extract from query string
+  if (!partyId && req.query?.partyId) {
+    partyId = req.query.partyId;
+  }
+  
+  // Extract from body
+  if (!partyId && req.body?.partyId) {
+    partyId = req.body.partyId;
+  }
+  
+  // For public endpoints, use 'public' instead of 'anonymous'
+  if (!partyId) {
+    // Check if this is a public endpoint
+    const publicPaths = ['/orderbooks', '/trades', '/health', '/ws'];
+    const isPublic = publicPaths.some(p => req.path.includes(p));
+    partyId = isPublic ? 'public' : 'anonymous';
+  }
+  
   const requestId = req.requestId || req.id || 'unknown';
 
   return `${timestamp}:${service}:${operation}:${partyId}:${requestId}`;

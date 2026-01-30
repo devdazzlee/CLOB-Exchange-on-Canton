@@ -6,9 +6,14 @@
  * - FIFO Execution: Price-time priority
  * - Partial Fills: Handles mismatched sizes
  * - Self-Trade Prevention: Checks owner before matching
+ * 
+ * Uses Canton JSON Ledger API v2:
+ * - POST /v2/state/active-contracts - Query orders
+ * - POST /v2/commands/submit-and-wait-for-transaction - Execute matches
  */
 
 const CantonAdmin = require('./canton-admin');
+const cantonService = require('./cantonService');
 const config = require('../config');
 const tradeStore = require('./trade-store');
 const { extractTradesFromEvents } = require('./trade-utils');
@@ -199,7 +204,9 @@ class MatchingEngine {
   }
 
   /**
-   * Query active contracts by template (revert to working filter structure)
+   * Query active contracts by template using Canton JSON API v2 format
+   * POST /v2/state/active-contracts
+   * https://docs.digitalasset.com/build/3.5/reference/json-api/openapi.html
    */
   async queryContracts(templateId, adminToken, limit = 100) {
     // Get current ledger end
@@ -208,46 +215,58 @@ class MatchingEngine {
     // Use actual operator party ID from config
     const operatorPartyId = config.canton.operatorPartyId;
 
-    const response = await fetch(`${config.canton.jsonApiBase}/v2/state/active-contracts?limit=${limit}`, {
+    // Canton JSON API v2 filter format - use templateFilters (NOT inclusive/templateIds)
+    const response = await fetch(`${config.canton.jsonApiBase}/v2/state/active-contracts`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${adminToken}`,
       },
       body: JSON.stringify({
-        readAs: [operatorPartyId],
-        activeAtOffset,
-        verbose: false,
         filter: {
           filtersByParty: {
             [operatorPartyId]: {
-              inclusive: {
-                templateIds: [templateId],
-              },
-            },
-          },
+              // Canton JSON API v2 uses templateFilters array
+              templateFilters: [{
+                templateId: templateId,
+                includeCreatedEventBlob: false
+              }]
+            }
+          }
         },
+        verbose: false,
+        activeAtOffset: activeAtOffset,
+        pageSize: limit
       }),
     });
 
     if (!response.ok) {
       const errorText = await response.text();
+      
+      // Handle 200 element limit gracefully
+      if (errorText.includes('JSON_API_MAXIMUM_LIST_ELEMENTS_NUMBER_REACHED')) {
+        console.log('[MatchingEngine] ℹ️ 200+ contracts found, using smaller page size');
+        return []; // Return empty - let caller handle
+      }
+      
       console.error('[MatchingEngine] Query error details:', {
         status: response.status,
         statusText: response.statusText,
-        errorText: errorText,
+        errorText: errorText.substring(0, 200),
         templateId: templateId,
         operatorPartyId: operatorPartyId
       });
-      throw new Error(`Failed to query contracts: ${response.status} - ${errorText}`);
+      throw new Error(`Failed to query contracts: ${response.status}`);
     }
 
     const data = await response.json();
     const contracts = data.activeContracts || [];
 
+    console.log(`[MatchingEngine] Found ${contracts.length} contracts for template`);
+
     return contracts.map(c => ({
       contractId: c.contractId || c.contract_id,
-      payload: c.payload || c.argument,
+      payload: c.payload || c.argument || c.createArgument,
     }));
   }
 

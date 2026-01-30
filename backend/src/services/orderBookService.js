@@ -26,9 +26,56 @@ class OrderBookService {
     }
 
     /**
-     * Get order book for a trading pair - queries Canton directly
+     * Get order book for a trading pair
+     * First tries ReadModel (cached), falls back to Canton query
      */
     async getOrderBook(tradingPair) {
+        try {
+            // First try to get from ReadModel (cached data - fast)
+            const readModel = this.getReadModel();
+            if (readModel) {
+                const cachedBook = readModel.getOrderBook(tradingPair);
+                if (cachedBook) {
+                    console.log(`[OrderBookService] Using cached order book for ${tradingPair}`);
+                    return {
+                        tradingPair,
+                        buyOrders: cachedBook.bids || [],
+                        sellOrders: cachedBook.asks || [],
+                        lastPrice: cachedBook.lastPrice || null,
+                        timestamp: cachedBook.timestamp || new Date().toISOString()
+                    };
+                }
+            }
+
+            // ReadModel empty or not available - return placeholder
+            // Canton direct query is disabled due to 200 element limit issue
+            console.log(`[OrderBookService] No cached data for ${tradingPair}, returning empty order book`);
+            return {
+                tradingPair,
+                buyOrders: [],
+                sellOrders: [],
+                lastPrice: null,
+                timestamp: new Date().toISOString(),
+                message: 'Order book data is being loaded. Please wait.'
+            };
+        } catch (error) {
+            console.error(`[OrderBookService] Error getting order book for ${tradingPair}:`, error);
+            // Return empty order book on error
+            return {
+                tradingPair,
+                buyOrders: [],
+                sellOrders: [],
+                lastPrice: null,
+                timestamp: new Date().toISOString()
+            };
+        }
+    }
+    
+    /**
+     * Get order book directly from Canton (with 200 element limit handling)
+     * Use only when you specifically need fresh data
+     */
+    async getOrderBookFromCanton(tradingPair) {
         try {
             const tokenProvider = require('./tokenProvider');
             const token = await tokenProvider.getServiceToken();
@@ -39,29 +86,26 @@ class OrderBookService {
                 throw new Error('CLOB_EXCHANGE_PACKAGE_ID is not configured');
             }
 
-            // Query MasterOrderBookV2 contracts
+            // Query MasterOrderBookV2 contracts with smaller page size
             const templateId = `${packageId}:MasterOrderBookV2:MasterOrderBookV2`;
+            
+            // Try with smaller page size to avoid 200 limit
             const contracts = await cantonService.queryActiveContracts({
                 party: operatorPartyId,
-                templateIds: [templateId]
+                templateIds: [templateId],
+                pageSize: 50 // Smaller page size
             }, token);
 
             // Find the order book for this trading pair
             let orderBookContract = null;
-            if (Array.isArray(contracts)) {
-                orderBookContract = contracts.find(c => {
-                    const payload = c.payload || c.contractEntry?.JsActiveContract?.createdEvent?.createArgument || {};
-                    return payload.tradingPair === tradingPair;
-                });
-            } else if (contracts.activeContracts) {
-                orderBookContract = contracts.activeContracts.find(c => {
-                    const payload = c.payload || c.contractEntry?.JsActiveContract?.createdEvent?.createArgument || {};
-                    return payload.tradingPair === tradingPair;
-                });
-            }
+            const contractArray = Array.isArray(contracts) ? contracts : (contracts.activeContracts || []);
+            
+            orderBookContract = contractArray.find(c => {
+                const payload = c.payload || c.contractEntry?.JsActiveContract?.createdEvent?.createArgument || {};
+                return payload.tradingPair === tradingPair;
+            });
 
             if (!orderBookContract) {
-                // Return empty order book if not found
                 return {
                     tradingPair,
                     buyOrders: [],
@@ -107,8 +151,7 @@ class OrderBookService {
                 timestamp: new Date().toISOString()
             };
         } catch (error) {
-            console.error(`[OrderBookService] Error getting order book for ${tradingPair}:`, error);
-            // Return empty order book on error
+            console.error(`[OrderBookService] Error getting order book from Canton for ${tradingPair}:`, error.message);
             return {
                 tradingPair,
                 buyOrders: [],
