@@ -13,12 +13,23 @@ const OnboardingService = require('../services/onboarding-service');
 const cantonService = require('../services/cantonService');
 const { requirePartyId, requirePublicKey } = require('../state/userRegistry');
 
-const ed25519 = require('@noble/ed25519');
-const { sha512 } = require('@noble/hashes/sha512');
-
-// Ensure noble has sha512Sync set (works in both node + browser builds)
-if (!ed25519.etc.sha512Sync) {
-  ed25519.etc.sha512Sync = (...m) => sha512(ed25519.etc.concatBytes(...m));
+// Dynamic import for ESM modules - loaded when needed
+let ed25519Cache = null;
+async function getEd25519() {
+  if (!ed25519Cache) {
+    const ed25519Module = await import('@noble/ed25519');
+    const { sha512 } = await import('@noble/hashes/sha512');
+    
+    // @noble/ed25519 v2.x - handle both default and namespace exports
+    const ed25519 = ed25519Module.default || ed25519Module;
+    
+    // Ensure noble has sha512Sync set (works in both node + browser builds)
+    if (ed25519.etc && !ed25519.etc.sha512Sync) {
+      ed25519.etc.sha512Sync = (...m) => sha512(ed25519.etc.concatBytes(...m));
+    }
+    ed25519Cache = ed25519;
+  }
+  return ed25519Cache;
 }
 
 // In-memory challenge store: userId -> { challenge, expiresAt }
@@ -87,6 +98,7 @@ class LedgerProxyController {
     const sigBytes = new Uint8Array(Buffer.from(signatureBase64, 'base64'));
     const msgBytes = toBytesUtf8(challenge);
 
+    const ed25519 = await getEd25519();
     const ok = await ed25519.verify(sigBytes, msgBytes, publicKeyBytes);
     if (!ok) {
       const err = new Error('Invalid wallet signature.');
