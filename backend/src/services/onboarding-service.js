@@ -19,6 +19,11 @@ class OnboardingService {
     // Track in-flight allocations to prevent duplicates
     // Maps partyHint -> { promise, timestamp }
     this.inFlightAllocations = new Map();
+    
+    // Configuration for internal vs external party allocation
+    // External: User controls keys, party has user's fingerprint (requires proper topology)
+    // Internal: Validator controls allocation, party has validator's fingerprint (works with existing topology)
+    this.useInternalAllocation = process.env.USE_INTERNAL_PARTY_ALLOCATION === 'true';
   }
 
   /**
@@ -436,30 +441,69 @@ class OnboardingService {
             const errorData = JSON.parse(text);
             
             // Check if it's REQUEST_ALREADY_IN_FLIGHT (retryable)
-            if (errorData.code === 'REQUEST_ALREADY_IN_FLIGHT' && retryCount < maxRetries) {
-              // Use Canton's retryInfo if available, otherwise use exponential backoff
-              let delay = baseDelay;
+            if (errorData.code === 'REQUEST_ALREADY_IN_FLIGHT') {
+              // Extract party hint from error message
+              const partyMatch = errorData.cause?.match(/Party\s+([\w-]+)\s+is in the process/);
+              const allocatingPartyHint = partyMatch ? partyMatch[1] : null;
               
-              if (errorData.retryInfo) {
-                // Parse retryInfo (e.g., "1 second" or "2 seconds")
-                const retryMatch = errorData.retryInfo.match(/(\d+)\s*(second|seconds?)/i);
-                if (retryMatch) {
-                  delay = parseInt(retryMatch[1]) * 1000;
+              if (retryCount < maxRetries) {
+                // Use Canton's retryInfo if available, otherwise use exponential backoff
+                let delay = baseDelay;
+                
+                if (errorData.retryInfo) {
+                  // Parse retryInfo (e.g., "1 second" or "2 seconds")
+                  const retryMatch = errorData.retryInfo.match(/(\d+)\s*(second|seconds?)/i);
+                  if (retryMatch) {
+                    delay = parseInt(retryMatch[1]) * 1000;
+                  }
+                } else {
+                  // Exponential backoff with jitter
+                  delay = Math.min(
+                    baseDelay * Math.pow(2, retryCount) + Math.random() * 1000,
+                    maxDelay
+                  );
                 }
-              } else {
-                // Exponential backoff with jitter
-                delay = Math.min(
-                  baseDelay * Math.pow(2, retryCount) + Math.random() * 1000,
-                  maxDelay
-                );
+                
+                console.log(`[OnboardingService] Allocation in progress (409), retrying in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                return this._allocateParty(body, token, synchronizerId, retryCount + 1);
               }
               
-              console.log(`[OnboardingService] Allocation in progress (409), retrying in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})`);
-              await new Promise(resolve => setTimeout(resolve, delay));
-              return this._allocateParty(body, token, synchronizerId, retryCount + 1);
+              // Exhausted retries - check if party was actually allocated
+              console.log(`[OnboardingService] Exhausted retries. Checking if party ${allocatingPartyHint} was allocated...`);
+              if (allocatingPartyHint) {
+                try {
+                  // Wait a bit more for allocation to complete
+                  await new Promise(resolve => setTimeout(resolve, 3000));
+                  
+                  // Try to list parties to check if it exists
+                  const cantonService = require('./cantonService');
+                  const parties = await cantonService.listParties(token);
+                  
+                  // Find our party in the list
+                  const foundParty = parties.find(p => 
+                    p.identifier?.party?.includes(allocatingPartyHint) ||
+                    p.party?.includes(allocatingPartyHint)
+                  );
+                  
+                  if (foundParty) {
+                    const partyId = foundParty.identifier?.party || foundParty.party;
+                    console.log(`[OnboardingService] Party was allocated successfully: ${partyId}`);
+                    
+                    // Return a synthetic result mimicking the successful allocation response
+                    return {
+                      partyId: partyId,
+                      userId: body.identityProviderId ? null : undefined, // External allocation doesn't create user
+                      _recoveredFromInFlight: true
+                    };
+                  }
+                } catch (checkError) {
+                  console.warn(`[OnboardingService] Could not verify party allocation: ${checkError.message}`);
+                }
+              }
             }
             
-            // Other 409 errors - don't retry
+            // Other 409 errors or couldn't verify allocation - don't retry
             throw new Error(`Allocate failed 409: ${text}`);
           } catch (parseError) {
             // If we can't parse the error, treat as non-retryable
@@ -544,14 +588,23 @@ class OnboardingService {
    */
   async completeOnboarding(publicKeyBase64, signatureBase64, topologyTransactions, publicKeyFingerprint, partyHint = null) {
     try {
-      // Step 1: Allocate party (with proper retry handling for 409/503)
-      const allocationResult = await this.allocateParty(
-        publicKeyBase64,
-        signatureBase64,
-        topologyTransactions,
-        publicKeyFingerprint,
-        partyHint
-      );
+      let allocationResult;
+      
+      // Check if we should use internal allocation (on validator's namespace)
+      // This works with the existing topology where operator is on the same namespace
+      if (this.useInternalAllocation) {
+        console.log('[Onboarding] Using internal party allocation (USE_INTERNAL_PARTY_ALLOCATION=true)');
+        allocationResult = await this.allocatePartyInternally(publicKeyBase64);
+      } else {
+        // Step 1: Allocate party externally (with proper retry handling for 409/503)
+        allocationResult = await this.allocateParty(
+          publicKeyBase64,
+          signatureBase64,
+          topologyTransactions,
+          publicKeyFingerprint,
+          partyHint
+        );
+      }
 
       console.log('[Onboarding] Party allocated successfully:', allocationResult.partyId);
 
@@ -576,7 +629,68 @@ class OnboardingService {
 
       // Step 2: Create UserAccount and mint tokens
       // Use the same token that was used for gRPC rights grant (validator-app token)
-      const tokenResult = await this.createUserAccountAndMintTokens(allocationResult.partyId);
+      // NOTE: This may fail if the operator party isn't connected to the same synchronizer
+      // as the new external party. This is a Canton topology configuration issue.
+      let tokenResult = {};
+      try {
+        tokenResult = await this.createUserAccountAndMintTokens(allocationResult.partyId);
+      } catch (accountError) {
+        console.warn('[Onboarding] UserAccount creation failed (may be topology issue):', accountError.message);
+        
+        // If it's a synchronizer issue, try internal allocation as fallback
+        if (accountError.code === 'NO_SYNCHRONIZER_FOR_SUBMISSION' && !this.useInternalAllocation) {
+          console.log('[Onboarding] External party allocation succeeded but UserAccount failed due to topology.');
+          console.log('[Onboarding] Attempting fallback to internal party allocation...');
+          
+          try {
+            // Try internal allocation (on validator's namespace)
+            const internalResult = await this.allocatePartyInternally(publicKeyBase64);
+            
+            console.log('[Onboarding] Internal party allocated:', internalResult.partyId);
+            
+            // Update allocationResult to use the internal party
+            allocationResult = internalResult;
+            
+            // Grant rights and wait
+            try {
+              await this.grantOperatorRightsForParty(internalResult.partyId);
+              await new Promise(resolve => setTimeout(resolve, 2000));
+            } catch (e) {
+              console.warn('[Onboarding] Rights grant warning:', e.message);
+            }
+            
+            // Try UserAccount creation again with internal party
+            tokenResult = await this.createUserAccountAndMintTokens(internalResult.partyId);
+            console.log('[Onboarding] ✅ UserAccount created successfully via internal allocation fallback');
+          } catch (fallbackError) {
+            console.warn('[Onboarding] Internal allocation fallback also failed:', fallbackError.message);
+            
+            // Return partial success - external party allocated but no UserAccount
+            tokenResult = {
+              userAccountCreated: false,
+              userAccountPending: true,
+              userAccountError: 'Topology issue: Set USE_INTERNAL_PARTY_ALLOCATION=true in .env to use internal allocation.',
+              usdtMinted: 0,
+              externalPartyAllocated: true,
+              externalPartyId: allocationResult.partyId,
+              fallbackAttempted: true,
+              fallbackError: fallbackError.message
+            };
+          }
+        } else if (accountError.code === 'NO_SYNCHRONIZER_FOR_SUBMISSION') {
+          // Internal allocation was already used but still failed
+          console.log('[Onboarding] Internal allocation also has topology issues.');
+          tokenResult = {
+            userAccountCreated: false,
+            userAccountPending: true,
+            userAccountError: 'Topology issue persists. Please contact Canton administrator.',
+            usdtMinted: 0
+          };
+        } else {
+          // For other errors, still throw
+          throw accountError;
+        }
+      }
 
       return {
         ...allocationResult,
@@ -621,41 +735,49 @@ class OnboardingService {
         // CRITICAL: Verify and grant rights via JSON API v2 before creating contract
         // This ensures the user has canActAs for both parties
         try {
+          // Discover identity provider ID (required for granting rights)
+          const identityProviderId = await this.discoverIdentityProviderId();
+          console.log('[Onboarding] Using identityProviderId for rights:', identityProviderId);
+          
           console.log('[Onboarding] Checking user rights via JSON API v2...');
-          const currentRights = await cantonService.getUserRights(adminToken, userId);
-          console.log('[Onboarding] Current user rights:', JSON.stringify(currentRights, null, 2));
+          const currentRightsRaw = await cantonService.getUserRights(adminToken, userId);
+          console.log('[Onboarding] Current user rights (raw):', JSON.stringify(currentRightsRaw, null, 2));
+          
+          // Parse rights using the helper that handles 'kind' wrapper format
+          // Canton JSON Ledger API v2 returns: { rights: [{ kind: { CanActAs: { value: { party } } } }] }
+          const parsedRights = cantonService.parseUserRights(currentRightsRaw);
+          console.log('[Onboarding] Parsed user rights:', JSON.stringify(parsedRights, null, 2));
           
           // Check if user has canActAs for operator party (signatory)
           // UserAccount has signatory operator, observer party - so we only need operator in actAs
-          const hasOperatorRights = currentRights.rights?.some(r => 
-            r.canActAs?.party === operatorPartyId
-          );
+          const hasOperatorRights = parsedRights.canActAs.includes(operatorPartyId);
           
           console.log('[Onboarding] Has operator party rights (canActAs):', hasOperatorRights);
           
-          // Grant rights for operator party if missing
-          // Note: Operator party is a domain party, may not be grantable via JSON API
-          // But we'll try anyway - the validator-operator user should already have these rights
+          // IMPORTANT: Operator party is a DOMAIN/SYSTEM party (global-domain::...)
+          // Domain parties are NOT in the user identity provider (wolfedgelabs-test)
+          // You CANNOT grant rights for domain parties via the JSON API user rights endpoint
+          // The service account token should already have inherent operator rights
+          
           const partiesToGrant = [];
+          
+          // Skip operator party - it's a domain party, not grantable via user rights API
           if (!hasOperatorRights) {
-            partiesToGrant.push(operatorPartyId);
-            console.log('[Onboarding] Will grant rights for operator party:', operatorPartyId);
+            console.log('[Onboarding] Note: Operator party rights missing, but operator is a domain party');
+            console.log('[Onboarding] Domain parties cannot be granted via JSON API - relying on token inherent rights');
           }
           
-          // Also ensure we have readAs for the new party (for visibility)
-          // This is less critical but helps with querying
-          const hasNewPartyReadRights = currentRights.rights?.some(r => 
-            r.canReadAs?.party === partyId
-          );
-          if (!hasNewPartyReadRights) {
-            // Grant readAs for new party (already done via gRPC, but ensure via JSON API too)
+          // Grant rights for the NEW USER party (which IS in the identity provider)
+          const hasNewPartyActRights = parsedRights.canActAs.includes(partyId);
+          const hasNewPartyReadRights = parsedRights.canReadAs.includes(partyId);
+          if (!hasNewPartyActRights || !hasNewPartyReadRights) {
             partiesToGrant.push(partyId);
-            console.log('[Onboarding] Will grant readAs rights for new party:', partyId);
+            console.log('[Onboarding] Will grant rights for new user party:', partyId);
           }
           
           if (partiesToGrant.length > 0) {
             console.log('[Onboarding] Granting missing rights via JSON API v2...');
-            await cantonService.grantUserRights(adminToken, userId, partiesToGrant);
+            await cantonService.grantUserRights(adminToken, userId, partiesToGrant, identityProviderId);
             console.log('[Onboarding] Rights granted successfully');
             // Wait a bit for rights to propagate
             await new Promise(resolve => setTimeout(resolve, 1000));
@@ -688,16 +810,31 @@ class OnboardingService {
         ],
       };
 
-      // NOTE: synchronizerId is NOT used in submit-and-wait-for-transaction
-      // It's only used in external party allocation endpoints
       // CRITICAL: UserAccount template has signatory operator, observer party
       // Therefore actAs MUST be operator only (signatory), party goes in readAs (observer)
+      
+      // For internal allocation (parties on validator's namespace), do NOT specify domainId
+      // Canton will automatically find the common synchronizer
+      // For external allocation, we may need to specify the domain where external party was allocated
+      const useInternalAllocation = process.env.USE_INTERNAL_PARTY_ALLOCATION === 'true';
+      
+      let synchronizerId = null;
+      if (!useInternalAllocation) {
+        // External allocation: specify the domain where external party was allocated
+        synchronizerId = config.canton.synchronizerId || process.env.SYNCHRONIZER_ID;
+        console.log('[Onboarding] Using synchronizerId for command (external allocation):', synchronizerId);
+      } else {
+        // Internal allocation: let Canton find the common synchronizer automatically
+        console.log('[Onboarding] Not specifying synchronizerId (internal allocation - Canton will auto-detect)');
+      }
+      
       const result = await cantonService.createContract({
         token: adminToken,
         actAsParty: operatorPartyId, // Only operator is signatory
         templateId,
         createArguments,
-        readAs: [operatorPartyId, partyId] // Include both for visibility (operator + observer)
+        readAs: [operatorPartyId, partyId], // Include both for visibility (operator + observer)
+        ...(synchronizerId && { synchronizerId }) // Only include if specified
       });
 
       console.log('[Onboarding] UserAccount created successfully:', result);
@@ -809,6 +946,66 @@ class OnboardingService {
       console.warn('[Onboarding] Failed to grant operator rights via gRPC:', error.message);
       // Don't throw - this might not be available in all setups
       return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Allocate party internally via gRPC (on validator's namespace)
+   * This creates parties like: external-wallet-user-xxx::122087fa...
+   * These parties share the validator's namespace fingerprint and CAN interact with the operator
+   * 
+   * Use this when external party allocation fails due to topology issues
+   * (operator not connected to global-domain synchronizer)
+   */
+  async allocatePartyInternally(publicKeyBase64) {
+    try {
+      const adminToken = await this.getCantonToken();
+      const synchronizerId = await this.discoverSynchronizerId();
+      
+      // Generate a party hint from the public key (for uniqueness)
+      const publicKeyBuffer = Buffer.from(publicKeyBase64, 'base64');
+      const publicKeyHash = crypto.createHash('sha256').update(publicKeyBuffer).digest('hex');
+      const partyHint = `external-wallet-user-${publicKeyHash.substring(0, 16)}`;
+      
+      console.log(`[Onboarding] Allocating party internally: ${partyHint}`);
+      
+      // Use gRPC to allocate party (on validator's namespace)
+      const CantonGrpcClient = require('./canton-grpc-client');
+      const grpcClient = new CantonGrpcClient();
+      
+      const result = await grpcClient.allocateParty(partyHint, partyHint, adminToken);
+      
+      // Extract the full party ID from the result
+      const partyId = result.party_details?.party || result.party || result.identifier;
+      
+      if (!partyId) {
+        throw new Error('No party ID returned from internal allocation');
+      }
+      
+      console.log(`[Onboarding] ✅ Party allocated internally: ${partyId}`);
+      
+      // Grant rights for the new party
+      try {
+        const tokenPayload = JSON.parse(Buffer.from(adminToken.split('.')[1], 'base64').toString());
+        const userId = tokenPayload.sub;
+        if (userId) {
+          await grpcClient.grantUserRights(userId, partyId, adminToken);
+          console.log('[Onboarding] Granted rights for internal party');
+        }
+      } catch (rightsError) {
+        console.warn('[Onboarding] Could not grant rights for internal party:', rightsError.message);
+      }
+      
+      return {
+        step: 'ALLOCATED',
+        partyId,
+        synchronizerId,
+        allocationType: 'internal',
+        partyHint
+      };
+    } catch (error) {
+      console.error('[Onboarding] Internal party allocation failed:', error.message);
+      throw error;
     }
   }
 

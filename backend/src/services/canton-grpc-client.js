@@ -222,6 +222,134 @@ class CantonGrpcClient {
   }
 
   /**
+   * Vet a package on the participant (required for transactions to work)
+   * Uses the PackageService to vet a package for use on connected domains
+   */
+  async vetPackage(packageId, token) {
+    try {
+      await this.initialize(token);
+      
+      const protoBasePath = path.join(__dirname, '..', 'proto');
+      
+      // Try to load the package management service proto
+      const packageProtoPath = path.join(protoBasePath, 'package_service.proto');
+      
+      const pkgDef = protoLoader.loadSync(packageProtoPath, {
+        keepCase: true,
+        longs: String,
+        enums: String,
+        defaults: true,
+        oneofs: true
+      });
+      
+      const proto = grpc.loadPackageDefinition(pkgDef);
+      const PackageService = proto?.com?.daml?.ledger?.api?.v1?.admin?.PackageManagementService ||
+                            proto?.com?.daml?.ledger?.api?.v2?.admin?.PackageManagementService;
+      
+      if (!PackageService) {
+        console.log('[gRPC] PackageManagementService not available, trying participant admin...');
+        // Try via participant admin API on port 30100
+        return this.vetPackageViaAdmin(packageId, token);
+      }
+      
+      const packageClient = new PackageService(CANTON_LEDGER_API_URL, grpc.credentials.createInsecure());
+      
+      const request = {
+        package_ids: [packageId]
+      };
+      
+      return new Promise((resolve, reject) => {
+        const deadline = new Date();
+        deadline.setSeconds(deadline.getSeconds() + 30);
+        
+        // Try VetDar or similar method
+        if (packageClient.VetDar) {
+          packageClient.VetDar(request, this.metadata, { deadline }, (error, response) => {
+            if (error) {
+              console.error('[gRPC] VetDar failed:', error.message);
+              reject(error);
+            } else {
+              console.log('[gRPC] Package vetted successfully');
+              resolve(response);
+            }
+          });
+        } else {
+          console.log('[gRPC] VetDar method not available');
+          reject(new Error('VetDar method not available'));
+        }
+      });
+    } catch (error) {
+      console.error('[gRPC] Package vetting error:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Vet package via participant admin API (port 30100)
+   * This uses the Canton Admin gRPC service to vet packages on synchronizers
+   */
+  async vetPackageViaAdmin(packageId, synchronizerId, token) {
+    const adminHost = config.canton.adminHost || process.env.CANTON_ADMIN_API_GRPC_HOST;
+    const adminPort = config.canton.adminPort || process.env.CANTON_ADMIN_API_GRPC_PORT;
+    
+    if (!adminHost || !adminPort) {
+      throw new Error('Admin API not configured');
+    }
+    
+    const adminUrl = `${adminHost}:${adminPort}`;
+    console.log(`[gRPC] Vetting package via admin API at ${adminUrl}`);
+    console.log(`[gRPC] Package: ${packageId}`);
+    console.log(`[gRPC] Synchronizer: ${synchronizerId}`);
+    
+    try {
+      // Load the Canton admin package service proto
+      const protoBasePath = path.join(__dirname, '..', 'proto');
+      const adminPackageProtoPath = path.join(protoBasePath, 'canton_admin_package_service.proto');
+      
+      // If custom proto doesn't exist, we'll use grpc reflection or direct call
+      const metadata = new grpc.Metadata();
+      metadata.add('authorization', `Bearer ${token}`);
+      
+      // Create channel to admin API
+      const channel = new grpc.Client(adminUrl, grpc.credentials.createInsecure());
+      
+      // Make unary call using generic client
+      // The service is: com.digitalasset.canton.admin.participant.v30.PackageService/VetDar
+      const request = {
+        main_package_id: packageId,
+        synchronize: true,
+        synchronizer_id: synchronizerId
+      };
+      
+      return new Promise((resolve, reject) => {
+        // Use makeUnaryRequest for dynamic service call
+        const servicePath = '/com.digitalasset.canton.admin.participant.v30.PackageService/VetDar';
+        
+        channel.makeUnaryRequest(
+          servicePath,
+          (arg) => Buffer.from(JSON.stringify(arg)), // Simple serializer
+          (buffer) => JSON.parse(buffer.toString()), // Simple deserializer
+          request,
+          metadata,
+          { deadline: new Date(Date.now() + 30000) },
+          (error, response) => {
+            if (error) {
+              console.error('[gRPC Admin] VetDar failed:', error.message);
+              reject(error);
+            } else {
+              console.log('[gRPC Admin] Package vetted successfully');
+              resolve(response || {});
+            }
+          }
+        );
+      });
+    } catch (error) {
+      console.error('[gRPC Admin] Package vetting error:', error.message);
+      throw error;
+    }
+  }
+
+  /**
    * Allocate a party via gRPC v2 PartyManagementService
    */
   async allocateParty(partyIdHint, displayName, token) {

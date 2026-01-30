@@ -221,14 +221,16 @@ class CantonService {
     const templateIdString = templateIdToString(templateId);
 
     // Build correct v2 API structure with top-level "commands" object
-    // NOTE: synchronizerId is NOT a valid field in submit-and-wait-for-transaction
-    // It's only used in external party allocation endpoints
     // CRITICAL: Use "CreateCommand" (capitalized) not "create" per JSON Ledger API v2 spec
+    // CRITICAL: domainId is REQUIRED when parties are on multiple synchronizers
     const body = {
       commands: {
         commandId: commandId || `cmd-create-${crypto.randomUUID()}`,
         actAs,
         ...(readAs.length > 0 && { readAs }),
+        // domainId tells Canton which synchronizer to use for this transaction
+        // Required when parties may be on different domains
+        ...(synchronizerId && { domainId: synchronizerId }),
         commands: [{
           CreateCommand: {
             templateId: templateIdString,
@@ -817,24 +819,47 @@ class CantonService {
    * Grant user rights via JSON Ledger API v2
    * POST /v2/users/{user-id}/rights
    * 
+   * CRITICAL: Canton JSON Ledger API v2 requires rights in 'kind' wrapper format:
+   * {
+   *   "rights": [
+   *     { "kind": { "CanActAs": { "value": { "party": "..." } } } },
+   *     { "kind": { "CanReadAs": { "value": { "party": "..." } } } }
+   *   ]
+   * }
+   * 
    * @param {string} token - Bearer token
    * @param {string} userId - User ID (from JWT 'sub' claim)
    * @param {Array<string>} partyIds - Array of party IDs to grant rights for
+   * @param {string} identityProviderId - Identity provider ID (empty string for default IDP)
    * @returns {Object} Grant result
    */
-  async grantUserRights(token, userId, partyIds) {
+  async grantUserRights(token, userId, partyIds, identityProviderId = "") {
     const url = `${this.jsonApiBase}/v2/users/${encodeURIComponent(userId)}/rights`;
     
-    // Build rights array: canActAs and canReadAs for each party
+    // Build rights array with CORRECT 'kind' wrapper format
+    // Canton JSON Ledger API v2 requires: { kind: { CanActAs: { value: { party } } } }
     const rights = [];
     for (const partyId of partyIds) {
-      rights.push({ canActAs: { party: partyId } });
-      rights.push({ canReadAs: { party: partyId } });
+      rights.push({ 
+        kind: { 
+          CanActAs: { 
+            value: { party: partyId } 
+          } 
+        } 
+      });
+      rights.push({ 
+        kind: { 
+          CanReadAs: { 
+            value: { party: partyId } 
+          } 
+        } 
+      });
     }
     
-    // API requires userId in the body, not just in the URL path
+    // CRITICAL: Canton JSON API v2 requires userId AND identityProviderId in the body
     const body = { 
-      userId: userId,
+      userId, 
+      identityProviderId, // Required field - use discovered IDP or empty string for default
       rights 
     };
     
@@ -862,8 +887,56 @@ class CantonService {
     console.log(`[CantonService] ✅ User rights granted:`, JSON.stringify(result, null, 2));
     return result;
   }
+
+  /**
+   * Parse user rights response from Canton JSON Ledger API v2
+   * Handles the 'kind' wrapper format and normalizes to simple format
+   * 
+   * Input format from API:
+   * { "rights": [{ "kind": { "CanActAs": { "value": { "party": "..." } } } }] }
+   * 
+   * Output format (normalized):
+   * { "canActAs": ["party1", "party2"], "canReadAs": ["party1", "party3"] }
+   */
+  parseUserRights(rightsResponse) {
+    const result = {
+      canActAs: [],
+      canReadAs: []
+    };
+
+    const rights = rightsResponse.rights || [];
+    for (const right of rights) {
+      // Handle 'kind' wrapper format (Canton JSON Ledger API v2)
+      if (right.kind) {
+        if (right.kind.CanActAs?.value?.party) {
+          result.canActAs.push(right.kind.CanActAs.value.party);
+        }
+        if (right.kind.CanReadAs?.value?.party) {
+          result.canReadAs.push(right.kind.CanReadAs.value.party);
+        }
+      }
+      // Also handle direct format for backwards compatibility
+      if (right.canActAs?.party) {
+        result.canActAs.push(right.canActAs.party);
+      }
+      if (right.canReadAs?.party) {
+        result.canReadAs.push(right.canReadAs.party);
+      }
+      // Handle can_act_as format (snake_case variant)
+      if (right.can_act_as?.party) {
+        result.canActAs.push(right.can_act_as.party);
+      }
+      if (right.can_read_as?.party) {
+        result.canReadAs.push(right.can_read_as.party);
+      }
+    }
+
+    return result;
+  }
 }
 
-module.exports = new CantonService();
+const cantonServiceInstance = new CantonService();
+module.exports = cantonServiceInstance;
 module.exports.CantonService = CantonService;
 module.exports.decodeTokenPayload = decodeTokenPayload;
+module.exports.parseUserRights = cantonServiceInstance.parseUserRights.bind(cantonServiceInstance);

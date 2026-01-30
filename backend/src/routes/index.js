@@ -25,6 +25,7 @@ const balanceRoutes = require('./balanceRoutes');
 // NEW: Wallet routes (External Party Onboarding - No Keycloak)
 const walletRoutes = require('./v1/walletRoutes');
 const exchangeRoutes = require('./v1/exchangeRoutes');
+const simpleWalletRoutes = require('./walletRoutes'); // Simplified wallet creation
 
 // Debug middleware to log all incoming requests to this router
 router.use((req, res, next) => {
@@ -40,7 +41,8 @@ router.use('/admin', adminRoutes);
 router.use('/create-party', partyRoutes); // POST /api/create-party (legacy)
 router.use('/onboarding', onboardingRoutes); // POST /api/onboarding/* (new external party flow)
 router.use('/quota-status', quotaRoutes); // GET /api/quota-status
-router.use('/token-exchange', authRoutes); // POST /api/token-exchange
+router.use('/token-exchange', authRoutes); // POST /api/token-exchange (legacy)
+router.use('/auth', authRoutes); // NEW: POST /api/auth/challenge, /api/auth/verify
 router.post('/inspect-token', authController.inspectToken); // POST /api/inspect-token
 router.use('/ws/status', healthRoutes); // GET /api/ws/status
 router.use('/balance', balanceRoutes); // GET /api/balance/:partyId
@@ -49,6 +51,9 @@ router.use('/ledger', ledgerProxyRoutes);
 // Legacy raw proxy (kept for backwards compatibility / debugging)
 router.use('/canton', ledgerRoutes);
 router.use('/testnet', mintingRoutes); // Test token minting endpoints
+
+// NEW: Simplified wallet routes
+router.use('/wallet', simpleWalletRoutes); // POST /api/wallet/create, POST /api/wallet/allocate
 
 // NEW: v1 API routes (External Party Onboarding + Exchange)
 router.use('/v1/wallets', walletRoutes); // External party onboarding
@@ -62,7 +67,10 @@ console.log('  POST /api/onboarding/ensure-rights');
 console.log('  POST /api/onboarding/create-preapproval');
 console.log('  GET  /api/onboarding/discover-synchronizer');
 console.log('  GET  /api/quota-status');
-console.log('  POST /api/token-exchange');
+console.log('  POST /api/token-exchange (legacy)');
+console.log('  POST /api/auth/challenge - Get nonce to sign');
+console.log('  POST /api/auth/verify - Verify signature, issue session token');
+console.log('  POST /api/auth/refresh - Refresh session token');
 console.log('  POST /api/inspect-token');
 console.log('  GET  /api/ws/status');
 console.log('  GET  /api/balance/:partyId');
@@ -76,6 +84,12 @@ console.log('  ALL  /api/canton/* (legacy proxy)');
 console.log('  POST /api/testnet/mint-tokens');
 console.log('  POST /api/testnet/quick-mint');
 console.log('  GET  /api/testnet/balances/:partyId');
+console.log('');
+console.log('NEW Wallet API (Simplified - No Keycloak):');
+console.log('  POST /api/wallet/create - Create wallet (step 1: generate topology)');
+console.log('  POST /api/wallet/allocate - Allocate wallet (step 2: with signature)');
+console.log('  GET  /api/wallet - Get current wallet info');
+console.log('  GET  /api/wallet/:walletId - Get specific wallet info');
 console.log('');
 console.log('NEW v1 API (External Party Onboarding):');
 console.log('  POST /api/v1/wallets/create - Generate onboarding material');
