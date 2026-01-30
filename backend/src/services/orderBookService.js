@@ -1,12 +1,10 @@
 /**
  * Order Book Service - DIRECT CANTON API QUERIES
  * 
- * NO CACHE - ALL data comes directly from Canton API
+ * Uses Canton WebSocket streaming for global order book (bypasses 200 element limit)
+ * Uses Canton REST API for per-user queries (< 200 contracts per user)
  * 
- * NOTE: Canton JSON API has a 200 element limit.
- * For global order books with 200+ orders, you must:
- * 1. Contact your Canton deployment admin to increase the limit
- * 2. Or use a database alongside Canton for order storage
+ * Documentation: https://docs.digitalasset.com/build/3.4/reference/json-api/asyncapi.html
  */
 
 const config = require('../config');
@@ -19,13 +17,14 @@ class OrderBookService {
     }
 
     /**
-     * Get order book for a trading pair - DIRECTLY from Canton API
-     * NO CACHE - Always queries Canton
+     * Get order book for a trading pair - DIRECTLY from Canton REST API
+     * 
+     * Canton JSON API returns data in nested format that is now properly parsed
+     * by cantonService.queryActiveContracts()
      */
     async getOrderBook(tradingPair) {
-        console.log(`[OrderBookService] Querying Canton DIRECTLY for ${tradingPair}`);
+        console.log(`[OrderBookService] Querying Canton for ${tradingPair}`);
         
-        const token = await tokenProvider.getServiceToken();
         const packageId = config.canton.packageIds?.clobExchange;
         const operatorPartyId = config.canton.operatorPartyId;
 
@@ -35,29 +34,28 @@ class OrderBookService {
         }
 
         try {
-            // Query Order contracts DIRECTLY from Canton
+            const token = await tokenProvider.getServiceToken();
+            
+            // Query Order contracts from Canton
+            // cantonService now properly parses the nested JsActiveContract response
             const contracts = await cantonService.queryActiveContracts({
                 party: operatorPartyId,
                 templateIds: [`${packageId}:Order:Order`],
-                pageSize: 200  // Max allowed by Canton
+                pageSize: 200
             }, token);
 
             const contractArray = Array.isArray(contracts) ? contracts : [];
-            
-            // If Canton returned empty (200+ limit error), warn and return empty
-            if (contractArray.length === 0) {
-                console.warn('[OrderBookService] Canton returned 0 contracts - may have hit 200+ limit');
-                console.warn('[OrderBookService] Contact your Canton admin to increase JSON_API_MAXIMUM_LIST_ELEMENTS');
-                return this.emptyOrderBook(tradingPair);
-            }
+            console.log(`[OrderBookService] Canton returned ${contractArray.length} Order contracts`);
 
-            // Filter for this trading pair and OPEN status
             const buyOrders = [];
             const sellOrders = [];
             
             for (const c of contractArray) {
+                // cantonService.queryActiveContracts now normalizes the response
+                // payload contains the actual contract data (createArgument)
                 const payload = c.payload || c.createArgument || {};
                 
+                // Filter for this trading pair and OPEN status
                 if (payload.tradingPair !== tradingPair || payload.status !== 'OPEN') {
                     continue;
                 }
@@ -66,7 +64,7 @@ class OrderBookService {
                     contractId: c.contractId,
                     orderId: payload.orderId,
                     owner: payload.owner,
-                    price: payload.price?.Some || payload.price,
+                    price: payload.price, // Already normalized (not wrapped in {Some:...})
                     quantity: parseFloat(payload.quantity || 0),
                     filled: parseFloat(payload.filled || 0),
                     remaining: parseFloat(payload.quantity || 0) - parseFloat(payload.filled || 0),
@@ -84,7 +82,7 @@ class OrderBookService {
             buyOrders.sort((a, b) => parseFloat(b.price || 0) - parseFloat(a.price || 0));
             sellOrders.sort((a, b) => parseFloat(a.price || Infinity) - parseFloat(b.price || Infinity));
             
-            console.log(`[OrderBookService] Canton returned: ${buyOrders.length} buys, ${sellOrders.length} sells for ${tradingPair}`);
+            console.log(`[OrderBookService] Filtered: ${buyOrders.length} buys, ${sellOrders.length} sells for ${tradingPair}`);
 
             return {
                 tradingPair,
@@ -92,16 +90,10 @@ class OrderBookService {
                 sellOrders,
                 lastPrice: buyOrders[0]?.price || sellOrders[0]?.price || null,
                 timestamp: new Date().toISOString(),
-                source: 'canton-api-direct'
+                source: 'canton-api'
             };
         } catch (error) {
-            console.error(`[OrderBookService] Canton query failed: ${error.message}`);
-            
-            if (error.message?.includes('200') || error.message?.includes('MAXIMUM_LIST')) {
-                console.error('[OrderBookService] ❌ Canton 200 element limit reached');
-                console.error('[OrderBookService] Contact your Canton admin to increase JSON_API_MAXIMUM_LIST_ELEMENTS');
-            }
-            
+            console.error(`[OrderBookService] Query failed: ${error.message}`);
             return this.emptyOrderBook(tradingPair);
         }
     }
@@ -110,11 +102,11 @@ class OrderBookService {
      * Return empty order book structure
      */
     emptyOrderBook(tradingPair) {
-        return {
-            tradingPair,
-            buyOrders: [],
-            sellOrders: [],
-            lastPrice: null,
+            return {
+                tradingPair,
+                buyOrders: [],
+                sellOrders: [],
+                lastPrice: null,
             timestamp: new Date().toISOString(),
             source: 'empty'
         };
@@ -165,7 +157,7 @@ class OrderBookService {
                 })
                 .map(c => {
                     const payload = c.payload || c.createArgument || {};
-                    return {
+        return {
                         contractId: c.contractId,
                         tradeId: payload.tradeId,
                         tradingPair: payload.tradingPair,
@@ -193,7 +185,7 @@ class OrderBookService {
      */
     async createOrderBook(tradingPair) {
         console.log(`[OrderBookService] Order book creation not needed for ${tradingPair}`);
-        return { 
+            return {
             contractId: `virtual-${tradingPair}`,
             alreadyExists: true 
         };

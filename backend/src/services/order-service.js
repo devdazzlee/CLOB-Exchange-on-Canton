@@ -446,14 +446,26 @@ class OrderService {
 
       const orders = (Array.isArray(contracts) ? contracts : [])
         .filter(c => {
+          // cantonService.queryActiveContracts now normalizes the response
+          // Data is at c.payload, c.templateId, c.contractId directly
+          const templateId = c.templateId;
+          
+          // Only process Order templates
+          if (!templateId?.includes(':Order:Order')) {
+            return false;
+          }
+          
           const payload = c.payload || c.createArgument || {};
+          
           if (payload.owner !== partyId) return false;
           return status === 'ALL' || payload.status === status;
         })
         .map(c => {
           const payload = c.payload || c.createArgument || {};
+          const contractId = c.contractId;
+          
           return {
-            contractId: c.contractId,
+            contractId: contractId,
             orderId: payload.orderId,
             owner: payload.owner,
             tradingPair: payload.tradingPair,

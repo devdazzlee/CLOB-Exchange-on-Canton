@@ -411,28 +411,63 @@ class CantonService {
       }
     }
 
-    // Build the correct v2 filter structure - SIMPLIFIED FORMAT
-    // Canton JSON API v2 uses simpler filter without cumulative/identifierFilter
+    // Build the correct v2 filter structure using CUMULATIVE format
+    // IMPORTANT: The 'cumulative' format with TemplateFilter inside identifierFilter
+    // correctly returns only matching contracts and avoids the 413 error.
+    // The simpler 'templateFilters' format triggers 413 when total contracts > 200.
     const filter = {};
     
     if (party) {
       filter.filtersByParty = {
         [party]: templateIds.length > 0 ? {
-          // Use templateFilters for specific templates
-          templateFilters: templateIds.map(t => ({
-            templateId: normalizeTemplateId(t),
-            includeCreatedEventBlob: false
+          // Use cumulative format with identifierFilter -> TemplateFilter
+          cumulative: templateIds.map(t => ({
+            identifierFilter: {
+              TemplateFilter: {
+                value: {
+                  templateId: typeof t === 'string' ? t : `${t.packageId}:${t.moduleName}:${t.entityName}`,
+                  includeCreatedEventBlob: false
+                }
+              }
+            }
           }))
-        } : {} // Empty object = wildcard (all templates)
+        } : {
+          // Wildcard filter for all templates
+          cumulative: [{
+            identifierFilter: {
+              WildcardFilter: {
+                value: {
+                  includeCreatedEventBlob: false
+                }
+              }
+            }
+          }]
+        }
       };
     } else {
       // If no party specified, use filtersForAnyParty
       filter.filtersForAnyParty = templateIds.length > 0 ? {
-        templateFilters: templateIds.map(t => ({
-          templateId: normalizeTemplateId(t),
-          includeCreatedEventBlob: false
+        cumulative: templateIds.map(t => ({
+          identifierFilter: {
+            TemplateFilter: {
+              value: {
+                templateId: typeof t === 'string' ? t : `${t.packageId}:${t.moduleName}:${t.entityName}`,
+                includeCreatedEventBlob: false
+              }
+            }
+          }
         }))
-      } : {}; // Empty object = wildcard
+      } : {
+        cumulative: [{
+          identifierFilter: {
+            WildcardFilter: {
+              value: {
+                includeCreatedEventBlob: false
+              }
+            }
+          }
+        }]
+      };
     }
 
     const body = {
@@ -477,8 +512,32 @@ class CantonService {
     }
 
     const result = JSON.parse(text);
-    const contracts = result.activeContracts || result || [];
-    console.log(`[CantonService] ✅ Found ${contracts.length || 0} contracts`);
+    const rawContracts = result.activeContracts || result || [];
+    console.log(`[CantonService] ✅ Found ${rawContracts.length || 0} contracts`);
+
+    // Canton JSON API v2 returns contracts wrapped in:
+    // [{workflowId, contractEntry: {JsActiveContract: {createdEvent: {...}, synchronizerId}}}]
+    // Normalize to a simple format for consumers
+    const contracts = rawContracts.map(item => {
+      if (item.contractEntry?.JsActiveContract) {
+        const activeContract = item.contractEntry.JsActiveContract;
+        const createdEvent = activeContract.createdEvent || {};
+        return {
+          contractId: createdEvent.contractId,
+          templateId: createdEvent.templateId,
+          payload: createdEvent.createArgument, // The actual contract data
+          createArgument: createdEvent.createArgument,
+          signatories: createdEvent.signatories,
+          observers: createdEvent.observers,
+          witnessParties: createdEvent.witnessParties,
+          offset: createdEvent.offset,
+          synchronizerId: activeContract.synchronizerId,
+          createdAt: createdEvent.createdAt
+        };
+      }
+      // Fallback for other response formats
+      return item;
+    });
 
     return contracts;
   }
@@ -502,19 +561,43 @@ class CantonService {
       if (party) {
         filter.filtersByParty = {
           [party]: templateIds.length > 0 ? {
-            templateFilters: templateIds.map(t => ({
-              templateId: normalizeTemplateId(t),
-              includeCreatedEventBlob: false
+            cumulative: templateIds.map(t => ({
+              identifierFilter: {
+                TemplateFilter: {
+                  value: {
+                    templateId: normalizeTemplateId(t),
+                    includeCreatedEventBlob: false
+                  }
+                }
+              }
             }))
-          } : {}
+          } : {
+            cumulative: [{
+              identifierFilter: {
+                WildcardFilter: { value: { includeCreatedEventBlob: false } }
+              }
+            }]
+          }
         };
       } else {
         filter.filtersForAnyParty = templateIds.length > 0 ? {
-          templateFilters: templateIds.map(t => ({
-            templateId: normalizeTemplateId(t),
-            includeCreatedEventBlob: false
+          cumulative: templateIds.map(t => ({
+            identifierFilter: {
+              TemplateFilter: {
+                value: {
+                  templateId: normalizeTemplateId(t),
+                  includeCreatedEventBlob: false
+                }
+              }
+            }
           }))
-        } : {};
+        } : {
+          cumulative: [{
+            identifierFilter: {
+              WildcardFilter: { value: { includeCreatedEventBlob: false } }
+            }
+          }]
+        };
       }
 
       const body = {
@@ -549,7 +632,26 @@ class CantonService {
       }
 
       const result = await res.json();
-      const contracts = result.activeContracts || [];
+      const rawContracts = result.activeContracts || result || [];
+      
+      // Normalize Canton JSON API v2 response format
+      const contracts = rawContracts.map(item => {
+        if (item.contractEntry?.JsActiveContract) {
+          const activeContract = item.contractEntry.JsActiveContract;
+          const createdEvent = activeContract.createdEvent || {};
+          return {
+            contractId: createdEvent.contractId,
+            templateId: createdEvent.templateId,
+            payload: createdEvent.createArgument,
+            createArgument: createdEvent.createArgument,
+            signatories: createdEvent.signatories,
+            observers: createdEvent.observers,
+            synchronizerId: activeContract.synchronizerId
+          };
+        }
+        return item;
+      });
+      
       allContracts.push(...contracts);
       
       pageToken = result.nextPageToken || null;
