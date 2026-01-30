@@ -1,54 +1,72 @@
 /**
  * Server Entry Point
  * Professional backend with MVC architecture
+ * 
+ * Supports both:
+ * - Traditional server mode (for local development)
+ * - Vercel serverless mode (for deployment)
  */
 
-const { startServer } = require('./src/app');
+const { createApp, startServer } = require('./src/app');
 
-// Start the server
-const { app, server } = startServer();
+// Check if running on Vercel (serverless)
+const isVercel = process.env.VERCEL === '1' || process.env.VERCEL_ENV;
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down gracefully...');
-  if (server && typeof server.close === 'function') {
-    server.close(() => {
-      console.log('Server closed');
+if (isVercel) {
+  // Vercel serverless mode - export Express app as default
+  console.log('[Server] Running in Vercel serverless mode');
+  const { app } = createApp();
+  
+  // Export app as default for Vercel
+  module.exports = app;
+} else {
+  // Traditional server mode - start listening
+  console.log('[Server] Running in traditional server mode');
+  const { app, server } = startServer();
+
+  // Graceful shutdown
+  process.on('SIGTERM', () => {
+    console.log('SIGTERM received, shutting down gracefully...');
+    if (server && typeof server.close === 'function') {
+      server.close(() => {
+        console.log('Server closed');
+        process.exit(0);
+      });
+    } else {
       process.exit(0);
-    });
-  } else {
-    process.exit(0);
-  }
-});
+    }
+  });
 
-process.on('SIGINT', () => {
-  console.log('SIGINT received, shutting down gracefully...');
-  if (server && typeof server.close === 'function') {
-    server.close(() => {
-      console.log('Server closed');
+  process.on('SIGINT', () => {
+    console.log('SIGINT received, shutting down gracefully...');
+    if (server && typeof server.close === 'function') {
+      server.close(() => {
+        console.log('Server closed');
+        process.exit(0);
+      });
+    } else {
       process.exit(0);
-    });
-  } else {
-    process.exit(0);
-  }
-});
+    }
+  });
 
-// Handle unhandled promise rejections
-process.on('unhandledRejection', (err) => {
-  console.error('Unhandled Promise Rejection:', err);
-  if (server && typeof server.close === 'function') {
-    server.close(() => {
+  // Handle unhandled promise rejections
+  process.on('unhandledRejection', (err) => {
+    console.error('Unhandled Promise Rejection:', err);
+    if (server && typeof server.close === 'function') {
+      server.close(() => {
+        process.exit(1);
+      });
+    } else {
       process.exit(1);
-    });
-  } else {
+    }
+  });
+
+  // Handle uncaught exceptions
+  process.on('uncaughtException', (err) => {
+    console.error('Uncaught Exception:', err);
     process.exit(1);
-  }
-});
+  });
 
-// Handle uncaught exceptions
-process.on('uncaughtException', (err) => {
-  console.error('Uncaught Exception:', err);
-  process.exit(1);
-});
-
-module.exports = { app, server };
+  // Export for compatibility
+  module.exports = { app, server };
+}

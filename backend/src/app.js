@@ -40,21 +40,53 @@ function createApp() {
   const app = express();
   const server = http.createServer(app);
 
-  // Middleware
+  // Middleware - CORS configuration
   app.use(cors({
-    origin: [
-      "http://localhost:3000",
-      "http://127.0.0.1:3000",
-      "http://localhost:5173",
-      "http://127.0.0.1:5173",
-      "http://localhost:5174",
-      "http://127.0.0.1:5174",
-      "https://clob-exchange-on-canton.vercel.app"
-    ],
+    origin: function (origin, callback) {
+      // Allow requests with no origin (like mobile apps, Postman, or server-to-server)
+      if (!origin) return callback(null, true);
+      
+      const allowedOrigins = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "https://clob-exchange-on-canton.vercel.app"
+      ];
+      
+      // Normalize origin (remove trailing slash)
+      const normalizedOrigin = origin.replace(/\/$/, '');
+      
+      // Check exact match
+      if (allowedOrigins.includes(normalizedOrigin)) {
+        return callback(null, true);
+      }
+      
+      // Check if it's a Vercel preview deployment
+      if (normalizedOrigin.includes('.vercel.app')) {
+        return callback(null, true);
+      }
+      
+      // Default: reject
+      callback(new Error('Not allowed by CORS'));
+    },
     credentials: true,
-    allowedHeaders: ["Content-Type", "Authorization", "x-user-id", "x-public-key", "x-party-id"],
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: [
+      "Content-Type", 
+      "Authorization", 
+      "x-user-id", 
+      "x-public-key", 
+      "x-party-id", 
+      "X-Requested-With",
+      "Accept",
+      "Origin"
+    ],
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     optionsSuccessStatus: 204,
+    preflightContinue: false,
+    maxAge: 86400, // 24 hours
   }));
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ extended: true, limit: '10mb' }));
@@ -118,18 +150,25 @@ function createApp() {
   // Global error handler (must be last)
   app.use(errorHandler);
 
-  // Initialize WebSocket service
-  initializeWebSocketService(server);
+  // Initialize WebSocket service (skip in serverless/Vercel mode)
+  const isServerless = process.env.VERCEL === '1' || process.env.VERCEL_ENV;
+  if (!isServerless && server) {
+    initializeWebSocketService(server);
+  } else {
+    console.log('[App] Skipping WebSocket initialization (serverless mode)');
+  }
 
-  // Milestone 4: Start stop-loss service
-  try {
-    const { getStopLossService } = require('./services/stopLossService');
-    const stopLossService = getStopLossService();
-    stopLossService.start().catch(err => {
-      console.warn('⚠️  Stop-loss service failed to start:', err.message);
-    });
-  } catch (err) {
-    console.warn('⚠️  Stop-loss service not available:', err.message);
+  // Milestone 4: Start stop-loss service (skip in serverless mode)
+  if (!isServerless) {
+    try {
+      const { getStopLossService } = require('./services/stopLossService');
+      const stopLossService = getStopLossService();
+      stopLossService.start().catch(err => {
+        console.warn('⚠️  Stop-loss service failed to start:', err.message);
+      });
+    } catch (err) {
+      console.warn('⚠️  Stop-loss service not available:', err.message);
+    }
   }
 
   return { app, server };
