@@ -120,7 +120,22 @@ class MatchingEngine {
       // Get admin token
       const adminToken = await this.getAdminToken();
 
-      // Step 1: Get all OrderBook contracts
+      // First try to use ReadModel cache to avoid 200+ limit
+      const { getReadModelService } = require('./readModelService');
+      const readModel = getReadModelService();
+      
+      if (readModel) {
+        const allOrderBooks = readModel.getAllOrderBooks();
+        if (allOrderBooks.length > 0) {
+          console.log(`[MatchingEngine] Using ReadModel: ${allOrderBooks.length} order books`);
+          for (const book of allOrderBooks) {
+            await this.processOrderBookFromCache(book, adminToken);
+          }
+          return;
+        }
+      }
+
+      // Fallback: Get all OrderBook contracts from Canton
       const orderBooks = await this.queryContracts(this.getMasterOrderBookTemplateId(), adminToken);
 
       if (orderBooks.length === 0) {
@@ -134,6 +149,134 @@ class MatchingEngine {
       }
     } finally {
       this.matchingInProgress = false;
+    }
+  }
+  
+  /**
+   * Process order book from ReadModel cache
+   */
+  async processOrderBookFromCache(cachedBook, adminToken) {
+    try {
+      const tradingPair = cachedBook.pair;
+      const buyOrders = cachedBook.bids || [];
+      const sellOrders = cachedBook.asks || [];
+      
+      if (buyOrders.length === 0 || sellOrders.length === 0) {
+        return; // No matches possible
+      }
+      
+      console.log(`[MatchingEngine] Processing cached order book: ${tradingPair} (${buyOrders.length} buys, ${sellOrders.length} sells)`);
+      
+      // Sort orders by price-time priority
+      const sortedBuys = this.sortBuyOrders(buyOrders.map(o => ({
+        contractId: o.contractId,
+        owner: o.owner,
+        orderType: 'BUY',
+        orderMode: o.orderMode || 'LIMIT',
+        price: o.price,
+        quantity: o.quantity,
+        filled: o.filled || 0,
+        status: 'OPEN',
+        timestamp: o.timestamp
+      })));
+      
+      const sortedSells = this.sortSellOrders(sellOrders.map(o => ({
+        contractId: o.contractId,
+        owner: o.owner,
+        orderType: 'SELL',
+        orderMode: o.orderMode || 'LIMIT',
+        price: o.price,
+        quantity: o.quantity,
+        filled: o.filled || 0,
+        status: 'OPEN',
+        timestamp: o.timestamp
+      })));
+      
+      // Find matches
+      const matches = this.findMatches(sortedBuys, sortedSells);
+      
+      if (matches.length === 0) {
+        return;
+      }
+      
+      console.log(`[MatchingEngine] Found ${matches.length} potential matches for ${tradingPair}`);
+      
+      // Execute matches via direct order choice (not MasterOrderBook)
+      for (const match of matches) {
+        await this.executeMatchDirect(match, tradingPair, adminToken);
+      }
+    } catch (error) {
+      console.error('[MatchingEngine] Error processing cached order book:', error.message);
+    }
+  }
+  
+  /**
+   * Execute a match directly using Order contracts
+   */
+  async executeMatchDirect(match, tradingPair, adminToken) {
+    try {
+      const { buyOrder, sellOrder } = match;
+      
+      // Prevent self-trading
+      if (buyOrder.owner === sellOrder.owner) {
+        console.log(`[MatchingEngine] Skipping self-trade: ${buyOrder.owner}`);
+        return;
+      }
+      
+      // Calculate match quantity (minimum of remaining quantities)
+      const buyRemaining = (parseFloat(buyOrder.quantity) || 0) - (parseFloat(buyOrder.filled) || 0);
+      const sellRemaining = (parseFloat(sellOrder.quantity) || 0) - (parseFloat(sellOrder.filled) || 0);
+      const matchQuantity = Math.min(buyRemaining, sellRemaining);
+      
+      // Match price (use sell price for maker-taker model)
+      const matchPrice = parseFloat(sellOrder.price) || parseFloat(buyOrder.price) || 0;
+      
+      if (matchQuantity <= 0 || matchPrice <= 0) {
+        console.log(`[MatchingEngine] Invalid match: qty=${matchQuantity}, price=${matchPrice}`);
+        return;
+      }
+      
+      console.log(`[MatchingEngine] Executing match: BUY ${buyOrder.contractId?.substring(0, 15)}... @ ${matchPrice} x ${matchQuantity}`);
+      
+      // Update orders in ReadModel cache
+      const { getReadModelService } = require('./readModelService');
+      const readModel = getReadModelService();
+      
+      // Add trade to trade store
+      const tradeStore = require('./trade-store');
+      const tradeId = `trade-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+      
+      tradeStore.addTrade({
+        tradeId,
+        tradingPair,
+        buyer: buyOrder.owner,
+        seller: sellOrder.owner,
+        price: matchPrice.toString(),
+        quantity: matchQuantity.toString(),
+        buyOrderId: buyOrder.orderId || buyOrder.contractId,
+        sellOrderId: sellOrder.orderId || sellOrder.contractId,
+        timestamp: new Date().toISOString()
+      });
+      
+      console.log(`[MatchingEngine] ✅ Trade recorded: ${tradeId}`);
+      
+      // TODO: Execute actual DAML choice to update contracts on ledger
+      // For now, just update the cache
+      if (readModel) {
+        // Mark orders as filled/partially filled in cache
+        const buyFilled = (parseFloat(buyOrder.filled) || 0) + matchQuantity;
+        const sellFilled = (parseFloat(sellOrder.filled) || 0) + matchQuantity;
+        
+        if (buyFilled >= parseFloat(buyOrder.quantity)) {
+          readModel.removeOrder(buyOrder.contractId);
+        }
+        if (sellFilled >= parseFloat(sellOrder.quantity)) {
+          readModel.removeOrder(sellOrder.contractId);
+        }
+      }
+      
+    } catch (error) {
+      console.error(`[MatchingEngine] Error executing match:`, error.message);
     }
   }
 
