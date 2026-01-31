@@ -301,6 +301,27 @@ class OrderService {
       });
     }
 
+    // IMMEDIATE MATCHING: Trigger matching engine right after order placement
+    // This ensures fastest execution instead of waiting for polling cycle
+    try {
+      const { getMatchingEngine } = require('./matching-engine');
+      const matchingEngine = getMatchingEngine();
+      if (matchingEngine && matchingEngine.isRunning) {
+        console.log(`[OrderService] Triggering immediate matching for ${tradingPair}`);
+        // Run matching asynchronously - don't block the order response
+        setImmediate(async () => {
+          try {
+            await matchingEngine.runMatchingCycle();
+          } catch (matchError) {
+            console.error('[OrderService] Immediate matching failed:', matchError.message);
+          }
+        });
+      }
+    } catch (matchErr) {
+      // Don't fail order placement if matching trigger fails
+      console.error('[OrderService] Could not trigger immediate matching:', matchErr.message);
+    }
+
     return {
       success: true,
       orderId: orderId,

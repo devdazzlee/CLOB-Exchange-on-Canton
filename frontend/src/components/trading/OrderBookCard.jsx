@@ -35,8 +35,13 @@ export default function OrderBookCard({
       });
   };
 
-  const buyOrdersWithDepth = calculateDepth([...orderBook.buys].reverse()); // Reverse for display (highest first)
-  const sellOrdersWithDepth = calculateDepth([...orderBook.sells]); // Lowest first
+  // Sort buy orders: highest price first (best bid at top)
+  const sortedBuys = [...orderBook.buys].sort((a, b) => parseFloat(b.price || 0) - parseFloat(a.price || 0));
+  // Sort sell orders: lowest price first (best ask at top)  
+  const sortedSells = [...orderBook.sells].sort((a, b) => parseFloat(a.price || 0) - parseFloat(b.price || 0));
+  
+  const buyOrdersWithDepth = calculateDepth(sortedBuys);
+  const sellOrdersWithDepth = calculateDepth(sortedSells);
   
   const maxDepth = Math.max(
     buyOrdersWithDepth.length > 0 ? buyOrdersWithDepth[buyOrdersWithDepth.length - 1]?.cumulative || 0 : 0,
@@ -136,21 +141,17 @@ export default function OrderBookCard({
                                 animate={{ opacity: 1, x: 0 }}
                                 exit={{ opacity: 0 }}
                                 className="border-b border-border/50 hover:bg-card transition-colors cursor-pointer relative"
+                                style={{
+                                  background: `linear-gradient(to left, rgba(239, 68, 68, 0.1) ${depthPercent}%, transparent ${depthPercent}%)`
+                                }}
                               >
-                                {/* Depth bar background */}
-                                <td colSpan="3" className="absolute inset-0 pointer-events-none">
-                                  <div 
-                                    className="h-full bg-destructive/10"
-                                    style={{ width: `${depthPercent}%`, marginLeft: 'auto' }}
-                                  />
-                                </td>
-                                <td className="py-2.5 px-3 text-destructive font-mono text-sm font-medium relative z-10">
+                                <td className="py-2.5 px-3 text-destructive font-mono text-sm font-medium">
                                   {order.price !== null ? parseFloat(order.price).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 }) : 'Market'}
                                 </td>
-                                <td className="py-2.5 px-3 text-right text-foreground text-sm relative z-10">
+                                <td className="py-2.5 px-3 text-right text-foreground text-sm">
                                   {order.remaining != null ? parseFloat(order.remaining).toFixed(8) : '0.00000000'}
                                 </td>
-                                <td className="py-2.5 px-3 text-right text-muted-foreground text-sm relative z-10">
+                                <td className="py-2.5 px-3 text-right text-muted-foreground text-sm">
                                   {order.price !== null && order.remaining != null ? (parseFloat(order.price) * parseFloat(order.remaining)).toLocaleString(undefined, { maximumFractionDigits: 2 }) : '-'}
                                 </td>
                               </motion.tr>
@@ -193,22 +194,18 @@ export default function OrderBookCard({
                                 initial={{ opacity: 0, x: 10 }}
                                 animate={{ opacity: 1, x: 0 }}
                                 exit={{ opacity: 0 }}
-                                className="border-b border-border/50 hover:bg-card transition-colors cursor-pointer relative"
+                                className="border-b border-border/50 hover:bg-card transition-colors cursor-pointer"
+                                style={{
+                                  background: `linear-gradient(to right, rgba(34, 197, 94, 0.1) ${depthPercent}%, transparent ${depthPercent}%)`
+                                }}
                               >
-                                {/* Depth bar background */}
-                                <td colSpan="3" className="absolute inset-0 pointer-events-none">
-                                  <div 
-                                    className="h-full bg-success/10"
-                                    style={{ width: `${depthPercent}%` }}
-                                  />
-                                </td>
-                                <td className="py-2.5 px-3 text-success font-mono text-sm font-medium relative z-10">
+                                <td className="py-2.5 px-3 text-success font-mono text-sm font-medium">
                                   {order.price !== null ? parseFloat(order.price).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 }) : 'Market'}
                                 </td>
-                                <td className="py-2.5 px-3 text-right text-foreground text-sm relative z-10">
+                                <td className="py-2.5 px-3 text-right text-foreground text-sm">
                                   {order.remaining != null ? parseFloat(order.remaining).toFixed(8) : '0.00000000'}
                                 </td>
-                                <td className="py-2.5 px-3 text-right text-muted-foreground text-sm relative z-10">
+                                <td className="py-2.5 px-3 text-right text-muted-foreground text-sm">
                                   {order.price !== null && order.remaining != null ? (parseFloat(order.price) * parseFloat(order.remaining)).toLocaleString(undefined, { maximumFractionDigits: 2 }) : '-'}
                                 </td>
                               </motion.tr>

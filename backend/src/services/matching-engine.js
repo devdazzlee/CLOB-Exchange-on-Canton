@@ -219,11 +219,8 @@ class MatchingEngine {
           continue;
         }
         
-        // Self-trade prevention
-        if (buyOrder.owner === sellOrder.owner) {
-          console.log(`[MatchingEngine] Skipping self-trade: ${buyOrder.owner.substring(0, 30)}...`);
-          continue;
-        }
+        // Self-trade prevention DISABLED per client request
+        // Market will handle it naturally
         
         // Check if orders match (buy price >= sell price)
         // Ensure prices are numbers
@@ -390,8 +387,14 @@ class MatchingEngine {
   
   /**
    * Update UserAccount balances after a trade
-   * Buyer: receives base token (matchQty), already withdrew quote (matchPrice * matchQty)
-   * Seller: receives quote token (matchPrice * matchQty), already withdrew base (matchQty)
+   * 
+   * Buyer: receives base token (+matchQty BTC), already withdrew quote (-quoteAmount USDT when order placed)
+   * Seller: receives quote token (+quoteAmount USDT), gives base token (-matchQty BTC)
+   * 
+   * Uses UpdateAfterTrade choice which is controlled by OPERATOR (not party like Deposit)
+   * 
+   * IMPORTANT: Re-query for each account IMMEDIATELY before exercising choice
+   * because DAML contracts are immutable - each choice creates a new contract with new ID
    */
   async updateBalancesAfterTrade(adminToken, tradingPair, buyerPartyId, sellerPartyId, matchQty, matchPrice) {
     const packageId = config.canton.packageIds?.clobExchange;
@@ -402,56 +405,70 @@ class MatchingEngine {
     const [baseToken, quoteToken] = tradingPair.split('/');
     const quoteAmount = matchQty * matchPrice;
     
-    // Find both UserAccounts
-    const contracts = await cantonService.queryActiveContracts({
-      party: operatorPartyId,
-      templateIds: [`${packageId}:UserAccount:UserAccount`],
-      pageSize: 100
-    }, adminToken);
+    // Helper to find fresh UserAccount contract for a party
+    const findFreshAccount = async (partyId) => {
+      const contracts = await cantonService.queryActiveContracts({
+        party: operatorPartyId,
+        templateIds: [`${packageId}:UserAccount:UserAccount`],
+        pageSize: 200
+      }, adminToken);
+      return contracts.find(c => (c.payload?.party || c.createArgument?.party) === partyId);
+    };
     
-    const buyerAccount = contracts.find(c => (c.payload?.party || c.createArgument?.party) === buyerPartyId);
-    const sellerAccount = contracts.find(c => (c.payload?.party || c.createArgument?.party) === sellerPartyId);
-    
-    // Deposit base token to buyer (they receive the BTC they bought)
+    // ========== UPDATE BUYER BALANCE ==========
+    // Buyer receives base token (BTC), quote token was already deducted when order was placed
+    const buyerAccount = await findFreshAccount(buyerPartyId);
     if (buyerAccount) {
       try {
         await cantonService.exerciseChoice({
           token: adminToken,
-          actAsParty: buyerPartyId,
+          actAsParty: operatorPartyId,  // UpdateAfterTrade is controlled by operator
           templateId: `${packageId}:UserAccount:UserAccount`,
           contractId: buyerAccount.contractId,
-          choice: 'Deposit',
+          choice: 'UpdateAfterTrade',
           choiceArgument: {
-            token: baseToken,
-            amount: matchQty.toFixed(8)
+            baseToken: baseToken,
+            quoteToken: quoteToken,
+            baseAmount: matchQty.toFixed(8),   // +BTC (buyer receives)
+            quoteAmount: '0.00000000'          // Already deducted when order placed
           },
           readAs: [operatorPartyId]
         });
-        console.log(`[MatchingEngine] Deposited ${matchQty.toFixed(8)} ${baseToken} to buyer`);
+        console.log(`[MatchingEngine] ✅ Credited ${matchQty.toFixed(8)} ${baseToken} to buyer`);
       } catch (e) {
-        console.error(`[MatchingEngine] Failed to deposit to buyer:`, e.message);
+        console.error(`[MatchingEngine] ❌ Failed to update buyer balance:`, e.message);
       }
+    } else {
+      console.warn(`[MatchingEngine] ⚠️ No UserAccount found for buyer: ${buyerPartyId.substring(0, 30)}...`);
     }
     
-    // Deposit quote token to seller (they receive the USDT from the sale)
+    // ========== UPDATE SELLER BALANCE ==========
+    // Seller receives quote token (USDT)
+    // BTC was ALREADY deducted when they placed the SELL order (withdrawForOrder)
+    // Query FRESH contract immediately before exercising (buyer update created new contracts)
+    const sellerAccount = await findFreshAccount(sellerPartyId);
     if (sellerAccount) {
       try {
         await cantonService.exerciseChoice({
           token: adminToken,
-          actAsParty: sellerPartyId,
+          actAsParty: operatorPartyId,  // UpdateAfterTrade is controlled by operator
           templateId: `${packageId}:UserAccount:UserAccount`,
           contractId: sellerAccount.contractId,
-          choice: 'Deposit',
+          choice: 'UpdateAfterTrade',
           choiceArgument: {
-            token: quoteToken,
-            amount: quoteAmount.toFixed(8)
+            baseToken: baseToken,
+            quoteToken: quoteToken,
+            baseAmount: '0.00000000',              // BTC already deducted when sell order placed
+            quoteAmount: quoteAmount.toFixed(8)     // +USDT (seller receives payment)
           },
           readAs: [operatorPartyId]
         });
-        console.log(`[MatchingEngine] Deposited ${quoteAmount.toFixed(8)} ${quoteToken} to seller`);
+        console.log(`[MatchingEngine] ✅ Credited ${quoteAmount.toFixed(8)} ${quoteToken} to seller`);
       } catch (e) {
-        console.error(`[MatchingEngine] Failed to deposit to seller:`, e.message);
+        console.error(`[MatchingEngine] ❌ Failed to update seller balance:`, e.message);
       }
+    } else {
+      console.warn(`[MatchingEngine] ⚠️ No UserAccount found for seller: ${sellerPartyId.substring(0, 30)}...`);
     }
   }
   
@@ -574,11 +591,8 @@ class MatchingEngine {
     try {
       const { buyOrder, sellOrder } = match;
       
-      // Prevent self-trading
-      if (buyOrder.owner === sellOrder.owner) {
-        console.log(`[MatchingEngine] Skipping self-trade: ${buyOrder.owner}`);
-        return;
-      }
+      // Self-trade prevention DISABLED per client request
+      // Market will handle it naturally
       
       // Calculate match quantity (minimum of remaining quantities)
       const buyRemaining = (parseFloat(buyOrder.quantity) || 0) - (parseFloat(buyOrder.filled) || 0);

@@ -14,6 +14,10 @@ const tokenProvider = require('../services/tokenProvider');
 class TradeController {
   /**
    * Query trades directly from Canton API
+   * 
+   * Since Trade template has signatory buyer, seller (not operator),
+   * we need to query as the trade participants. We get the list of 
+   * known parties from UserAccount contracts and query trades for each.
    */
   async queryTradesFromCanton(filterFn, limit = 50) {
     const token = await tokenProvider.getServiceToken();
@@ -24,34 +28,59 @@ class TradeController {
       throw new Error('CLOB_EXCHANGE_PACKAGE_ID not configured');
     }
 
-    // Query Trade contracts from Canton
-    const contracts = await cantonService.queryActiveContracts({
+    // First, get all known parties from UserAccount contracts
+    const userAccounts = await cantonService.queryActiveContracts({
       party: operatorPartyId,
-      templateIds: [`${packageId}:Trade:Trade`],
-      pageSize: Math.min(limit * 2, 500) // Query more to account for filtering
+      templateIds: [`${packageId}:UserAccount:UserAccount`],
+      pageSize: 200
     }, token);
 
-    const trades = (Array.isArray(contracts) ? contracts : [])
-      .map(c => {
-        const payload = c.payload || c.createArgument || {};
-        return {
-          contractId: c.contractId,
-          tradeId: payload.tradeId,
-          tradingPair: payload.tradingPair,
-          buyer: payload.buyer,
-          seller: payload.seller,
-          price: payload.price,
-          quantity: payload.quantity,
-          buyOrderId: payload.buyOrderId,
-          sellOrderId: payload.sellOrderId,
-          timestamp: payload.timestamp
-        };
-      })
+    const knownParties = (Array.isArray(userAccounts) ? userAccounts : [])
+      .map(c => (c.payload || c.createArgument || {}).party)
+      .filter(Boolean);
+
+    // Query trades for each known party (they're signatories on Trade)
+    const allTradeContractIds = new Set();
+    const allTrades = [];
+
+    for (const partyId of knownParties) {
+      try {
+        const contracts = await cantonService.queryActiveContracts({
+          party: partyId,
+          templateIds: [`${packageId}:Trade:Trade`],
+          pageSize: Math.min(limit * 2, 200)
+        }, token);
+
+        for (const c of (Array.isArray(contracts) ? contracts : [])) {
+          // Dedupe by contractId
+          if (!allTradeContractIds.has(c.contractId)) {
+            allTradeContractIds.add(c.contractId);
+            const payload = c.payload || c.createArgument || {};
+            allTrades.push({
+              contractId: c.contractId,
+              tradeId: payload.tradeId,
+              tradingPair: payload.tradingPair,
+              buyer: payload.buyer,
+              seller: payload.seller,
+              price: payload.price,
+              quantity: payload.quantity,
+              buyOrderId: payload.buyOrderId,
+              sellOrderId: payload.sellOrderId,
+              timestamp: payload.timestamp
+            });
+          }
+        }
+      } catch (e) {
+        // Continue with other parties
+        console.error(`[TradeController] Failed to query trades for party ${partyId.substring(0, 30)}...:`, e.message);
+      }
+    }
+
+    // Apply filter, sort by timestamp, and limit
+    return allTrades
       .filter(filterFn || (() => true))
       .sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0))
       .slice(0, limit);
-
-    return trades;
   }
 
   // GET /api/trades - Get all trades from Canton API
