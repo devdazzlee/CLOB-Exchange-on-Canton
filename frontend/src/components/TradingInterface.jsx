@@ -37,7 +37,7 @@ export default function TradingInterface({ partyId }) {
   const [orderMode, setOrderMode] = useState('LIMIT');
   const [price, setPrice] = useState('');
   const [quantity, setQuantity] = useState('');
-  const [balance, setBalance] = useState({ BTC: '1.0', USDT: '10000.0', ETH: '10.0', SOL: '100.0' });
+  const [balance, setBalance] = useState({ BTC: '0.0', USDT: '0.0', ETH: '0.0', SOL: '0.0' });
   const [balanceLoading, setBalanceLoading] = useState(false);
   const isMintingRef = useRef(false);
   const lastMintAtRef = useRef(0);
@@ -90,23 +90,11 @@ export default function TradingInterface({ partyId }) {
         }
       }
     } catch (err) {
-      console.log('[Mint] Backend mint failed, using local fallback');
+      console.error('[Mint] Backend mint failed:', err);
+      toast.error('Failed to mint tokens. Please complete onboarding first.', {
+        title: '❌ Mint Failed'
+      });
     }
-    
-    // Fallback: Local mint
-    const newBalance = {
-      BTC: '100.0',
-      USDT: '1000000.0',
-      ETH: '1000.0',
-      SOL: '10000.0'
-    };
-    
-    setBalance(newBalance);
-    console.log('[Mint] Local fallback mint successful:', newBalance);
-    toast.success('Test tokens minted locally!', {
-      title: '🪙 Tokens Minted',
-      details: `BTC: ${newBalance.BTC} | USDT: ${newBalance.USDT}`
-    });
   }, [partyId, toast]);
 
   const handlePlaceOrder = useCallback(async (orderData) => {
@@ -589,7 +577,7 @@ export default function TradingInterface({ partyId }) {
             if (balanceObj && typeof balanceObj === 'object') {
               setBalance({
                 BTC: balanceObj.BTC || '0.0',
-                USDT: balanceObj.USDT || '10000.0',
+                USDT: balanceObj.USDT || '0.0',
                 ETH: balanceObj.ETH || '0.0',
                 SOL: balanceObj.SOL || '0.0'
               });
@@ -598,20 +586,20 @@ export default function TradingInterface({ partyId }) {
               return;
             }
           }
-          // If response not ok, use default balance with test amounts
-          console.log('[Balance] Backend returned error, using default balance');
-          setBalance({ BTC: '1.0', USDT: '10000.0', ETH: '10.0', SOL: '100.0' });
+          // If response not ok, show zero balance (user needs onboarding)
+          console.log('[Balance] Backend returned error - user may need onboarding');
+          setBalance({ BTC: '0.0', USDT: '0.0', ETH: '0.0', SOL: '0.0' });
           hasLoadedBalanceRef.current = true;
         } catch (balanceError) {
           console.error('[Balance] Backend balance fetch failed:', balanceError);
-          // Use default balance on error with test amounts
-          setBalance({ BTC: '1.0', USDT: '10000.0', ETH: '10.0', SOL: '100.0' });
+          // Show zero balance on error (no fake balances)
+          setBalance({ BTC: '0.0', USDT: '0.0', ETH: '0.0', SOL: '0.0' });
           hasLoadedBalanceRef.current = true;
         }
       } catch (error) {
         console.error('[Balance] Failed to load balance:', error);
-        // Ensure we always set some balance with test amounts
-        setBalance({ BTC: '1.0', USDT: '10000.0', ETH: '10.0', SOL: '100.0' });
+        // Show zero balance on error (no fake balances)
+        setBalance({ BTC: '0.0', USDT: '0.0', ETH: '0.0', SOL: '0.0' });
         hasLoadedBalanceRef.current = true;
       } finally {
         // FIX: Always stop loading regardless of outcome
