@@ -56,6 +56,7 @@ function aggregatePriceLevels(orders, options = {}) {
     .map(level => ({
       price: level.price,
       quantity: level.quantity.toFixed(8),
+      remaining: level.quantity.toFixed(8), // Alias for frontend compatibility
       count: level.count,
       // Keep original orders for reference if needed
       _orders: level.orders
