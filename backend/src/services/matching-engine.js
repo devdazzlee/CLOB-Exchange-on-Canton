@@ -15,24 +15,16 @@
 const CantonAdmin = require('./canton-admin');
 const cantonService = require('./cantonService');
 const config = require('../config');
-const tradeStore = require('./trade-store');
 const { getUpdateStream } = require('./cantonUpdateStream');
 const { extractTradesFromEvents } = require('./trade-utils');
 
+// NO IN-MEMORY CACHE - All trades are stored on Canton ledger as Trade contracts
 function recordTradesFromResult(result) {
   const trades = extractTradesFromEvents(result?.events);
   if (trades.length === 0) return [];
 
   trades.forEach((trade) => {
-    // Add to UpdateStream for persistence
-    const updateStream = getUpdateStream();
-    if (updateStream) {
-      updateStream.addTrade(trade);
-    }
-    
-    // Also add to in-memory store
-    tradeStore.addTrade(trade);
-    
+    // Broadcast via WebSocket for real-time UI updates
     if (global.broadcastWebSocket) {
       global.broadcastWebSocket(`trades:${trade.tradingPair}`, {
         type: 'NEW_TRADE',
@@ -116,7 +108,7 @@ class MatchingEngine {
   }
 
   /**
-   * Run one matching cycle
+   * Run one matching cycle - DIRECTLY queries Canton API
    */
   async runMatchingCycle() {
     if (this.matchingInProgress) {
@@ -129,53 +121,337 @@ class MatchingEngine {
       // Get admin token
       const adminToken = await this.getAdminToken();
 
-      // Use UpdateStream for persistent order data (handles Canton's 200+ limit)
-      const updateStream = getUpdateStream();
+      // Query Canton DIRECTLY for Order contracts (no cache)
+      const tradingPairs = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'];
       
-      if (updateStream && updateStream.initialized) {
-        // Get all trading pairs from UpdateStream
-        const tradingPairs = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']; // Common pairs
-        
-        for (const pair of tradingPairs) {
-          const { buyOrders, sellOrders } = updateStream.getOrdersForPair(pair);
-          
-          if (buyOrders.length > 0 || sellOrders.length > 0) {
-            console.log(`[MatchingEngine] Using UpdateStream: ${pair} (${buyOrders.length} buys, ${sellOrders.length} sells)`);
-            await this.processOrderBookFromUpdateStream(pair, buyOrders, sellOrders, adminToken);
-          }
-        }
-        return;
+      for (const pair of tradingPairs) {
+        await this.processOrderBookFromCanton(pair, adminToken);
       }
-
-      // Fallback: try ReadModel cache
-      const { getReadModelService } = require('./readModelService');
-      const readModel = getReadModelService();
-      
-      if (readModel) {
-        const allOrderBooks = readModel.getAllOrderBooks();
-        if (allOrderBooks.length > 0) {
-          console.log(`[MatchingEngine] Using ReadModel: ${allOrderBooks.length} order books`);
-          for (const book of allOrderBooks) {
-            await this.processOrderBookFromCache(book, adminToken);
-          }
-          return;
-        }
-      }
-
-      // Fallback: Get all OrderBook contracts from Canton
-      const orderBooks = await this.queryContracts(this.getMasterOrderBookTemplateId(), adminToken);
-
-      if (orderBooks.length === 0) {
-        // No order books yet
-        return;
-      }
-
-      // Step 2: For each order book, find matching orders
-      for (const orderBook of orderBooks) {
-        await this.processOrderBook(orderBook, adminToken);
-      }
+    } catch (error) {
+      console.error('[MatchingEngine] Error in matching cycle:', error.message);
     } finally {
       this.matchingInProgress = false;
+    }
+  }
+  
+  /**
+   * Process order book by querying Canton DIRECTLY
+   */
+  async processOrderBookFromCanton(tradingPair, adminToken) {
+    try {
+      const packageId = config.canton.packageIds?.clobExchange;
+      const operatorPartyId = config.canton.operatorPartyId;
+      
+      if (!packageId || !operatorPartyId) {
+        return;
+      }
+      
+      // Query Canton for Order contracts
+      const contracts = await cantonService.queryActiveContracts({
+        party: operatorPartyId,
+        templateIds: [`${packageId}:Order:Order`],
+        pageSize: 200
+      }, adminToken);
+      
+      if (!contracts || contracts.length === 0) {
+        return;
+      }
+      
+      // Filter by trading pair and OPEN status
+      const buyOrders = [];
+      const sellOrders = [];
+      
+      for (const c of contracts) {
+        const payload = c.payload || c.createArgument || {};
+        
+        if (payload.tradingPair !== tradingPair || payload.status !== 'OPEN') {
+          continue;
+        }
+        
+        const order = {
+          contractId: c.contractId,
+          orderId: payload.orderId,
+          owner: payload.owner,
+          orderType: payload.orderType,
+          orderMode: payload.orderMode || 'LIMIT',
+          price: parseFloat(payload.price) || 0,
+          quantity: parseFloat(payload.quantity) || 0,
+          filled: parseFloat(payload.filled) || 0,
+          remaining: (parseFloat(payload.quantity) || 0) - (parseFloat(payload.filled) || 0),
+          timestamp: payload.timestamp
+        };
+        
+        if (payload.orderType === 'BUY') {
+          buyOrders.push(order);
+        } else if (payload.orderType === 'SELL') {
+          sellOrders.push(order);
+        }
+      }
+      
+      if (buyOrders.length === 0 || sellOrders.length === 0) {
+        return; // No matches possible
+      }
+      
+      console.log(`[MatchingEngine] ${tradingPair}: ${buyOrders.length} buys, ${sellOrders.length} sells`);
+      
+      // Sort orders: buys by price (highest first), sells by price (lowest first)
+      const sortedBuys = buyOrders.sort((a, b) => b.price - a.price || new Date(a.timestamp) - new Date(b.timestamp));
+      const sortedSells = sellOrders.sort((a, b) => a.price - b.price || new Date(a.timestamp) - new Date(b.timestamp));
+      
+      // Find and execute matches
+      await this.findAndExecuteMatches(tradingPair, sortedBuys, sortedSells, adminToken);
+      
+    } catch (error) {
+      console.error(`[MatchingEngine] Error processing ${tradingPair}:`, error.message);
+    }
+  }
+  
+  /**
+   * Find and execute matching orders
+   */
+  async findAndExecuteMatches(tradingPair, buyOrders, sellOrders, adminToken) {
+    let matchCount = 0;
+    
+    for (const buyOrder of buyOrders) {
+      for (const sellOrder of sellOrders) {
+        // Skip if already filled
+        if (buyOrder.remaining <= 0 || sellOrder.remaining <= 0) {
+          continue;
+        }
+        
+        // Self-trade prevention
+        if (buyOrder.owner === sellOrder.owner) {
+          console.log(`[MatchingEngine] Skipping self-trade: ${buyOrder.owner.substring(0, 30)}...`);
+          continue;
+        }
+        
+        // Check if orders match (buy price >= sell price)
+        // Ensure prices are numbers
+        const buyPrice = parseFloat(buyOrder.price) || 0;
+        const sellPrice = parseFloat(sellOrder.price) || 0;
+        
+        if (buyPrice > 0 && sellPrice > 0 && buyPrice >= sellPrice) {
+          const matchQty = Math.min(buyOrder.remaining, sellOrder.remaining);
+          const matchPrice = sellPrice; // Use sell price (maker-taker model)
+          
+          console.log(`[MatchingEngine] ✅ MATCH FOUND:`);
+          console.log(`  Buy: ${buyOrder.contractId.substring(0, 20)}... @${buyPrice} qty=${buyOrder.remaining}`);
+          console.log(`  Sell: ${sellOrder.contractId.substring(0, 20)}... @${sellPrice} qty=${sellOrder.remaining}`);
+          console.log(`  Match: ${matchQty} @${matchPrice}`);
+          
+          try {
+            // Execute the match by filling both orders
+            await this.executeFillOrders(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, adminToken);
+            matchCount++;
+            
+            // Update remaining quantities for next iteration
+            buyOrder.remaining -= matchQty;
+            sellOrder.remaining -= matchQty;
+          } catch (error) {
+            console.error(`[MatchingEngine] Failed to execute match:`, error.message);
+          }
+        }
+      }
+    }
+    
+    if (matchCount > 0) {
+      console.log(`[MatchingEngine] ✅ Executed ${matchCount} matches for ${tradingPair}`);
+    }
+  }
+  
+  /**
+   * Round quantity to avoid floating point precision issues
+   * Canton Decimal(10) supports max 10 decimal places
+   */
+  roundQuantity(qty) {
+    // Round to 8 decimal places to avoid precision issues
+    return Math.round(qty * 100000000) / 100000000;
+  }
+  
+  /**
+   * Execute match by filling both orders using FillOrder choice
+   */
+  async executeFillOrders(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, adminToken) {
+    const packageId = config.canton.packageIds?.clobExchange;
+    const operatorPartyId = config.canton.operatorPartyId;
+    
+    // Round quantity to avoid floating point precision errors
+    matchQty = this.roundQuantity(matchQty);
+    
+    if (!packageId || !operatorPartyId) {
+      throw new Error('Missing package ID or operator party ID');
+    }
+    
+    // Fill the buy order
+    console.log(`[MatchingEngine] Filling buy order: ${matchQty}`);
+    await cantonService.exerciseChoice({
+      token: adminToken,
+      actAsParty: operatorPartyId,
+      templateId: `${packageId}:Order:Order`,
+      contractId: buyOrder.contractId,
+      choice: 'FillOrder',
+      choiceArgument: { fillQuantity: matchQty.toFixed(8) },
+      readAs: [operatorPartyId, buyOrder.owner]
+    });
+    
+    // Fill the sell order
+    console.log(`[MatchingEngine] Filling sell order: ${matchQty.toFixed(8)}`);
+    await cantonService.exerciseChoice({
+      token: adminToken,
+      actAsParty: operatorPartyId,
+      templateId: `${packageId}:Order:Order`,
+      contractId: sellOrder.contractId,
+      choice: 'FillOrder',
+      choiceArgument: { fillQuantity: matchQty.toFixed(8) },
+      readAs: [operatorPartyId, sellOrder.owner]
+    });
+    
+    // Record trade (off-chain since Trade template needs both signatories)
+    const tradeRecord = {
+      tradeId: `trade-${Date.now()}-${Math.random().toString(36).substring(7)}`,
+      buyer: buyOrder.owner,
+      seller: sellOrder.owner,
+      tradingPair,
+      price: matchPrice.toString(),
+      quantity: matchQty.toString(),
+      buyOrderId: buyOrder.orderId,
+      sellOrderId: sellOrder.orderId,
+      timestamp: new Date().toISOString()
+    };
+    
+    // Create Trade contract on Canton ledger (NO IN-MEMORY CACHE)
+    try {
+      const packageId = config.canton.packageIds?.clobExchange;
+      const operatorPartyId = config.canton.operatorPartyId;
+      
+      await cantonService.createContractWithTransaction({
+        token: adminToken,
+        actAsParty: [operatorPartyId, buyOrder.owner, sellOrder.owner],
+        templateId: `${packageId}:Trade:Trade`,
+        createArguments: {
+          tradeId: tradeRecord.tradeId,
+          buyer: buyOrder.owner,
+          seller: sellOrder.owner,
+          tradingPair: tradingPair,
+          price: matchPrice.toString(),
+          quantity: matchQty.toString(),
+          buyOrderId: buyOrder.orderId,
+          sellOrderId: sellOrder.orderId,
+          timestamp: tradeRecord.timestamp
+        },
+        readAs: [operatorPartyId, buyOrder.owner, sellOrder.owner]
+      });
+      console.log(`[MatchingEngine] Trade contract created on Canton: ${tradeRecord.tradeId}`);
+    } catch (tradeContractError) {
+      console.error(`[MatchingEngine] Failed to create Trade contract:`, tradeContractError.message);
+      // Continue - trade data will still be broadcast via WebSocket
+    }
+    
+    // ========= UPDATE BALANCES AFTER TRADE =========
+    // Buyer: receives baseToken (e.g., BTC), already paid quoteToken
+    // Seller: receives quoteToken (e.g., USDT), already gave baseToken
+    try {
+      await this.updateBalancesAfterTrade(
+        adminToken,
+        tradingPair,
+        buyOrder.owner,
+        sellOrder.owner,
+        matchQty,
+        matchPrice
+      );
+      console.log(`[MatchingEngine] Balances updated for trade`);
+    } catch (balanceError) {
+      console.error(`[MatchingEngine] Balance update failed:`, balanceError.message);
+      // Continue anyway - the trade already happened on the orders
+    }
+    
+    // Broadcast via WebSocket
+    if (global.broadcastWebSocket) {
+      global.broadcastWebSocket(`trades:${tradingPair}`, {
+        type: 'NEW_TRADE',
+        ...tradeRecord
+      });
+      global.broadcastWebSocket('trades:all', {
+        type: 'NEW_TRADE',
+        ...tradeRecord
+      });
+    }
+    
+    // Also broadcast order updates
+    if (global.broadcastWebSocket) {
+      global.broadcastWebSocket(`orderbook:${tradingPair}`, {
+        type: 'ORDER_FILLED',
+        buyOrderId: buyOrder.orderId,
+        sellOrderId: sellOrder.orderId,
+        fillQuantity: matchQty
+      });
+    }
+  }
+  
+  /**
+   * Update UserAccount balances after a trade
+   * Buyer: receives base token (matchQty), already withdrew quote (matchPrice * matchQty)
+   * Seller: receives quote token (matchPrice * matchQty), already withdrew base (matchQty)
+   */
+  async updateBalancesAfterTrade(adminToken, tradingPair, buyerPartyId, sellerPartyId, matchQty, matchPrice) {
+    const packageId = config.canton.packageIds?.clobExchange;
+    const operatorPartyId = config.canton.operatorPartyId;
+    
+    if (!packageId || !operatorPartyId) return;
+    
+    const [baseToken, quoteToken] = tradingPair.split('/');
+    const quoteAmount = matchQty * matchPrice;
+    
+    // Find both UserAccounts
+    const contracts = await cantonService.queryActiveContracts({
+      party: operatorPartyId,
+      templateIds: [`${packageId}:UserAccount:UserAccount`],
+      pageSize: 100
+    }, adminToken);
+    
+    const buyerAccount = contracts.find(c => (c.payload?.party || c.createArgument?.party) === buyerPartyId);
+    const sellerAccount = contracts.find(c => (c.payload?.party || c.createArgument?.party) === sellerPartyId);
+    
+    // Deposit base token to buyer (they receive the BTC they bought)
+    if (buyerAccount) {
+      try {
+        await cantonService.exerciseChoice({
+          token: adminToken,
+          actAsParty: buyerPartyId,
+          templateId: `${packageId}:UserAccount:UserAccount`,
+          contractId: buyerAccount.contractId,
+          choice: 'Deposit',
+          choiceArgument: {
+            token: baseToken,
+            amount: matchQty.toFixed(8)
+          },
+          readAs: [operatorPartyId]
+        });
+        console.log(`[MatchingEngine] Deposited ${matchQty.toFixed(8)} ${baseToken} to buyer`);
+      } catch (e) {
+        console.error(`[MatchingEngine] Failed to deposit to buyer:`, e.message);
+      }
+    }
+    
+    // Deposit quote token to seller (they receive the USDT from the sale)
+    if (sellerAccount) {
+      try {
+        await cantonService.exerciseChoice({
+          token: adminToken,
+          actAsParty: sellerPartyId,
+          templateId: `${packageId}:UserAccount:UserAccount`,
+          contractId: sellerAccount.contractId,
+          choice: 'Deposit',
+          choiceArgument: {
+            token: quoteToken,
+            amount: quoteAmount.toFixed(8)
+          },
+          readAs: [operatorPartyId]
+        });
+        console.log(`[MatchingEngine] Deposited ${quoteAmount.toFixed(8)} ${quoteToken} to seller`);
+      } catch (e) {
+        console.error(`[MatchingEngine] Failed to deposit to seller:`, e.message);
+      }
     }
   }
   
@@ -337,16 +613,23 @@ class MatchingEngine {
         timestamp: new Date().toISOString()
       };
       
-      // Add to UpdateStream (persistent)
-      const updateStream = getUpdateStream();
-      if (updateStream) {
-        updateStream.addTrade(tradeData);
+      // Create Trade contract on Canton (NO IN-MEMORY CACHE)
+      try {
+        const packageId = config.canton.packageIds?.clobExchange;
+        const operatorPartyId = config.canton.operatorPartyId;
+        const adminToken = await this.getAdminToken();
+        
+        await cantonService.createContractWithTransaction({
+          token: adminToken,
+          actAsParty: [operatorPartyId, buyOrder.owner, sellOrder.owner],
+          templateId: `${packageId}:Trade:Trade`,
+          createArguments: tradeData,
+          readAs: [operatorPartyId, buyOrder.owner, sellOrder.owner]
+        });
+        console.log(`[MatchingEngine] ✅ Trade contract created on Canton: ${tradeId}`);
+      } catch (tradeContractError) {
+        console.error(`[MatchingEngine] Failed to create Trade contract:`, tradeContractError.message);
       }
-      
-      // Add to in-memory store
-      tradeStore.addTrade(tradeData);
-      
-      console.log(`[MatchingEngine] ✅ Trade recorded: ${tradeId}`);
       
       // Broadcast trade via WebSocket for real-time UI updates
       if (global.broadcastWebSocket) {

@@ -40,7 +40,8 @@ template UserAccount
         assert (amount > 0.0)
         let currentBalance = getBalanceDefault balances token
         assert (currentBalance >= amount)
-        let newBalances = Map.insertWith (-) token amount balances
+        -- FIXED: insertWith f(new, old) so we use flip (-) to get old - new
+        let newBalances = Map.insertWith (\new old -> old - new) token amount balances
         _ <- create this with balances = newBalances
         return ()
 

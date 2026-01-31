@@ -318,23 +318,33 @@ async function getUserBalances(req, res) {
 }
 
 /**
- * Get default test token amounts
+ * Get token amounts from environment variables
+ * NO HARDCODED DEFAULTS - amounts must be configured or passed explicitly
  */
-function getDefaultTestTokens() {
-  return [
-    { symbol: 'BTC', amount: 10.0 },
-    { symbol: 'ETH', amount: 100.0 },
-    { symbol: 'SOL', amount: 1000.0 },
-    { symbol: 'USDT', amount: 100000.0 }
-  ];
+function getConfiguredTokens() {
+  const tokens = [];
+  if (process.env.MINT_BTC_AMOUNT) {
+    tokens.push({ symbol: 'BTC', amount: parseFloat(process.env.MINT_BTC_AMOUNT) });
+  }
+  if (process.env.MINT_ETH_AMOUNT) {
+    tokens.push({ symbol: 'ETH', amount: parseFloat(process.env.MINT_ETH_AMOUNT) });
+  }
+  if (process.env.MINT_SOL_AMOUNT) {
+    tokens.push({ symbol: 'SOL', amount: parseFloat(process.env.MINT_SOL_AMOUNT) });
+  }
+  if (process.env.MINT_USDT_AMOUNT) {
+    tokens.push({ symbol: 'USDT', amount: parseFloat(process.env.MINT_USDT_AMOUNT) });
+  }
+  return tokens;
 }
 
 /**
- * Quick mint - Mint default test tokens
+ * Quick mint - Mint tokens from environment configuration
+ * Requires MINT_*_AMOUNT environment variables to be set
  */
 async function quickMint(req, res) {
   try {
-    const { partyId } = req.body;
+    const { partyId, tokens: requestTokens } = req.body;
 
     if (!partyId) {
       return res.status(400).json({
@@ -343,8 +353,15 @@ async function quickMint(req, res) {
       });
     }
 
-    // Use default amounts
-    const tokens = getDefaultTestTokens();
+    // Use tokens from request or from environment config
+    const tokens = requestTokens || getConfiguredTokens();
+    
+    if (tokens.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No tokens specified. Provide tokens in request body or configure MINT_*_AMOUNT environment variables'
+      });
+    }
 
     // Reuse the mintTestTokens logic
     req.body.tokens = tokens;
@@ -363,5 +380,5 @@ module.exports = {
   mintTestTokens,
   getUserBalances,
   quickMint,
-  getDefaultTestTokens
+  getConfiguredTokens
 };

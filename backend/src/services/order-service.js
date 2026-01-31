@@ -52,6 +52,63 @@ class OrderService {
   }
 
   /**
+   * Verify and lock funds from UserAccount for order placement
+   * Uses UpdateAfterTrade with negative amounts to deduct (Withdraw is bugged in DAML)
+   */
+  async withdrawForOrder(token, partyId, operatorPartyId, packageId, asset, amount) {
+    // 1. Find user's UserAccount
+    const contracts = await cantonService.queryActiveContracts({
+      party: operatorPartyId,
+      templateIds: [`${packageId}:UserAccount:UserAccount`],
+      pageSize: 100
+    }, token);
+    
+    const userAccount = (Array.isArray(contracts) ? contracts : [])
+      .find(c => {
+        const payload = c.payload || c.createArgument || {};
+        return payload.party === partyId;
+      });
+    
+    if (!userAccount) {
+      throw new Error(`No UserAccount found for party ${partyId.substring(0, 40)}...`);
+    }
+    
+    // 2. Check balance
+    const payload = userAccount.payload || userAccount.createArgument || {};
+    const balances = payload.balances || [];
+    const currentBalance = balances.find(([t]) => t === asset)?.[1] || '0';
+    
+    if (parseFloat(currentBalance) < parseFloat(amount)) {
+      throw new Error(`Insufficient ${asset}. Have: ${currentBalance}, Need: ${amount}`);
+    }
+    
+    console.log(`[OrderService] UserAccount balance for ${asset}: ${currentBalance}, locking: ${amount}`);
+    
+    // 3. Use UpdateAfterTrade to deduct (operator-controlled, works correctly)
+    // Pass negative amount to deduct from balance
+    // Determine base/quote based on asset type
+    const baseToken = asset;
+    const quoteToken = asset === 'USDT' ? 'BTC' : 'USDT';
+    
+    await cantonService.exerciseChoice({
+      token,
+      actAsParty: operatorPartyId, // UpdateAfterTrade is controlled by operator
+      templateId: `${packageId}:UserAccount:UserAccount`,
+      contractId: userAccount.contractId,
+      choice: 'UpdateAfterTrade',
+      choiceArgument: {
+        baseToken: baseToken,
+        quoteToken: quoteToken,
+        baseAmount: (-parseFloat(amount)).toFixed(8), // Negative to deduct
+        quoteAmount: '0.0'
+      },
+      readAs: [partyId]
+    });
+    
+    return userAccount.contractId;
+  }
+
+  /**
    * Place order using Canton JSON Ledger API v2
    * POST /v2/commands/submit-and-wait-for-transaction
    * 
@@ -118,6 +175,25 @@ class OrderService {
     // Calculate what needs to be locked
     const lockInfo = this.calculateLockAmount(tradingPair, orderType, price, quantity);
     console.log(`[OrderService] Order will lock ${lockInfo.amount} ${lockInfo.asset}`);
+
+    // ========= BALANCE CHECK AND WITHDRAWAL =========
+    // 1. Find user's UserAccount contract
+    // 2. Verify sufficient balance
+    // 3. Withdraw (lock) the required amount
+    try {
+      const userAccountContractId = await this.withdrawForOrder(
+        token, 
+        partyId, 
+        operatorPartyId,
+        packageId,
+        lockInfo.asset, 
+        lockInfo.amount
+      );
+      console.log(`[OrderService] Withdrew ${lockInfo.amount} ${lockInfo.asset} from UserAccount`);
+    } catch (withdrawError) {
+      console.error(`[OrderService] Balance check/withdrawal failed:`, withdrawError.message);
+      throw new ValidationError(`Insufficient ${lockInfo.asset} balance. Required: ${lockInfo.amount}`);
+    }
 
     // Create Order contract on Canton using submit-and-wait-for-transaction
     // Canton JSON API v2 serialization:

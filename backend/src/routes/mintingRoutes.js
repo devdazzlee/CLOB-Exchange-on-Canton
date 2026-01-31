@@ -1,5 +1,6 @@
 /**
- * Minting Routes - Test token faucet endpoints
+ * Minting Routes - Token deposit endpoints
+ * NO HARDCODED VALUES - All amounts from request or environment
  */
 
 const express = require('express');
@@ -12,7 +13,7 @@ const mintingController = require('../controllers/mintingController');
  *
  * Body:
  * {
- *   "partyId": "8100b2db-86cf-40a1-8351-55483c151cdc",
+ *   "partyId": "party-id-here",
  *   "tokens": [
  *     { "symbol": "BTC", "amount": 5.0 },
  *     { "symbol": "USDT", "amount": 50000.0 }
@@ -23,35 +24,37 @@ router.post('/mint-tokens', mintingController.mintTestTokens);
 
 /**
  * POST /api/testnet/quick-mint
- * Mint default test token amounts
+ * Mint tokens using environment configuration or request body
  *
  * Body:
  * {
- *   "partyId": "8100b2db-86cf-40a1-8351-55483c151cdc"
+ *   "partyId": "party-id-here",
+ *   "tokens": [{ "symbol": "BTC", "amount": 1.0 }]  // Optional - uses env config if not provided
  * }
- *
- * Default amounts:
- * - BTC: 10.0
- * - ETH: 100.0
- * - SOL: 1000.0
- * - USDT: 100000.0
+ * 
+ * Environment variables (if tokens not in request):
+ * - MINT_BTC_AMOUNT
+ * - MINT_ETH_AMOUNT
+ * - MINT_SOL_AMOUNT
+ * - MINT_USDT_AMOUNT
  */
 router.post('/quick-mint', mintingController.quickMint);
 
 /**
  * GET /api/testnet/balances/:partyId
- * Get user's current token balances
+ * Get user's current token balances from Canton
  */
 router.get('/balances/:partyId', mintingController.getUserBalances);
 
 /**
- * GET /api/testnet/default-tokens
- * Get list of default test tokens
+ * GET /api/testnet/configured-tokens
+ * Get list of tokens configured in environment
  */
-router.get('/default-tokens', (req, res) => {
+router.get('/configured-tokens', (req, res) => {
   res.json({
     success: true,
-    data: mintingController.getDefaultTestTokens()
+    data: mintingController.getConfiguredTokens(),
+    message: 'Tokens configured from environment variables'
   });
 });
 

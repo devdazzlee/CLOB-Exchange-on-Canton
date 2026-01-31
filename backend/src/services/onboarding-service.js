@@ -800,14 +800,26 @@ class OnboardingService {
       
       console.log('[Onboarding] Using templateId:', templateId.substring(0, 50) + '...');
 
+      // Initial balances from environment or empty (user must deposit via API)
+      const initialBalances = [];
+      if (process.env.INITIAL_USDT_BALANCE) {
+        initialBalances.push(["USDT", process.env.INITIAL_USDT_BALANCE]);
+      }
+      if (process.env.INITIAL_BTC_BALANCE) {
+        initialBalances.push(["BTC", process.env.INITIAL_BTC_BALANCE]);
+      }
+      if (process.env.INITIAL_ETH_BALANCE) {
+        initialBalances.push(["ETH", process.env.INITIAL_ETH_BALANCE]);
+      }
+      if (process.env.INITIAL_SOL_BALANCE) {
+        initialBalances.push(["SOL", process.env.INITIAL_SOL_BALANCE]);
+      }
+
       const createArguments = {
         party: partyId,
         operator: operatorPartyId,
         // DA.Map.Map Text Decimal => encoded as JSON array of [key, value] pairs
-        // NOT { map: [...] } - Canton expects direct array: [["USDT", "10000.0"]]
-        balances: [
-          ["USDT", "10000.0"]
-        ],
+        balances: initialBalances,
       };
 
       // CRITICAL: UserAccount template has signatory operator, observer party
@@ -841,7 +853,7 @@ class OnboardingService {
       
       return {
         userAccountCreated: true,
-        usdtMinted: 10000,
+        initialBalances: initialBalances,
         userAccountResult: result
       };
     } catch (error) {
