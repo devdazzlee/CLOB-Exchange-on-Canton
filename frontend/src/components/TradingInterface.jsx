@@ -58,44 +58,86 @@ export default function TradingInterface({ partyId }) {
   const { showModal, ModalComponent, isOpenRef: modalIsOpenRef } = useConfirmationModal();
   const isLoadingRef = useRef(false);
 
+  // Minting state
+  const [mintingLoading, setMintingLoading] = useState(false);
+  
   // === PHASE 3: ALL USECALLBACK HOOKS - NO CONDITIONALS ===
   const handleMintTokens = useCallback(async () => {
-    console.log('[Mint] Manual mint button clicked!');
+    console.log('[Mint] Manual mint button clicked for party:', partyId);
+    
+    if (mintingLoading || isMintingRef.current) {
+      console.log('[Mint] Already minting, skipping...');
+      return;
+    }
+    
+    isMintingRef.current = true;
+    setMintingLoading(true);
+    
+    const API_BASE = import.meta.env.VITE_API_BASE_URL || 
+      (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
     
     try {
-      // Try to use backend mint endpoint
-      const response = await fetch(`http://localhost:3001/api/balance/${partyId}/mint`, {
+      // Try the balance/mint endpoint (creates/updates UserAccount)
+      const response = await fetch(`${API_BASE}/balance/mint`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          BTC: '100.0',
-          USDT: '1000000.0',
-          ETH: '1000.0',
-          SOL: '10000.0'
+          partyId: partyId,
+          tokens: [
+            { symbol: 'BTC', amount: 10 },
+            { symbol: 'USDT', amount: 100000 },
+            { symbol: 'ETH', amount: 100 },
+            { symbol: 'SOL', amount: 1000 }
+          ]
         })
       });
       
-      if (response.ok) {
-        const mintData = await response.json();
-        if (mintData.success && mintData.data?.balance) {
-          setBalance(mintData.data.balance);
-          console.log('[Mint] Backend mint successful:', mintData.data.balance);
-          toast.success('Test tokens minted successfully!', {
-            title: '🪙 Tokens Minted',
-            details: `BTC: ${mintData.data.balance.BTC} | USDT: ${mintData.data.balance.USDT}`
-          });
-          return;
-        }
+      const mintData = await response.json();
+      
+      if (response.ok && mintData.success) {
+        console.log('[Mint] Backend mint successful:', mintData);
+        toast.success('Test tokens minted successfully!', {
+          title: '🪙 Tokens Minted',
+          details: 'BTC: 10 | USDT: 100,000 | ETH: 100 | SOL: 1,000'
+        });
+        
+        // Refresh balance from backend
+        setTimeout(async () => {
+          try {
+            const balanceResponse = await fetch(`${API_BASE}/balance/${partyId}`);
+            const balanceData = await balanceResponse.json();
+            if (balanceResponse.ok && balanceData.success && balanceData.data?.balance) {
+              setBalance({
+                BTC: balanceData.data.balance.BTC || '0.0',
+                USDT: balanceData.data.balance.USDT || '0.0',
+                ETH: balanceData.data.balance.ETH || '0.0',
+                SOL: balanceData.data.balance.SOL || '0.0'
+              });
+              console.log('[Mint] Balance refreshed:', balanceData.data.balance);
+            }
+          } catch (err) {
+            console.error('[Mint] Failed to refresh balance:', err);
+          }
+        }, 1000);
+        
+        return;
       }
+      
+      // If the response wasn't ok, show error
+      throw new Error(mintData.error || mintData.message || 'Failed to mint tokens');
+      
     } catch (err) {
       console.error('[Mint] Backend mint failed:', err);
-      toast.error('Failed to mint tokens. Please complete onboarding first.', {
+      toast.error(err.message || 'Failed to mint tokens. Please complete onboarding first.', {
         title: '❌ Mint Failed'
       });
+    } finally {
+      isMintingRef.current = false;
+      setMintingLoading(false);
     }
-  }, [partyId, toast]);
+  }, [partyId, toast, mintingLoading]);
 
   const handlePlaceOrder = useCallback(async (orderData) => {
     try {
@@ -736,6 +778,8 @@ export default function TradingInterface({ partyId }) {
               onSubmit={handlePlaceOrder}
               balance={balance}
               orderBook={orderBook}
+              onMintTokens={handleMintTokens}
+              mintingLoading={mintingLoading}
             />
           )}
           
