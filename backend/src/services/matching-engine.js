@@ -168,13 +168,19 @@ class MatchingEngine {
           continue;
         }
         
+        // Handle price: null for MARKET orders, keep as null to distinguish from 0
+        const rawPrice = payload.price;
+        const parsedPrice = rawPrice !== null && rawPrice !== undefined && rawPrice !== '' 
+          ? parseFloat(rawPrice) 
+          : null;
+        
         const order = {
           contractId: c.contractId,
           orderId: payload.orderId,
           owner: payload.owner,
           orderType: payload.orderType,
           orderMode: payload.orderMode || 'LIMIT',
-          price: parseFloat(payload.price) || 0,
+          price: parsedPrice,  // null for MARKET orders
           quantity: parseFloat(payload.quantity) || 0,
           filled: parseFloat(payload.filled) || 0,
           remaining: (parseFloat(payload.quantity) || 0) - (parseFloat(payload.filled) || 0),
@@ -194,9 +200,51 @@ class MatchingEngine {
       
       console.log(`[MatchingEngine] ${tradingPair}: ${buyOrders.length} buys, ${sellOrders.length} sells`);
       
-      // Sort orders: buys by price (highest first), sells by price (lowest first)
-      const sortedBuys = buyOrders.sort((a, b) => b.price - a.price || new Date(a.timestamp) - new Date(b.timestamp));
-      const sortedSells = sellOrders.sort((a, b) => a.price - b.price || new Date(a.timestamp) - new Date(b.timestamp));
+      // Sort orders: buys by price (highest first, MARKET first), sells by price (lowest first, MARKET first)
+      const sortedBuys = buyOrders.sort((a, b) => {
+        // MARKET orders (null price) have highest priority
+        if (a.price === null && b.price !== null) return -1;
+        if (a.price !== null && b.price === null) return 1;
+        if (a.price === null && b.price === null) return new Date(a.timestamp) - new Date(b.timestamp);
+        // For LIMIT orders: higher price first
+        if (b.price !== a.price) return b.price - a.price;
+        // Same price: earlier timestamp wins
+        return new Date(a.timestamp) - new Date(b.timestamp);
+      });
+      
+      const sortedSells = sellOrders.sort((a, b) => {
+        // MARKET orders (null price) have highest priority
+        if (a.price === null && b.price !== null) return -1;
+        if (a.price !== null && b.price === null) return 1;
+        if (a.price === null && b.price === null) return new Date(a.timestamp) - new Date(b.timestamp);
+        // For LIMIT orders: lower price first
+        if (a.price !== b.price) return a.price - b.price;
+        // Same price: earlier timestamp wins
+        return new Date(a.timestamp) - new Date(b.timestamp);
+      });
+      
+      // Log best bid/ask for debugging
+      if (sortedBuys.length > 0 && sortedSells.length > 0) {
+        const bestBuy = sortedBuys[0];
+        const bestSell = sortedSells[0];
+        const buyPriceDisplay = bestBuy.price !== null ? bestBuy.price : 'MARKET';
+        const sellPriceDisplay = bestSell.price !== null ? bestSell.price : 'MARKET';
+        
+        console.log(`[MatchingEngine] Best BUY: ${buyPriceDisplay} qty=${bestBuy.remaining} owner=${bestBuy.owner.substring(0, 25)}...`);
+        console.log(`[MatchingEngine] Best SELL: ${sellPriceDisplay} qty=${bestSell.remaining} owner=${bestSell.owner.substring(0, 25)}...`);
+        
+        // Check why they might not match
+        const canCross = (bestBuy.price === null) || (bestSell.price === null) || (bestBuy.price >= bestSell.price);
+        if (canCross) {
+          console.log(`[MatchingEngine] 📊 Prices can match (buy=${buyPriceDisplay}, sell=${sellPriceDisplay})`);
+          if (bestBuy.owner === bestSell.owner) {
+            console.log(`[MatchingEngine] ⚠️ Same owner - self-trade (now allowed)`);
+          }
+        } else {
+          const spread = bestSell.price - bestBuy.price;
+          console.log(`[MatchingEngine] No spread cross: ${buyPriceDisplay} < ${sellPriceDisplay} (spread: ${spread.toFixed(2)})`);
+        }
+      }
       
       // Find and execute matches
       await this.findAndExecuteMatches(tradingPair, sortedBuys, sortedSells, adminToken);
@@ -212,9 +260,10 @@ class MatchingEngine {
   async findAndExecuteMatches(tradingPair, buyOrders, sellOrders, adminToken) {
     let matchCount = 0;
     
+    outerLoop:
     for (const buyOrder of buyOrders) {
       for (const sellOrder of sellOrders) {
-        // Skip if already filled
+        // Skip if already filled (or processed this cycle)
         if (buyOrder.remaining <= 0 || sellOrder.remaining <= 0) {
           continue;
         }
@@ -222,18 +271,44 @@ class MatchingEngine {
         // Self-trade prevention DISABLED per client request
         // Market will handle it naturally
         
-        // Check if orders match (buy price >= sell price)
-        // Ensure prices are numbers
-        const buyPrice = parseFloat(buyOrder.price) || 0;
-        const sellPrice = parseFloat(sellOrder.price) || 0;
+        // Check if orders match
+        // Handle MARKET orders (price is null) - they match at the counterparty's price
+        const buyPrice = buyOrder.price;
+        const sellPrice = sellOrder.price;
         
-        if (buyPrice > 0 && sellPrice > 0 && buyPrice >= sellPrice) {
+        // Determine if orders can match:
+        // - LIMIT vs LIMIT: buyPrice >= sellPrice
+        // - MARKET BUY vs LIMIT SELL: always matches at sellPrice
+        // - LIMIT BUY vs MARKET SELL: always matches at buyPrice
+        // - MARKET vs MARKET: match at 0 (edge case, shouldn't happen normally)
+        let canMatch = false;
+        let matchPrice = 0;
+        
+        if (buyPrice !== null && sellPrice !== null) {
+          // Both are LIMIT orders
+          if (buyPrice >= sellPrice) {
+            canMatch = true;
+            matchPrice = sellPrice; // Use sell price (maker-taker model)
+          }
+        } else if (buyPrice === null && sellPrice !== null) {
+          // MARKET BUY vs LIMIT SELL - always matches at sell price
+          canMatch = true;
+          matchPrice = sellPrice;
+        } else if (buyPrice !== null && sellPrice === null) {
+          // LIMIT BUY vs MARKET SELL - always matches at buy price
+          canMatch = true;
+          matchPrice = buyPrice;
+        } else {
+          // Both MARKET orders - skip (shouldn't match MARKET vs MARKET)
+          canMatch = false;
+        }
+        
+        if (canMatch && matchPrice > 0) {
           const matchQty = Math.min(buyOrder.remaining, sellOrder.remaining);
-          const matchPrice = sellPrice; // Use sell price (maker-taker model)
           
           console.log(`[MatchingEngine] ✅ MATCH FOUND:`);
-          console.log(`  Buy: ${buyOrder.contractId.substring(0, 20)}... @${buyPrice} qty=${buyOrder.remaining}`);
-          console.log(`  Sell: ${sellOrder.contractId.substring(0, 20)}... @${sellPrice} qty=${sellOrder.remaining}`);
+          console.log(`  Buy: ${buyOrder.contractId.substring(0, 20)}... @${buyPrice !== null ? buyPrice : 'MARKET'} qty=${buyOrder.remaining}`);
+          console.log(`  Sell: ${sellOrder.contractId.substring(0, 20)}... @${sellPrice !== null ? sellPrice : 'MARKET'} qty=${sellOrder.remaining}`);
           console.log(`  Match: ${matchQty} @${matchPrice}`);
           
           try {
@@ -241,11 +316,20 @@ class MatchingEngine {
             await this.executeFillOrders(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, adminToken);
             matchCount++;
             
-            // Update remaining quantities for next iteration
-            buyOrder.remaining -= matchQty;
-            sellOrder.remaining -= matchQty;
+            // IMPORTANT: After FillOrder, the contract IDs change (DAML archives old, creates new)
+            // Mark these orders as "processed this cycle" to avoid CONTRACT_NOT_FOUND errors
+            // Next cycle will fetch fresh contract IDs from Canton
+            buyOrder.remaining = 0;  // Mark as fully processed this cycle
+            sellOrder.remaining = 0;
+            
+            // Break out of both loops - contract IDs are now stale
+            // Next cycle will fetch fresh contract IDs from Canton
+            break outerLoop;
           } catch (error) {
             console.error(`[MatchingEngine] Failed to execute match:`, error.message);
+            // Mark orders as processed to avoid retrying with stale contract IDs
+            buyOrder.remaining = 0;
+            break outerLoop;
           }
         }
       }
@@ -935,16 +1019,15 @@ class MatchingEngine {
 
   /**
    * Find matching orders
+   * NOTE: Self-trade prevention DISABLED per client request - market handles it naturally
    */
   findMatches(buyOrders, sellOrders) {
     const matches = [];
 
     for (const buyOrder of buyOrders) {
       for (const sellOrder of sellOrders) {
-        // Self-trade check
-        if (buyOrder.owner === sellOrder.owner) {
-          continue;
-        }
+        // Self-trade prevention DISABLED per client request
+        // Market will handle it naturally
 
         // Check if orders can match
         if (this.canOrdersMatch(buyOrder, sellOrder)) {
