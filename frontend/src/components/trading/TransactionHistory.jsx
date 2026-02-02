@@ -22,9 +22,10 @@ export default function TransactionHistory({ partyId, cantonApi }) {
     
     setLoading(true);
     try {
-      const backendBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
+      const API_BASE = import.meta.env.VITE_API_BASE_URL || 
+        (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
       const response = await fetch(
-        `${backendBase}/api/trades/user/${encodeURIComponent(partyId)}?limit=500`,
+        `${API_BASE}/trades/user/${encodeURIComponent(partyId)}?limit=500`,
         { method: 'GET' }
       );
       if (!response.ok) {

@@ -20,10 +20,11 @@ export default function GlobalTrades({ tradingPair, limit = 50 }) {
       setLoading(true);
       setError(null);
       
-      const backendBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
-      const url = tradingPair 
-        ? `${backendBase}/api/orderbooks/${encodeURIComponent(tradingPair)}/trades?limit=${limit}`
-        : `${backendBase}/api/trades?limit=${limit}`;
+      const API_BASE = import.meta.env.VITE_API_BASE_URL || 
+        (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
+      const url = tradingPair
+        ? `${API_BASE}/orderbooks/${encodeURIComponent(tradingPair)}/trades?limit=${limit}`
+        : `${API_BASE}/trades?limit=${limit}`;
       
       const response = await fetch(url, {
         method: 'GET',

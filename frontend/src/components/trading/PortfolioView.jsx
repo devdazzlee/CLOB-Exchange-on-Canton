@@ -41,9 +41,10 @@ export default function PortfolioView({ partyId, cantonApi }) {
         balances = normalizeDamlMap(account?.payload?.balances);
       }
 
-      const backendBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
+      const API_BASE = import.meta.env.VITE_API_BASE_URL || 
+        (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
       const tradesResponse = await fetch(
-        `${backendBase}/api/trades/user/${encodeURIComponent(partyId)}?limit=500`,
+        `${API_BASE}/trades/user/${encodeURIComponent(partyId)}?limit=500`,
         { method: 'GET' }
       );
       if (!tradesResponse.ok) {
