@@ -19,6 +19,7 @@ import MarketData from './trading/MarketData';
 
 // Import skeleton components
 import OrderBookSkeleton from './trading/OrderBookSkeleton';
+import TradingPageSkeleton from './trading/TradingPageSkeleton';
 
 // Import services
 import websocketService from '../services/websocketService';
@@ -55,6 +56,7 @@ export default function TradingInterface({ partyId }) {
   const [tradesLoading, setTradesLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('trading');
   const [showOrderSuccess, setShowOrderSuccess] = useState(false);
+  const [initialLoading, setInitialLoading] = useState(true);
   const [lastOrderData, setLastOrderData] = useState(null);
   const { showModal, ModalComponent, isOpenRef: modalIsOpenRef } = useConfirmationModal();
   const isLoadingRef = useRef(false);
@@ -333,9 +335,12 @@ export default function TradingInterface({ partyId }) {
         
         setAvailablePairs(pairs.length > 0 ? pairs : ['BTC/USDT']);
         console.log('[TradingInterface] Data initialization completed');
+        // Set initial loading to false after a short delay to ensure all components render
+        setTimeout(() => setInitialLoading(false), 500);
       } catch (error) {
         console.error('[TradingInterface] Failed to initialize data:', error);
         setError('Failed to initialize trading interface');
+        setInitialLoading(false);
       }
     };
 
@@ -728,6 +733,12 @@ export default function TradingInterface({ partyId }) {
   // Order placement now uses orderPlacing state and shows inline loading on button
 
   // === PHASE 6: MAIN RENDER - NO HOOKS HERE ===
+  
+  // Show full-page skeleton during initial load
+  if (initialLoading) {
+    return <TradingPageSkeleton />;
+  }
+
   return (
     <>
       {memoizedModal}
@@ -759,30 +770,26 @@ export default function TradingInterface({ partyId }) {
         )}
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {balanceLoading ? (
-            <OrderBookSkeleton />
-          ) : (
-            <OrderForm
-              tradingPair={tradingPair}
-              availablePairs={availablePairs}
-              onTradingPairChange={setTradingPair}
-              orderBookExists={orderBookExists}
-              orderType={orderType}
-              onOrderTypeChange={(e) => setOrderType(e.target.value)}
-              orderMode={orderMode}
-              onOrderModeChange={(e) => setOrderMode(e.target.value)}
-              price={price}
-              onPriceChange={setPrice}
-              quantity={quantity}
-              onQuantityChange={setQuantity}
-              loading={orderPlacing}
-              onSubmit={handlePlaceOrder}
-              balance={balance}
-              orderBook={orderBook}
-              onMintTokens={handleMintTokens}
-              mintingLoading={mintingLoading}
-            />
-          )}
+          <OrderForm
+            tradingPair={tradingPair}
+            availablePairs={availablePairs}
+            onTradingPairChange={setTradingPair}
+            orderBookExists={orderBookExists}
+            orderType={orderType}
+            onOrderTypeChange={(e) => setOrderType(e.target.value)}
+            orderMode={orderMode}
+            onOrderModeChange={(e) => setOrderMode(e.target.value)}
+            price={price}
+            onPriceChange={setPrice}
+            quantity={quantity}
+            onQuantityChange={setQuantity}
+            loading={orderPlacing}
+            onSubmit={handlePlaceOrder}
+            balance={balance}
+            orderBook={orderBook}
+            onMintTokens={handleMintTokens}
+            mintingLoading={mintingLoading}
+          />
           
           {/* Balance Card */}
           {/* {balanceLoading ? (
