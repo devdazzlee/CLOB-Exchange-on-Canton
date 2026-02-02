@@ -30,13 +30,25 @@ class OrderService {
    * Calculate amount to lock for an order
    * BUY order: lock quote currency (e.g., USDT)
    * SELL order: lock base currency (e.g., BTC)
+   * 
+   * For MARKET orders, use estimatedPrice (from order book) 
+   * with a slippage buffer to ensure sufficient funds
    */
-  calculateLockAmount(tradingPair, orderType, price, quantity) {
+  calculateLockAmount(tradingPair, orderType, price, quantity, orderMode = 'LIMIT', estimatedPrice = null) {
     const [baseAsset, quoteAsset] = tradingPair.split('/');
     const qty = parseFloat(quantity);
-    const prc = parseFloat(price) || 0;
-
+    
     if (orderType.toUpperCase() === 'BUY') {
+      // For MARKET BUY: use estimated price with 5% slippage buffer
+      let prc;
+      if (orderMode.toUpperCase() === 'MARKET') {
+        prc = parseFloat(estimatedPrice) || 0;
+        // Add 5% slippage buffer for market orders
+        prc = prc * 1.05;
+      } else {
+        prc = parseFloat(price) || 0;
+      }
+      
       // Lock quote currency (e.g., USDT = price * quantity)
       return {
         asset: quoteAsset,
@@ -44,6 +56,7 @@ class OrderService {
       };
     } else {
       // Lock base currency (e.g., BTC = quantity)
+      // Same for both LIMIT and MARKET sell orders
       return {
         asset: baseAsset,
         amount: qty
@@ -172,8 +185,49 @@ class OrderService {
     // Generate unique order ID
     const orderId = `order-${Date.now()}-${uuidv4().substring(0, 8)}`;
 
+    // For MARKET orders, get estimated price from order book (query Canton directly)
+    let estimatedPrice = null;
+    if (orderMode.toUpperCase() === 'MARKET') {
+      try {
+        // Query Canton directly for current order book - don't rely on cache
+        const { getOrderBookService } = require('./orderBookService');
+        const orderBookService = getOrderBookService();
+        const orderBook = await orderBookService.getOrderBook(tradingPair);
+        
+        if (orderType.toUpperCase() === 'BUY') {
+          // For MARKET BUY, use best ASK (lowest sell price)
+          const sells = orderBook.sellOrders || [];
+          if (sells.length > 0) {
+            // Sort by price ascending to get best ask
+            const sortedSells = sells.sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
+            estimatedPrice = parseFloat(sortedSells[0].price);
+            console.log(`[OrderService] MARKET BUY estimated price: ${estimatedPrice} (best ask from ${sells.length} sell orders)`);
+          }
+        } else {
+          // For MARKET SELL, use best BID (highest buy price)
+          const buys = orderBook.buyOrders || [];
+          if (buys.length > 0) {
+            // Sort by price descending to get best bid
+            const sortedBuys = buys.sort((a, b) => parseFloat(b.price) - parseFloat(a.price));
+            estimatedPrice = parseFloat(sortedBuys[0].price);
+            console.log(`[OrderService] MARKET SELL estimated price: ${estimatedPrice} (best bid from ${buys.length} buy orders)`);
+          }
+        }
+      } catch (err) {
+        console.warn('[OrderService] Could not get order book for price estimation:', err.message);
+      }
+      
+      // If no price available, fail for MARKET BUY (need price to calculate lock amount)
+      if (orderType.toUpperCase() === 'BUY' && !estimatedPrice) {
+        throw new ValidationError('No sell orders available in the market. Please use LIMIT order or wait for sellers.');
+      }
+      if (orderType.toUpperCase() === 'SELL' && !estimatedPrice) {
+        throw new ValidationError('No buy orders available in the market. Please use LIMIT order or wait for buyers.');
+      }
+    }
+
     // Calculate what needs to be locked
-    const lockInfo = this.calculateLockAmount(tradingPair, orderType, price, quantity);
+    const lockInfo = this.calculateLockAmount(tradingPair, orderType, price, quantity, orderMode, estimatedPrice);
     console.log(`[OrderService] Order will lock ${lockInfo.amount} ${lockInfo.asset}`);
 
     // ========= BALANCE CHECK AND WITHDRAWAL =========
