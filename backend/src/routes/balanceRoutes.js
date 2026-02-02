@@ -119,12 +119,16 @@ router.post('/mint', asyncHandler(async (req, res) => {
 
   if (existingAccount) {
     // Deposit to existing account
+    // IMPORTANT: After each Deposit, the contract is archived and a new one is created
+    // So we must re-fetch the contract ID after each deposit
+    let currentContractId = existingAccount.contractId;
+    
     for (const tokenInfo of tokens) {
-      await cantonService.exerciseChoice({
+      const result = await cantonService.exerciseChoice({
         token: adminToken,
         actAsParty: partyId,
         templateId: `${packageId}:UserAccount:UserAccount`,
-        contractId: existingAccount.contractId,
+        contractId: currentContractId,
         choice: 'Deposit',
         choiceArgument: {
           token: tokenInfo.symbol,
@@ -132,11 +136,25 @@ router.post('/mint', asyncHandler(async (req, res) => {
         },
         readAs: [operatorPartyId]
       });
+      
+      // Extract the new contract ID from the result (created by the exercise)
+      if (result?.transaction?.events) {
+        const createdEvent = result.transaction.events.find(e => 
+          (e.created?.templateId?.includes('UserAccount')) || 
+          (e.CreatedEvent?.templateId?.includes('UserAccount'))
+        );
+        const newContractId = createdEvent?.created?.contractId || 
+                              createdEvent?.CreatedEvent?.contractId;
+        if (newContractId) {
+          currentContractId = newContractId;
+          console.log(`[Balance] Deposit ${tokenInfo.symbol} complete, new contractId: ${newContractId.substring(0, 20)}...`);
+        }
+      }
     }
 
     return success(res, {
       partyId,
-      contractId: existingAccount.contractId,
+      contractId: currentContractId,
       tokens,
       status: 'deposited'
     }, 'Tokens deposited to existing UserAccount', 200);
