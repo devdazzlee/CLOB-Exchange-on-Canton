@@ -10,6 +10,7 @@ import OrderForm from './trading/OrderForm';
 import OrderBookCard from './trading/OrderBookCard';
 import ActiveOrdersTable from './trading/ActiveOrdersTable';
 import DepthChart from './trading/DepthChart';
+import PriceChart from './trading/PriceChart';
 import RecentTrades from './trading/RecentTrades';
 import GlobalTrades from './trading/GlobalTrades';
 import TransactionHistory from './trading/TransactionHistory';
@@ -849,6 +850,18 @@ export default function TradingInterface({ partyId }) {
           )} */}
         </div>
 
+        {/* Price Chart - Full Width */}
+        <PriceChart 
+          tradingPair={tradingPair}
+          trades={trades}
+          currentPrice={orderBook.buys?.[0]?.price ? parseFloat(orderBook.buys[0].price) : 
+                       orderBook.sells?.[0]?.price ? parseFloat(orderBook.sells[0].price) : 0}
+          priceChange24h={0}
+          high24h={trades.length > 0 ? Math.max(...trades.map(t => parseFloat(t.price) || 0)) : 0}
+          low24h={trades.length > 0 ? Math.min(...trades.filter(t => parseFloat(t.price) > 0).map(t => parseFloat(t.price))) : 0}
+          volume24h={trades.reduce((sum, t) => sum + (parseFloat(t.quantity) || 0), 0)}
+        />
+
         {/* Order Book and Active Orders */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="lg:col-span-2 space-y-6">
@@ -883,12 +896,15 @@ export default function TradingInterface({ partyId }) {
           </div>
         </div>
 
-        {/* Charts and History */}
+        {/* Depth Chart and History */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <DepthChart 
-            orderBook={orderBook}
-            loading={orderBookLoading}
-            tradingPair={tradingPair}
+            orderBook={{
+              bids: orderBook.buys || [],
+              asks: orderBook.sells || []
+            }}
+            currentPrice={orderBook.buys?.[0]?.price ? parseFloat(orderBook.buys[0].price) : 
+                         orderBook.sells?.[0]?.price ? parseFloat(orderBook.sells[0].price) : 0}
           />
           
           <TransactionHistory 

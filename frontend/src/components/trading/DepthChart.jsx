@@ -1,175 +1,246 @@
-import { useMemo } from 'react';
-import { motion } from 'framer-motion';
+import { useEffect, useRef, memo } from 'react';
+import { createChart, ColorType } from 'lightweight-charts';
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
+import { cn } from '@/lib/utils';
+import { Layers } from 'lucide-react';
 
 /**
- * Depth Chart Component - Visualizes order book depth
- * Shows cumulative buy and sell orders as a depth chart
+ * Professional Depth Chart Component
+ * Shows cumulative bid/ask liquidity as area mountains
  */
-export default function DepthChart({ orderBook, buyOrders: propBuyOrders, sellOrders: propSellOrders, tradingPair, loading }) {
-  // Support both orderBook object OR separate buyOrders/sellOrders props
-  const buyOrders = propBuyOrders || orderBook?.buys || orderBook?.buyOrders || [];
-  const sellOrders = propSellOrders || orderBook?.sells || orderBook?.sellOrders || [];
-  
-  const chartData = useMemo(() => {
-    if (!buyOrders?.length && !sellOrders?.length) return { buyData: [], sellData: [], maxDepth: 0 };
+function DepthChart({ 
+  orderBook = { bids: [], asks: [] },
+  currentPrice = 0,
+  className 
+}) {
+  const chartContainerRef = useRef(null);
+  const chartRef = useRef(null);
+  const bidSeriesRef = useRef(null);
+  const askSeriesRef = useRef(null);
+  const resizeObserverRef = useRef(null);
 
-    // Process buy orders (cumulative from lowest to highest price)
-    let buyCumulative = 0;
-    const buyData = [...buyOrders]
-      .filter(order => order.price !== null && order.price !== undefined)
-      .sort((a, b) => parseFloat(a.price) - parseFloat(b.price))
-      .map(order => {
-        buyCumulative += parseFloat(order.remaining || order.quantity || 0);
-        return { 
-          price: parseFloat(order.price), 
-          depth: buyCumulative,
-          quantity: parseFloat(order.remaining || order.quantity || 0)
-        };
-      });
+  // Process order book into cumulative depth data
+  const processDepthData = (bids, asks) => {
+    // Process bids (buy orders) - cumulative from highest to lowest price
+    const sortedBids = [...bids]
+      .filter(b => parseFloat(b.price) > 0 && parseFloat(b.quantity || b.amount) > 0)
+      .sort((a, b) => parseFloat(b.price) - parseFloat(a.price));
+    
+    let bidCumulative = 0;
+    const bidData = sortedBids.map(bid => {
+      bidCumulative += parseFloat(bid.quantity || bid.amount || 0);
+      return {
+        price: parseFloat(bid.price),
+        cumulative: bidCumulative
+      };
+    });
 
-    // Process sell orders (cumulative from lowest to highest price)
-    let sellCumulative = 0;
-    const sellData = [...sellOrders]
-      .filter(order => order.price !== null && order.price !== undefined)
-      .sort((a, b) => parseFloat(a.price) - parseFloat(b.price))
-      .map(order => {
-        sellCumulative += parseFloat(order.remaining || order.quantity || 0);
-        return { 
-          price: parseFloat(order.price), 
-          depth: sellCumulative,
-          quantity: parseFloat(order.remaining || order.quantity || 0)
-        };
-      });
+    // Process asks (sell orders) - cumulative from lowest to highest price
+    const sortedAsks = [...asks]
+      .filter(a => parseFloat(a.price) > 0 && parseFloat(a.quantity || a.amount) > 0)
+      .sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
+    
+    let askCumulative = 0;
+    const askData = sortedAsks.map(ask => {
+      askCumulative += parseFloat(ask.quantity || ask.amount || 0);
+      return {
+        price: parseFloat(ask.price),
+        cumulative: askCumulative
+      };
+    });
 
-    const maxDepth = Math.max(
-      buyData.length > 0 ? buyData[buyData.length - 1]?.depth || 0 : 0,
-      sellData.length > 0 ? sellData[sellData.length - 1]?.depth || 0 : 0
-    );
+    return { bidData, askData };
+  };
 
-    return { buyData, sellData, maxDepth };
-  }, [buyOrders, sellOrders]);
+  // Initialize chart
+  useEffect(() => {
+    if (!chartContainerRef.current) return;
 
-  const { buyData, sellData, maxDepth } = chartData;
+    const chart = createChart(chartContainerRef.current, {
+      layout: {
+        background: { type: ColorType.Solid, color: 'transparent' },
+        textColor: '#9CA3AF',
+        fontFamily: "'JetBrains Mono', 'SF Mono', Monaco, monospace",
+        fontSize: 10,
+      },
+      grid: {
+        vertLines: { color: 'rgba(255, 255, 255, 0.02)' },
+        horzLines: { color: 'rgba(255, 255, 255, 0.02)' },
+      },
+      crosshair: {
+        mode: 0, // Normal mode
+        vertLine: {
+          color: 'rgba(255, 255, 255, 0.3)',
+          width: 1,
+          style: 2,
+        },
+        horzLine: {
+          color: 'rgba(255, 255, 255, 0.3)',
+          width: 1,
+          style: 2,
+        },
+      },
+      rightPriceScale: {
+        borderColor: 'rgba(255, 255, 255, 0.1)',
+        scaleMargins: {
+          top: 0.1,
+          bottom: 0.1,
+        },
+      },
+      timeScale: {
+        visible: false,
+      },
+      handleScroll: false,
+      handleScale: false,
+    });
 
-  if (loading) {
-    return (
-      <Card>
-        <CardHeader>
-          <CardTitle>Depth Chart - {tradingPair}</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="flex items-center justify-center h-64">
-            <div className="animate-pulse text-muted-foreground">Loading depth chart...</div>
-          </div>
-        </CardContent>
-      </Card>
-    );
-  }
+    chartRef.current = chart;
 
-  if (maxDepth === 0 || (!buyOrders.length && !sellOrders.length)) {
-    return (
-      <Card>
-        <CardHeader>
-          <CardTitle>Depth Chart - {tradingPair}</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="flex flex-col items-center justify-center h-64 text-muted-foreground space-y-2">
-            <span>No order book data available</span>
-            <span className="text-xs opacity-60">Place orders to see the depth chart</span>
-          </div>
-        </CardContent>
-      </Card>
-    );
-  }
+    // Create bid area series (green)
+    bidSeriesRef.current = chart.addAreaSeries({
+      topColor: 'rgba(34, 197, 94, 0.4)',
+      bottomColor: 'rgba(34, 197, 94, 0.0)',
+      lineColor: '#22C55E',
+      lineWidth: 2,
+      priceLineVisible: false,
+      lastValueVisible: false,
+    });
 
-  // Find the price range
-  const allPrices = [
-    ...buyData.map(d => d.price),
-    ...sellData.map(d => d.price)
-  ].filter(p => p > 0);
-  
-  const minPrice = allPrices.length > 0 ? Math.min(...allPrices) : 0;
-  const maxPrice = allPrices.length > 0 ? Math.max(...allPrices) : 0;
-  const priceRange = maxPrice - minPrice || 1;
+    // Create ask area series (red)
+    askSeriesRef.current = chart.addAreaSeries({
+      topColor: 'rgba(239, 68, 68, 0.4)',
+      bottomColor: 'rgba(239, 68, 68, 0.0)',
+      lineColor: '#EF4444',
+      lineWidth: 2,
+      priceLineVisible: false,
+      lastValueVisible: false,
+    });
+
+    // Handle resize
+    const handleResize = () => {
+      if (chartContainerRef.current && chartRef.current) {
+        chartRef.current.applyOptions({
+          width: chartContainerRef.current.clientWidth,
+          height: chartContainerRef.current.clientHeight,
+        });
+      }
+    };
+
+    resizeObserverRef.current = new ResizeObserver(handleResize);
+    resizeObserverRef.current.observe(chartContainerRef.current);
+
+    return () => {
+      if (resizeObserverRef.current) {
+        resizeObserverRef.current.disconnect();
+      }
+      if (chartRef.current) {
+        chartRef.current.remove();
+        chartRef.current = null;
+      }
+    };
+  }, []);
+
+  // Update data when orderBook changes
+  useEffect(() => {
+    if (!bidSeriesRef.current || !askSeriesRef.current) return;
+
+    const { bidData, askData } = processDepthData(orderBook.bids || [], orderBook.asks || []);
+
+    // Convert to chart format - using price as pseudo-time for x-axis
+    // We need to normalize prices to create a continuous line
+    if (bidData.length > 0) {
+      // Reverse bids so they go from low to high price
+      const reversedBids = [...bidData].reverse();
+      const bidChartData = reversedBids.map((d, i) => ({
+        time: i,
+        value: d.cumulative
+      }));
+      bidSeriesRef.current.setData(bidChartData);
+    } else {
+      bidSeriesRef.current.setData([]);
+    }
+
+    if (askData.length > 0) {
+      // Offset ask data to appear after bids
+      const offset = bidData.length;
+      const askChartData = askData.map((d, i) => ({
+        time: offset + i,
+        value: d.cumulative
+      }));
+      askSeriesRef.current.setData(askChartData);
+    } else {
+      askSeriesRef.current.setData([]);
+    }
+
+    // Fit content
+    if (chartRef.current) {
+      chartRef.current.timeScale().fitContent();
+    }
+  }, [orderBook]);
+
+  // Calculate market stats
+  const { bidData, askData } = processDepthData(orderBook.bids || [], orderBook.asks || []);
+  const totalBidVolume = bidData.length > 0 ? bidData[bidData.length - 1]?.cumulative || 0 : 0;
+  const totalAskVolume = askData.length > 0 ? askData[askData.length - 1]?.cumulative || 0 : 0;
+  const totalVolume = totalBidVolume + totalAskVolume;
+  const bidPercent = totalVolume > 0 ? (totalBidVolume / totalVolume * 100) : 50;
+  const askPercent = totalVolume > 0 ? (totalAskVolume / totalVolume * 100) : 50;
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Depth Chart - {tradingPair}</CardTitle>
-      </CardHeader>
-      <CardContent>
-        <div className="relative h-64 w-full">
-          {/* Buy Orders Depth (Green) */}
-          <svg className="absolute inset-0 w-full h-full" viewBox="0 0 100 100" preserveAspectRatio="none">
-            {buyData.map((point, idx) => {
-              const nextPoint = buyData[idx + 1];
-              if (!nextPoint) return null;
-              
-              const x1 = ((point.price - minPrice) / priceRange) * 100;
-              const x2 = ((nextPoint.price - minPrice) / priceRange) * 100;
-              const y1 = 100 - (point.depth / maxDepth) * 100;
-              const y2 = 100 - (nextPoint.depth / maxDepth) * 100;
-              
-              return (
-                <polygon
-                  key={`buy-${idx}`}
-                  points={`${x1},100 ${x1},${y1} ${x2},${y2} ${x2},100`}
-                  fill="rgba(34, 197, 94, 0.2)"
-                  stroke="rgba(34, 197, 94, 0.5)"
-                  strokeWidth="0.5"
-                />
-              );
-            })}
-          </svg>
-
-          {/* Sell Orders Depth (Red) */}
-          <svg className="absolute inset-0 w-full h-full" viewBox="0 0 100 100" preserveAspectRatio="none">
-            {sellData.map((point, idx) => {
-              const nextPoint = sellData[idx + 1];
-              if (!nextPoint) return null;
-              
-              const x1 = ((point.price - minPrice) / priceRange) * 100;
-              const x2 = ((nextPoint.price - minPrice) / priceRange) * 100;
-              const y1 = 100 - (point.depth / maxDepth) * 100;
-              const y2 = 100 - (nextPoint.depth / maxDepth) * 100;
-              
-              return (
-                <polygon
-                  key={`sell-${idx}`}
-                  points={`${x1},100 ${x1},${y1} ${x2},${y2} ${x2},100`}
-                  fill="rgba(239, 68, 68, 0.2)"
-                  stroke="rgba(239, 68, 68, 0.5)"
-                  strokeWidth="0.5"
-                />
-              );
-            })}
-          </svg>
-
-          {/* Price Labels */}
-          <div className="absolute bottom-0 left-0 right-0 flex justify-between text-xs text-muted-foreground px-2 pb-1">
-            <span>{minPrice.toFixed(2)}</span>
-            <span>{((minPrice + maxPrice) / 2).toFixed(2)}</span>
-            <span>{maxPrice.toFixed(2)}</span>
-          </div>
-
-          {/* Depth Labels */}
-          <div className="absolute left-0 top-0 bottom-0 flex flex-col justify-between text-xs text-muted-foreground pl-2 py-2">
-            <span>{maxDepth.toFixed(2)}</span>
-            <span>{(maxDepth / 2).toFixed(2)}</span>
-            <span>0</span>
+    <Card className={cn("bg-card/50 backdrop-blur-sm border-border/50", className)}>
+      <CardHeader className="pb-2">
+        <div className="flex items-center justify-between">
+          <CardTitle className="text-sm font-medium text-foreground flex items-center gap-2">
+            <Layers className="w-4 h-4 text-primary" />
+            Market Depth
+          </CardTitle>
+          <div className="flex items-center gap-4 text-xs">
+            <div className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded-full bg-success"></span>
+              <span className="text-success font-medium">{bidPercent.toFixed(1)}%</span>
+              <span className="text-muted-foreground">Bids</span>
+            </div>
+            <div className="flex items-center gap-1">
+              <span className="w-2 h-2 rounded-full bg-destructive"></span>
+              <span className="text-destructive font-medium">{askPercent.toFixed(1)}%</span>
+              <span className="text-muted-foreground">Asks</span>
+            </div>
           </div>
         </div>
-
-        {/* Legend */}
-        <div className="flex items-center justify-center space-x-6 mt-4 pt-4 border-t border-border">
-          <div className="flex items-center space-x-2">
-            <div className="w-4 h-4 bg-success/20 border border-success/50 rounded"></div>
-            <span className="text-xs text-muted-foreground">Buy Orders</span>
+        
+        {/* Buy/Sell Pressure Bar */}
+        <div className="mt-2 h-2 w-full rounded-full overflow-hidden flex">
+          <div 
+            className="h-full bg-gradient-to-r from-success/80 to-success transition-all duration-500"
+            style={{ width: `${bidPercent}%` }}
+          />
+          <div 
+            className="h-full bg-gradient-to-r from-destructive to-destructive/80 transition-all duration-500"
+            style={{ width: `${askPercent}%` }}
+          />
+        </div>
+      </CardHeader>
+      
+      <CardContent className="p-0">
+        <div 
+          ref={chartContainerRef} 
+          className="w-full h-[150px]"
+        />
+        
+        {/* Volume Stats */}
+        <div className="px-4 py-2 border-t border-border/50 flex items-center justify-between text-xs">
+          <div className="flex items-center gap-1">
+            <span className="text-muted-foreground">Bid Depth:</span>
+            <span className="text-success font-mono font-medium">
+              {totalBidVolume.toLocaleString(undefined, { maximumFractionDigits: 4 })}
+            </span>
           </div>
-          <div className="flex items-center space-x-2">
-            <div className="w-4 h-4 bg-destructive/20 border border-destructive/50 rounded"></div>
-            <span className="text-xs text-muted-foreground">Sell Orders</span>
+          <div className="text-muted-foreground">|</div>
+          <div className="flex items-center gap-1">
+            <span className="text-muted-foreground">Ask Depth:</span>
+            <span className="text-destructive font-mono font-medium">
+              {totalAskVolume.toLocaleString(undefined, { maximumFractionDigits: 4 })}
+            </span>
           </div>
         </div>
       </CardContent>
@@ -177,3 +248,4 @@ export default function DepthChart({ orderBook, buyOrders: propBuyOrders, sellOr
   );
 }
 
+export default memo(DepthChart);
