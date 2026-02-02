@@ -1,11 +1,11 @@
 import { useEffect, useRef, memo } from 'react';
-import { createChart, ColorType } from 'lightweight-charts';
+import { createChart, AreaSeries, ColorType } from 'lightweight-charts';
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
 import { cn } from '@/lib/utils';
 import { Layers } from 'lucide-react';
 
 /**
- * Professional Depth Chart Component
+ * Professional Depth Chart Component using Lightweight Charts v5
  * Shows cumulative bid/ask liquidity as area mountains
  */
 function DepthChart({ 
@@ -21,28 +21,26 @@ function DepthChart({
 
   // Process order book into cumulative depth data
   const processDepthData = (bids, asks) => {
-    // Process bids (buy orders) - cumulative from highest to lowest price
     const sortedBids = [...bids]
-      .filter(b => parseFloat(b.price) > 0 && parseFloat(b.quantity || b.amount) > 0)
+      .filter(b => parseFloat(b.price) > 0 && parseFloat(b.quantity || b.amount || b.remaining) > 0)
       .sort((a, b) => parseFloat(b.price) - parseFloat(a.price));
     
     let bidCumulative = 0;
     const bidData = sortedBids.map(bid => {
-      bidCumulative += parseFloat(bid.quantity || bid.amount || 0);
+      bidCumulative += parseFloat(bid.quantity || bid.amount || bid.remaining || 0);
       return {
         price: parseFloat(bid.price),
         cumulative: bidCumulative
       };
     });
 
-    // Process asks (sell orders) - cumulative from lowest to highest price
     const sortedAsks = [...asks]
-      .filter(a => parseFloat(a.price) > 0 && parseFloat(a.quantity || a.amount) > 0)
+      .filter(a => parseFloat(a.price) > 0 && parseFloat(a.quantity || a.amount || a.remaining) > 0)
       .sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
     
     let askCumulative = 0;
     const askData = sortedAsks.map(ask => {
-      askCumulative += parseFloat(ask.quantity || ask.amount || 0);
+      askCumulative += parseFloat(ask.quantity || ask.amount || ask.remaining || 0);
       return {
         price: parseFloat(ask.price),
         cumulative: askCumulative
@@ -68,36 +66,23 @@ function DepthChart({
         horzLines: { color: 'rgba(255, 255, 255, 0.02)' },
       },
       crosshair: {
-        mode: 0, // Normal mode
-        vertLine: {
-          color: 'rgba(255, 255, 255, 0.3)',
-          width: 1,
-          style: 2,
-        },
-        horzLine: {
-          color: 'rgba(255, 255, 255, 0.3)',
-          width: 1,
-          style: 2,
-        },
+        mode: 0,
+        vertLine: { color: 'rgba(255, 255, 255, 0.3)', width: 1, style: 2 },
+        horzLine: { color: 'rgba(255, 255, 255, 0.3)', width: 1, style: 2 },
       },
       rightPriceScale: {
         borderColor: 'rgba(255, 255, 255, 0.1)',
-        scaleMargins: {
-          top: 0.1,
-          bottom: 0.1,
-        },
+        scaleMargins: { top: 0.1, bottom: 0.1 },
       },
-      timeScale: {
-        visible: false,
-      },
+      timeScale: { visible: false },
       handleScroll: false,
       handleScale: false,
     });
 
     chartRef.current = chart;
 
-    // Create bid area series (green)
-    bidSeriesRef.current = chart.addAreaSeries({
+    // Create bid area series (green) - v5 API
+    bidSeriesRef.current = chart.addSeries(AreaSeries, {
       topColor: 'rgba(34, 197, 94, 0.4)',
       bottomColor: 'rgba(34, 197, 94, 0.0)',
       lineColor: '#22C55E',
@@ -106,8 +91,8 @@ function DepthChart({
       lastValueVisible: false,
     });
 
-    // Create ask area series (red)
-    askSeriesRef.current = chart.addAreaSeries({
+    // Create ask area series (red) - v5 API
+    askSeriesRef.current = chart.addSeries(AreaSeries, {
       topColor: 'rgba(239, 68, 68, 0.4)',
       bottomColor: 'rgba(239, 68, 68, 0.0)',
       lineColor: '#EF4444',
@@ -116,7 +101,6 @@ function DepthChart({
       lastValueVisible: false,
     });
 
-    // Handle resize
     const handleResize = () => {
       if (chartContainerRef.current && chartRef.current) {
         chartRef.current.applyOptions({
@@ -146,10 +130,7 @@ function DepthChart({
 
     const { bidData, askData } = processDepthData(orderBook.bids || [], orderBook.asks || []);
 
-    // Convert to chart format - using price as pseudo-time for x-axis
-    // We need to normalize prices to create a continuous line
     if (bidData.length > 0) {
-      // Reverse bids so they go from low to high price
       const reversedBids = [...bidData].reverse();
       const bidChartData = reversedBids.map((d, i) => ({
         time: i,
@@ -161,7 +142,6 @@ function DepthChart({
     }
 
     if (askData.length > 0) {
-      // Offset ask data to appear after bids
       const offset = bidData.length;
       const askChartData = askData.map((d, i) => ({
         time: offset + i,
@@ -172,7 +152,6 @@ function DepthChart({
       askSeriesRef.current.setData([]);
     }
 
-    // Fit content
     if (chartRef.current) {
       chartRef.current.timeScale().fitContent();
     }

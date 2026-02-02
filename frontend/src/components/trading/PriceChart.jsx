@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback, memo } from 'react';
-import { createChart, ColorType, CrosshairMode } from 'lightweight-charts';
+import { createChart, CandlestickSeries, LineSeries, AreaSeries, HistogramSeries, ColorType, CrosshairMode } from 'lightweight-charts';
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
 import { Button } from '../ui/button';
 import { cn } from '@/lib/utils';
@@ -9,8 +9,6 @@ import {
   BarChart3, 
   LineChart,
   CandlestickChart as CandleIcon,
-  Settings,
-  Maximize2,
   RefreshCw
 } from 'lucide-react';
 
@@ -33,8 +31,7 @@ const CHART_TYPES = [
 ];
 
 /**
- * Professional Price Chart Component using TradingView Lightweight Charts
- * Supports candlestick, line, and area chart types
+ * Professional Price Chart Component using TradingView Lightweight Charts v5
  */
 function PriceChart({ 
   tradingPair = 'BTC/USDT',
@@ -55,14 +52,12 @@ function PriceChart({
   const [selectedInterval, setSelectedInterval] = useState(TIME_INTERVALS[3]); // Default 1H
   const [chartType, setChartType] = useState('candlestick');
   const [chartData, setChartData] = useState([]);
-  const [volumeData, setVolumeData] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [lastUpdate, setLastUpdate] = useState(null);
 
   // Generate OHLC data from trades
   const generateOHLCData = useCallback((tradesData, intervalMs) => {
     if (!tradesData || tradesData.length === 0) {
-      // Generate sample data if no trades
       return generateSampleData(intervalMs);
     }
 
@@ -88,7 +83,7 @@ function PriceChart({
         candle.volume += volume;
       } else {
         candles.set(candleTime, {
-          time: candleTime / 1000, // Lightweight charts expects Unix timestamp in seconds
+          time: candleTime / 1000,
           open: price,
           high: price,
           low: price,
@@ -100,7 +95,6 @@ function PriceChart({
 
     const candleArray = Array.from(candles.values()).sort((a, b) => a.time - b.time);
     
-    // Fill gaps between candles
     if (candleArray.length > 1) {
       const filled = [];
       for (let i = 0; i < candleArray.length; i++) {
@@ -111,7 +105,6 @@ function PriceChart({
           const nextTime = candleArray[i + 1].time;
           const intervalSec = intervalMs / 1000;
           
-          // Fill gaps with flat candles
           for (let t = currentTime + intervalSec; t < nextTime; t += intervalSec) {
             filled.push({
               time: t,
@@ -147,15 +140,7 @@ function PriceChart({
       const low = Math.min(open, close) * (1 - Math.random() * volatility * 0.5);
       const volume = Math.random() * 10 + 1;
       
-      candles.push({
-        time,
-        open,
-        high,
-        low,
-        close,
-        volume
-      });
-      
+      candles.push({ time, open, high, low, close, volume });
       price = close;
     }
     
@@ -166,7 +151,6 @@ function PriceChart({
   useEffect(() => {
     if (!chartContainerRef.current) return;
 
-    // Chart configuration with professional dark theme
     const chart = createChart(chartContainerRef.current, {
       layout: {
         background: { type: ColorType.Solid, color: 'transparent' },
@@ -195,39 +179,19 @@ function PriceChart({
       },
       rightPriceScale: {
         borderColor: 'rgba(255, 255, 255, 0.1)',
-        scaleMargins: {
-          top: 0.1,
-          bottom: 0.2,
-        },
+        scaleMargins: { top: 0.1, bottom: 0.2 },
       },
       timeScale: {
         borderColor: 'rgba(255, 255, 255, 0.1)',
         timeVisible: true,
         secondsVisible: false,
-        tickMarkFormatter: (time) => {
-          const date = new Date(time * 1000);
-          if (selectedInterval.value >= 86400000) {
-            return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-          }
-          return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
-        },
       },
-      handleScroll: {
-        mouseWheel: true,
-        pressedMouseMove: true,
-        horzTouchDrag: true,
-        vertTouchDrag: false,
-      },
-      handleScale: {
-        axisPressedMouseMove: true,
-        mouseWheel: true,
-        pinch: true,
-      },
+      handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false },
+      handleScale: { axisPressedMouseMove: true, mouseWheel: true, pinch: true },
     });
 
     chartRef.current = chart;
 
-    // Handle resize
     const handleResize = () => {
       if (chartContainerRef.current && chartRef.current) {
         chartRef.current.applyOptions({
@@ -265,9 +229,9 @@ function PriceChart({
       volumeSeriesRef.current = null;
     }
 
-    // Create new series based on chart type
+    // Create new series based on chart type - v5 API
     if (chartType === 'candlestick') {
-      seriesRef.current = chartRef.current.addCandlestickSeries({
+      seriesRef.current = chartRef.current.addSeries(CandlestickSeries, {
         upColor: '#22C55E',
         downColor: '#EF4444',
         borderUpColor: '#22C55E',
@@ -276,18 +240,16 @@ function PriceChart({
         wickDownColor: '#EF4444',
       });
     } else if (chartType === 'line') {
-      seriesRef.current = chartRef.current.addLineSeries({
+      seriesRef.current = chartRef.current.addSeries(LineSeries, {
         color: '#FFC107',
         lineWidth: 2,
         crosshairMarkerVisible: true,
         crosshairMarkerRadius: 4,
-        crosshairMarkerBorderColor: '#FFC107',
-        crosshairMarkerBackgroundColor: '#1a1a2e',
         lastValueVisible: true,
         priceLineVisible: true,
       });
     } else if (chartType === 'area') {
-      seriesRef.current = chartRef.current.addAreaSeries({
+      seriesRef.current = chartRef.current.addSeries(AreaSeries, {
         topColor: 'rgba(255, 193, 7, 0.4)',
         bottomColor: 'rgba(255, 193, 7, 0.0)',
         lineColor: '#FFC107',
@@ -295,17 +257,14 @@ function PriceChart({
       });
     }
 
-    // Add volume series
-    volumeSeriesRef.current = chartRef.current.addHistogramSeries({
+    // Add volume series - v5 API
+    volumeSeriesRef.current = chartRef.current.addSeries(HistogramSeries, {
       color: '#26a69a',
-      priceFormat: {
-        type: 'volume',
-      },
+      priceFormat: { type: 'volume' },
       priceScaleId: '',
-      scaleMargins: {
-        top: 0.85,
-        bottom: 0,
-      },
+    });
+    volumeSeriesRef.current.priceScale().applyOptions({
+      scaleMargins: { top: 0.85, bottom: 0 },
     });
 
     // Set data
@@ -313,21 +272,15 @@ function PriceChart({
       if (chartType === 'candlestick') {
         seriesRef.current.setData(chartData);
       } else {
-        // For line and area charts, use close prices
-        seriesRef.current.setData(chartData.map(d => ({
-          time: d.time,
-          value: d.close
-        })));
+        seriesRef.current.setData(chartData.map(d => ({ time: d.time, value: d.close })));
       }
 
-      // Set volume data with colors
-      volumeSeriesRef.current.setData(chartData.map((d, i) => ({
+      volumeSeriesRef.current.setData(chartData.map((d) => ({
         time: d.time,
         value: d.volume,
         color: d.close >= d.open ? 'rgba(34, 197, 94, 0.3)' : 'rgba(239, 68, 68, 0.3)'
       })));
 
-      // Fit content
       chartRef.current.timeScale().fitContent();
     }
 
@@ -353,7 +306,6 @@ function PriceChart({
     const lastCandle = chartData[chartData.length - 1];
     
     if (lastCandle && lastCandle.time === currentCandleTime) {
-      // Update existing candle
       const updatedCandle = {
         ...lastCandle,
         high: Math.max(lastCandle.high, currentPrice),
@@ -391,7 +343,6 @@ function PriceChart({
     <Card className={cn("bg-card/50 backdrop-blur-sm border-border/50", className)}>
       <CardHeader className="pb-2">
         <div className="flex items-center justify-between flex-wrap gap-4">
-          {/* Market Info */}
           <div className="flex items-center gap-6">
             <div>
               <CardTitle className="text-lg font-bold text-foreground flex items-center gap-2">
@@ -417,7 +368,6 @@ function PriceChart({
               </div>
             </div>
             
-            {/* 24h Stats */}
             <div className="hidden md:flex items-center gap-4 text-xs">
               <div className="border-l border-border pl-4">
                 <div className="text-muted-foreground">24h High</div>
@@ -434,9 +384,7 @@ function PriceChart({
             </div>
           </div>
 
-          {/* Controls */}
           <div className="flex items-center gap-2">
-            {/* Chart Type Selector */}
             <div className="flex items-center bg-background/50 rounded-lg p-1 border border-border/50">
               {CHART_TYPES.map((type) => {
                 const Icon = type.icon;
@@ -460,7 +408,6 @@ function PriceChart({
               })}
             </div>
 
-            {/* Time Interval Selector */}
             <div className="flex items-center bg-background/50 rounded-lg p-1 border border-border/50">
               {TIME_INTERVALS.map((interval) => (
                 <Button
@@ -480,7 +427,6 @@ function PriceChart({
               ))}
             </div>
 
-            {/* Refresh Button */}
             <Button
               variant="ghost"
               size="sm"
@@ -514,7 +460,6 @@ function PriceChart({
           )}
         </div>
 
-        {/* Chart Legend */}
         <div className="px-4 py-2 border-t border-border/50 flex items-center justify-between text-xs text-muted-foreground">
           <div className="flex items-center gap-4">
             <span className="flex items-center gap-1">
@@ -527,9 +472,7 @@ function PriceChart({
             </span>
           </div>
           {lastUpdate && (
-            <span>
-              Updated: {lastUpdate.toLocaleTimeString()}
-            </span>
+            <span>Updated: {lastUpdate.toLocaleTimeString()}</span>
           )}
         </div>
       </CardContent>
