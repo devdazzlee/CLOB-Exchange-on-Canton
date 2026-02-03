@@ -47,6 +47,10 @@ const config = {
 
     // Package ID for template IDs (package-id format) - REQUIRED for UserAccount creation
     packageId: process.env.CLOB_EXCHANGE_PACKAGE_ID,
+    
+    // Token Standard Package ID (Instrument, Holding, Settlement, OrderV3)
+    // clob-token-standard v1.0.0 - successfully vetted and deployed
+    tokenStandardPackageId: process.env.TOKEN_STANDARD_PACKAGE_ID || '813a7f5a2d053bb8e408035cf0a7f86d216f62b216eb6a6e157b253d0d2ccb69',
 
     // OAuth configuration (SERVICE TOKEN ONLY)
     oauth: {
@@ -61,7 +65,8 @@ const config = {
     get packageIds() {
       return {
         clobExchange: this.packageId || this.packageName, // Prefer package-id format
-        userAccount: this.packageId || this.packageName   // Prefer package-id format
+        userAccount: this.packageId || this.packageName,  // Prefer package-id format
+        tokenStandard: this.tokenStandardPackageId        // Token Standard package
       };
     },
 

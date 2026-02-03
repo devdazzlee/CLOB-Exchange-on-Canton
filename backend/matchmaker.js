@@ -18,9 +18,13 @@ const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.
 const MATCHING_INTERVAL_MS = 5000; // Check every 5 seconds
 const MAX_MATCHES_PER_CYCLE = 10; // Limit matches per cycle to avoid overload
 
-// CRITICAL: Hardcoded Package ID for MasterOrderBook to prevent 413 errors
-// This package ID was discovered from logs and is used to bypass broken discovery logic
-const MASTER_ORDERBOOK_PACKAGE_ID = "dd500bf887d7e153ee6628b3f6722f234d3d62ce855572ff7ce73b7b3c2afefd";
+// CRITICAL: Package IDs for DAML contracts
+// Token Standard package (Instrument, Holding, Settlement) - clob-token-standard v1.0.0
+const TOKEN_STANDARD_PACKAGE_ID = "813a7f5a2d053bb8e408035cf0a7f86d216f62b216eb6a6e157b253d0d2ccb69";
+// Legacy package (UserAccount, Order, MasterOrderBook) - clob-exchange v1.0.0
+const LEGACY_PACKAGE_ID = "dd500bf887d7e153ee6628b3f6722f234d3d62ce855572ff7ce73b7b3c2afefd";
+// Use legacy for MasterOrderBook until migration complete
+const MASTER_ORDERBOOK_PACKAGE_ID = LEGACY_PACKAGE_ID;
 
 // Get admin token (assumes you have a way to get it)
 // This should use your existing CantonAdmin service
