@@ -17,6 +17,10 @@ const cantonService = require('./cantonService');
 const config = require('../config');
 const { getUpdateStream } = require('./cantonUpdateStream');
 const { extractTradesFromEvents } = require('./trade-utils');
+const { getSettlementService } = require('./settlementService');
+
+// Feature flag - set to true when deploying new token standard DAR
+const USE_DvP_SETTLEMENT = process.env.USE_DVP_SETTLEMENT === 'true' || false;
 
 // NO IN-MEMORY CACHE - All trades are stored on Canton ledger as Trade contracts
 function recordTradesFromResult(result) {
@@ -329,10 +333,17 @@ class MatchingEngine {
           console.log(`  Buy: ${buyOrder.contractId.substring(0, 20)}... @${buyPrice !== null ? buyPrice : 'MARKET'} qty=${buyOrder.remaining}`);
           console.log(`  Sell: ${sellOrder.contractId.substring(0, 20)}... @${sellPrice !== null ? sellPrice : 'MARKET'} qty=${sellOrder.remaining}`);
           console.log(`  Match: ${matchQty} @${matchPrice}`);
+          console.log(`  Settlement mode: ${USE_DvP_SETTLEMENT ? 'DvP (Token Standard)' : 'Legacy (FillOrder + Balance Update)'}`);
           
           try {
-            // Execute the match by filling both orders
-            await this.executeFillOrders(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, adminToken);
+            // Execute the match
+            if (USE_DvP_SETTLEMENT) {
+              // NEW: Use atomic DvP settlement with real token Holdings
+              await this.executeDvPSettlement(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, adminToken);
+            } else {
+              // LEGACY: Fill orders and update UserAccount balances
+              await this.executeFillOrders(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, adminToken);
+            }
             matchCount++;
             
             // IMPORTANT: After FillOrder, the contract IDs change (DAML archives old, creates new)
@@ -485,6 +496,93 @@ class MatchingEngine {
         sellOrderId: sellOrder.orderId,
         fillQuantity: matchQty
       });
+    }
+  }
+
+  /**
+   * Execute match using DvP (Delivery vs Payment) atomic settlement
+   * 
+   * This uses the new token standard with Holdings:
+   * - Both parties' locked Holdings are swapped atomically
+   * - Either both succeed or both rollback
+   * - No partial state possible
+   * 
+   * Requirements:
+   * - OrderV3 contracts (with lockedHoldingCid field)
+   * - Holding contracts (locked for each order)
+   * - SettlementInstruction template
+   */
+  async executeDvPSettlement(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, adminToken) {
+    const settlementService = getSettlementService();
+    const [baseSymbol, quoteSymbol] = tradingPair.split('/');
+    const quoteAmount = matchQty * matchPrice;
+    
+    console.log(`[MatchingEngine] 🔄 Executing DvP settlement...`);
+    console.log(`  Base: ${matchQty} ${baseSymbol}`);
+    console.log(`  Quote: ${quoteAmount} ${quoteSymbol}`);
+    console.log(`  Buyer: ${buyOrder.owner.substring(0, 30)}...`);
+    console.log(`  Seller: ${sellOrder.owner.substring(0, 30)}...`);
+    
+    try {
+      // Execute atomic settlement via SettlementService
+      const result = await settlementService.settleMatch({
+        buyOrder: {
+          ...buyOrder,
+          tradingPair,
+          lockedHoldingCid: buyOrder.lockedHoldingCid || buyOrder.holdingCid,
+        },
+        sellOrder: {
+          ...sellOrder,
+          tradingPair,
+          lockedHoldingCid: sellOrder.lockedHoldingCid || sellOrder.holdingCid,
+        },
+        fillQuantity: matchQty,
+        fillPrice: matchPrice,
+      }, adminToken);
+      
+      console.log(`[MatchingEngine] ✅ DvP Settlement complete: Trade ${result.tradeContractId}`);
+      
+      // Broadcast trade
+      const tradeRecord = {
+        tradeId: result.tradeContractId,
+        buyer: buyOrder.owner,
+        seller: sellOrder.owner,
+        tradingPair,
+        price: matchPrice.toString(),
+        quantity: matchQty.toString(),
+        buyOrderId: buyOrder.orderId,
+        sellOrderId: sellOrder.orderId,
+        timestamp: new Date().toISOString(),
+        settlementType: 'DvP',
+      };
+      
+      if (global.broadcastWebSocket) {
+        global.broadcastWebSocket(`trades:${tradingPair}`, {
+          type: 'NEW_TRADE',
+          ...tradeRecord
+        });
+        global.broadcastWebSocket('trades:all', {
+          type: 'NEW_TRADE',
+          ...tradeRecord
+        });
+        global.broadcastWebSocket(`orderbook:${tradingPair}`, {
+          type: 'DVP_SETTLEMENT',
+          buyOrderId: buyOrder.orderId,
+          sellOrderId: sellOrder.orderId,
+          fillQuantity: matchQty,
+          fillPrice: matchPrice,
+        });
+      }
+      
+      return result;
+    } catch (error) {
+      console.error(`[MatchingEngine] ❌ DvP Settlement failed:`, error.message);
+      
+      // If DvP fails, try to cancel the settlement and return locked funds
+      // This is automatic in the Settlement contract - on failure, nothing changes
+      console.log(`[MatchingEngine] Holdings remain locked - manual unlock may be required`);
+      
+      throw error;
     }
   }
   
