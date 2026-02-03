@@ -208,8 +208,15 @@ function PriceChart({
       if (resizeObserverRef.current) {
         resizeObserverRef.current.disconnect();
       }
+      // Clear series refs before removing chart
+      seriesRef.current = null;
+      volumeSeriesRef.current = null;
       if (chartRef.current) {
-        chartRef.current.remove();
+        try {
+          chartRef.current.remove();
+        } catch (e) {
+          console.warn('[PriceChart] Error removing chart:', e.message);
+        }
         chartRef.current = null;
       }
     };
@@ -219,15 +226,24 @@ function PriceChart({
   useEffect(() => {
     if (!chartRef.current) return;
 
-    // Remove existing series
-    if (seriesRef.current) {
-      chartRef.current.removeSeries(seriesRef.current);
-      seriesRef.current = null;
+    // Remove existing series safely
+    try {
+      if (seriesRef.current) {
+        chartRef.current.removeSeries(seriesRef.current);
+      }
+    } catch (e) {
+      console.warn('[PriceChart] Error removing price series:', e.message);
     }
-    if (volumeSeriesRef.current) {
-      chartRef.current.removeSeries(volumeSeriesRef.current);
-      volumeSeriesRef.current = null;
+    seriesRef.current = null;
+    
+    try {
+      if (volumeSeriesRef.current) {
+        chartRef.current.removeSeries(volumeSeriesRef.current);
+      }
+    } catch (e) {
+      console.warn('[PriceChart] Error removing volume series:', e.message);
     }
+    volumeSeriesRef.current = null;
 
     // Create new series based on chart type - v5 API
     if (chartType === 'candlestick') {
@@ -268,20 +284,26 @@ function PriceChart({
     });
 
     // Set data
-    if (chartData.length > 0) {
-      if (chartType === 'candlestick') {
-        seriesRef.current.setData(chartData);
-      } else {
-        seriesRef.current.setData(chartData.map(d => ({ time: d.time, value: d.close })));
+    if (chartData.length > 0 && seriesRef.current) {
+      try {
+        if (chartType === 'candlestick') {
+          seriesRef.current.setData(chartData);
+        } else {
+          seriesRef.current.setData(chartData.map(d => ({ time: d.time, value: d.close })));
+        }
+
+        if (volumeSeriesRef.current) {
+          volumeSeriesRef.current.setData(chartData.map((d) => ({
+            time: d.time,
+            value: d.volume,
+            color: d.close >= d.open ? 'rgba(34, 197, 94, 0.3)' : 'rgba(239, 68, 68, 0.3)'
+          })));
+        }
+
+        chartRef.current.timeScale().fitContent();
+      } catch (e) {
+        console.warn('[PriceChart] Error setting chart data:', e.message);
       }
-
-      volumeSeriesRef.current.setData(chartData.map((d) => ({
-        time: d.time,
-        value: d.volume,
-        color: d.close >= d.open ? 'rgba(34, 197, 94, 0.3)' : 'rgba(239, 68, 68, 0.3)'
-      })));
-
-      chartRef.current.timeScale().fitContent();
     }
 
     setLastUpdate(new Date());
@@ -299,25 +321,29 @@ function PriceChart({
   useEffect(() => {
     if (!seriesRef.current || !chartData.length || !currentPrice) return;
 
-    const now = Math.floor(Date.now() / 1000);
-    const intervalSec = selectedInterval.value / 1000;
-    const currentCandleTime = Math.floor(now / intervalSec) * intervalSec;
-    
-    const lastCandle = chartData[chartData.length - 1];
-    
-    if (lastCandle && lastCandle.time === currentCandleTime) {
-      const updatedCandle = {
-        ...lastCandle,
-        high: Math.max(lastCandle.high, currentPrice),
-        low: Math.min(lastCandle.low, currentPrice),
-        close: currentPrice
-      };
+    try {
+      const now = Math.floor(Date.now() / 1000);
+      const intervalSec = selectedInterval.value / 1000;
+      const currentCandleTime = Math.floor(now / intervalSec) * intervalSec;
       
-      if (chartType === 'candlestick') {
-        seriesRef.current.update(updatedCandle);
-      } else {
-        seriesRef.current.update({ time: updatedCandle.time, value: currentPrice });
+      const lastCandle = chartData[chartData.length - 1];
+      
+      if (lastCandle && lastCandle.time === currentCandleTime) {
+        const updatedCandle = {
+          ...lastCandle,
+          high: Math.max(lastCandle.high, currentPrice),
+          low: Math.min(lastCandle.low, currentPrice),
+          close: currentPrice
+        };
+        
+        if (chartType === 'candlestick') {
+          seriesRef.current.update(updatedCandle);
+        } else {
+          seriesRef.current.update({ time: updatedCandle.time, value: currentPrice });
+        }
       }
+    } catch (e) {
+      console.warn('[PriceChart] Error updating candle:', e.message);
     }
   }, [currentPrice, chartData, selectedInterval, chartType]);
 

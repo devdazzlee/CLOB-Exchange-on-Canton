@@ -247,15 +247,86 @@ export default function TradingInterface({ partyId }) {
     }
   }, [partyId, toast]);
 
-  const handleCancelOrder = useCallback(async (orderId) => {
-    try {
-      console.log('[Cancel Order] Cancelling order:', orderId);
-      // Order cancellation logic would go here
-    } catch (error) {
-      console.error('[Cancel Order] Failed:', error);
-      setError(error.message || 'Failed to cancel order');
+  const handleCancelOrder = useCallback(async (contractId) => {
+    if (!contractId) {
+      console.error('[Cancel Order] No contractId provided');
+      toast.error('Cannot cancel order: missing contract ID');
+      throw new Error('Missing contract ID');
     }
-  }, []);
+    
+    if (!partyId) {
+      console.error('[Cancel Order] No partyId available');
+      toast.error('Cannot cancel order: not logged in');
+      throw new Error('Not logged in');
+    }
+    
+    console.log('[Cancel Order] Cancelling order with contractId:', contractId);
+    
+    const API_BASE = import.meta.env.VITE_API_BASE_URL || 
+      (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
+    
+    // Use POST /api/orders/:orderId/cancel endpoint
+    const response = await fetch(`${API_BASE}/orders/${encodeURIComponent(contractId)}/cancel`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-party-id': partyId
+      },
+      body: JSON.stringify({
+        partyId: partyId
+      })
+    });
+    
+    const data = await response.json();
+    
+    if (!response.ok || !data.success) {
+      const errorMsg = data.error || 'Failed to cancel order';
+      console.error('[Cancel Order] Failed:', errorMsg);
+      toast.error(errorMsg);
+      throw new Error(errorMsg);
+    }
+    
+    console.log('[Cancel Order] Order cancelled successfully:', data);
+    toast.success('Order cancelled successfully! Funds have been unlocked.');
+    
+    // Refresh orders list directly
+    try {
+      const ordersResponse = await fetch(`${API_BASE}/orders/user/${encodeURIComponent(partyId)}?status=OPEN`);
+      if (ordersResponse.ok) {
+        const ordersData = await ordersResponse.json();
+        const ordersList = ordersData?.data?.orders || ordersData?.orders || [];
+        setOrders(ordersList.map(order => ({
+          id: order.orderId || order.contractId,
+          contractId: order.contractId,
+          type: order.orderType,
+          mode: order.orderMode,
+          price: order.price,
+          quantity: order.quantity,
+          filled: order.filled || '0',
+          status: order.status,
+          tradingPair: order.tradingPair,
+          timestamp: order.timestamp
+        })));
+      }
+    } catch (e) {
+      console.warn('[Cancel Order] Failed to refresh orders:', e);
+    }
+    
+    // Refresh balance
+    try {
+      const balanceResponse = await fetch(`${API_BASE}/balance/${encodeURIComponent(partyId)}`);
+      if (balanceResponse.ok) {
+        const balanceData = await balanceResponse.json();
+        if (balanceData?.data?.balances) {
+          setBalance(balanceData.data.balances);
+        }
+      }
+    } catch (e) {
+      console.warn('[Cancel Order] Failed to refresh balance:', e);
+    }
+    
+    return data;
+  }, [partyId, toast, setOrders, setBalance]);
 
 
   // === PHASE 2: ALL USEEFFECT HOOKS - NO CONDITIONALS ===

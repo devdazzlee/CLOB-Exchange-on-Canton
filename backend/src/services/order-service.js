@@ -37,7 +37,7 @@ class OrderService {
   calculateLockAmount(tradingPair, orderType, price, quantity, orderMode = 'LIMIT', estimatedPrice = null) {
     const [baseAsset, quoteAsset] = tradingPair.split('/');
     const qty = parseFloat(quantity);
-    
+
     if (orderType.toUpperCase() === 'BUY') {
       // For MARKET BUY: use estimated price with 5% slippage buffer
       let prc;
@@ -615,6 +615,24 @@ class OrderService {
           const payload = c.payload || c.createArgument || {};
           const contractId = c.contractId;
           
+          // Debug: Log raw price format from Canton
+          console.log(`[OrderService] DEBUG RAW PRICE for ${payload.orderId}:`, JSON.stringify(payload.price));
+          
+          // Handle DAML Optional price format
+          let extractedPrice = null;
+          if (payload.price) {
+            if (payload.price.Some !== undefined) {
+              // DAML Optional with Some value
+              extractedPrice = payload.price.Some;
+            } else if (typeof payload.price === 'string' || typeof payload.price === 'number') {
+              // Direct value
+              extractedPrice = payload.price;
+            } else if (payload.price === null) {
+              // Explicitly null (MARKET order)
+              extractedPrice = null;
+            }
+          }
+          
           return {
             contractId: contractId,
             orderId: payload.orderId,
@@ -622,7 +640,7 @@ class OrderService {
             tradingPair: payload.tradingPair,
             orderType: payload.orderType,
             orderMode: payload.orderMode,
-            price: payload.price?.Some || payload.price,
+            price: extractedPrice,
             quantity: payload.quantity,
             filled: payload.filled || '0',
             status: payload.status,
