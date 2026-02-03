@@ -10,9 +10,9 @@
 
 import { apiClient, API_ROUTES } from '../config/config';
 
-// Feature flag - Orders still use legacy API (V2 order creation has DAML encoding issues)
-// Balances use V2 (Holdings) - that's handled in balanceService.js
-const USE_TOKEN_STANDARD = import.meta.env.VITE_USE_TOKEN_STANDARD === 'true' || false; // Legacy for orders
+// TOKEN STANDARD: Orders use legacy route but backend now locks Holdings
+// The backend has been updated to use Token Standard internally
+const USE_TOKEN_STANDARD = false; // Legacy route, but backend uses Holdings
 
 /**
  * Place an order

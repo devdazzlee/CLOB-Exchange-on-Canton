@@ -793,68 +793,53 @@ class OnboardingService {
         console.log('[Onboarding] Creating UserAccount for party:', partyId);
       }
       
-      // ✅ Use template helper with package-id format (NOT package-name format)
-      // This avoids package selection/vetting issues and runtime discovery
-      const { userAccountTemplateId } = require('../utils/templateId');
-      const templateId = userAccountTemplateId();
+      // ✅ TOKEN STANDARD: Create Holdings instead of UserAccount
+      // This uses real token contracts instead of text-based balance maps
+      const { getHoldingService } = require('./holdingService');
+      const holdingService = getHoldingService();
+      await holdingService.initialize();
       
-      console.log('[Onboarding] Using templateId:', templateId.substring(0, 50) + '...');
+      console.log('[Onboarding] TOKEN STANDARD: Creating Holdings for new party');
 
-      // Initial balances from environment or empty (user must deposit via API)
-      const initialBalances = [];
+      // Initial balances from environment or empty (user must mint via API)
+      const initialTokens = [];
       if (process.env.INITIAL_USDT_BALANCE) {
-        initialBalances.push(["USDT", process.env.INITIAL_USDT_BALANCE]);
+        initialTokens.push({ symbol: "USDT", amount: parseFloat(process.env.INITIAL_USDT_BALANCE) });
       }
       if (process.env.INITIAL_BTC_BALANCE) {
-        initialBalances.push(["BTC", process.env.INITIAL_BTC_BALANCE]);
+        initialTokens.push({ symbol: "BTC", amount: parseFloat(process.env.INITIAL_BTC_BALANCE) });
       }
       if (process.env.INITIAL_ETH_BALANCE) {
-        initialBalances.push(["ETH", process.env.INITIAL_ETH_BALANCE]);
+        initialTokens.push({ symbol: "ETH", amount: parseFloat(process.env.INITIAL_ETH_BALANCE) });
       }
       if (process.env.INITIAL_SOL_BALANCE) {
-        initialBalances.push(["SOL", process.env.INITIAL_SOL_BALANCE]);
+        initialTokens.push({ symbol: "SOL", amount: parseFloat(process.env.INITIAL_SOL_BALANCE) });
       }
 
-      const createArguments = {
-        party: partyId,
-        operator: operatorPartyId,
-        // DA.Map.Map Text Decimal => encoded as JSON array of [key, value] pairs
-        balances: initialBalances,
-      };
-
-      // CRITICAL: UserAccount template has signatory operator, observer party
-      // Therefore actAs MUST be operator only (signatory), party goes in readAs (observer)
-      
-      // For internal allocation (parties on validator's namespace), do NOT specify domainId
-      // Canton will automatically find the common synchronizer
-      // For external allocation, we may need to specify the domain where external party was allocated
-      const useInternalAllocation = process.env.USE_INTERNAL_PARTY_ALLOCATION === 'true';
-      
-      let synchronizerId = null;
-      if (!useInternalAllocation) {
-        // External allocation: specify the domain where external party was allocated
-        synchronizerId = config.canton.synchronizerId || process.env.SYNCHRONIZER_ID;
-        console.log('[Onboarding] Using synchronizerId for command (external allocation):', synchronizerId);
-      } else {
-        // Internal allocation: let Canton find the common synchronizer automatically
-        console.log('[Onboarding] Not specifying synchronizerId (internal allocation - Canton will auto-detect)');
+      // Mint Holdings for each initial token
+      const mintedHoldings = [];
+      for (const token of initialTokens) {
+        try {
+          await holdingService.mintDirect(
+            partyId,
+            token.symbol,
+            token.amount,
+            adminToken
+          );
+          mintedHoldings.push(token);
+          console.log(`[Onboarding] Minted ${token.amount} ${token.symbol} for ${partyId.substring(0, 30)}...`);
+        } catch (mintError) {
+          console.warn(`[Onboarding] Failed to mint ${token.symbol}:`, mintError.message);
+        }
       }
-      
-      const result = await cantonService.createContract({
-        token: adminToken,
-        actAsParty: operatorPartyId, // Only operator is signatory
-        templateId,
-        createArguments,
-        readAs: [operatorPartyId, partyId], // Include both for visibility (operator + observer)
-        ...(synchronizerId && { synchronizerId }) // Only include if specified
-      });
 
-      console.log('[Onboarding] UserAccount created successfully:', result);
+      console.log('[Onboarding] Holdings created successfully');
       
       return {
-        userAccountCreated: true,
-        initialBalances: initialBalances,
-        userAccountResult: result
+        userAccountCreated: false, // No longer using UserAccount
+        holdingsCreated: true,
+        tokenStandard: true,
+        initialHoldings: mintedHoldings
       };
     } catch (error) {
       console.error('[Onboarding] Failed to create UserAccount or mint tokens:', error);

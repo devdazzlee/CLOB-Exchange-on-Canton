@@ -19,21 +19,9 @@ const { getUpdateStream } = require('./cantonUpdateStream');
 const { extractTradesFromEvents } = require('./trade-utils');
 const { getSettlementService } = require('./settlementService');
 
-// Feature flag - AUTO-DETECT: Use DvP when both orders have locked Holdings
-// Set USE_DVP_SETTLEMENT=true to force DvP for all orders (requires new DAR)
-const FORCE_DvP_SETTLEMENT = process.env.USE_DVP_SETTLEMENT === 'true';
-
-// Auto-detect DvP mode based on order structure
-function shouldUseDvP(buyOrder, sellOrder) {
-  // If forced via env var, always use DvP
-  if (FORCE_DvP_SETTLEMENT) return true;
-  
-  // AUTO-DETECT: Use DvP if both orders have locked Holdings (new token standard)
-  const buyHasHolding = buyOrder.lockedHoldingCid || buyOrder.allocationCid;
-  const sellHasHolding = sellOrder.lockedHoldingCid || sellOrder.allocationCid;
-  
-  return buyHasHolding && sellHasHolding;
-}
+// TOKEN STANDARD: Always use DvP Settlement with Holdings
+// Legacy UserAccount-based settlement has been removed per client requirement
+const USE_DvP_SETTLEMENT = true;
 
 // NO IN-MEMORY CACHE - All trades are stored on Canton ledger as Trade contracts
 function recordTradesFromResult(result) {
@@ -345,24 +333,15 @@ class MatchingEngine {
         if (canMatch && matchPrice > 0) {
           const matchQty = Math.min(buyOrder.remaining, sellOrder.remaining);
           
-          // Auto-detect settlement mode based on order structure
-          const useDvP = shouldUseDvP(buyOrder, sellOrder);
-          
           console.log(`[MatchingEngine] ✅ MATCH FOUND:`);
           console.log(`  Buy: ${buyOrder.contractId.substring(0, 20)}... @${buyPrice !== null ? buyPrice : 'MARKET'} qty=${buyOrder.remaining}`);
           console.log(`  Sell: ${sellOrder.contractId.substring(0, 20)}... @${sellPrice !== null ? sellPrice : 'MARKET'} qty=${sellOrder.remaining}`);
           console.log(`  Match: ${matchQty} @${matchPrice}`);
-          console.log(`  Settlement mode: ${useDvP ? 'DvP (Token Standard with Holdings)' : 'Legacy (FillOrder + Balance Update)'}`);
+          console.log(`  Settlement: DvP (Token Standard with Holdings)`);
           
           try {
-            // Execute the match
-            if (useDvP) {
-              // NEW: Use atomic DvP settlement with real token Holdings
-              await this.executeDvPSettlement(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, adminToken);
-            } else {
-              // LEGACY: Fill orders and update UserAccount balances
-              await this.executeFillOrders(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, adminToken);
-            }
+            // TOKEN STANDARD: Always use DvP settlement with Holdings
+            await this.executeDvPSettlement(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, adminToken);
             matchCount++;
             
             // IMPORTANT: After FillOrder, the contract IDs change (DAML archives old, creates new)
@@ -398,125 +377,8 @@ class MatchingEngine {
     return Math.round(qty * 100000000) / 100000000;
   }
   
-  /**
-   * Execute match by filling both orders using FillOrder choice
-   */
-  async executeFillOrders(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, adminToken) {
-    const packageId = config.canton.packageIds?.clobExchange;
-    const operatorPartyId = config.canton.operatorPartyId;
-    
-    // Round quantity to avoid floating point precision errors
-    matchQty = this.roundQuantity(matchQty);
-    
-    if (!packageId || !operatorPartyId) {
-      throw new Error('Missing package ID or operator party ID');
-    }
-    
-    // Fill the buy order
-    console.log(`[MatchingEngine] Filling buy order: ${matchQty}`);
-    await cantonService.exerciseChoice({
-      token: adminToken,
-      actAsParty: operatorPartyId,
-      templateId: `${packageId}:Order:Order`,
-      contractId: buyOrder.contractId,
-      choice: 'FillOrder',
-      choiceArgument: { fillQuantity: matchQty.toFixed(8) },
-      readAs: [operatorPartyId, buyOrder.owner]
-    });
-    
-    // Fill the sell order
-    console.log(`[MatchingEngine] Filling sell order: ${matchQty.toFixed(8)}`);
-    await cantonService.exerciseChoice({
-      token: adminToken,
-      actAsParty: operatorPartyId,
-      templateId: `${packageId}:Order:Order`,
-      contractId: sellOrder.contractId,
-      choice: 'FillOrder',
-      choiceArgument: { fillQuantity: matchQty.toFixed(8) },
-      readAs: [operatorPartyId, sellOrder.owner]
-    });
-    
-    // Record trade (off-chain since Trade template needs both signatories)
-    const tradeRecord = {
-      tradeId: `trade-${Date.now()}-${Math.random().toString(36).substring(7)}`,
-      buyer: buyOrder.owner,
-      seller: sellOrder.owner,
-      tradingPair,
-      price: matchPrice.toString(),
-      quantity: matchQty.toString(),
-      buyOrderId: buyOrder.orderId,
-      sellOrderId: sellOrder.orderId,
-      timestamp: new Date().toISOString()
-    };
-    
-    // Create Trade contract on Canton ledger (NO IN-MEMORY CACHE)
-    try {
-      const packageId = config.canton.packageIds?.clobExchange;
-      const operatorPartyId = config.canton.operatorPartyId;
-      
-      await cantonService.createContractWithTransaction({
-        token: adminToken,
-        actAsParty: [operatorPartyId, buyOrder.owner, sellOrder.owner],
-        templateId: `${packageId}:Trade:Trade`,
-        createArguments: {
-          tradeId: tradeRecord.tradeId,
-          buyer: buyOrder.owner,
-          seller: sellOrder.owner,
-          tradingPair: tradingPair,
-          price: matchPrice.toString(),
-          quantity: matchQty.toString(),
-          buyOrderId: buyOrder.orderId,
-          sellOrderId: sellOrder.orderId,
-          timestamp: tradeRecord.timestamp
-        },
-        readAs: [operatorPartyId, buyOrder.owner, sellOrder.owner]
-      });
-      console.log(`[MatchingEngine] Trade contract created on Canton: ${tradeRecord.tradeId}`);
-    } catch (tradeContractError) {
-      console.error(`[MatchingEngine] Failed to create Trade contract:`, tradeContractError.message);
-      // Continue - trade data will still be broadcast via WebSocket
-    }
-    
-    // ========= UPDATE BALANCES AFTER TRADE =========
-    // Buyer: receives baseToken (e.g., BTC), already paid quoteToken
-    // Seller: receives quoteToken (e.g., USDT), already gave baseToken
-    try {
-      await this.updateBalancesAfterTrade(
-        adminToken,
-        tradingPair,
-        buyOrder.owner,
-        sellOrder.owner,
-        matchQty,
-        matchPrice
-      );
-      console.log(`[MatchingEngine] Balances updated for trade`);
-    } catch (balanceError) {
-      console.error(`[MatchingEngine] Balance update failed:`, balanceError.message);
-      // Continue anyway - the trade already happened on the orders
-    }
-    
-    // Broadcast via WebSocket
-    if (global.broadcastWebSocket) {
-      global.broadcastWebSocket(`trades:${tradingPair}`, {
-        type: 'NEW_TRADE',
-        ...tradeRecord
-      });
-      global.broadcastWebSocket('trades:all', {
-        type: 'NEW_TRADE',
-        ...tradeRecord
-      });
-    }
-    
-    // Also broadcast order updates
-    if (global.broadcastWebSocket) {
-      global.broadcastWebSocket(`orderbook:${tradingPair}`, {
-        type: 'ORDER_FILLED',
-        buyOrderId: buyOrder.orderId,
-        sellOrderId: sellOrder.orderId,
-        fillQuantity: matchQty
-      });
-    }
-  }
+  // REMOVED: executeFillOrders - Token Standard uses DvP Settlement instead
+  // All order matching now goes through executeDvPSettlement()
 
   /**
    * Execute match using DvP (Delivery vs Payment) atomic settlement
@@ -605,92 +467,7 @@ class MatchingEngine {
     }
   }
   
-  /**
-   * Update UserAccount balances after a trade
-   * 
-   * Buyer: receives base token (+matchQty BTC), already withdrew quote (-quoteAmount USDT when order placed)
-   * Seller: receives quote token (+quoteAmount USDT), gives base token (-matchQty BTC)
-   * 
-   * Uses UpdateAfterTrade choice which is controlled by OPERATOR (not party like Deposit)
-   * 
-   * IMPORTANT: Re-query for each account IMMEDIATELY before exercising choice
-   * because DAML contracts are immutable - each choice creates a new contract with new ID
-   */
-  async updateBalancesAfterTrade(adminToken, tradingPair, buyerPartyId, sellerPartyId, matchQty, matchPrice) {
-    const packageId = config.canton.packageIds?.clobExchange;
-    const operatorPartyId = config.canton.operatorPartyId;
-    
-    if (!packageId || !operatorPartyId) return;
-    
-    const [baseToken, quoteToken] = tradingPair.split('/');
-    const quoteAmount = matchQty * matchPrice;
-    
-    // Helper to find fresh UserAccount contract for a party
-    const findFreshAccount = async (partyId) => {
-      const contracts = await cantonService.queryActiveContracts({
-        party: operatorPartyId,
-        templateIds: [`${packageId}:UserAccount:UserAccount`],
-        pageSize: 200
-      }, adminToken);
-      return contracts.find(c => (c.payload?.party || c.createArgument?.party) === partyId);
-    };
-    
-    // ========== UPDATE BUYER BALANCE ==========
-    // Buyer receives base token (BTC), quote token was already deducted when order was placed
-    const buyerAccount = await findFreshAccount(buyerPartyId);
-    if (buyerAccount) {
-      try {
-        await cantonService.exerciseChoice({
-          token: adminToken,
-          actAsParty: operatorPartyId,  // UpdateAfterTrade is controlled by operator
-          templateId: `${packageId}:UserAccount:UserAccount`,
-          contractId: buyerAccount.contractId,
-          choice: 'UpdateAfterTrade',
-          choiceArgument: {
-            baseToken: baseToken,
-            quoteToken: quoteToken,
-            baseAmount: matchQty.toFixed(8),   // +BTC (buyer receives)
-            quoteAmount: '0.00000000'          // Already deducted when order placed
-          },
-          readAs: [operatorPartyId]
-        });
-        console.log(`[MatchingEngine] ✅ Credited ${matchQty.toFixed(8)} ${baseToken} to buyer`);
-      } catch (e) {
-        console.error(`[MatchingEngine] ❌ Failed to update buyer balance:`, e.message);
-      }
-    } else {
-      console.warn(`[MatchingEngine] ⚠️ No UserAccount found for buyer: ${buyerPartyId.substring(0, 30)}...`);
-    }
-    
-    // ========== UPDATE SELLER BALANCE ==========
-    // Seller receives quote token (USDT)
-    // BTC was ALREADY deducted when they placed the SELL order (withdrawForOrder)
-    // Query FRESH contract immediately before exercising (buyer update created new contracts)
-    const sellerAccount = await findFreshAccount(sellerPartyId);
-    if (sellerAccount) {
-      try {
-        await cantonService.exerciseChoice({
-          token: adminToken,
-          actAsParty: operatorPartyId,  // UpdateAfterTrade is controlled by operator
-          templateId: `${packageId}:UserAccount:UserAccount`,
-          contractId: sellerAccount.contractId,
-          choice: 'UpdateAfterTrade',
-          choiceArgument: {
-            baseToken: baseToken,
-            quoteToken: quoteToken,
-            baseAmount: '0.00000000',              // BTC already deducted when sell order placed
-            quoteAmount: quoteAmount.toFixed(8)     // +USDT (seller receives payment)
-          },
-          readAs: [operatorPartyId]
-        });
-        console.log(`[MatchingEngine] ✅ Credited ${quoteAmount.toFixed(8)} ${quoteToken} to seller`);
-      } catch (e) {
-        console.error(`[MatchingEngine] ❌ Failed to update seller balance:`, e.message);
-      }
-    } else {
-      console.warn(`[MatchingEngine] ⚠️ No UserAccount found for seller: ${sellerPartyId.substring(0, 30)}...`);
-    }
-  }
+  // REMOVED: updateBalancesAfterTrade - Token Standard uses DvP Settlement instead
   
   /**
    * Process order book from UpdateStream (persistent storage)

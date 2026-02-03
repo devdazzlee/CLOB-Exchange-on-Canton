@@ -1,7 +1,7 @@
 /**
- * Balance Routes - REAL Canton integration ONLY
- * Queries actual UserAccount contracts from Canton ledger
- * NO HARDCODED DATA - All data from Canton API
+ * Balance Routes - TOKEN STANDARD (Holdings) ONLY
+ * Uses real Holding contracts from Canton ledger
+ * NO UserAccount/text balances - Token Standard only
  */
 
 const express = require('express');
@@ -17,8 +17,8 @@ const { getInstrumentService } = require('../services/instrumentService');
 
 /**
  * GET /api/balance/:partyId
- * Get REAL balance from Canton UserAccount contracts
- * NO FALLBACKS - Returns error if no UserAccount found
+ * Get REAL balance from Holdings (Token Standard)
+ * Redirects to V2 endpoint for Token Standard
  */
 router.get('/:partyId', asyncHandler(async (req, res) => {
   const { partyId } = req.params;
@@ -27,63 +27,47 @@ router.get('/:partyId', asyncHandler(async (req, res) => {
     throw new ValidationError('Party ID is required');
   }
 
-  console.log(`[Balance] Getting REAL balance for party: ${partyId}`);
+  console.log(`[Balance] TOKEN STANDARD: Getting Holdings for party: ${partyId}`);
   
   const token = await tokenProvider.getServiceToken();
-  const packageId = config.canton.packageIds?.clobExchange;
-  const operatorPartyId = config.canton.operatorPartyId;
+  const holdingService = getHoldingService();
+  await holdingService.initialize();
   
-  if (!packageId) {
-    throw new Error('CLOB_EXCHANGE_PACKAGE_ID not configured');
-  }
-  
-  // Query UserAccount contracts as OPERATOR (signatory)
-  const contracts = await cantonService.queryActiveContracts({
-    party: operatorPartyId,
-    templateIds: [`${packageId}:UserAccount:UserAccount`],
-    pageSize: 100
-  }, token);
-  
-  // Find the UserAccount for this specific party
-  const userAccountContract = (Array.isArray(contracts) ? contracts : [])
-    .find(c => {
-      const payload = c.payload || c.createArgument || {};
-      return payload.party === partyId;
-    });
-  
-  if (!userAccountContract) {
-    // Return error - user needs to be onboarded first
-    return error(res, 'No UserAccount found - user must complete onboarding first', 404);
-  }
-  
-  // Extract balance from UserAccount contract - REAL DATA ONLY
-  const payload = userAccountContract.payload || userAccountContract.createArgument || {};
-  const balances = payload.balances || [];
-  const contractId = userAccountContract.contractId;
+  try {
+    const balances = await holdingService.getBalances(partyId, token);
+    
+    console.log(`[Balance] Found ${Object.keys(balances.available).length} tokens in Holdings`);
 
-  // Convert balance array to object - only include tokens that exist on ledger
-  const availableBalances = {};
-  balances.forEach(([tokenName, amount]) => {
-    availableBalances[tokenName] = amount;
-  });
-
-  console.log(`[Balance] Found UserAccount for ${partyId.substring(0, 40)}...: ${JSON.stringify(availableBalances)}`);
-
+    return success(res, {
+      partyId,
+      balance: balances.available,
+      available: balances.available,
+      locked: balances.locked || {},
+      total: balances.total || balances.available,
+      holdings: balances.holdings,
+      tokenStandard: true,
+      source: 'holdings'
+    }, 'Token Standard balances retrieved from Holdings');
+  } catch (err) {
+    console.error(`[Balance] Failed to get Holdings:`, err.message);
+    // Return empty balances if no Holdings found
   return success(res, {
     partyId,
-    contractId,
-    balance: availableBalances,
-    available: availableBalances,
-    locked: {}, // TODO: Calculate from open orders when needed
-    total: availableBalances,
-    source: 'canton'
-  }, 'Real balances retrieved from Canton UserAccount');
+      balance: {},
+      available: {},
+      locked: {},
+      total: {},
+      holdings: [],
+      tokenStandard: true,
+      source: 'holdings'
+    }, 'No Holdings found - mint tokens first');
+  }
 }));
 
 /**
  * POST /api/balance/mint
- * Mint tokens by creating/updating UserAccount
- * REAL Canton contract creation
+ * TOKEN STANDARD: Mint tokens by creating Holding contracts
+ * Redirects to V2 Holdings-based minting
  */
 router.post('/mint', asyncHandler(async (req, res) => {
   const { partyId, tokens } = req.body;
@@ -96,108 +80,45 @@ router.post('/mint', asyncHandler(async (req, res) => {
     throw new ValidationError('Tokens array is required');
   }
 
-  console.log(`[Balance] Minting REAL tokens for party: ${partyId}`, tokens);
+  console.log(`[Balance] TOKEN STANDARD: Minting Holdings for party: ${partyId}`, tokens);
 
   const adminToken = await tokenProvider.getServiceToken();
-  const packageId = config.canton.packageIds?.clobExchange;
-  const operatorPartyId = config.canton.operatorPartyId;
-
-  if (!packageId) {
-    throw new Error('CLOB_EXCHANGE_PACKAGE_ID not configured');
-  }
-
-  // Check if user already has a UserAccount
-  const contracts = await cantonService.queryActiveContracts({
-    party: operatorPartyId,
-    templateIds: [`${packageId}:UserAccount:UserAccount`],
-    pageSize: 100
-  }, adminToken);
-
-  const existingAccount = (Array.isArray(contracts) ? contracts : [])
-    .find(c => {
-      const payload = c.payload || c.createArgument || {};
-      return payload.party === partyId;
-    });
-
-  if (existingAccount) {
-    // Deposit to existing account
-    // IMPORTANT: After each Deposit, the contract is archived and a new one is created
-    // So we must re-fetch the contract ID after each deposit
-    let currentContractId = existingAccount.contractId;
-    
-    for (const tokenInfo of tokens) {
-      const result = await cantonService.exerciseChoice({
-        token: adminToken,
-        actAsParty: partyId,
-        templateId: `${packageId}:UserAccount:UserAccount`,
-        contractId: currentContractId,
-        choice: 'Deposit',
-        choiceArgument: {
-          token: tokenInfo.symbol,
-          amount: tokenInfo.amount.toString()
-        },
-        readAs: [operatorPartyId]
+  const holdingService = getHoldingService();
+  await holdingService.initialize();
+  
+  const minted = [];
+  
+  for (const tokenInfo of tokens) {
+    try {
+      await holdingService.mintDirect(
+        partyId,
+        tokenInfo.symbol,
+        tokenInfo.amount,
+        adminToken
+      );
+      minted.push({
+        symbol: tokenInfo.symbol,
+        amount: tokenInfo.amount,
+        status: 'minted'
       });
-      
-      // Extract the new contract ID from the result (created by the exercise)
-      if (result?.transaction?.events) {
-        const createdEvent = result.transaction.events.find(e => 
-          (e.created?.templateId?.includes('UserAccount')) || 
-          (e.CreatedEvent?.templateId?.includes('UserAccount'))
-        );
-        const newContractId = createdEvent?.created?.contractId || 
-                              createdEvent?.CreatedEvent?.contractId;
-        if (newContractId) {
-          currentContractId = newContractId;
-          console.log(`[Balance] Deposit ${tokenInfo.symbol} complete, new contractId: ${newContractId.substring(0, 20)}...`);
-        }
-      }
+      console.log(`[Balance] Minted ${tokenInfo.amount} ${tokenInfo.symbol} for ${partyId.substring(0, 30)}...`);
+    } catch (err) {
+      console.error(`[Balance] Failed to mint ${tokenInfo.symbol}:`, err.message);
+      minted.push({
+        symbol: tokenInfo.symbol,
+        amount: tokenInfo.amount,
+        status: 'failed',
+        error: err.message
+      });
     }
-
-    return success(res, {
-      partyId,
-      contractId: currentContractId,
-      tokens,
-      status: 'deposited'
-    }, 'Tokens deposited to existing UserAccount', 200);
   }
-
-  // Create new UserAccount with initial balance
-  const result = await cantonService.createContractWithTransaction({
-    token: adminToken,
-    actAsParty: operatorPartyId,
-    templateId: `${packageId}:UserAccount:UserAccount`,
-    createArguments: {
-      party: partyId,
-      operator: operatorPartyId,
-      balances: tokens.map(t => [t.symbol, t.amount.toString()])
-    },
-    readAs: [partyId]
-  });
-
-  // Extract created contract ID
-  let contractId = null;
-  if (result.transaction?.events) {
-    const createdEvent = result.transaction.events.find(e => 
-      e.created?.templateId?.includes('UserAccount') || 
-      e.CreatedEvent?.templateId?.includes('UserAccount')
-    );
-    contractId = createdEvent?.created?.contractId || 
-                 createdEvent?.CreatedEvent?.contractId;
-  }
-
-  if (!contractId) {
-    throw new Error('Token minting failed - no UserAccount contract created');
-  }
-
-  console.log(`[Balance] UserAccount created: ${contractId}`);
 
   return success(res, {
     partyId,
-    contractId,
-    tokens,
-    status: 'minted'
-  }, 'UserAccount created with tokens on Canton', 201);
+    minted,
+    tokenStandard: true,
+    source: 'holdings'
+  }, 'Tokens minted as Holdings (Token Standard)', 201);
 }));
 
 // ============================================================
@@ -415,8 +336,8 @@ router.post('/v2/unlock', asyncHandler(async (req, res) => {
   
   try {
     const result = await holdingService.unlockHolding(holdingCid, ownerPartyId, token);
-    
-    return success(res, {
+
+  return success(res, {
       originalHoldingCid: holdingCid,
       unlockedHoldingCid: result.events?.[0]?.created?.contractId,
     }, 'Holding unlocked successfully');
