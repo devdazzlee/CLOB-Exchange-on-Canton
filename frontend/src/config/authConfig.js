@@ -12,6 +12,8 @@ export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ||
   (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
 
 // Package ID for DAML contracts
+// Old: dd500bf887d7e153ee6628b3f6722f234d3d62ce855572ff7ce73b7b3c2afefd (existing contracts)
+// New: f10023e35e41e6c76e2863bca154fbec275d01fdf528012dc3954e5f4a769454 (with token standard)
 export const PACKAGE_ID = import.meta.env.VITE_PACKAGE_ID || 
   'dd500bf887d7e153ee6628b3f6722f234d3d62ce855572ff7ce73b7b3c2afefd';
 
