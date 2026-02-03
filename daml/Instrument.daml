@@ -1,0 +1,93 @@
+-- | Instrument.daml - Defines token types (like ERC-20 metadata)
+-- 
+-- This follows the Splice Token Standard pattern where each token type
+-- is represented by an Instrument contract that defines its properties.
+--
+-- Examples:
+--   - USDT Instrument: symbol="USDT", decimals=6, issuer=stablecoinIssuer
+--   - cBTC Instrument: symbol="cBTC", decimals=8, issuer=cantonBridge
+--
+module Instrument where
+
+-- | Instrument ID - Uniquely identifies a token type
+data InstrumentId = InstrumentId
+  with
+    issuer : Party      -- Who issued/created this token
+    symbol : Text       -- Token symbol (e.g., "USDT", "cBTC")
+    version : Text      -- Version for upgrades (e.g., "1.0")
+  deriving (Eq, Show, Ord)
+
+-- | Instrument - Defines a token type (metadata contract)
+-- This is created once per token type and referenced by Holdings
+template Instrument
+  with
+    instrumentId : InstrumentId
+    description : Text              -- Human-readable description
+    decimals : Int                  -- Number of decimal places (e.g., 8 for BTC, 6 for USDT)
+    observers : [Party]             -- Who can see this instrument exists
+  where
+    signatory instrumentId.issuer
+    observer observers
+
+    -- Allow issuer to update observers
+    choice Instrument_AddObserver : ContractId Instrument
+      with
+        newObserver : Party
+      controller instrumentId.issuer
+      do
+        create this with observers = newObserver :: observers
+
+    -- Archive instrument (burn token type - use carefully!)
+    choice Instrument_Archive : ()
+      controller instrumentId.issuer
+      do
+        return ()
+
+-- | Helper to create standard instruments
+createStandardInstrument : Party -> Text -> Text -> Int -> [Party] -> Update (ContractId Instrument)
+createStandardInstrument issuer symbol description decimals observers = do
+  create Instrument with
+    instrumentId = InstrumentId with
+      issuer = issuer
+      symbol = symbol
+      version = "1.0"
+    description = description
+    decimals = decimals
+    observers = observers
+
+-- | Trading pair instruments - represents a tradeable pair
+template TradingPair
+  with
+    operator : Party
+    baseInstrument : InstrumentId   -- e.g., cBTC
+    quoteInstrument : InstrumentId  -- e.g., USDT
+    minOrderSize : Decimal          -- Minimum order size in base currency
+    tickSize : Decimal              -- Minimum price increment
+    enabled : Bool                  -- Is trading enabled
+    observers : [Party]
+    pairId : Text                   -- Unique identifier (e.g., "cBTC/USDT")
+  where
+    signatory operator
+    observer observers
+
+    -- Get pair string (e.g., "cBTC/USDT")
+    nonconsuming choice TradingPair_GetPairString : Text
+      controller operator
+      do
+        return $ baseInstrument.symbol <> "/" <> quoteInstrument.symbol
+
+    -- Enable/disable trading
+    choice TradingPair_SetEnabled : ContractId TradingPair
+      with
+        newEnabled : Bool
+      controller operator
+      do
+        create this with enabled = newEnabled
+
+    -- Update tick size
+    choice TradingPair_UpdateTickSize : ContractId TradingPair
+      with
+        newTickSize : Decimal
+      controller operator
+      do
+        create this with tickSize = newTickSize

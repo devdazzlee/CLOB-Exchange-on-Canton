@@ -1,0 +1,240 @@
+-- | Holding.daml - Represents actual token ownership (like UTXOs)
+--
+-- Each Holding contract represents a specific amount of tokens owned by a party.
+-- This is the core of the token standard - instead of updating a balance map,
+-- we create/archive Holding contracts.
+--
+-- Benefits:
+--   - Atomic transfers (DvP)
+--   - Proper audit trail
+--   - Interoperability with other Canton apps
+--   - Compliance-ready
+--
+module Holding where
+
+import Instrument (InstrumentId)
+
+-- | Holding Lock - Represents a lock on holdings (e.g., for orders)
+data HoldingLock = HoldingLock
+  with
+    lockHolder : Party      -- Who created the lock (e.g., exchange operator)
+    lockReason : Text       -- Why locked (e.g., "order-12345")
+    lockedAmount : Decimal  -- Amount locked
+  deriving (Eq, Show)
+
+-- | Holding - Represents token ownership
+-- 
+-- Similar to a UTXO - consumed when spent, new ones created for change
+template Holding
+  with
+    owner : Party               -- Who owns this holding
+    instrumentId : InstrumentId -- What token this is
+    amount : Decimal            -- How much
+    lock : Optional HoldingLock -- Optional lock for orders/escrow
+    custodian : Party           -- Who custodies (usually same as issuer or operator)
+  where
+    signatory custodian, owner
+    observer if Some lock == None then [] else [lock.lockHolder | Some lock <- [lock]]
+
+    ensure amount > 0.0
+
+    -- Transfer holding to another party (creates TransferProposal)
+    choice Holding_Transfer : ContractId TransferProposal
+      with
+        newOwner : Party
+        transferAmount : Decimal
+      controller owner
+      do
+        assertMsg "Cannot transfer locked holding" (lock == None)
+        assertMsg "Insufficient balance" (amount >= transferAmount)
+        
+        -- Create transfer proposal for new owner to accept
+        create TransferProposal with
+          sender = owner
+          receiver = newOwner
+          instrumentId = instrumentId
+          amount = transferAmount
+          custodian = custodian
+          originalHoldingCid = self
+
+    -- Split holding into two (useful for partial orders)
+    choice Holding_Split : (ContractId Holding, ContractId Holding)
+      with
+        splitAmount : Decimal
+      controller owner
+      do
+        assertMsg "Cannot split locked holding" (lock == None)
+        assertMsg "Split amount must be positive" (splitAmount > 0.0)
+        assertMsg "Split amount exceeds balance" (splitAmount < amount)
+        
+        -- Create two new holdings
+        h1 <- create this with amount = splitAmount
+        h2 <- create this with amount = amount - splitAmount
+        return (h1, h2)
+
+    -- Merge with another holding (consolidate UTXOs)
+    choice Holding_Merge : ContractId Holding
+      with
+        otherHoldingCid : ContractId Holding
+      controller owner
+      do
+        otherHolding <- fetch otherHoldingCid
+        assertMsg "Cannot merge different instruments" (instrumentId == otherHolding.instrumentId)
+        assertMsg "Cannot merge with different owner" (owner == otherHolding.owner)
+        assertMsg "Cannot merge locked holdings" (lock == None && otherHolding.lock == None)
+        
+        -- Archive the other holding
+        archive otherHoldingCid
+        
+        -- Create merged holding
+        create this with amount = amount + otherHolding.amount
+
+    -- Lock holding for an order
+    choice Holding_Lock : ContractId Holding
+      with
+        lockHolder : Party
+        lockReason : Text
+        lockAmount : Decimal
+      controller owner, lockHolder
+      do
+        assertMsg "Already locked" (lock == None)
+        assertMsg "Lock amount exceeds balance" (lockAmount <= amount)
+        
+        if lockAmount == amount
+          then do
+            -- Lock entire holding
+            create this with 
+              lock = Some HoldingLock with
+                lockHolder = lockHolder
+                lockReason = lockReason
+                lockedAmount = lockAmount
+          else do
+            -- Split and lock only part
+            lockedHolding <- create this with 
+              amount = lockAmount
+              lock = Some HoldingLock with
+                lockHolder = lockHolder
+                lockReason = lockReason
+                lockedAmount = lockAmount
+            unlockedHolding <- create this with amount = amount - lockAmount
+            -- Return the locked one
+            return lockedHolding
+
+    -- Unlock holding (cancel order)
+    choice Holding_Unlock : ContractId Holding
+      with
+      controller owner
+      do
+        assertMsg "Holding not locked" (lock /= None)
+        let Some currentLock = lock
+        -- Also allow lock holder to unlock
+        create this with lock = None
+
+    -- Release locked holding to lock holder (for trade execution)
+    -- This is called during DvP settlement
+    choice Holding_Release : ContractId Holding
+      with
+        releaseAmount : Decimal
+        newOwner : Party
+        releasingParty : Party  -- The lock holder releasing
+      controller owner, releasingParty
+      do
+        let Some currentLock = lock
+        assertMsg "Only lock holder can release" (releasingParty == currentLock.lockHolder)
+        assertMsg "Release amount exceeds locked amount" (releaseAmount <= currentLock.lockedAmount)
+        
+        -- Create new holding for the new owner
+        create Holding with
+          owner = newOwner
+          instrumentId = instrumentId
+          amount = releaseAmount
+          lock = None
+          custodian = custodian
+
+-- | TransferProposal - Pending transfer awaiting receiver acceptance
+template TransferProposal
+  with
+    sender : Party
+    receiver : Party
+    instrumentId : InstrumentId
+    amount : Decimal
+    custodian : Party
+    originalHoldingCid : ContractId Holding
+  where
+    signatory sender, custodian
+    observer receiver
+
+    -- Receiver accepts the transfer
+    choice TransferProposal_Accept : ContractId Holding
+      controller receiver
+      do
+        -- Archive original holding and create new one for receiver
+        originalHolding <- fetch originalHoldingCid
+        
+        if originalHolding.amount == amount
+          then do
+            -- Transfer entire holding
+            archive originalHoldingCid
+            create Holding with
+              owner = receiver
+              instrumentId = instrumentId
+              amount = amount
+              lock = None
+              custodian = custodian
+          else do
+            -- Partial transfer - archive original, create two new
+            archive originalHoldingCid
+            -- New holding for receiver
+            receiverHolding <- create Holding with
+              owner = receiver
+              instrumentId = instrumentId
+              amount = amount
+              lock = None
+              custodian = custodian
+            -- Return change to sender
+            _ <- create Holding with
+              owner = sender
+              instrumentId = originalHolding.instrumentId
+              amount = originalHolding.amount - amount
+              lock = None
+              custodian = custodian
+            return receiverHolding
+
+    -- Sender cancels the proposal
+    choice TransferProposal_Cancel : ()
+      controller sender
+      do
+        return ()
+
+    -- Proposal expires
+    choice TransferProposal_Reject : ()
+      controller receiver
+      do
+        return ()
+
+-- | Mint new holdings (only custodian/issuer can do this)
+template MintRequest
+  with
+    requestor : Party
+    instrumentId : InstrumentId
+    amount : Decimal
+    recipient : Party
+    custodian : Party
+  where
+    signatory requestor
+    observer custodian
+
+    choice MintRequest_Execute : ContractId Holding
+      controller custodian
+      do
+        create Holding with
+          owner = recipient
+          instrumentId = instrumentId
+          amount = amount
+          lock = None
+          custodian = custodian
+
+    choice MintRequest_Reject : ()
+      controller custodian
+      do
+        return ()

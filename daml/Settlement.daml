@@ -1,0 +1,192 @@
+-- | Settlement.daml - Delivery vs Payment (DvP) atomic settlement
+--
+-- This enables atomic swaps: buyer gets tokens, seller gets payment,
+-- or the entire transaction rolls back. No partial state.
+--
+-- Flow:
+--   1. Matching engine finds crossing orders
+--   2. Creates SettlementInstruction with both locked Holdings
+--   3. Operator executes settlement atomically
+--   4. Holdings are transferred, Trade contract created
+--
+module Settlement where
+
+import Instrument (InstrumentId)
+import Holding
+import DA.Action (when)
+
+-- | Settlement status
+data SettlementStatus 
+  = SettlementPending
+  | SettlementExecuted
+  | SettlementFailed Text
+  | SettlementCancelled
+  deriving (Eq, Show)
+
+-- | Settlement leg - one side of the trade
+data SettlementLeg = SettlementLeg
+  with
+    party : Party
+    instrumentId : InstrumentId
+    amount : Decimal
+    holdingCid : ContractId Holding
+  deriving (Eq, Show)
+
+-- | SettlementInstruction - Pending atomic settlement
+--
+-- Created by matching engine when orders cross.
+-- Holds references to both parties' locked holdings.
+template SettlementInstruction
+  with
+    operator : Party
+    buyer : Party
+    seller : Party
+    baseInstrumentId : InstrumentId     -- What's being bought (e.g., cBTC)
+    quoteInstrumentId : InstrumentId    -- What's being paid (e.g., USDT)
+    baseAmount : Decimal                 -- Amount of base (e.g., 0.5 BTC)
+    quoteAmount : Decimal                -- Amount of quote (e.g., 25,000 USDT)
+    price : Decimal                      -- Trade price
+    buyerHoldingCid : ContractId Holding  -- Buyer's locked USDT
+    sellerHoldingCid : ContractId Holding -- Seller's locked BTC
+    buyOrderId : Text
+    sellOrderId : Text
+    timestamp : Time
+    status : SettlementStatus
+  where
+    signatory operator
+    observer buyer, seller
+
+    -- Execute the settlement atomically
+    choice Settlement_Execute : (ContractId Holding, ContractId Holding, ContractId Trade)
+      controller operator
+      do
+        -- Fetch both holdings to verify they exist and are locked
+        buyerHolding <- fetch buyerHoldingCid
+        sellerHolding <- fetch sellerHoldingCid
+        
+        -- Verify holdings are properly locked
+        assertMsg "Buyer holding not locked" (buyerHolding.lock /= None)
+        assertMsg "Seller holding not locked" (sellerHolding.lock /= None)
+        
+        -- Verify amounts match
+        assertMsg "Buyer holding insufficient" (buyerHolding.amount >= quoteAmount)
+        assertMsg "Seller holding insufficient" (sellerHolding.amount >= baseAmount)
+        
+        -- Execute atomic swap:
+        -- 1. Transfer base (e.g., BTC) from seller to buyer
+        -- 2. Transfer quote (e.g., USDT) from buyer to seller
+        
+        -- Archive old holdings
+        archive buyerHoldingCid
+        archive sellerHoldingCid
+        
+        -- Create new holdings for buyer (receives base token)
+        buyerNewHolding <- create Holding with
+          owner = buyer
+          instrumentId = baseInstrumentId
+          amount = baseAmount
+          lock = None
+          custodian = operator
+        
+        -- Create new holdings for seller (receives quote token)
+        sellerNewHolding <- create Holding with
+          owner = seller
+          instrumentId = quoteInstrumentId
+          amount = quoteAmount
+          lock = None
+          custodian = operator
+        
+        -- Handle any remainder (partial fills)
+        -- If buyer had more locked than needed, return change
+        when (buyerHolding.amount > quoteAmount) do
+          _ <- create Holding with
+            owner = buyer
+            instrumentId = quoteInstrumentId
+            amount = buyerHolding.amount - quoteAmount
+            lock = None
+            custodian = operator
+          return ()
+        
+        -- If seller had more locked than needed, return change
+        when (sellerHolding.amount > baseAmount) do
+          _ <- create Holding with
+            owner = seller
+            instrumentId = baseInstrumentId
+            amount = sellerHolding.amount - baseAmount
+            lock = None
+            custodian = operator
+          return ()
+        
+        -- Create trade record
+        trade <- create Trade with
+          tradeId = buyOrderId <> "-" <> sellOrderId <> "-" <> show timestamp
+          operator = operator
+          buyer = buyer
+          seller = seller
+          baseInstrumentId = baseInstrumentId
+          quoteInstrumentId = quoteInstrumentId
+          baseAmount = baseAmount
+          quoteAmount = quoteAmount
+          price = price
+          buyOrderId = buyOrderId
+          sellOrderId = sellOrderId
+          timestamp = timestamp
+        
+        return (buyerNewHolding, sellerNewHolding, trade)
+
+    -- Cancel settlement (returns locked funds)
+    choice Settlement_Cancel : ()
+      with
+        reason : Text
+      controller operator
+      do
+        -- Unlock both holdings
+        buyerHolding <- fetch buyerHoldingCid
+        sellerHolding <- fetch sellerHoldingCid
+        
+        archive buyerHoldingCid
+        archive sellerHoldingCid
+        
+        -- Return unlocked holdings
+        _ <- create buyerHolding with lock = None
+        _ <- create sellerHolding with lock = None
+        
+        return ()
+
+-- | Trade - Record of an executed trade
+template Trade
+  with
+    tradeId : Text
+    operator : Party
+    buyer : Party
+    seller : Party
+    baseInstrumentId : InstrumentId
+    quoteInstrumentId : InstrumentId
+    baseAmount : Decimal
+    quoteAmount : Decimal
+    price : Decimal
+    buyOrderId : Text
+    sellOrderId : Text
+    timestamp : Time
+  where
+    signatory operator
+    observer buyer, seller
+
+-- | Batch settlement for multiple trades
+template BatchSettlement
+  with
+    operator : Party
+    settlements : [ContractId SettlementInstruction]
+    timestamp : Time
+  where
+    signatory operator
+
+    -- Execute all settlements atomically
+    choice BatchSettlement_Execute : [ContractId Trade]
+      controller operator
+      do
+        -- Execute each settlement
+        results <- forA settlements \settlementCid -> do
+          (_, _, tradeCid) <- exercise settlementCid Settlement_Execute
+          return tradeCid
+        return results
