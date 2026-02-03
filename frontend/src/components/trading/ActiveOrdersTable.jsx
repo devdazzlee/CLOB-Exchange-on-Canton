@@ -51,8 +51,27 @@ export default function ActiveOrdersTable({ orders, onCancelOrder }) {
                         {order.type}
                       </td>
                       <td className="py-3 px-4 text-foreground">{order.mode}</td>
-                      <td className="py-3 px-4 text-foreground">
-                        {order.price?.Some ? parseFloat(order.price.Some).toLocaleString() : (order.price === null || order.price === undefined ? 'Market' : 'N/A')}
+                      <td className="py-3 px-4 text-foreground font-mono">
+                        {(() => {
+                          // Handle various price formats
+                          const price = order.price;
+                          
+                          // DAML Optional format: { Some: "value" } or None
+                          if (price?.Some) {
+                            return parseFloat(price.Some).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 });
+                          }
+                          
+                          // Direct number or string value
+                          if (price !== null && price !== undefined && price !== '' && price !== 'None') {
+                            const numPrice = parseFloat(price);
+                            if (!isNaN(numPrice) && numPrice > 0) {
+                              return numPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 });
+                            }
+                          }
+                          
+                          // Market order (no price)
+                          return order.mode === 'MARKET' ? 'Market' : 'N/A';
+                        })()}
                       </td>
                       <td className="py-3 px-4 text-right text-foreground">{parseFloat(order.quantity || 0).toFixed(8)}</td>
                       <td className="py-3 px-4 text-right text-foreground">{parseFloat(order.filled || 0).toFixed(8)}</td>
