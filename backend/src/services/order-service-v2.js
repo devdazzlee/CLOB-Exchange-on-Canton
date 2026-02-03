@@ -124,13 +124,17 @@ class OrderServiceV2 {
         adminToken
       );
 
-      // Extract the locked holding contract ID
-      const lockedHoldingCid = lockResult.events?.find(e => 
-        e.created?.templateId?.includes('Holding')
-      )?.created?.contractId;
+      // Extract the locked holding contract ID from transaction events
+      const events = lockResult.transaction?.events || lockResult.events || [];
+      const lockedHoldingCid = events.find(e => 
+        e.created?.templateId?.includes('Holding') || 
+        e.CreatedEvent?.templateId?.includes('Holding')
+      )?.created?.contractId || 
+      events.find(e => e.CreatedEvent)?.CreatedEvent?.contractId;
 
       if (!lockedHoldingCid) {
-        throw new Error('Failed to lock holding for order');
+        console.error('[OrderServiceV2] Lock result:', JSON.stringify(lockResult, null, 2));
+        throw new Error('Failed to lock holding for order - no contract ID in response');
       }
 
       console.log(`[OrderServiceV2] Holding locked: ${lockedHoldingCid.substring(0, 30)}...`);
@@ -140,17 +144,18 @@ class OrderServiceV2 {
       const baseInstrumentId = instrumentService.getInstrumentId(baseSymbol);
       const quoteInstrumentId = instrumentService.getInstrumentId(quoteSymbol);
 
+      // Daml-LF JSON encoding for variants: { "tag": "Name", "value": {} } for constructors without data
       const orderArgs = {
         orderId,
         operator: operatorPartyId,
         owner: partyId,
-        side: { tag: side.toUpperCase() === 'BUY' ? 'Buy' : 'Sell', value: {} },
+        side: side.toUpperCase() === 'BUY' ? { tag: 'Buy', value: {} } : { tag: 'Sell', value: {} },
         orderType: type.toUpperCase() === 'MARKET' 
-          ? { tag: 'Market', value: {} }
+          ? { tag: 'Market', value: {} } 
           : { tag: 'Limit', value: {} },
         baseInstrumentId,
         quoteInstrumentId,
-        price: price ? { Some: price.toString() } : null,
+        price: price ? price.toString() : null, // Optional Decimal - null or string
         quantity: quantity.toString(),
         filledQuantity: '0',
         lockedHoldingCid,
@@ -160,22 +165,21 @@ class OrderServiceV2 {
         expiresAt: null,
       };
 
-      const orderResult = await cantonService.submitCommand({
+      const orderResult = await cantonService.createContractWithTransaction({
         token: adminToken,
-        actAs: [operatorPartyId, partyId],
-        readAs: [operatorPartyId, partyId],
+        actAsParty: operatorPartyId,
+        templateId: templateIds.order,
+        createArguments: orderArgs,
+        readAs: [partyId],
         synchronizerId,
-        commands: [{
-          CreateCommand: {
-            templateId: templateIds.order,
-            createArguments: orderArgs,
-          },
-        }],
       });
 
-      const orderContractId = orderResult.events?.find(e =>
-        e.created?.templateId?.includes('OrderV3:Order')
-      )?.created?.contractId;
+      const orderEvents = orderResult.transaction?.events || orderResult.events || [];
+      const orderContractId = orderEvents.find(e =>
+        e.created?.templateId?.includes('OrderV3:Order') ||
+        e.created?.templateId?.includes('Order')
+      )?.created?.contractId ||
+      orderEvents.find(e => e.CreatedEvent)?.CreatedEvent?.contractId;
 
       console.log(`[OrderServiceV2] Order created: ${orderContractId?.substring(0, 30)}...`);
 

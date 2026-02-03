@@ -180,12 +180,17 @@ function createApp() {
 async function initializeReadModel() {
   try {
     const cantonService = require('./services/cantonService');
-    const { getReadModelService } = require('./services/readModelService');
+    const { initializeReadModelService, getReadModelService } = require('./services/readModelService');
 
-    const readModel = getReadModelService(cantonService);
-    await readModel.initialize();
-
-    console.log('✅ Read Model initialized');
+    // Initialize the service first (this creates the instance)
+    initializeReadModelService(cantonService);
+    
+    // Now get the initialized instance
+    const readModel = getReadModelService();
+    if (readModel) {
+      await readModel.initialize();
+      console.log('✅ Read Model initialized');
+    }
     return readModel;
   } catch (error) {
     console.error('⚠️  Read Model initialization failed:', error.message);

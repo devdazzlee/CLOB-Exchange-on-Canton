@@ -3,7 +3,7 @@
  * Handles admin-related HTTP requests
  */
 
-const orderBookService = require('../services/orderBookService');
+const { getOrderBookService } = require('../services/orderBookService');
 const cantonService = require('../services/cantonService');
 const CantonAdmin = require('../services/canton-admin');
 const { success, error } = require('../utils/response');
@@ -12,13 +12,30 @@ const config = require('../config');
 
 class AdminController {
   /**
+   * Get all OrderBooks
+   */
+  getOrderBooks = asyncHandler(async (req, res) => {
+    const orderBookSvc = getOrderBookService();
+    // Initialize if needed
+    if (orderBookSvc.initialize) {
+      await orderBookSvc.initialize();
+    }
+    const orderBooks = await orderBookSvc.getAllOrderBooks();
+    return success(res, { orderBooks }, 'OrderBooks retrieved', 200);
+  });
+
+  /**
    * Create OrderBook for trading pair
    */
   createOrderBook = asyncHandler(async (req, res) => {
     const { tradingPair } = req.params;
     const decodedTradingPair = decodeURIComponent(tradingPair);
 
-    const result = await orderBookService.createOrderBook(decodedTradingPair);
+    const orderBookSvc = getOrderBookService();
+    if (orderBookSvc.initialize) {
+      await orderBookSvc.initialize();
+    }
+    const result = await orderBookSvc.createOrderBook(decodedTradingPair);
 
     if (result.alreadyExists) {
       return success(

@@ -20,6 +20,7 @@ const { ValidationError, NotFoundError } = require('../utils/errors');
 const { v4: uuidv4 } = require('uuid');
 const { getReadModelService } = require('./readModelService');
 const { getUpdateStream } = require('./cantonUpdateStream');
+const { getHoldingService } = require('./holdingService');
 
 class OrderService {
   constructor() {
@@ -65,60 +66,85 @@ class OrderService {
   }
 
   /**
-   * Verify and lock funds from UserAccount for order placement
-   * Uses UpdateAfterTrade with negative amounts to deduct (Withdraw is bugged in DAML)
+   * TOKEN STANDARD: Lock Holdings for order placement
+   * Uses real Holding contracts (UTXO-like) instead of text balances
+   * 
+   * Flow:
+   * 1. Find available Holdings for the required asset
+   * 2. Select sufficient Holdings to cover the amount
+   * 3. Lock the Holding(s) with order reference
+   * 4. Return the locked Holding contractId
    */
-  async withdrawForOrder(token, partyId, operatorPartyId, packageId, asset, amount) {
-    // 1. Find user's UserAccount
-    const contracts = await cantonService.queryActiveContracts({
-      party: operatorPartyId,
-      templateIds: [`${packageId}:UserAccount:UserAccount`],
-      pageSize: 100
-    }, token);
+  async lockHoldingsForOrder(token, partyId, operatorPartyId, asset, amount, orderId) {
+    console.log(`[OrderService] TOKEN STANDARD: Locking ${amount} ${asset} from Holdings`);
     
-    const userAccount = (Array.isArray(contracts) ? contracts : [])
-      .find(c => {
-        const payload = c.payload || c.createArgument || {};
-        return payload.party === partyId;
-      });
+    const holdingService = getHoldingService();
+    await holdingService.initialize();
     
-    if (!userAccount) {
-      throw new Error(`No UserAccount found for party ${partyId.substring(0, 40)}...`);
+    // 1. Find available Holdings that can cover the required amount
+    let holdingsResult;
+    try {
+      holdingsResult = await holdingService.findHoldingsForAmount(partyId, asset, amount, token);
+    } catch (err) {
+      throw new ValidationError(`Insufficient ${asset} balance. Required: ${amount}. ${err.message}`);
     }
     
-    // 2. Check balance
-    const payload = userAccount.payload || userAccount.createArgument || {};
-    const balances = payload.balances || [];
-    const currentBalance = balances.find(([t]) => t === asset)?.[1] || '0';
+    console.log(`[OrderService] Found ${holdingsResult.holdings.length} Holdings with total ${holdingsResult.totalAmount} ${asset}`);
     
-    if (parseFloat(currentBalance) < parseFloat(amount)) {
-      throw new Error(`Insufficient ${asset}. Have: ${currentBalance}, Need: ${amount}`);
+    // 2. For simplicity, lock the first (largest) holding that covers the amount
+    // In production, could merge multiple holdings or split
+    const primaryHolding = holdingsResult.holdings[0];
+    
+    if (primaryHolding.amount < amount) {
+      // Need to handle partial holdings - for now require single holding
+      throw new ValidationError(`Largest ${asset} Holding (${primaryHolding.amount}) is less than required (${amount}). Please consolidate your holdings.`);
     }
     
-    console.log(`[OrderService] UserAccount balance for ${asset}: ${currentBalance}, locking: ${amount}`);
+    // 3. Lock the Holding for this order
+    try {
+      await holdingService.lockHolding(
+        primaryHolding.contractId,
+        operatorPartyId,        // Lock holder (operator manages order matching)
+        `ORDER:${orderId}`,     // Lock reason references the order
+        amount,                 // Lock amount
+        partyId,               // Owner party
+        token
+      );
+      
+      console.log(`[OrderService] ✅ Holding ${primaryHolding.contractId.substring(0, 20)}... locked for ${amount} ${asset}`);
+      
+      return {
+        lockedHoldingCid: primaryHolding.contractId,
+        lockedAmount: amount,
+        asset: asset
+      };
+    } catch (lockError) {
+      console.error(`[OrderService] Failed to lock Holding:`, lockError.message);
+      throw new ValidationError(`Failed to lock ${asset} Holding: ${lockError.message}`);
+    }
+  }
+
+  /**
+   * TOKEN STANDARD: Unlock Holdings when order is cancelled
+   */
+  async unlockHoldingsForOrder(token, partyId, lockedHoldingCid) {
+    console.log(`[OrderService] TOKEN STANDARD: Unlocking Holding ${lockedHoldingCid?.substring(0, 20)}...`);
     
-    // 3. Use UpdateAfterTrade to deduct (operator-controlled, works correctly)
-    // Pass negative amount to deduct from balance
-    // Determine base/quote based on asset type
-    const baseToken = asset;
-    const quoteToken = asset === 'USDT' ? 'BTC' : 'USDT';
+    if (!lockedHoldingCid) {
+      console.warn('[OrderService] No locked Holding CID to unlock');
+      return;
+    }
     
-    await cantonService.exerciseChoice({
-      token,
-      actAsParty: operatorPartyId, // UpdateAfterTrade is controlled by operator
-      templateId: `${packageId}:UserAccount:UserAccount`,
-      contractId: userAccount.contractId,
-      choice: 'UpdateAfterTrade',
-      choiceArgument: {
-        baseToken: baseToken,
-        quoteToken: quoteToken,
-        baseAmount: (-parseFloat(amount)).toFixed(8), // Negative to deduct
-        quoteAmount: '0.0'
-      },
-      readAs: [partyId]
-    });
+    const holdingService = getHoldingService();
+    await holdingService.initialize();
     
-    return userAccount.contractId;
+    try {
+      await holdingService.unlockHolding(lockedHoldingCid, partyId, token);
+      console.log(`[OrderService] ✅ Holding unlocked successfully`);
+    } catch (err) {
+      console.error(`[OrderService] Failed to unlock Holding:`, err.message);
+      // Don't throw - order cancellation should still succeed
+    }
   }
 
   /**
@@ -230,22 +256,21 @@ class OrderService {
     const lockInfo = this.calculateLockAmount(tradingPair, orderType, price, quantity, orderMode, estimatedPrice);
     console.log(`[OrderService] Order will lock ${lockInfo.amount} ${lockInfo.asset}`);
 
-    // ========= BALANCE CHECK AND WITHDRAWAL =========
-    // 1. Find user's UserAccount contract
-    // 2. Verify sufficient balance
-    // 3. Withdraw (lock) the required amount
+    // ========= TOKEN STANDARD: LOCK HOLDINGS =========
+    // Uses real Holding contracts instead of text balances
+    let lockedHoldingInfo = null;
     try {
-      const userAccountContractId = await this.withdrawForOrder(
+      lockedHoldingInfo = await this.lockHoldingsForOrder(
         token, 
         partyId, 
         operatorPartyId,
-        packageId,
         lockInfo.asset, 
-        lockInfo.amount
+        lockInfo.amount,
+        orderId
       );
-      console.log(`[OrderService] Withdrew ${lockInfo.amount} ${lockInfo.asset} from UserAccount`);
-    } catch (withdrawError) {
-      console.error(`[OrderService] Balance check/withdrawal failed:`, withdrawError.message);
+      console.log(`[OrderService] TOKEN STANDARD: Locked Holding ${lockedHoldingInfo.lockedHoldingCid?.substring(0, 20)}...`);
+    } catch (lockError) {
+      console.error(`[OrderService] Holding lock failed:`, lockError.message);
       throw new ValidationError(`Insufficient ${lockInfo.asset} balance. Required: ${lockInfo.amount}`);
     }
 
@@ -276,7 +301,8 @@ class OrderService {
         // Canton JSON API v2: Time is ISO 8601 datetime string
         timestamp: timestamp,
         operator: operatorPartyId,
-        allocationCid: '' // Placeholder until Splice is integrated
+        // TOKEN STANDARD: Store locked Holding reference
+        allocationCid: lockedHoldingInfo?.lockedHoldingCid || ''
       },
       readAs: [operatorPartyId, partyId]
     });
@@ -310,7 +336,11 @@ class OrderService {
       quantity: quantity.toString(),
       filled: '0',
       status: 'OPEN',
-      timestamp: timestamp
+      timestamp: timestamp,
+      // TOKEN STANDARD: Track locked Holding
+      lockedHoldingCid: lockedHoldingInfo?.lockedHoldingCid || null,
+      lockedAmount: lockedHoldingInfo?.lockedAmount || null,
+      lockedAsset: lockedHoldingInfo?.asset || null
     };
     
     const updateStream = getUpdateStream();
@@ -390,6 +420,9 @@ class OrderService {
       remaining: quantity,
       lockedAsset: lockInfo.asset,
       lockedAmount: lockInfo.amount,
+      // TOKEN STANDARD: Return locked Holding info
+      lockedHoldingCid: lockedHoldingInfo?.lockedHoldingCid || null,
+      tokenStandard: true,
       timestamp: new Date().toISOString()
     };
   }
@@ -472,6 +505,17 @@ class OrderService {
       orderDetails = await this.getOrder(orderContractId);
     } catch (e) {
       console.warn('[OrderService] Could not fetch order details before cancel:', e.message);
+    }
+
+    // TOKEN STANDARD: Unlock the Holding before cancelling
+    if (orderDetails?.allocationCid) {
+      try {
+        await this.unlockHoldingsForOrder(token, partyId, orderDetails.allocationCid);
+        console.log(`[OrderService] TOKEN STANDARD: Holding unlocked for cancelled order`);
+      } catch (unlockErr) {
+        console.warn('[OrderService] Could not unlock Holding:', unlockErr.message);
+        // Continue with cancellation even if unlock fails
+      }
     }
 
     // Exercise CancelOrder choice on the Order contract
@@ -813,7 +857,9 @@ class OrderService {
         quantity: payload.quantity,
         filled: payload.filled || '0',
         status: payload.status,
-        timestamp: payload.timestamp
+        timestamp: payload.timestamp,
+        // TOKEN STANDARD: Include locked Holding reference
+        allocationCid: payload.allocationCid || null
       };
     } catch (error) {
       console.error('[OrderService] Error getting order:', error.message);

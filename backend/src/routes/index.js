@@ -49,6 +49,7 @@ router.use('/token-exchange', authRoutes); // POST /api/token-exchange (legacy)
 router.use('/auth', authRoutes); // NEW: POST /api/auth/challenge, /api/auth/verify
 router.post('/inspect-token', authController.inspectToken); // POST /api/inspect-token
 router.use('/ws/status', healthRoutes); // GET /api/ws/status
+router.use('/health', healthRoutes); // GET /api/health
 router.use('/balance', balanceRoutes); // GET /api/balance/:partyId
 // New BFF routes (no Keycloak / no Canton token in browser)
 router.use('/ledger', ledgerProxyRoutes);

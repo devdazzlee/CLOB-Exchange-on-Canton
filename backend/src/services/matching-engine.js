@@ -19,8 +19,21 @@ const { getUpdateStream } = require('./cantonUpdateStream');
 const { extractTradesFromEvents } = require('./trade-utils');
 const { getSettlementService } = require('./settlementService');
 
-// Feature flag - set to true when deploying new token standard DAR
-const USE_DvP_SETTLEMENT = process.env.USE_DVP_SETTLEMENT === 'true' || false;
+// Feature flag - AUTO-DETECT: Use DvP when both orders have locked Holdings
+// Set USE_DVP_SETTLEMENT=true to force DvP for all orders (requires new DAR)
+const FORCE_DvP_SETTLEMENT = process.env.USE_DVP_SETTLEMENT === 'true';
+
+// Auto-detect DvP mode based on order structure
+function shouldUseDvP(buyOrder, sellOrder) {
+  // If forced via env var, always use DvP
+  if (FORCE_DvP_SETTLEMENT) return true;
+  
+  // AUTO-DETECT: Use DvP if both orders have locked Holdings (new token standard)
+  const buyHasHolding = buyOrder.lockedHoldingCid || buyOrder.allocationCid;
+  const sellHasHolding = sellOrder.lockedHoldingCid || sellOrder.allocationCid;
+  
+  return buyHasHolding && sellHasHolding;
+}
 
 // NO IN-MEMORY CACHE - All trades are stored on Canton ledger as Trade contracts
 function recordTradesFromResult(result) {
@@ -203,7 +216,10 @@ class MatchingEngine {
           quantity: parseFloat(payload.quantity) || 0,
           filled: parseFloat(payload.filled) || 0,
           remaining: (parseFloat(payload.quantity) || 0) - (parseFloat(payload.filled) || 0),
-          timestamp: payload.timestamp
+          timestamp: payload.timestamp,
+          // TOKEN STANDARD: Include locked Holding reference for DvP settlement
+          allocationCid: payload.allocationCid || null,
+          lockedHoldingCid: payload.allocationCid || null  // allocationCid contains the Holding CID
         };
         
         if (payload.orderType === 'BUY') {
@@ -329,15 +345,18 @@ class MatchingEngine {
         if (canMatch && matchPrice > 0) {
           const matchQty = Math.min(buyOrder.remaining, sellOrder.remaining);
           
+          // Auto-detect settlement mode based on order structure
+          const useDvP = shouldUseDvP(buyOrder, sellOrder);
+          
           console.log(`[MatchingEngine] ✅ MATCH FOUND:`);
           console.log(`  Buy: ${buyOrder.contractId.substring(0, 20)}... @${buyPrice !== null ? buyPrice : 'MARKET'} qty=${buyOrder.remaining}`);
           console.log(`  Sell: ${sellOrder.contractId.substring(0, 20)}... @${sellPrice !== null ? sellPrice : 'MARKET'} qty=${sellOrder.remaining}`);
           console.log(`  Match: ${matchQty} @${matchPrice}`);
-          console.log(`  Settlement mode: ${USE_DvP_SETTLEMENT ? 'DvP (Token Standard)' : 'Legacy (FillOrder + Balance Update)'}`);
+          console.log(`  Settlement mode: ${useDvP ? 'DvP (Token Standard with Holdings)' : 'Legacy (FillOrder + Balance Update)'}`);
           
           try {
             // Execute the match
-            if (USE_DvP_SETTLEMENT) {
+            if (useDvP) {
               // NEW: Use atomic DvP settlement with real token Holdings
               await this.executeDvPSettlement(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, adminToken);
             } else {

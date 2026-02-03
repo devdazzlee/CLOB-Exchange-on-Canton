@@ -69,7 +69,9 @@ export const API_ROUTES = {
       if (status) params.append('status', status);
       return `/orders/user/${encodeURIComponent(partyId)}${params.toString() ? `?${params.toString()}` : ''}`;
     },
-    CANCEL: (contractId) => `/orders/${encodeURIComponent(contractId)}/cancel`,
+    // NOTE: Cancel is POST, not DELETE - use cancelOrder method
+    CANCEL: '/orders/cancel',
+    CANCEL_BY_ID: (contractId) => `/orders/${encodeURIComponent(contractId)}/cancel`,
     GET_ALL: (params = {}) => {
       const queryString = new URLSearchParams(params).toString();
       return `/v1/orders${queryString ? `?${queryString}` : ''}`;

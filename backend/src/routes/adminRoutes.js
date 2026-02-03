@@ -11,6 +11,9 @@ const { getInstrumentService } = require('../services/instrumentService');
 const tokenProvider = require('../services/tokenProvider');
 const { success, error } = require('../utils/response');
 
+// GET /api/admin/orderbooks - List all order books
+router.get('/orderbooks', adminController.getOrderBooks);
+
 // POST /api/admin/orderbooks/:tradingPair - Create OrderBook
 router.post('/orderbooks/:tradingPair', validate(createOrderBookSchema), adminController.createOrderBook);
 

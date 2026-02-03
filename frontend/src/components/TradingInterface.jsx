@@ -25,6 +25,9 @@ import TradingPageSkeleton from './trading/TradingPageSkeleton';
 import websocketService from '../services/websocketService';
 import { getAvailableTradingPairs, getGlobalOrderBook } from '../services/cantonApi';
 import { apiClient, API_ROUTES } from '../config/config';
+// Token Standard V2 services
+import * as balanceService from '../services/balanceService';
+import * as orderService from '../services/orderService';
 
 export default function TradingInterface({ partyId }) {
   // === PHASE 1: ALL HOOKS MUST BE DECLARED FIRST - NO EXCEPTIONS ===
@@ -64,13 +67,14 @@ export default function TradingInterface({ partyId }) {
 
   // Minting state
   const [mintingLoading, setMintingLoading] = useState(false);
-  
+
   // === PHASE 3: ALL USECALLBACK HOOKS - NO CONDITIONALS ===
+  // TOKEN STANDARD V2: Mint creates Holding contracts (real tokens)
   const handleMintTokens = useCallback(async () => {
-    console.log('[Mint] Manual mint button clicked for party:', partyId);
+    console.log('[Mint V2] Manual mint button clicked for party:', partyId);
     
     if (mintingLoading || isMintingRef.current) {
-      console.log('[Mint] Already minting, skipping...');
+      console.log('[Mint V2] Already minting, skipping...');
       return;
     }
     
@@ -78,50 +82,46 @@ export default function TradingInterface({ partyId }) {
     setMintingLoading(true);
     
     try {
-      // Try the balance/mint endpoint (creates/updates UserAccount)
-      const mintData = await apiClient.post(API_ROUTES.BALANCE.MINT, {
-        partyId: partyId,
-        tokens: [
-          { symbol: 'BTC', amount: 10 },
-          { symbol: 'USDT', amount: 100000 },
-          { symbol: 'ETH', amount: 100 },
-          { symbol: 'SOL', amount: 1000 }
-        ]
-      });
+      // TOKEN STANDARD V2: Create Holding contracts (real tokens, not text balances)
+      const mintResult = await balanceService.mintTokens(partyId, [
+        { symbol: 'BTC', amount: 10 },
+        { symbol: 'USDT', amount: 100000 },
+        { symbol: 'ETH', amount: 100 },
+        { symbol: 'SOL', amount: 1000 }
+      ]);
       
-      if (mintData.success) {
-        console.log('[Mint] Backend mint successful:', mintData);
-        toast.success('Test tokens minted successfully!', {
-          title: '🪙 Tokens Minted',
+      if (mintResult.success) {
+        console.log('[Mint V2] Holdings created:', mintResult);
+        toast.success('Test tokens minted as Holdings!', {
+          title: '🪙 Holdings Created',
           details: 'BTC: 10 | USDT: 100,000 | ETH: 100 | SOL: 1,000'
         });
         
-        // Refresh balance from backend
+        // Refresh balance from V2 Holdings
         setTimeout(async () => {
           try {
-            const balanceData = await apiClient.get(API_ROUTES.BALANCE.GET(partyId));
-            if (balanceData.success && balanceData.data?.balance) {
+            const balanceData = await balanceService.getBalances(partyId);
+            if (balanceData.available) {
               setBalance({
-                BTC: balanceData.data.balance.BTC || '0.0',
-                USDT: balanceData.data.balance.USDT || '0.0',
-                ETH: balanceData.data.balance.ETH || '0.0',
-                SOL: balanceData.data.balance.SOL || '0.0'
+                BTC: balanceData.available.BTC?.toString() || '0.0',
+                USDT: balanceData.available.USDT?.toString() || '0.0',
+                ETH: balanceData.available.ETH?.toString() || '0.0',
+                SOL: balanceData.available.SOL?.toString() || '0.0'
               });
-              console.log('[Mint] Balance refreshed:', balanceData.data.balance);
+              console.log('[Mint V2] Balance refreshed from Holdings:', balanceData.available);
             }
           } catch (err) {
-            console.error('[Mint] Failed to refresh balance:', err);
+            console.error('[Mint V2] Failed to refresh balance:', err);
           }
         }, 1000);
         
         return;
       }
       
-      // If the response wasn't ok, show error
-      throw new Error(mintData.error || mintData.message || 'Failed to mint tokens');
+      throw new Error(mintResult.error || 'Failed to mint tokens');
       
     } catch (err) {
-      console.error('[Mint] Backend mint failed:', err);
+      console.error('[Mint V2] Failed:', err);
       toast.error(err.message || 'Failed to mint tokens. Please complete onboarding first.', {
         title: '❌ Mint Failed'
       });
@@ -131,19 +131,20 @@ export default function TradingInterface({ partyId }) {
     }
   }, [partyId, toast, mintingLoading]);
 
+  // Place order - uses legacy API but balances are V2 Holdings
   const handlePlaceOrder = useCallback(async (orderData) => {
     try {
-      setOrderPlacing(true); // Use separate state - don't use setLoading which causes full-screen
+      setOrderPlacing(true);
       console.log('[Place Order] Placing order:', orderData);
       
-      // Use the simpler /api/orders/place endpoint that works with partyId
+      // Use legacy order API (OrderV3 DAML encoding needs more work)
       const result = await apiClient.post(API_ROUTES.ORDERS.PLACE, {
-        tradingPair: orderData.tradingPair,
-        orderType: orderData.orderType,
-        orderMode: orderData.orderMode,
-        price: orderData.price,
-        quantity: orderData.quantity,
-        partyId: partyId
+          tradingPair: orderData.tradingPair,
+          orderType: orderData.orderType,
+          orderMode: orderData.orderMode,
+          price: orderData.price,
+          quantity: orderData.quantity,
+          partyId: partyId
       }, {
         headers: {
           'x-user-id': partyId || 'anonymous'
@@ -154,13 +155,13 @@ export default function TradingInterface({ partyId }) {
         throw new Error(result.error || result.message || 'Failed to place order');
       }
 
-      console.log('[Place Order] Order placed successfully:', result);
+      console.log('[Place Order] Order placed:', result);
       
-      // Clear form fields on success
+      // Clear form fields
       setPrice('');
       setQuantity('');
       
-      // Show beautiful success modal
+      // Show success modal
       setLastOrderData({
         orderId: result.data?.orderId,
         orderType: orderData.orderType,
@@ -171,38 +172,47 @@ export default function TradingInterface({ partyId }) {
       });
       setShowOrderSuccess(true);
       
-      // IMPORTANT: Refresh all data from API after order placement
-      // This ensures UI shows real data, not stale cache
-      console.log('[Place Order] Refreshing data from API...');
-      
-      // Refresh order book from API
+      // Refresh order book
       try {
         const bookData = await apiClient.get(API_ROUTES.ORDERBOOK.GET(tradingPair));
-        setOrderBook({
-          buys: bookData.data?.raw?.buyOrders || [],
-          sells: bookData.data?.raw?.sellOrders || []
-        });
+          setOrderBook({
+            buys: bookData.data?.raw?.buyOrders || [],
+            sells: bookData.data?.raw?.sellOrders || []
+          });
       } catch (e) { console.error('[Refresh] Order book error:', e); }
       
-      // Refresh user orders from API
+      // Refresh user orders
       try {
         const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
-        const ordersList = ordersData?.data?.orders || [];
-        setOrders(ordersList.map(order => ({
-          id: order.orderId || order.contractId,
-          contractId: order.contractId,
-          type: order.orderType,
-          mode: order.orderMode,
-          price: order.price,
-          quantity: order.quantity,
-          filled: order.filled || '0',
-          status: order.status,
-          tradingPair: order.tradingPair,
-          timestamp: order.timestamp
-        })));
+          const ordersList = ordersData?.data?.orders || [];
+          setOrders(ordersList.map(order => ({
+            id: order.orderId || order.contractId,
+            contractId: order.contractId,
+            type: order.orderType,
+            mode: order.orderMode,
+            price: order.price,
+            quantity: order.quantity,
+            filled: order.filled || '0',
+            status: order.status,
+            tradingPair: order.tradingPair,
+            timestamp: order.timestamp
+          })));
       } catch (e) { console.error('[Refresh] User orders error:', e); }
       
-      // Refresh trades from API
+      // Refresh balance from V2 Holdings
+      try {
+        const balanceData = await balanceService.getBalances(partyId);
+        if (balanceData.available) {
+          setBalance({
+            BTC: balanceData.available.BTC?.toString() || '0.0',
+            USDT: balanceData.available.USDT?.toString() || '0.0',
+            ETH: balanceData.available.ETH?.toString() || '0.0',
+            SOL: balanceData.available.SOL?.toString() || '0.0'
+          });
+        }
+      } catch (e) { console.error('[Refresh] Balance error:', e); }
+      
+      // Refresh trades
       try {
         const tradesData = await apiClient.get(API_ROUTES.TRADES.GET(tradingPair, 50));
         setTrades(tradesData?.data?.trades || []);
@@ -217,8 +227,9 @@ export default function TradingInterface({ partyId }) {
     } finally {
       setOrderPlacing(false);
     }
-  }, [partyId, toast]);
+  }, [partyId, tradingPair, toast]);
 
+  // Cancel order - uses legacy API but balances are V2 Holdings
   const handleCancelOrder = useCallback(async (contractId) => {
     if (!contractId) {
       console.error('[Cancel Order] No contractId provided');
@@ -232,31 +243,29 @@ export default function TradingInterface({ partyId }) {
       throw new Error('Not logged in');
     }
     
-    console.log('[Cancel Order] Cancelling order with contractId:', contractId);
+    console.log('[Cancel Order] Cancelling order:', contractId);
     
-    // Use POST /api/orders/:orderId/cancel endpoint
-    const data = await apiClient.post(API_ROUTES.ORDERS.CANCEL(contractId), {
-      partyId: partyId
-    }, {
+    // Use legacy cancel API (POST, not DELETE)
+    const result = await apiClient.post(API_ROUTES.ORDERS.CANCEL_BY_ID(contractId), {}, {
       headers: {
-        'x-party-id': partyId
+        'x-user-id': partyId
       }
     });
     
-    if (!data.success) {
-      const errorMsg = data.error || 'Failed to cancel order';
+    if (!result.success) {
+      const errorMsg = result.error || 'Failed to cancel order';
       console.error('[Cancel Order] Failed:', errorMsg);
       toast.error(errorMsg);
       throw new Error(errorMsg);
     }
     
-    console.log('[Cancel Order] Order cancelled successfully:', data);
-    toast.success('Order cancelled successfully! Funds have been unlocked.');
+    console.log('[Cancel Order] Order cancelled:', result);
+    toast.success('Order cancelled successfully! Funds unlocked.');
     
-    // Refresh orders list directly
+    // Refresh orders list
     try {
       const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
-      const ordersList = ordersData?.data?.orders || ordersData?.orders || [];
+      const ordersList = ordersData?.data?.orders || [];
       setOrders(ordersList.map(order => ({
         id: order.orderId || order.contractId,
         contractId: order.contractId,
@@ -273,17 +282,22 @@ export default function TradingInterface({ partyId }) {
       console.warn('[Cancel Order] Failed to refresh orders:', e);
     }
     
-    // Refresh balance
+    // Refresh balance from V2 Holdings
     try {
-      const balanceData = await apiClient.get(API_ROUTES.BALANCE.GET(partyId));
-      if (balanceData?.data?.balances) {
-        setBalance(balanceData.data.balances);
+      const balanceData = await balanceService.getBalances(partyId);
+      if (balanceData.available) {
+        setBalance({
+          BTC: balanceData.available.BTC?.toString() || '0.0',
+          USDT: balanceData.available.USDT?.toString() || '0.0',
+          ETH: balanceData.available.ETH?.toString() || '0.0',
+          SOL: balanceData.available.SOL?.toString() || '0.0'
+        });
       }
     } catch (e) {
       console.warn('[Cancel Order] Failed to refresh balance:', e);
     }
     
-    return data;
+    return result;
   }, [partyId, toast, setOrders, setBalance]);
 
 
@@ -509,26 +523,23 @@ export default function TradingInterface({ partyId }) {
 
     loadInitialOrderBook();
     
-    // Load initial trades from backend - merge with existing (don't overwrite WebSocket data)
+    // Load initial trades (legacy API)
     const loadInitialTrades = async () => {
       try {
-        const data = await apiClient.get(API_ROUTES.TRADES.GET(tradingPair, 50));
-        const tradesList = data?.data?.trades || data?.trades || [];
+        const tradesData = await apiClient.get(API_ROUTES.TRADES.GET(tradingPair, 50));
+        const tradesList = tradesData?.data?.trades || [];
         
-        // Merge with existing trades (keep WebSocket trades that aren't in API response)
-        setTrades(prev => {
-          if (tradesList.length === 0) {
-            return prev; // Keep existing if API returns empty
-          }
-          // Merge: API trades + any WebSocket trades not in API
-          const apiTradeIds = new Set(tradesList.map(t => t.tradeId));
-          const newFromWs = prev.filter(t => !apiTradeIds.has(t.tradeId));
-          return [...newFromWs, ...tradesList].slice(0, 50);
-        });
-        console.log('[TradingInterface] Initial trades loaded:', tradesList.length);
+          setTrades(prev => {
+            if (tradesList.length === 0) {
+            return prev;
+            }
+            const apiTradeIds = new Set(tradesList.map(t => t.tradeId));
+            const newFromWs = prev.filter(t => !apiTradeIds.has(t.tradeId));
+            return [...newFromWs, ...tradesList].slice(0, 50);
+          });
+          console.log('[TradingInterface] Initial trades loaded:', tradesList.length);
       } catch (error) {
         console.error('[TradingInterface] Failed to load initial trades:', error);
-        // On error, keep existing trades
       } finally {
         setTradesLoading(false);
       }
@@ -543,23 +554,20 @@ export default function TradingInterface({ partyId }) {
     websocketService.subscribe(`orderbook:${tradingPair}`, orderBookCallback);
     websocketService.subscribe(`trades:${tradingPair}`, tradeCallback);
 
-    // Poll order book - but DON'T overwrite existing data with empty results
+    // Poll order book (legacy API)
     interval = setInterval(async () => {
       if (!isLoadingRef.current) {
         try {
           const bookData = await getGlobalOrderBook(tradingPair);
-          // Only update if we got actual data (not empty due to Canton 200+ limit)
+          // Only update if we got actual data
           if (bookData && (bookData.buyOrders?.length > 0 || bookData.sellOrders?.length > 0)) {
             setOrderBook(prev => ({
-              // Merge: keep existing if new is empty
               buys: bookData.buyOrders?.length > 0 ? bookData.buyOrders : prev.buys,
               sells: bookData.sellOrders?.length > 0 ? bookData.sellOrders : prev.sells
             }));
           }
-          // If API returns empty, keep existing data (from WebSocket)
         } catch (error) {
           console.error('[TradingInterface] Failed to poll order book:', error);
-          // On error, keep existing data
         }
       }
     }, 30000);
@@ -571,56 +579,50 @@ export default function TradingInterface({ partyId }) {
     };
   }, [partyId, tradingPair]);
 
-  // Load user's active orders
+  // Load user's active orders (legacy Order contracts)
   useEffect(() => {
     if (!partyId) return;
 
     const loadUserOrders = async (isInitial = false) => {
       try {
-        const data = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
-        const ordersList = data?.data?.orders || data?.orders || [];
+        const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
+        const ordersList = ordersData?.data?.orders || [];
         
-        // Transform orders to expected format
-        const formattedOrders = ordersList.map(order => ({
-          id: order.orderId || order.contractId,
-          contractId: order.contractId,
-          type: order.orderType,
-          mode: order.orderMode,
-          price: order.price,
-          quantity: order.quantity,
-          filled: order.filled || '0',
-          status: order.status,
-          tradingPair: order.tradingPair,
-          timestamp: order.timestamp
-        }));
-        
-        // Only update if we got data OR if it's initial load
-        // Don't overwrite WebSocket data with empty API results
-        if (formattedOrders.length > 0 || isInitial) {
-          setOrders(prev => {
-            // If API returned data, use it
-            if (formattedOrders.length > 0) {
-              return formattedOrders;
-            }
-            // If API returned empty but we have existing data, keep it
-            return prev;
-          });
-        }
-        console.log('[TradingInterface] User orders loaded:', formattedOrders.length);
+          const formattedOrders = ordersList.map(order => ({
+            id: order.orderId || order.contractId,
+            contractId: order.contractId,
+            type: order.orderType,
+            mode: order.orderMode,
+            price: order.price,
+            quantity: order.quantity,
+            filled: order.filled || '0',
+          remaining: order.remaining,
+            status: order.status,
+            tradingPair: order.tradingPair,
+            timestamp: order.timestamp
+          }));
+          
+          if (formattedOrders.length > 0 || isInitial) {
+            setOrders(prev => {
+              if (formattedOrders.length > 0) {
+                return formattedOrders;
+              }
+              return prev;
+            });
+          }
+          console.log('[TradingInterface] User orders loaded:', formattedOrders.length);
       } catch (error) {
         console.error('[TradingInterface] Failed to load user orders:', error);
-        // On error, keep existing data
       }
     };
 
-    loadUserOrders(true); // Initial load
-    
-    // Refresh user orders every 10 seconds - but don't overwrite with empty
+    loadUserOrders(true);
     const ordersInterval = setInterval(() => loadUserOrders(false), 10000);
     
     return () => clearInterval(ordersInterval);
   }, [partyId]);
 
+  // Load balance from Holdings (Token Standard V2)
   useEffect(() => {
     if (!partyId) return;
 
@@ -629,44 +631,38 @@ export default function TradingInterface({ partyId }) {
         if (showLoader && !hasLoadedBalanceRef.current) {
           setBalanceLoading(true);
         }
-        console.log('[Balance] Loading balance for party:', partyId);
+        console.log('[Balance V2] Loading Holdings-based balance for party:', partyId);
         
-        // Try to load real balance from backend first
+        // TOKEN STANDARD V2: Load balance from Holding contracts
         try {
-          const balanceData = await apiClient.get(API_ROUTES.BALANCE.GET(partyId));
+          const balanceData = await balanceService.getBalances(partyId);
           
-          if (balanceData.success) {
-            // Handle different response formats
-            const balanceObj = balanceData.data?.balance || balanceData.data?.available || balanceData.data;
-            if (balanceObj && typeof balanceObj === 'object') {
+          if (balanceData.available) {
               setBalance({
-                BTC: balanceObj.BTC || '0.0',
-                USDT: balanceObj.USDT || '0.0',
-                ETH: balanceObj.ETH || '0.0',
-                SOL: balanceObj.SOL || '0.0'
-              });
-              console.log('[Balance] Balance loaded:', balanceObj);
+              BTC: balanceData.available.BTC?.toString() || '0.0',
+              USDT: balanceData.available.USDT?.toString() || '0.0',
+              ETH: balanceData.available.ETH?.toString() || '0.0',
+              SOL: balanceData.available.SOL?.toString() || '0.0'
+            });
+            console.log('[Balance V2] Holdings balance loaded:', balanceData.available);
               hasLoadedBalanceRef.current = true;
               return;
             }
-          }
-          // If response not ok, show zero balance (user needs onboarding)
-          console.log('[Balance] Backend returned error - user may need onboarding');
+          
+          // No Holdings found - show zero balance
+          console.log('[Balance V2] No Holdings found - user needs to mint tokens');
           setBalance({ BTC: '0.0', USDT: '0.0', ETH: '0.0', SOL: '0.0' });
           hasLoadedBalanceRef.current = true;
         } catch (balanceError) {
-          console.error('[Balance] Backend balance fetch failed:', balanceError);
-          // Show zero balance on error (no fake balances)
+          console.error('[Balance V2] Holdings fetch failed:', balanceError);
           setBalance({ BTC: '0.0', USDT: '0.0', ETH: '0.0', SOL: '0.0' });
           hasLoadedBalanceRef.current = true;
         }
       } catch (error) {
-        console.error('[Balance] Failed to load balance:', error);
-        // Show zero balance on error (no fake balances)
+        console.error('[Balance V2] Failed to load balance:', error);
         setBalance({ BTC: '0.0', USDT: '0.0', ETH: '0.0', SOL: '0.0' });
         hasLoadedBalanceRef.current = true;
       } finally {
-        // FIX: Always stop loading regardless of outcome
         setBalanceLoading(false);
       }
     };
@@ -786,26 +782,26 @@ export default function TradingInterface({ partyId }) {
         )}
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          <OrderForm
-            tradingPair={tradingPair}
-            availablePairs={availablePairs}
-            onTradingPairChange={setTradingPair}
-            orderBookExists={orderBookExists}
-            orderType={orderType}
-            onOrderTypeChange={(e) => setOrderType(e.target.value)}
-            orderMode={orderMode}
-            onOrderModeChange={(e) => setOrderMode(e.target.value)}
-            price={price}
-            onPriceChange={setPrice}
-            quantity={quantity}
-            onQuantityChange={setQuantity}
-            loading={orderPlacing}
-            onSubmit={handlePlaceOrder}
-            balance={balance}
-            orderBook={orderBook}
+            <OrderForm
+              tradingPair={tradingPair}
+              availablePairs={availablePairs}
+              onTradingPairChange={setTradingPair}
+              orderBookExists={orderBookExists}
+              orderType={orderType}
+              onOrderTypeChange={(e) => setOrderType(e.target.value)}
+              orderMode={orderMode}
+              onOrderModeChange={(e) => setOrderMode(e.target.value)}
+              price={price}
+              onPriceChange={setPrice}
+              quantity={quantity}
+              onQuantityChange={setQuantity}
+              loading={orderPlacing}
+              onSubmit={handlePlaceOrder}
+              balance={balance}
+              orderBook={orderBook}
             onMintTokens={handleMintTokens}
             mintingLoading={mintingLoading}
-          />
+            />
           
           {/* Balance Card */}
           {/* {balanceLoading ? (

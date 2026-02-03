@@ -10,8 +10,9 @@
 
 import { apiClient, API_ROUTES } from '../config/config';
 
-// Feature flag - set to true to use new token standard
-const USE_TOKEN_STANDARD = import.meta.env.VITE_USE_TOKEN_STANDARD === 'true' || true; // Default to V2 now
+// Feature flag - Orders still use legacy API (V2 order creation has DAML encoding issues)
+// Balances use V2 (Holdings) - that's handled in balanceService.js
+const USE_TOKEN_STANDARD = import.meta.env.VITE_USE_TOKEN_STANDARD === 'true' || false; // Legacy for orders
 
 /**
  * Place an order
