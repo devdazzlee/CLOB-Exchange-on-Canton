@@ -10,7 +10,7 @@
  * Holdings reference Instruments via instrumentId.
  */
 
-const { getCantonService } = require('./cantonService');
+const cantonService = require('./cantonService');
 const config = require('../config');
 
 // Template IDs
@@ -46,7 +46,7 @@ class InstrumentService {
   }
 
   async initialize() {
-    this.cantonService = getCantonService();
+    this.cantonService = cantonService;
     console.log('[InstrumentService] Initialized');
   }
 
@@ -54,9 +54,9 @@ class InstrumentService {
    * Create an Instrument contract (defines a token type)
    */
   async createInstrument(symbol, description, decimals, observers, adminToken) {
-    const cantonService = getCantonService();
     const templateIds = getTemplateIds();
     const operatorPartyId = config.operatorPartyId || process.env.OPERATOR_PARTY_ID;
+    const synchronizerId = config.synchronizerId || process.env.DEFAULT_SYNCHRONIZER_ID;
 
     try {
       const instrumentId = {
@@ -65,28 +65,31 @@ class InstrumentService {
         version: '1.0',
       };
 
-      const result = await cantonService.submitCommand({
+      console.log(`[InstrumentService] Creating instrument ${symbol} with template: ${templateIds.instrument}`);
+      console.log(`[InstrumentService] Using synchronizerId: ${synchronizerId?.substring(0, 30)}...`);
+
+      const result = await cantonService.createContractWithTransaction({
         token: adminToken,
-        actAs: [operatorPartyId],
+        actAsParty: operatorPartyId,
+        templateId: templateIds.instrument,
+        createArguments: {
+          instrumentId: instrumentId,
+          description: description,
+          decimals: decimals,
+          observers: observers || [],
+        },
         readAs: [operatorPartyId],
-        commands: [{
-          CreateCommand: {
-            templateId: templateIds.instrument,
-            createArguments: {
-              instrumentId: instrumentId,
-              description: description,
-              decimals: decimals,
-              observers: observers || [],
-            },
-          },
-        }],
+        synchronizerId: synchronizerId,
       });
 
       console.log(`[InstrumentService] Created instrument: ${symbol}`);
       
+      // Extract contract ID from result
+      const contractId = result.transaction?.events?.[0]?.created?.contractId;
+      
       // Update cache
       this.instrumentCache.set(symbol, {
-        contractId: result.events?.[0]?.created?.contractId,
+        contractId: contractId,
         instrumentId,
         description,
         decimals,
@@ -103,40 +106,39 @@ class InstrumentService {
    * Create a TradingPair contract
    */
   async createTradingPair(baseSymbol, quoteSymbol, minOrderSize, tickSize, adminToken) {
-    const cantonService = getCantonService();
     const templateIds = getTemplateIds();
     const operatorPartyId = config.operatorPartyId || process.env.OPERATOR_PARTY_ID;
+    const synchronizerId = config.synchronizerId || process.env.DEFAULT_SYNCHRONIZER_ID;
 
     try {
       const pairId = `${baseSymbol}/${quoteSymbol}`;
       
-      const result = await cantonService.submitCommand({
+      console.log(`[InstrumentService] Creating trading pair ${pairId} with template: ${templateIds.tradingPair}`);
+      
+      const result = await cantonService.createContractWithTransaction({
         token: adminToken,
-        actAs: [operatorPartyId],
-        readAs: [operatorPartyId],
-        commands: [{
-          CreateCommand: {
-            templateId: templateIds.tradingPair,
-            createArguments: {
-              operator: operatorPartyId,
-              baseInstrument: {
-                issuer: operatorPartyId,
-                symbol: baseSymbol,
-                version: '1.0',
-              },
-              quoteInstrument: {
-                issuer: operatorPartyId,
-                symbol: quoteSymbol,
-                version: '1.0',
-              },
-              minOrderSize: minOrderSize,
-              tickSize: tickSize,
-              enabled: true,
-              observers: [],
-              pairId: pairId,
-            },
+        actAsParty: operatorPartyId,
+        templateId: templateIds.tradingPair,
+        createArguments: {
+          operator: operatorPartyId,
+          baseInstrument: {
+            issuer: operatorPartyId,
+            symbol: baseSymbol,
+            version: '1.0',
           },
-        }],
+          quoteInstrument: {
+            issuer: operatorPartyId,
+            symbol: quoteSymbol,
+            version: '1.0',
+          },
+          minOrderSize: minOrderSize,
+          tickSize: tickSize,
+          enabled: true,
+          observers: [],
+          pairId: pairId,
+        },
+        readAs: [operatorPartyId],
+        synchronizerId: synchronizerId,
       });
 
       console.log(`[InstrumentService] Created trading pair: ${pairId}`);
@@ -151,7 +153,6 @@ class InstrumentService {
    * Get all Instruments
    */
   async getInstruments(token) {
-    const cantonService = getCantonService();
     const templateIds = getTemplateIds();
     const operatorPartyId = config.operatorPartyId || process.env.OPERATOR_PARTY_ID;
 
@@ -179,7 +180,6 @@ class InstrumentService {
    * Get all TradingPairs
    */
   async getTradingPairs(token) {
-    const cantonService = getCantonService();
     const templateIds = getTemplateIds();
     const operatorPartyId = config.operatorPartyId || process.env.OPERATOR_PARTY_ID;
 
