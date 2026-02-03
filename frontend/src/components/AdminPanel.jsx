@@ -5,7 +5,7 @@ import { Button } from './ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card';
 import { Input } from './ui/input';
 import { Label } from './ui/label';
-import { OPERATOR_PARTY_ID } from '../config/authConfig';
+import { OPERATOR_PARTY_ID } from '@/config/authConfig';
 
 /**
  * AdminPanel - Operator-only interface for managing Global OrderBooks
