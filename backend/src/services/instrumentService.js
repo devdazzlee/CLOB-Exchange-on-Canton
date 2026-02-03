@@ -13,9 +13,12 @@
 const cantonService = require('./cantonService');
 const config = require('../config');
 
-// Template IDs
+// Template IDs - Use Token Standard package for Instrument/TradingPair
 const getTemplateIds = () => {
-  const packageId = config.packageId || process.env.CLOB_EXCHANGE_PACKAGE_ID;
+  // Token Standard package contains Instrument, Holding, Settlement, OrderV3
+  const packageId = config.canton?.tokenStandardPackageId || 
+                    process.env.TOKEN_STANDARD_PACKAGE_ID ||
+                    '813a7f5a2d053bb8e408035cf0a7f86d216f62b216eb6a6e157b253d0d2ccb69';
   return {
     instrument: `${packageId}:Instrument:Instrument`,
     tradingPair: `${packageId}:Instrument:TradingPair`,
