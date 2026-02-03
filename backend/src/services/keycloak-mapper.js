@@ -1,5 +1,9 @@
 // Keycloak Protocol Mapper Configuration
 // Add this to your Keycloak realm configuration
+//
+// IMPORTANT: Values from centralized constants (../config/constants.js)
+
+const { OPERATOR_PARTY_ID } = require('../config/constants');
 
 const keycloakConfig = {
   realm: 'canton-devnet',
@@ -33,7 +37,8 @@ const keycloakConfig = {
       protocol: 'openid-connect',
       protocolMapper: 'oidc-hardcoded-claim-mapper',
       config: {
-        'claim.value': '["8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292"]',
+        // Uses centralized OPERATOR_PARTY_ID
+        'claim.value': `["${OPERATOR_PARTY_ID}"]`,
         'claim.name': 'actAs',
         'jsonType.label': 'JSON',
         'access.token.claim': 'true'
@@ -44,7 +49,8 @@ const keycloakConfig = {
       protocol: 'openid-connect',
       protocolMapper: 'oidc-hardcoded-claim-mapper',
       config: {
-        'claim.value': '["8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292"]',
+        // Uses centralized OPERATOR_PARTY_ID
+        'claim.value': `["${OPERATOR_PARTY_ID}"]`,
         'claim.name': 'readAs',
         'jsonType.label': 'JSON',
         'access.token.claim': 'true'

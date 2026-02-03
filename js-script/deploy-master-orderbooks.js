@@ -2,10 +2,31 @@
 /**
  * Direct Deployment Script - Creates MasterOrderBooks using provided token
  * Uses the token you provided to create the global order books
+ * 
+ * IMPORTANT: Get a fresh token and pass via environment variable:
+ * ACCESS_TOKEN="your_token" node deploy-master-orderbooks.js
  */
 
-// Your deployment token (fresh token)
-const ACCESS_TOKEN = "eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICJDdjhRQVpEa3pYTlVvSXdNTnpZQWxBSmlBWlUtbmlvelV4VG96R0I4eXM0In0.eyJleHAiOjE3Njg2NTcyMzEsImlhdCI6MTc2ODY1NTQzMSwiYXV0aF90aW1lIjoxNzY4NjU0NzY0LCJqdGkiOiJvbnJ0YWM6ODNhMGMwNWItZTdkZS02MzhjLTgzN2EtMTAxZDlhZWQzNzIzIiwiaXNzIjoiaHR0cHM6Ly9rZXljbG9hay53b2xmZWRnZWxhYnMuY29tOjg0NDMvcmVhbG1zL2NhbnRvbi1kZXZuZXQiLCJhdWQiOiJhY2NvdW50Iiwic3ViIjoiODEwMGIyZGItODZjZi00MGExLTgzNTEtNTU0ODNjMTUxY2RjIiwidHlwIjoiQmVhcmVyIiwiYXpwIjoiYWNjb3VudC1jb25zb2xlIiwic2lkIjoiYTlhOWIwYTUtNTM0OC00ZjVmLThiOGUtZGRlZDU0MzcxNDZlIiwiYWNyIjoiMCIsInJlc291cmNlX2FjY2VzcyI6eyJhY2NvdW50Ijp7InJvbGVzIjpbIm1hbmFnZS1hY2NvdW50IiwibWFuYWdlLWFjY291bnQtbGlua3MiXX19LCJzY29wZSI6Im9wZW5pZCBwcm9maWxlIGVtYWlsIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsIm5hbWUiOiJab3lhIE11aGFtbWFkIiwicHJlZmVycmVkX3VzZXJuYW1lIjoiem95YSIsImdpdmVuX25hbWUiOiJab3lhIiwiZmFtaWx5X25hbWUiOiJNdWhhbW1hZCIsImVtYWlsIjoiem95YW11aGFtbWFkOTlAZ21haWwuY29tIn0.qzqyVvcsitLxFrx08SWelzrFrXzQBsKxUpATI6j1TLUBtzaKrLj1gYqqKmpyJVmPb5Bw5tz9jd3lJTbJSNQufablHfZhTT52vpKt4tNTMqMKSvrheyqv5qRUYsE-kaP5ZSlob__o3ZZRXC1WmUhQU_tNdFVXytDXO6_3BXBPWJk5Frv-b9CcjxApJSioCNoiiC3UrlfJ7UTS0T5GyLcrT-hAld-pYavZu-SG3CdC49poijntcJ1ybSphddDkdNkcLp2Q2jEIdgleQkaqFaesRSylxWykUS0WViuN3DId-hP_ksIClu_jw4BpsaJFaA9SFZEyoMKqeoPrsBuRAaRJKw";
+// Try to load from backend constants if available
+let backendConstants = null;
+try {
+  backendConstants = require('../backend/src/config/constants');
+} catch (e) {
+  console.log('[Deploy] Backend constants not available, using local config');
+}
+
+// Get token from environment (REQUIRED - do not hardcode tokens!)
+const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
+if (!ACCESS_TOKEN) {
+  console.error('ERROR: ACCESS_TOKEN environment variable is required');
+  console.error('Usage: ACCESS_TOKEN="your_fresh_token" node deploy-master-orderbooks.js');
+  process.exit(1);
+}
+
+// Operator party ID from centralized constants
+const DEFAULT_OPERATOR_PARTY_ID = backendConstants?.OPERATOR_PARTY_ID || 
+  process.env.OPERATOR_PARTY_ID || 
+  '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
 
 // Extract party ID from token
 function getPartyIdFromToken(token) {
@@ -13,30 +34,24 @@ function getPartyIdFromToken(token) {
     const parts = token.split('.');
     if (parts.length === 3) {
       const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
-      const sub = payload.sub; // This is the party ID prefix: 8100b2db-86cf-40a1-8351-55483c151cdc
+      const sub = payload.sub;
       
       // Check if token has ledger API claims with actAs
       const ledgerApi = payload['https://daml.com/ledgerapi'];
       if (ledgerApi && ledgerApi.actAs && ledgerApi.actAs.length > 0) {
-        // Use the first actAs party (this is the full party ID)
         console.log(`[Deploy] Using actAs from token: ${ledgerApi.actAs[0]}`);
         return ledgerApi.actAs[0];
       }
       
-      // Try the token's sub value first (maybe Canton accepts just the prefix)
-      // If that doesn't work, we'll try the full party ID
       console.log(`[Deploy] Token sub: ${sub}`);
-      console.log(`[Deploy] Will try both sub and full party ID`);
-      
-      // Return the sub for now - we'll try full party ID if this fails
       return sub;
     }
   } catch (e) {
     console.warn('[Deploy] Could not extract party from token:', e.message);
   }
   
-  // Default fallback
-  return '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
+  // Use centralized default
+  return DEFAULT_OPERATOR_PARTY_ID;
 }
 
 const OPERATOR_PARTY_ID = getPartyIdFromToken(ACCESS_TOKEN);

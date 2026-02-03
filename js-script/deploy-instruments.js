@@ -2,20 +2,30 @@
 /**
  * Deploy Instrument contracts for supported tokens (Token Standard)
  * Creates Instrument contracts for BTC, USDT, ETH, SOL
+ * 
+ * IMPORTANT: Values here should match backend/src/config/constants.js
  */
 
 const https = require('https');
 const http = require('http');
 
-// Configuration
+// Try to load from backend constants if available
+let backendConstants = null;
+try {
+  backendConstants = require('../backend/src/config/constants');
+} catch (e) {
+  console.log('[Deploy] Backend constants not available, using local config');
+}
+
+// Configuration - from centralized constants or fallback
 const CONFIG = {
-  cantonApi: 'http://65.108.40.104:31539',
-  keycloakUrl: 'https://keycloak.wolfedgelabs.com:8443/realms/canton-devnet/protocol/openid-connect/token',
-  oauthClientId: 'Sesnp3u6udkFF983rfprvsBbx3X3mBpw',
-  oauthClientSecret: 'mEGBw5Td3OUSanQoGeNMWg2nnPxq1VYc',
-  operatorPartyId: '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292',
-  packageId: 'ac5e34e7fc50cb726251a4fa71cbca275ebc19de34dae8f63bf8ba37bb91c0e4',
-  synchronizerId: 'global-domain::1220be58c29e65de40bf273be1dc2b266d43a9a002ea5b18955aeef7aac881bb471a'
+  cantonApi: backendConstants?.CANTON_JSON_API_BASE || process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539',
+  keycloakUrl: process.env.KEYCLOAK_TOKEN_URL || 'https://keycloak.wolfedgelabs.com:8443/realms/canton-devnet/protocol/openid-connect/token',
+  oauthClientId: process.env.OAUTH_CLIENT_ID || 'Sesnp3u6udkFF983rfprvsBbx3X3mBpw',
+  oauthClientSecret: process.env.OAUTH_CLIENT_SECRET || 'mEGBw5Td3OUSanQoGeNMWg2nnPxq1VYc',
+  operatorPartyId: backendConstants?.OPERATOR_PARTY_ID || process.env.OPERATOR_PARTY_ID || '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292',
+  packageId: backendConstants?.TOKEN_STANDARD_PACKAGE_ID || process.env.TOKEN_STANDARD_PACKAGE_ID || 'f552adda6b4c5ed9caa3c943d004c0e727cc29df62e1fdc91b9f1797491f9390',
+  synchronizerId: backendConstants?.DEFAULT_SYNCHRONIZER_ID || process.env.DEFAULT_SYNCHRONIZER_ID || 'global-domain::1220be58c29e65de40bf273be1dc2b266d43a9a002ea5b18955aeef7aac881bb471a'
 };
 
 // Instruments to create

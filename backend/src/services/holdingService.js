@@ -12,26 +12,13 @@
 
 const cantonService = require('./cantonService');
 const config = require('../config');
+const { getTokenStandardTemplateIds } = require('../config/constants');
 
 // Helper to get canton service instance
 const getCantonService = () => cantonService;
 
-// Template IDs for token standard contracts
-// CRITICAL: Use Token Standard package ID (813a7f5a...) NOT the legacy package
-const getTemplateIds = () => {
-  const tokenStandardPackageId = config.canton?.tokenStandardPackageId || 
-                                  process.env.TOKEN_STANDARD_PACKAGE_ID ||
-                                  '813a7f5a2d053bb8e408035cf0a7f86d216f62b216eb6a6e157b253d0d2ccb69';
-  return {
-    instrument: `${tokenStandardPackageId}:Instrument:Instrument`,
-    tradingPair: `${tokenStandardPackageId}:Instrument:TradingPair`,
-    holding: `${tokenStandardPackageId}:Holding:Holding`,
-    transferProposal: `${tokenStandardPackageId}:Holding:TransferProposal`,
-    mintRequest: `${tokenStandardPackageId}:Holding:MintRequest`,
-    order: `${tokenStandardPackageId}:OrderV3:OrderV3`,
-    settlement: `${tokenStandardPackageId}:Settlement:Settlement`,
-  };
-};
+// Template IDs - Use centralized constants (single source of truth)
+const getTemplateIds = () => getTokenStandardTemplateIds();
 
 class HoldingService {
   constructor() {
@@ -212,6 +199,10 @@ class HoldingService {
   /**
    * Mint tokens directly (operator privilege)
    * Creates Holding contract directly without MintRequest flow
+   * 
+   * DESIGN: Holding template has "signatory custodian" only (v2.0.0)
+   * Owner is an observer, so only operator needs to authorize creation.
+   * This enables test faucet to mint tokens for external parties!
    */
   async mintDirect(partyId, symbol, amount, adminToken) {
     const cantonService = getCantonService();
@@ -226,8 +217,12 @@ class HoldingService {
         version: '1.0',
       };
 
+      console.log(`[HoldingService] Minting ${amount} ${symbol} for ${partyId}`);
+      console.log(`[HoldingService] actAs: ${operatorPartyId} (custodian-only signatory in v2.0.0)`);
+
       const result = await cantonService.createContractWithTransaction({
         token: adminToken,
+        // Only custodian (operator) needs to authorize - owner is observer
         actAsParty: operatorPartyId,
         templateId: templateIds.holding,
         createArguments: {
@@ -237,26 +232,32 @@ class HoldingService {
           lock: null,
           custodian: operatorPartyId,
         },
-        readAs: [partyId],
+        readAs: [partyId, operatorPartyId],
         synchronizerId: synchronizerId,
       });
 
-      console.log(`[HoldingService] Minted ${amount} ${symbol} for ${partyId}`);
+      console.log(`[HoldingService] ✅ Minted ${amount} ${symbol} for ${partyId}`);
       return result;
     } catch (error) {
-      console.error('[HoldingService] Failed to mint directly:', error.message);
+      console.error(`[HoldingService] ❌ Failed to mint ${symbol}:`, error.message);
       throw error;
     }
   }
 
   /**
    * Lock a Holding for an order
+   * 
+   * IMPORTANT: Holding_Lock choice has "controller owner, lockHolder"
+   * So BOTH parties must be in actAs for the command to succeed!
    */
   async lockHolding(holdingCid, lockHolder, lockReason, lockAmount, ownerPartyId, token) {
     const cantonService = getCantonService();
     const templateIds = getTemplateIds();
 
     try {
+      console.log(`[HoldingService] Locking Holding ${holdingCid.substring(0, 20)}...`);
+      console.log(`[HoldingService] actAs: [${ownerPartyId.substring(0, 30)}..., ${lockHolder.substring(0, 30)}...] (both controllers required)`);
+
       const result = await cantonService.exerciseChoice({
         token,
         templateId: templateIds.holding,
@@ -267,13 +268,14 @@ class HoldingService {
           lockReason: lockReason,
           lockAmount: lockAmount.toString(),
         },
-        actAsParty: ownerPartyId,
+        // CRITICAL: Both owner AND lockHolder must authorize (both are controllers)
+        actAsParty: [ownerPartyId, lockHolder],
       });
 
-      console.log('[HoldingService] Holding locked for:', lockReason);
+      console.log('[HoldingService] ✅ Holding locked for:', lockReason);
       return result;
     } catch (error) {
-      console.error('[HoldingService] Failed to lock holding:', error.message);
+      console.error('[HoldingService] ❌ Failed to lock holding:', error.message);
       throw error;
     }
   }

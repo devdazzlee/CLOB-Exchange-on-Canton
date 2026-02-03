@@ -19,24 +19,15 @@ const { getHoldingService } = require('./holdingService');
 const { getSettlementService } = require('./settlementService');
 const { getInstrumentService } = require('./instrumentService');
 const config = require('../config');
+const { getTokenStandardTemplateIds } = require('../config/constants');
 const tokenProvider = require('./tokenProvider');
 const crypto = require('crypto');
 
 // Helper to get canton service instance
 const getCantonService = () => cantonService;
 
-// Template IDs - Use Token Standard package
-const getTemplateIds = () => {
-  const tokenStandardPackageId = config.canton?.tokenStandardPackageId || 
-                                  process.env.TOKEN_STANDARD_PACKAGE_ID ||
-                                  '813a7f5a2d053bb8e408035cf0a7f86d216f62b216eb6a6e157b253d0d2ccb69';
-  return {
-    order: `${tokenStandardPackageId}:OrderV3:Order`,
-    orderRequest: `${tokenStandardPackageId}:OrderV3:OrderRequest`,
-    holding: `${tokenStandardPackageId}:Holding:Holding`,
-    instrument: `${tokenStandardPackageId}:Instrument:Instrument`,
-  };
-};
+// Template IDs - Use centralized constants (single source of truth)
+const getTemplateIds = () => getTokenStandardTemplateIds();
 
 class OrderServiceV2 {
   constructor() {

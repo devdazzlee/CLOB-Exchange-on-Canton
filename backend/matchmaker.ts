@@ -6,15 +6,23 @@
  * 
  * The bot runs as the Operator (Venue), giving it permission to execute
  * Allocations that were created with the Operator as the provider.
+ * 
+ * IMPORTANT: Configuration values should be set via environment variables
+ * and match backend/src/config/constants.js
  */
 
 import fetch from 'node-fetch';
 
-// Configuration
+// Configuration - MUST match backend/src/config/constants.js
+// TypeScript module - uses process.env with fallbacks
+// Set these env vars or update the constants.js file
 const OPERATOR_PARTY_ID = process.env.OPERATOR_PARTY_ID || 
   '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
 
-const CANTON_JSON_API_BASE = process.env.CANTON_JSON_API_BASE || 'http://65.108.40.104:31539';
+const CANTON_JSON_API_BASE = process.env.CANTON_JSON_LEDGER_API_BASE || 
+  process.env.CANTON_JSON_API_BASE || 
+  'http://65.108.40.104:31539';
+
 const MATCHING_INTERVAL_MS = 5000; // Check every 5 seconds
 const MAX_MATCHES_PER_CYCLE = 10; // Limit matches per cycle to avoid overload
 

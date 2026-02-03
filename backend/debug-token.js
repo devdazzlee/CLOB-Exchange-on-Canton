@@ -1,12 +1,22 @@
 /**
  * Debug admin token issue
+ * 
+ * Uses centralized constants for all values
  */
 
 const cantonService = require('./src/services/cantonService');
+const { 
+  OPERATOR_PARTY_ID, 
+  CANTON_JSON_API_BASE,
+  DEFAULT_SYNCHRONIZER_ID 
+} = require('./src/config/constants');
 
 async function debugToken() {
   try {
     console.log('🔍 Starting admin token debug...');
+    console.log('📋 Config: Operator Party ID:', OPERATOR_PARTY_ID.substring(0, 30) + '...');
+    console.log('📋 Config: Canton API:', CANTON_JSON_API_BASE);
+    console.log('📋 Config: Synchronizer:', DEFAULT_SYNCHRONIZER_ID.substring(0, 30) + '...');
     
     // Test 1: Get admin token
     console.log('\n1. Testing admin token fetch...');
@@ -17,7 +27,7 @@ async function debugToken() {
     
     // Test 2: Test simple Canton API call
     console.log('\n2. Testing Canton API connectivity...');
-    const testResponse = await fetch('http://65.108.40.104:31539/v2/packages', {
+    const testResponse = await fetch(`${CANTON_JSON_API_BASE}/v2/packages`, {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${adminToken}`,
@@ -40,10 +50,10 @@ async function debugToken() {
     try {
       const result = await cantonService.createContract({
         token: adminToken,
-        actAsParty: ['8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292'],
+        actAsParty: [OPERATOR_PARTY_ID],
         templateId: 'test:Template:Test',
         createArguments: {},
-        synchronizerId: 'global-domain::1220be58c29e65de40bf273be1dc2b266d43a9a002ea5b18955aeef7aac881bb471a',
+        synchronizerId: DEFAULT_SYNCHRONIZER_ID,
       });
       console.log('✗ This should fail but we can see the exact error');
     } catch (createError) {

@@ -12,35 +12,34 @@
 
 const cantonService = require('./cantonService');
 const config = require('../config');
+const { 
+  getTokenStandardTemplateIds, 
+  SUPPORTED_TOKENS, 
+  TRADING_PAIRS 
+} = require('../config/constants');
 
-// Template IDs - Use Token Standard package for Instrument/TradingPair
-const getTemplateIds = () => {
-  // Token Standard package contains Instrument, Holding, Settlement, OrderV3
-  const packageId = config.canton?.tokenStandardPackageId || 
-                    process.env.TOKEN_STANDARD_PACKAGE_ID ||
-                    '813a7f5a2d053bb8e408035cf0a7f86d216f62b216eb6a6e157b253d0d2ccb69';
-  return {
-    instrument: `${packageId}:Instrument:Instrument`,
-    tradingPair: `${packageId}:Instrument:TradingPair`,
-  };
-};
+// Template IDs - Use centralized constants (single source of truth)
+const getTemplateIds = () => getTokenStandardTemplateIds();
 
-// Standard instruments we support
-const STANDARD_INSTRUMENTS = {
-  cBTC: { symbol: 'cBTC', description: 'Canton-wrapped Bitcoin', decimals: 8 },
-  BTC: { symbol: 'BTC', description: 'Bitcoin (legacy)', decimals: 8 },
-  USDT: { symbol: 'USDT', description: 'Tether USD Stablecoin', decimals: 6 },
-  ETH: { symbol: 'ETH', description: 'Ethereum', decimals: 18 },
-  SOL: { symbol: 'SOL', description: 'Solana', decimals: 9 },
-};
+// Standard instruments we support - from centralized constants
+const STANDARD_INSTRUMENTS = Object.fromEntries(
+  Object.entries(SUPPORTED_TOKENS).map(([key, token]) => [
+    key,
+    { symbol: token.symbol, description: token.name, decimals: token.decimals }
+  ])
+);
+// Add cBTC as alias
+STANDARD_INSTRUMENTS.cBTC = { symbol: 'cBTC', description: 'Canton-wrapped Bitcoin', decimals: 8 };
 
-// Standard trading pairs
-const STANDARD_PAIRS = [
-  { base: 'cBTC', quote: 'USDT', minOrderSize: '0.0001', tickSize: '0.01' },
-  { base: 'BTC', quote: 'USDT', minOrderSize: '0.0001', tickSize: '0.01' },
-  { base: 'ETH', quote: 'USDT', minOrderSize: '0.001', tickSize: '0.01' },
-  { base: 'SOL', quote: 'USDT', minOrderSize: '0.1', tickSize: '0.001' },
-];
+// Standard trading pairs - from centralized constants
+const STANDARD_PAIRS = TRADING_PAIRS.map(pair => ({
+  base: pair.baseAsset,
+  quote: pair.quoteAsset,
+  minOrderSize: pair.baseAsset === 'SOL' ? '0.1' : (pair.baseAsset === 'ETH' ? '0.001' : '0.0001'),
+  tickSize: pair.baseAsset === 'SOL' ? '0.001' : '0.01',
+}));
+// Add cBTC pair
+STANDARD_PAIRS.push({ base: 'cBTC', quote: 'USDT', minOrderSize: '0.0001', tickSize: '0.01' });
 
 class InstrumentService {
   constructor() {

@@ -15,8 +15,8 @@ import {
   fetchContract 
 } from './cantonApi';
 
-// Operator Party ID (The Venue)
-const OPERATOR_PARTY_ID = '8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292';
+// Operator Party ID - from centralized constants (SINGLE SOURCE OF TRUTH)
+import { OPERATOR_PARTY_ID } from '../config/constants';
 
 /**
  * Parse trading pair to extract base and quote tokens

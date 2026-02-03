@@ -25,6 +25,11 @@ data HoldingLock = HoldingLock
 -- | Holding - Represents token ownership
 -- 
 -- Similar to a UTXO - consumed when spent, new ones created for change
+-- 
+-- DESIGN: Custodian is the sole signatory to allow operator-controlled minting.
+-- This is essential for test faucet functionality where users don't sign during minting.
+-- Owner is observer - they can see their holdings but can't unilaterally archive them.
+-- All transfer/unlock choices require owner as controller for security.
 template Holding
   with
     owner : Party               -- Who owns this holding
@@ -33,8 +38,8 @@ template Holding
     lock : Optional HoldingLock -- Optional lock for orders/escrow
     custodian : Party           -- Who custodies (usually same as issuer or operator)
   where
-    signatory custodian, owner
-    observer if Some lock == None then [] else [lock.lockHolder | Some lock <- [lock]]
+    signatory custodian
+    observer owner :: (case lock of None -> []; Some l -> [l.lockHolder])
 
     ensure amount > 0.0
 

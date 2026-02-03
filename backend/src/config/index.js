@@ -10,6 +10,19 @@
  * - Keycloak: https://keycloak.wolfedgelabs.com:8443/realms/canton-devnet
  */
 
+// Import centralized constants
+const {
+  TOKEN_STANDARD_PACKAGE_ID,
+  LEGACY_PACKAGE_ID,
+  TEMPLATE_IDS,
+  TRADING_PAIRS,
+  SUPPORTED_TOKENS,
+  DEFAULT_MINT_AMOUNTS,
+  getTokenStandardTemplateIds,
+  getLegacyTemplateIds,
+  buildInstrumentId,
+} = require('./constants');
+
 const config = {
   // Server
   server: {
@@ -46,11 +59,12 @@ const config = {
     packageName: process.env.PACKAGE_NAME || 'clob-exchange',
 
     // Package ID for template IDs (package-id format) - REQUIRED for UserAccount creation
-    packageId: process.env.CLOB_EXCHANGE_PACKAGE_ID,
+    // Uses centralized constant from constants.js
+    packageId: process.env.CLOB_EXCHANGE_PACKAGE_ID || LEGACY_PACKAGE_ID,
     
     // Token Standard Package ID (Instrument, Holding, Settlement, OrderV3)
-    // clob-token-standard v1.0.0 - successfully vetted and deployed
-    tokenStandardPackageId: process.env.TOKEN_STANDARD_PACKAGE_ID || '813a7f5a2d053bb8e408035cf0a7f86d216f62b216eb6a6e157b253d0d2ccb69',
+    // Uses centralized constant from constants.js
+    tokenStandardPackageId: TOKEN_STANDARD_PACKAGE_ID,
 
     // OAuth configuration (SERVICE TOKEN ONLY)
     oauth: {
@@ -204,6 +218,19 @@ const config = {
       },
     };
   },
+};
+
+// Re-export constants for convenience
+config.constants = {
+  TOKEN_STANDARD_PACKAGE_ID,
+  LEGACY_PACKAGE_ID,
+  TEMPLATE_IDS,
+  TRADING_PAIRS,
+  SUPPORTED_TOKENS,
+  DEFAULT_MINT_AMOUNTS,
+  getTokenStandardTemplateIds,
+  getLegacyTemplateIds,
+  buildInstrumentId,
 };
 
 module.exports = config;
