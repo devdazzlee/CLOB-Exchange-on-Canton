@@ -61,7 +61,7 @@ export const API_ROUTES = {
     CANCEL: (settlementId) => `/settlements/${encodeURIComponent(settlementId)}/cancel`,
   },
   
-  // Orders
+  // Orders (Legacy)
   ORDERS: {
     PLACE: '/orders/place',
     GET_USER: (partyId, status) => {
@@ -76,6 +76,23 @@ export const API_ROUTES = {
     },
   },
   
+  // Orders V2 (Token Standard - Holdings + OrderV3)
+  ORDERS_V2: {
+    PLACE: '/orders/v2',
+    GET: (partyId, status) => {
+      const params = new URLSearchParams();
+      if (partyId) params.append('partyId', partyId);
+      if (status) params.append('status', status);
+      return `/orders/v2${params.toString() ? `?${params.toString()}` : ''}`;
+    },
+    CANCEL: (contractId, partyId) => {
+      const params = new URLSearchParams();
+      if (partyId) params.append('partyId', partyId);
+      return `/orders/v2/${encodeURIComponent(contractId)}${params.toString() ? `?${params.toString()}` : ''}`;
+    },
+    ORDERBOOK: (pair) => `/orders/v2/orderbook/${encodeURIComponent(pair)}`,
+  },
+  
   // Order Book
   ORDERBOOK: {
     GET: (pair) => `/orderbooks/${encodeURIComponent(pair)}`,
@@ -86,7 +103,7 @@ export const API_ROUTES = {
       `/orderbooks/${encodeURIComponent(pair)}/trades?limit=${limit}`,
   },
   
-  // Trades
+  // Trades (Legacy)
   TRADES: {
     GET: (pair, limit = 50) => 
       `/trades/${encodeURIComponent(pair)}?limit=${limit}`,
@@ -96,6 +113,19 @@ export const API_ROUTES = {
       const queryString = new URLSearchParams(params).toString();
       return `/v1/trades${queryString ? `?${queryString}` : ''}`;
     },
+  },
+  
+  // Trades V2 (Token Standard - DvP Settlements)
+  TRADES_V2: {
+    GET: (pair, limit = 50) => {
+      const params = new URLSearchParams();
+      if (pair) params.append('pair', pair);
+      params.append('limit', limit);
+      return `/trades/v2?${params.toString()}`;
+    },
+    GET_USER: (partyId, limit = 50) => 
+      `/trades/v2/user/${encodeURIComponent(partyId)}?limit=${limit}`,
+    PENDING_SETTLEMENTS: '/trades/v2/pending-settlements',
   },
   
   // Admin

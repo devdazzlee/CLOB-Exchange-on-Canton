@@ -27,6 +27,10 @@ const walletRoutes = require('./v1/walletRoutes');
 const exchangeRoutes = require('./v1/exchangeRoutes');
 const simpleWalletRoutes = require('./walletRoutes'); // Simplified wallet creation
 
+// TOKEN STANDARD V2 routes (Holdings + DvP Settlement)
+const orderRoutesV2 = require('./orderRoutesV2');
+const tradeRoutesV2 = require('./tradeRoutesV2');
+
 // Debug middleware to log all incoming requests to this router
 router.use((req, res, next) => {
   console.log(`[Routes Index] ${req.method} ${req.path} - Original URL: ${req.originalUrl}`);
@@ -58,6 +62,10 @@ router.use('/wallet', simpleWalletRoutes); // POST /api/wallet/create, POST /api
 // NEW: v1 API routes (External Party Onboarding + Exchange)
 router.use('/v1/wallets', walletRoutes); // External party onboarding
 router.use('/v1', exchangeRoutes); // Exchange API (orders, trades, etc.)
+
+// TOKEN STANDARD V2 API (Holdings + DvP Settlement)
+router.use('/orders/v2', orderRoutesV2); // POST /api/orders/v2 (Token Standard orders)
+router.use('/trades/v2', tradeRoutesV2); // GET /api/trades/v2 (DvP trades)
 
 // Debug: Log all registered routes
 console.log('[Routes] Registered routes:');
@@ -103,5 +111,19 @@ console.log('  POST /api/v1/orders/:contractId/cancel - Cancel order (requires w
 console.log('  GET  /api/v1/orderbook/:pair - Get orderbook (public)');
 console.log('  GET  /api/v1/trades - Get trades (public)');
 console.log('  GET  /api/v1/balances/:partyId - Get balances (requires wallet auth)');
+console.log('');
+console.log('TOKEN STANDARD V2 API (Holdings + DvP Settlement):');
+console.log('  POST /api/orders/v2 - Place order (locks Holding)');
+console.log('  GET  /api/orders/v2 - Get orders (OrderV3 contracts)');
+console.log('  DELETE /api/orders/v2/:contractId - Cancel order (unlocks Holding)');
+console.log('  GET  /api/orders/v2/orderbook/:pair - Get orderbook');
+console.log('  GET  /api/balance/v2/:partyId - Get Holding-based balances');
+console.log('  POST /api/balance/v2/mint - Mint Holdings (create tokens)');
+console.log('  GET  /api/balance/v2/holdings/:partyId - List all Holdings');
+console.log('  POST /api/balance/v2/lock - Lock a Holding');
+console.log('  POST /api/balance/v2/unlock - Unlock a Holding');
+console.log('  GET  /api/trades/v2 - Get trades (DvP settlements)');
+console.log('  GET  /api/trades/v2/user/:partyId - Get user trades');
+console.log('  GET  /api/trades/v2/pending-settlements - Admin view');
 
 module.exports = router;

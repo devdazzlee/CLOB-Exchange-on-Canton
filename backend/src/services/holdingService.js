@@ -10,22 +10,26 @@
  * - Holdings can be locked for orders, split for partial fills
  */
 
-const { getCantonService } = require('./cantonService');
+const cantonService = require('./cantonService');
 const config = require('../config');
 
+// Helper to get canton service instance
+const getCantonService = () => cantonService;
+
 // Template IDs for token standard contracts
+// CRITICAL: Use Token Standard package ID (813a7f5a...) NOT the legacy package
 const getTemplateIds = () => {
-  const packageId = config.packageId || process.env.CLOB_EXCHANGE_PACKAGE_ID;
+  const tokenStandardPackageId = config.canton?.tokenStandardPackageId || 
+                                  process.env.TOKEN_STANDARD_PACKAGE_ID ||
+                                  '813a7f5a2d053bb8e408035cf0a7f86d216f62b216eb6a6e157b253d0d2ccb69';
   return {
-    instrument: `${packageId}:Instrument:Instrument`,
-    tradingPair: `${packageId}:Instrument:TradingPair`,
-    holding: `${packageId}:Holding:Holding`,
-    transferProposal: `${packageId}:Holding:TransferProposal`,
-    mintRequest: `${packageId}:Holding:MintRequest`,
-    order: `${packageId}:OrderV3:Order`,
-    orderRequest: `${packageId}:OrderV3:OrderRequest`,
-    settlement: `${packageId}:Settlement:SettlementInstruction`,
-    trade: `${packageId}:Settlement:Trade`,
+    instrument: `${tokenStandardPackageId}:Instrument:Instrument`,
+    tradingPair: `${tokenStandardPackageId}:Instrument:TradingPair`,
+    holding: `${tokenStandardPackageId}:Holding:Holding`,
+    transferProposal: `${tokenStandardPackageId}:Holding:TransferProposal`,
+    mintRequest: `${tokenStandardPackageId}:Holding:MintRequest`,
+    order: `${tokenStandardPackageId}:OrderV3:OrderV3`,
+    settlement: `${tokenStandardPackageId}:Settlement:Settlement`,
   };
 };
 
@@ -212,7 +216,8 @@ class HoldingService {
   async mintDirect(partyId, symbol, amount, adminToken) {
     const cantonService = getCantonService();
     const templateIds = getTemplateIds();
-    const operatorPartyId = config.operatorPartyId || process.env.OPERATOR_PARTY_ID;
+    const operatorPartyId = config.canton?.operatorPartyId || process.env.OPERATOR_PARTY_ID;
+    const synchronizerId = config.canton?.synchronizerId || process.env.DEFAULT_SYNCHRONIZER_ID;
 
     try {
       const instrumentId = {
@@ -221,22 +226,19 @@ class HoldingService {
         version: '1.0',
       };
 
-      const result = await cantonService.submitCommand({
+      const result = await cantonService.createContractWithTransaction({
         token: adminToken,
-        actAs: [operatorPartyId],
-        readAs: [operatorPartyId, partyId],
-        commands: [{
-          CreateCommand: {
-            templateId: templateIds.holding,
-            createArguments: {
-              owner: partyId,
-              instrumentId: instrumentId,
-              amount: amount.toString(),
-              lock: null,
-              custodian: operatorPartyId,
-            },
-          },
-        }],
+        actAsParty: operatorPartyId,
+        templateId: templateIds.holding,
+        createArguments: {
+          owner: partyId,
+          instrumentId: instrumentId,
+          amount: amount.toString(),
+          lock: null,
+          custodian: operatorPartyId,
+        },
+        readAs: [partyId],
+        synchronizerId: synchronizerId,
       });
 
       console.log(`[HoldingService] Minted ${amount} ${symbol} for ${partyId}`);

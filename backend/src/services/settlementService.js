@@ -12,18 +12,23 @@
  * complete the trade or nothing happens.
  */
 
-const { getCantonService } = require('./cantonService');
+const cantonService = require('./cantonService');
 const { getHoldingService } = require('./holdingService');
 const { getInstrumentService } = require('./instrumentService');
 const config = require('../config');
 
-// Template IDs
+// Helper to get canton service instance
+const getCantonService = () => cantonService;
+
+// Template IDs - Use Token Standard package for Settlement
 const getTemplateIds = () => {
-  const packageId = config.packageId || process.env.CLOB_EXCHANGE_PACKAGE_ID;
+  const tokenStandardPackageId = config.canton?.tokenStandardPackageId || 
+                                  process.env.TOKEN_STANDARD_PACKAGE_ID ||
+                                  '813a7f5a2d053bb8e408035cf0a7f86d216f62b216eb6a6e157b253d0d2ccb69';
   return {
-    settlement: `${packageId}:Settlement:SettlementInstruction`,
-    trade: `${packageId}:Settlement:Trade`,
-    batchSettlement: `${packageId}:Settlement:BatchSettlement`,
+    settlement: `${tokenStandardPackageId}:Settlement:SettlementInstruction`,
+    trade: `${tokenStandardPackageId}:Settlement:Trade`,
+    batchSettlement: `${tokenStandardPackageId}:Settlement:BatchSettlement`,
   };
 };
 

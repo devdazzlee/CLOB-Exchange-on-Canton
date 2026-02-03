@@ -10,8 +10,9 @@
 
 import { apiClient, API_ROUTES } from '../config/config';
 
-// Feature flag - set to true to use new token standard
-const USE_TOKEN_STANDARD = import.meta.env.VITE_USE_TOKEN_STANDARD === 'true' || false;
+// Feature flag - defaults to true for Token Standard (Holdings)
+// Set VITE_USE_TOKEN_STANDARD=false to use legacy UserAccount
+const USE_TOKEN_STANDARD = import.meta.env.VITE_USE_TOKEN_STANDARD !== 'false'; // Default to V2 now
 
 /**
  * Get user balances
