@@ -51,6 +51,7 @@ router.post('/inspect-token', authController.inspectToken); // POST /api/inspect
 router.use('/ws/status', healthRoutes); // GET /api/ws/status
 router.use('/health', healthRoutes); // GET /api/health
 router.use('/balance', balanceRoutes); // GET /api/balance/:partyId
+router.use('/transfers', require('./transferRoutes')); // Token transfer/accept offers (CBTC etc.)
 // New BFF routes (no Keycloak / no Canton token in browser)
 router.use('/ledger', ledgerProxyRoutes);
 // Legacy raw proxy (kept for backwards compatibility / debugging)
