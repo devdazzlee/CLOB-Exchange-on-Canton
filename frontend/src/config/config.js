@@ -22,11 +22,43 @@ export const API_ROUTES = {
     INFO: (walletId) => `/v1/wallets/${encodeURIComponent(walletId)}`,
   },
   
-  // Balance
+  // Balance (Legacy UserAccount-based)
   BALANCE: {
     GET: (partyId) => `/balance/${encodeURIComponent(partyId)}`,
     MINT: '/balance/mint',
     EXTERNAL: (walletId) => `/balance/external-wallet-${walletId}`,
+  },
+  
+  // Balance V2 (New Holding-based Token Standard)
+  BALANCE_V2: {
+    GET: (partyId) => `/balance/v2/${encodeURIComponent(partyId)}`,
+    MINT: '/balance/v2/mint',
+    HOLDINGS: (partyId, symbol) => {
+      const base = `/balance/v2/holdings/${encodeURIComponent(partyId)}`;
+      return symbol ? `${base}?symbol=${encodeURIComponent(symbol)}` : base;
+    },
+    LOCK: '/balance/v2/lock',
+    UNLOCK: '/balance/v2/unlock',
+  },
+  
+  // Instruments (Token Types)
+  INSTRUMENTS: {
+    GET_ALL: '/instruments',
+    GET: (symbol) => `/instruments/${encodeURIComponent(symbol)}`,
+    CREATE: '/instruments',
+  },
+  
+  // Trading Pairs
+  TRADING_PAIRS: {
+    GET_ALL: '/trading-pairs',
+    GET: (pairId) => `/trading-pairs/${encodeURIComponent(pairId)}`,
+  },
+  
+  // Settlements (DvP)
+  SETTLEMENTS: {
+    PENDING: '/settlements/pending',
+    EXECUTE: (settlementId) => `/settlements/${encodeURIComponent(settlementId)}/execute`,
+    CANCEL: (settlementId) => `/settlements/${encodeURIComponent(settlementId)}/cancel`,
   },
   
   // Orders
