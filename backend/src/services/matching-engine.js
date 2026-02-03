@@ -59,9 +59,20 @@ class MatchingEngine {
       return this.adminToken;
     }
 
+    console.log('[MatchingEngine] Refreshing admin token...');
     this.adminToken = await this.cantonAdmin.getAdminToken();
     this.tokenExpiry = Date.now() + (25 * 60 * 1000); // 25 minutes (token expires in 30)
+    console.log('[MatchingEngine] Admin token refreshed successfully');
     return this.adminToken;
+  }
+
+  /**
+   * Invalidate cached token (call on 401 errors)
+   */
+  invalidateToken() {
+    console.log('[MatchingEngine] Invalidating cached token due to auth error');
+    this.adminToken = null;
+    this.tokenExpiry = null;
   }
 
   /**
@@ -129,6 +140,10 @@ class MatchingEngine {
       }
     } catch (error) {
       console.error('[MatchingEngine] Error in matching cycle:', error.message);
+      // Invalidate token on 401 errors so it gets refreshed next cycle
+      if (error.message?.includes('401') || error.message?.includes('security-sensitive') || error.message?.includes('Unauthorized')) {
+        this.invalidateToken();
+      }
     } finally {
       this.matchingInProgress = false;
     }
@@ -251,6 +266,10 @@ class MatchingEngine {
       
     } catch (error) {
       console.error(`[MatchingEngine] Error processing ${tradingPair}:`, error.message);
+      // Invalidate token on 401 errors so it gets refreshed next cycle
+      if (error.message?.includes('401') || error.message?.includes('security-sensitive') || error.message?.includes('Unauthorized')) {
+        this.invalidateToken();
+      }
     }
   }
   
