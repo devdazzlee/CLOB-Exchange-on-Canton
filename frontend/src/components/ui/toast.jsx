@@ -229,234 +229,114 @@ function Toast({ toast, onRemove }) {
   );
 }
 
-// Confetti particle component
-function ConfettiParticle({ delay, color }) {
-  return (
-    <motion.div
-      initial={{ 
-        opacity: 1, 
-        y: 0, 
-        x: 0,
-        scale: 1,
-        rotate: 0
-      }}
-      animate={{ 
-        opacity: [1, 1, 0],
-        y: [0, -100, -200],
-        x: [0, (Math.random() - 0.5) * 200],
-        scale: [1, 1.2, 0.5],
-        rotate: [0, 360, 720]
-      }}
-      transition={{ 
-        duration: 2,
-        delay: delay,
-        ease: "easeOut"
-      }}
-      className="absolute w-3 h-3 rounded-sm"
-      style={{ 
-        backgroundColor: color,
-        left: `${50 + (Math.random() - 0.5) * 30}%`,
-        top: '50%'
-      }}
-    />
-  );
-}
-
-// Order success modal component - ATTRACTIVE VERSION
+// Order success modal component - Matching Cancel Modal Style
 export function OrderSuccessModal({ isOpen, onClose, orderData }) {
-  const [showConfetti, setShowConfetti] = React.useState(false);
-  
-  React.useEffect(() => {
-    if (isOpen) {
-      setShowConfetti(true);
-      const timer = setTimeout(() => setShowConfetti(false), 2500);
-      return () => clearTimeout(timer);
-    }
-  }, [isOpen]);
-
   if (!isOpen) return null;
 
-  const confettiColors = ['#22c55e', '#10b981', '#14b8a6', '#06b6d4', '#0ea5e9', '#3b82f6', '#8b5cf6', '#a855f7', '#ec4899', '#f43f5e', '#f97316', '#eab308'];
+  const isBuy = orderData?.orderType === 'BUY';
 
   return (
     <AnimatePresence>
       {isOpen && (
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          className="fixed inset-0 z-[9999] flex items-center justify-center p-4"
-          onClick={onClose}
-        >
-          {/* Backdrop with blur */}
+        <>
+          {/* Backdrop */}
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="absolute inset-0 bg-black/70 backdrop-blur-md"
+            className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[9999]"
+            onClick={onClose}
           />
-          
-          {/* Confetti */}
-          {showConfetti && (
-            <div className="absolute inset-0 pointer-events-none overflow-hidden">
-              {confettiColors.map((color, i) => (
-                <React.Fragment key={i}>
-                  <ConfettiParticle delay={i * 0.05} color={color} />
-                  <ConfettiParticle delay={i * 0.05 + 0.1} color={color} />
-                  <ConfettiParticle delay={i * 0.05 + 0.2} color={color} />
-                </React.Fragment>
-              ))}
-            </div>
-          )}
           
           {/* Modal */}
           <motion.div
-            initial={{ opacity: 0, scale: 0.8, y: 50 }}
+            initial={{ opacity: 0, scale: 0.95, y: 20 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.8, y: 50 }}
-            transition={{ type: "spring", stiffness: 400, damping: 25 }}
-            onClick={(e) => e.stopPropagation()}
-            className="relative overflow-hidden"
+            exit={{ opacity: 0, scale: 0.95, y: 20 }}
+            transition={{ type: 'spring', duration: 0.3 }}
+            className="fixed inset-0 z-[9999] flex items-center justify-center p-4"
           >
-            {/* Glow effect */}
-            <div className="absolute -inset-1 bg-gradient-to-r from-green-600 via-emerald-500 to-teal-500 rounded-3xl blur-lg opacity-50 animate-pulse" />
-            
-            {/* Modal content */}
-            <div className="relative bg-gradient-to-br from-[#1a1f2e] via-[#151922] to-[#0d1117] border border-green-500/40 rounded-2xl p-8 max-w-md w-full shadow-2xl">
-              {/* Decorative corner accents */}
-              <div className="absolute top-0 left-0 w-20 h-20 border-l-2 border-t-2 border-green-500/30 rounded-tl-2xl" />
-              <div className="absolute bottom-0 right-0 w-20 h-20 border-r-2 border-b-2 border-green-500/30 rounded-br-2xl" />
-              
-              {/* Success animation */}
-              <div className="flex flex-col items-center text-center">
-                {/* Animated success icon with rings */}
-                <div className="relative mb-6">
-                  {/* Outer ring */}
-                  <motion.div
-                    initial={{ scale: 0, opacity: 0 }}
-                    animate={{ scale: 1.5, opacity: 0 }}
-                    transition={{ duration: 1, repeat: Infinity, repeatDelay: 0.5 }}
-                    className="absolute inset-0 rounded-full bg-green-500/20"
-                  />
-                  {/* Middle ring */}
-                  <motion.div
-                    initial={{ scale: 0, opacity: 0 }}
-                    animate={{ scale: 1.3, opacity: 0 }}
-                    transition={{ duration: 1, repeat: Infinity, repeatDelay: 0.5, delay: 0.2 }}
-                    className="absolute inset-0 rounded-full bg-green-500/30"
-                  />
-                  {/* Main circle */}
-                  <motion.div
-                    initial={{ scale: 0, rotate: -180 }}
-                    animate={{ scale: 1, rotate: 0 }}
-                    transition={{ type: "spring", stiffness: 200, damping: 15, delay: 0.1 }}
-                    className="w-24 h-24 rounded-full bg-gradient-to-br from-green-400 via-emerald-500 to-teal-600 flex items-center justify-center shadow-xl shadow-green-500/40"
-                  >
-                    <motion.div
-                      initial={{ scale: 0 }}
-                      animate={{ scale: 1 }}
-                      transition={{ delay: 0.3, type: "spring", stiffness: 300 }}
-                    >
-                      <CheckCircle className="w-12 h-12 text-white drop-shadow-lg" />
-                    </motion.div>
-                  </motion.div>
-                </div>
-                
-                <motion.h3 
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: 0.2 }}
-                  className="text-2xl font-bold bg-gradient-to-r from-green-400 to-emerald-300 bg-clip-text text-transparent mb-1"
-                >
-                  🎉 Order Placed!
-                </motion.h3>
-                <motion.p
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  transition={{ delay: 0.3 }}
-                  className="text-gray-400 text-sm mb-4"
-                >
-                  Your order is now live on the Canton ledger
-                </motion.p>
-                
-                {orderData && (
+            <div className="bg-card border border-border rounded-xl shadow-2xl w-full max-w-md overflow-hidden">
+              {/* Header */}
+              <div className={`flex items-center justify-between p-4 border-b border-border ${
+                isBuy ? 'bg-green-500/10' : 'bg-red-500/10'
+              }`}>
+                <div className="flex items-center gap-3">
                   <motion.div 
-                    initial={{ opacity: 0, y: 20 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ delay: 0.4 }}
-                    className="w-full mt-2 space-y-3 text-left bg-black/40 rounded-xl p-5 border border-white/5"
+                    initial={{ scale: 0 }}
+                    animate={{ scale: 1 }}
+                    transition={{ type: "spring", stiffness: 300, damping: 20, delay: 0.1 }}
+                    className={`p-2 rounded-full ${isBuy ? 'bg-green-500/20' : 'bg-red-500/20'}`}
                   >
-                    <div className="flex justify-between items-center text-sm">
-                      <span className="text-gray-500 flex items-center gap-2">
-                        <span className="w-2 h-2 rounded-full bg-gray-500" />
-                        Order ID
-                      </span>
-                      <span className="text-gray-300 font-mono text-xs bg-black/30 px-2 py-1 rounded">
-                        {orderData.orderId?.substring(0, 16)}...
-                      </span>
-                    </div>
-                    <div className="flex justify-between items-center text-sm">
-                      <span className="text-gray-500 flex items-center gap-2">
-                        <span className={`w-2 h-2 rounded-full ${orderData.orderType === 'BUY' ? 'bg-green-500' : 'bg-red-500'}`} />
-                        Type
-                      </span>
-                      <span className={`font-semibold px-3 py-1 rounded-lg text-xs ${
-                        orderData.orderType === 'BUY' 
-                          ? 'text-green-400 bg-green-500/10 border border-green-500/20' 
-                          : 'text-red-400 bg-red-500/10 border border-red-500/20'
-                      }`}>
+                    <CheckCircle className={`w-5 h-5 ${isBuy ? 'text-green-500' : 'text-red-500'}`} />
+                  </motion.div>
+                  <h3 className="text-lg font-semibold text-foreground">Order Submitted</h3>
+                </div>
+                <button
+                  onClick={onClose}
+                  className="p-1 rounded-lg hover:bg-muted transition-colors"
+                >
+                  <X className="w-5 h-5 text-muted-foreground" />
+                </button>
+              </div>
+
+              {/* Content */}
+              <div className="p-6 space-y-4">
+                <p className="text-muted-foreground">
+                  Your order has been placed successfully and is now live on the Canton ledger.
+                </p>
+
+                {/* Order Details */}
+                {orderData && (
+                  <div className="bg-muted/50 rounded-lg p-4 space-y-3">
+                    {orderData.orderId && (
+                      <div className="flex justify-between items-center">
+                        <span className="text-sm text-muted-foreground">Order ID</span>
+                        <span className="text-sm font-mono text-foreground">{orderData.orderId?.substring(0, 16)}...</span>
+                      </div>
+                    )}
+                    <div className="flex justify-between items-center">
+                      <span className="text-sm text-muted-foreground">Type</span>
+                      <span className={`text-sm font-semibold ${isBuy ? 'text-green-500' : 'text-red-500'}`}>
                         {orderData.orderType} {orderData.orderMode}
                       </span>
                     </div>
-                    <div className="flex justify-between items-center text-sm">
-                      <span className="text-gray-500 flex items-center gap-2">
-                        <span className="w-2 h-2 rounded-full bg-blue-500" />
-                        Pair
-                      </span>
-                      <span className="text-white font-medium">{orderData.tradingPair}</span>
+                    <div className="flex justify-between items-center">
+                      <span className="text-sm text-muted-foreground">Trading Pair</span>
+                      <span className="text-sm font-semibold text-foreground">{orderData.tradingPair}</span>
                     </div>
                     {orderData.price && (
-                      <div className="flex justify-between items-center text-sm">
-                        <span className="text-gray-500 flex items-center gap-2">
-                          <span className="w-2 h-2 rounded-full bg-yellow-500" />
-                          Price
-                        </span>
-                        <span className="text-yellow-400 font-bold text-lg">
+                      <div className="flex justify-between items-center">
+                        <span className="text-sm text-muted-foreground">Price</span>
+                        <span className="text-sm font-mono text-foreground">
                           ${parseFloat(orderData.price).toLocaleString()}
                         </span>
                       </div>
                     )}
-                    <div className="flex justify-between items-center text-sm">
-                      <span className="text-gray-500 flex items-center gap-2">
-                        <span className="w-2 h-2 rounded-full bg-purple-500" />
-                        Quantity
-                      </span>
-                      <span className="text-purple-400 font-semibold">{orderData.quantity} BTC</span>
+                    <div className="flex justify-between items-center">
+                      <span className="text-sm text-muted-foreground">Quantity</span>
+                      <span className="text-sm font-mono text-foreground">{orderData.quantity}</span>
                     </div>
-                  </motion.div>
+                  </div>
                 )}
-                
-                <motion.button
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: 0.5 }}
+              </div>
+
+              {/* Footer */}
+              <div className="flex gap-3 p-4 border-t border-border bg-muted/30">
+                <button
                   onClick={onClose}
-                  whileHover={{ scale: 1.02 }}
-                  whileTap={{ scale: 0.98 }}
-                  className="mt-6 w-full py-4 bg-gradient-to-r from-green-600 via-emerald-500 to-teal-500 hover:from-green-500 hover:via-emerald-400 hover:to-teal-400 text-white font-bold rounded-xl transition-all duration-300 shadow-xl shadow-green-500/25 flex items-center justify-center gap-2"
+                  className={`flex-1 py-2.5 font-medium rounded-lg transition-colors ${
+                    isBuy 
+                      ? 'bg-green-500 hover:bg-green-600 text-white' 
+                      : 'bg-red-500 hover:bg-red-600 text-white'
+                  }`}
                 >
-                  <span>Continue Trading</span>
-                  <motion.span
-                    animate={{ x: [0, 5, 0] }}
-                    transition={{ repeat: Infinity, duration: 1 }}
-                  >
-                    →
-                  </motion.span>
-                </motion.button>
+                  Continue Trading
+                </button>
               </div>
             </div>
           </motion.div>
-        </motion.div>
+        </>
       )}
     </AnimatePresence>
   );
