@@ -24,6 +24,7 @@ import TradingPageSkeleton from './trading/TradingPageSkeleton';
 // Import services
 import websocketService from '../services/websocketService';
 import { getAvailableTradingPairs, getGlobalOrderBook } from '../services/cantonApi';
+import { apiClient, API_ROUTES } from '../config/config';
 
 export default function TradingInterface({ partyId }) {
   // === PHASE 1: ALL HOOKS MUST BE DECLARED FIRST - NO EXCEPTIONS ===
@@ -76,30 +77,19 @@ export default function TradingInterface({ partyId }) {
     isMintingRef.current = true;
     setMintingLoading(true);
     
-    const API_BASE = import.meta.env.VITE_API_BASE_URL || 
-      (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
-    
     try {
       // Try the balance/mint endpoint (creates/updates UserAccount)
-      const response = await fetch(`${API_BASE}/balance/mint`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          partyId: partyId,
-          tokens: [
-            { symbol: 'BTC', amount: 10 },
-            { symbol: 'USDT', amount: 100000 },
-            { symbol: 'ETH', amount: 100 },
-            { symbol: 'SOL', amount: 1000 }
-          ]
-        })
+      const mintData = await apiClient.post(API_ROUTES.BALANCE.MINT, {
+        partyId: partyId,
+        tokens: [
+          { symbol: 'BTC', amount: 10 },
+          { symbol: 'USDT', amount: 100000 },
+          { symbol: 'ETH', amount: 100 },
+          { symbol: 'SOL', amount: 1000 }
+        ]
       });
       
-      const mintData = await response.json();
-      
-      if (response.ok && mintData.success) {
+      if (mintData.success) {
         console.log('[Mint] Backend mint successful:', mintData);
         toast.success('Test tokens minted successfully!', {
           title: '🪙 Tokens Minted',
@@ -109,9 +99,8 @@ export default function TradingInterface({ partyId }) {
         // Refresh balance from backend
         setTimeout(async () => {
           try {
-            const balanceResponse = await fetch(`${API_BASE}/balance/${partyId}`);
-            const balanceData = await balanceResponse.json();
-            if (balanceResponse.ok && balanceData.success && balanceData.data?.balance) {
+            const balanceData = await apiClient.get(API_ROUTES.BALANCE.GET(partyId));
+            if (balanceData.success && balanceData.data?.balance) {
               setBalance({
                 BTC: balanceData.data.balance.BTC || '0.0',
                 USDT: balanceData.data.balance.USDT || '0.0',
@@ -148,28 +137,20 @@ export default function TradingInterface({ partyId }) {
       console.log('[Place Order] Placing order:', orderData);
       
       // Use the simpler /api/orders/place endpoint that works with partyId
-      const API_BASE = import.meta.env.VITE_API_BASE_URL || 
-        (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
-      
-      const response = await fetch(`${API_BASE}/orders/place`, {
-        method: 'POST',
+      const result = await apiClient.post(API_ROUTES.ORDERS.PLACE, {
+        tradingPair: orderData.tradingPair,
+        orderType: orderData.orderType,
+        orderMode: orderData.orderMode,
+        price: orderData.price,
+        quantity: orderData.quantity,
+        partyId: partyId
+      }, {
         headers: {
-          'Content-Type': 'application/json',
           'x-user-id': partyId || 'anonymous'
-        },
-        body: JSON.stringify({
-          tradingPair: orderData.tradingPair,
-          orderType: orderData.orderType,
-          orderMode: orderData.orderMode,
-          price: orderData.price,
-          quantity: orderData.quantity,
-          partyId: partyId
-        })
+        }
       });
       
-      const result = await response.json();
-      
-      if (!response.ok) {
+      if (!result.success) {
         throw new Error(result.error || result.message || 'Failed to place order');
       }
 
@@ -196,44 +177,35 @@ export default function TradingInterface({ partyId }) {
       
       // Refresh order book from API
       try {
-        const bookResponse = await fetch(`${API_BASE}/orderbooks/${encodeURIComponent(tradingPair)}`);
-        if (bookResponse.ok) {
-          const bookData = await bookResponse.json();
-          setOrderBook({
-            buys: bookData.data?.raw?.buyOrders || [],
-            sells: bookData.data?.raw?.sellOrders || []
-          });
-        }
+        const bookData = await apiClient.get(API_ROUTES.ORDERBOOK.GET(tradingPair));
+        setOrderBook({
+          buys: bookData.data?.raw?.buyOrders || [],
+          sells: bookData.data?.raw?.sellOrders || []
+        });
       } catch (e) { console.error('[Refresh] Order book error:', e); }
       
       // Refresh user orders from API
       try {
-        const ordersResponse = await fetch(`${API_BASE}/orders/user/${encodeURIComponent(partyId)}?status=OPEN`);
-        if (ordersResponse.ok) {
-          const ordersData = await ordersResponse.json();
-          const ordersList = ordersData?.data?.orders || [];
-          setOrders(ordersList.map(order => ({
-            id: order.orderId || order.contractId,
-            contractId: order.contractId,
-            type: order.orderType,
-            mode: order.orderMode,
-            price: order.price,
-            quantity: order.quantity,
-            filled: order.filled || '0',
-            status: order.status,
-            tradingPair: order.tradingPair,
-            timestamp: order.timestamp
-          })));
-        }
+        const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
+        const ordersList = ordersData?.data?.orders || [];
+        setOrders(ordersList.map(order => ({
+          id: order.orderId || order.contractId,
+          contractId: order.contractId,
+          type: order.orderType,
+          mode: order.orderMode,
+          price: order.price,
+          quantity: order.quantity,
+          filled: order.filled || '0',
+          status: order.status,
+          tradingPair: order.tradingPair,
+          timestamp: order.timestamp
+        })));
       } catch (e) { console.error('[Refresh] User orders error:', e); }
       
       // Refresh trades from API
       try {
-        const tradesResponse = await fetch(`${API_BASE}/trades/${encodeURIComponent(tradingPair)}?limit=50`);
-        if (tradesResponse.ok) {
-          const tradesData = await tradesResponse.json();
-          setTrades(tradesData?.data?.trades || []);
-        }
+        const tradesData = await apiClient.get(API_ROUTES.TRADES.GET(tradingPair, 50));
+        setTrades(tradesData?.data?.trades || []);
       } catch (e) { console.error('[Refresh] Trades error:', e); }
       
     } catch (error) {
@@ -262,24 +234,16 @@ export default function TradingInterface({ partyId }) {
     
     console.log('[Cancel Order] Cancelling order with contractId:', contractId);
     
-    const API_BASE = import.meta.env.VITE_API_BASE_URL || 
-      (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
-    
     // Use POST /api/orders/:orderId/cancel endpoint
-    const response = await fetch(`${API_BASE}/orders/${encodeURIComponent(contractId)}/cancel`, {
-      method: 'POST',
+    const data = await apiClient.post(API_ROUTES.ORDERS.CANCEL(contractId), {
+      partyId: partyId
+    }, {
       headers: {
-        'Content-Type': 'application/json',
         'x-party-id': partyId
-      },
-      body: JSON.stringify({
-        partyId: partyId
-      })
+      }
     });
     
-    const data = await response.json();
-    
-    if (!response.ok || !data.success) {
+    if (!data.success) {
       const errorMsg = data.error || 'Failed to cancel order';
       console.error('[Cancel Order] Failed:', errorMsg);
       toast.error(errorMsg);
@@ -291,35 +255,29 @@ export default function TradingInterface({ partyId }) {
     
     // Refresh orders list directly
     try {
-      const ordersResponse = await fetch(`${API_BASE}/orders/user/${encodeURIComponent(partyId)}?status=OPEN`);
-      if (ordersResponse.ok) {
-        const ordersData = await ordersResponse.json();
-        const ordersList = ordersData?.data?.orders || ordersData?.orders || [];
-        setOrders(ordersList.map(order => ({
-          id: order.orderId || order.contractId,
-          contractId: order.contractId,
-          type: order.orderType,
-          mode: order.orderMode,
-          price: order.price,
-          quantity: order.quantity,
-          filled: order.filled || '0',
-          status: order.status,
-          tradingPair: order.tradingPair,
-          timestamp: order.timestamp
-        })));
-      }
+      const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
+      const ordersList = ordersData?.data?.orders || ordersData?.orders || [];
+      setOrders(ordersList.map(order => ({
+        id: order.orderId || order.contractId,
+        contractId: order.contractId,
+        type: order.orderType,
+        mode: order.orderMode,
+        price: order.price,
+        quantity: order.quantity,
+        filled: order.filled || '0',
+        status: order.status,
+        tradingPair: order.tradingPair,
+        timestamp: order.timestamp
+      })));
     } catch (e) {
       console.warn('[Cancel Order] Failed to refresh orders:', e);
     }
     
     // Refresh balance
     try {
-      const balanceResponse = await fetch(`${API_BASE}/balance/${encodeURIComponent(partyId)}`);
-      if (balanceResponse.ok) {
-        const balanceData = await balanceResponse.json();
-        if (balanceData?.data?.balances) {
-          setBalance(balanceData.data.balances);
-        }
+      const balanceData = await apiClient.get(API_ROUTES.BALANCE.GET(partyId));
+      if (balanceData?.data?.balances) {
+        setBalance(balanceData.data.balances);
       }
     } catch (e) {
       console.warn('[Cancel Order] Failed to refresh balance:', e);
@@ -554,25 +512,20 @@ export default function TradingInterface({ partyId }) {
     // Load initial trades from backend - merge with existing (don't overwrite WebSocket data)
     const loadInitialTrades = async () => {
       try {
-        const API_BASE = import.meta.env.VITE_API_BASE_URL || 
-          (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
-        const response = await fetch(`${API_BASE}/trades/${encodeURIComponent(tradingPair)}?limit=50`);
-        if (response.ok) {
-          const data = await response.json();
-          const tradesList = data?.data?.trades || data?.trades || [];
-          
-          // Merge with existing trades (keep WebSocket trades that aren't in API response)
-          setTrades(prev => {
-            if (tradesList.length === 0) {
-              return prev; // Keep existing if API returns empty
-            }
-            // Merge: API trades + any WebSocket trades not in API
-            const apiTradeIds = new Set(tradesList.map(t => t.tradeId));
-            const newFromWs = prev.filter(t => !apiTradeIds.has(t.tradeId));
-            return [...newFromWs, ...tradesList].slice(0, 50);
-          });
-          console.log('[TradingInterface] Initial trades loaded:', tradesList.length);
-        }
+        const data = await apiClient.get(API_ROUTES.TRADES.GET(tradingPair, 50));
+        const tradesList = data?.data?.trades || data?.trades || [];
+        
+        // Merge with existing trades (keep WebSocket trades that aren't in API response)
+        setTrades(prev => {
+          if (tradesList.length === 0) {
+            return prev; // Keep existing if API returns empty
+          }
+          // Merge: API trades + any WebSocket trades not in API
+          const apiTradeIds = new Set(tradesList.map(t => t.tradeId));
+          const newFromWs = prev.filter(t => !apiTradeIds.has(t.tradeId));
+          return [...newFromWs, ...tradesList].slice(0, 50);
+        });
+        console.log('[TradingInterface] Initial trades loaded:', tradesList.length);
       } catch (error) {
         console.error('[TradingInterface] Failed to load initial trades:', error);
         // On error, keep existing trades
@@ -624,41 +577,36 @@ export default function TradingInterface({ partyId }) {
 
     const loadUserOrders = async (isInitial = false) => {
       try {
-        const API_BASE = import.meta.env.VITE_API_BASE_URL || 
-          (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
-        const response = await fetch(`${API_BASE}/orders/user/${encodeURIComponent(partyId)}?status=OPEN`);
-        if (response.ok) {
-          const data = await response.json();
-          const ordersList = data?.data?.orders || data?.orders || [];
-          
-          // Transform orders to expected format
-          const formattedOrders = ordersList.map(order => ({
-            id: order.orderId || order.contractId,
-            contractId: order.contractId,
-            type: order.orderType,
-            mode: order.orderMode,
-            price: order.price,
-            quantity: order.quantity,
-            filled: order.filled || '0',
-            status: order.status,
-            tradingPair: order.tradingPair,
-            timestamp: order.timestamp
-          }));
-          
-          // Only update if we got data OR if it's initial load
-          // Don't overwrite WebSocket data with empty API results
-          if (formattedOrders.length > 0 || isInitial) {
-            setOrders(prev => {
-              // If API returned data, use it
-              if (formattedOrders.length > 0) {
-                return formattedOrders;
-              }
-              // If API returned empty but we have existing data, keep it
-              return prev;
-            });
-          }
-          console.log('[TradingInterface] User orders loaded:', formattedOrders.length);
+        const data = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
+        const ordersList = data?.data?.orders || data?.orders || [];
+        
+        // Transform orders to expected format
+        const formattedOrders = ordersList.map(order => ({
+          id: order.orderId || order.contractId,
+          contractId: order.contractId,
+          type: order.orderType,
+          mode: order.orderMode,
+          price: order.price,
+          quantity: order.quantity,
+          filled: order.filled || '0',
+          status: order.status,
+          tradingPair: order.tradingPair,
+          timestamp: order.timestamp
+        }));
+        
+        // Only update if we got data OR if it's initial load
+        // Don't overwrite WebSocket data with empty API results
+        if (formattedOrders.length > 0 || isInitial) {
+          setOrders(prev => {
+            // If API returned data, use it
+            if (formattedOrders.length > 0) {
+              return formattedOrders;
+            }
+            // If API returned empty but we have existing data, keep it
+            return prev;
+          });
         }
+        console.log('[TradingInterface] User orders loaded:', formattedOrders.length);
       } catch (error) {
         console.error('[TradingInterface] Failed to load user orders:', error);
         // On error, keep existing data
@@ -685,12 +633,9 @@ export default function TradingInterface({ partyId }) {
         
         // Try to load real balance from backend first
         try {
-          const API_BASE = import.meta.env.VITE_API_BASE_URL || 
-            (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
-          const response = await fetch(`${API_BASE}/balance/${partyId}`);
-          const balanceData = await response.json();
+          const balanceData = await apiClient.get(API_ROUTES.BALANCE.GET(partyId));
           
-          if (response.ok && balanceData.success) {
+          if (balanceData.success) {
             // Handle different response formats
             const balanceObj = balanceData.data?.balance || balanceData.data?.available || balanceData.data;
             if (balanceObj && typeof balanceObj === 'object') {

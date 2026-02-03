@@ -4,6 +4,7 @@ import { TrendingUp, TrendingDown } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
 import websocketService from '../../services/websocketService';
 import { cn } from '@/lib/utils';
+import { apiClient, API_ROUTES } from '@/config/config';
 
 /**
  * GlobalTrades Component - Shows ALL trades across ALL users (global view)
@@ -20,24 +21,11 @@ export default function GlobalTrades({ tradingPair, limit = 50 }) {
       setLoading(true);
       setError(null);
       
-      const API_BASE = import.meta.env.VITE_API_BASE_URL || 
-        (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
-      const url = tradingPair
-        ? `${API_BASE}/orderbooks/${encodeURIComponent(tradingPair)}/trades?limit=${limit}`
-        : `${API_BASE}/trades?limit=${limit}`;
-      
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: {
-          'Content-Type': 'application/json'
-        }
-      });
-
-      if (!response.ok) {
-        throw new Error(`Failed to fetch trades: ${response.statusText}`);
-      }
-
-      const data = await response.json().catch(() => ({}));
+      const data = await apiClient.get(
+        tradingPair 
+          ? API_ROUTES.ORDERBOOK.TRADES(tradingPair, limit)
+          : API_ROUTES.TRADES.GET_ALL({ limit })
+      );
       const payload = data?.data ?? data;
       const nextTrades = payload?.trades || [];
       setTrades(nextTrades);

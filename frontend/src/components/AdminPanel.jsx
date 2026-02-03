@@ -6,6 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from './ui/card';
 import { Input } from './ui/input';
 import { Label } from './ui/label';
 import { OPERATOR_PARTY_ID } from '@/config/authConfig';
+import { apiClient, API_ROUTES } from '@/config/config';
 
 /**
  * AdminPanel - Operator-only interface for managing Global OrderBooks
@@ -34,11 +35,7 @@ export default function AdminPanel({ partyId }) {
     setLoading(true);
     setError('');
     try {
-      const response = await fetch('http://localhost:3001/api/orderbooks');
-      if (!response.ok) {
-        throw new Error('Failed to load OrderBooks');
-      }
-      const data = await response.json();
+      const data = await apiClient.get(API_ROUTES.ORDERBOOK.GET_ALL);
       setOrderBooks(data.orderBooks || []);
     } catch (err) {
       setError(err.message || 'Failed to load OrderBooks');
@@ -59,15 +56,7 @@ export default function AdminPanel({ partyId }) {
     setSuccess('');
 
     try {
-      const encodedPair = encodeURIComponent(tradingPair);
-      const response = await fetch(`http://localhost:3001/api/admin/orderbooks/${encodedPair}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      });
-
-      const data = await response.json();
+      const data = await apiClient.post(API_ROUTES.ADMIN.ORDERBOOK_CREATE(tradingPair));
 
       if (!response.ok) {
         if (response.status === 409) {
@@ -98,19 +87,9 @@ export default function AdminPanel({ partyId }) {
     setSuccess('');
 
     try {
-      const response = await fetch('http://localhost:3001/api/admin/orderbooks', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ tradingPairs: pairs }),
+      const data = await apiClient.post(API_ROUTES.ADMIN.ORDERBOOKS, {
+        tradingPairs: pairs
       });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || data.message || 'Failed to create OrderBooks');
-      }
 
       setSuccess(`Created ${data.results.filter(r => r.success).length} of ${pairs.length} OrderBooks`);
       await loadOrderBooks();

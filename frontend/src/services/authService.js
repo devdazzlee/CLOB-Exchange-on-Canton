@@ -9,8 +9,7 @@
  * - Retry with token refresh on 401
  */
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || 
-  (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
+import { apiClient, API_ROUTES } from '../config/config';
 
 // Token storage keys
 const ACCESS_TOKEN_KEY = 'clob_access_token';
@@ -51,18 +50,11 @@ class AuthService {
    * Login with wallet signature
    */
   async login(publicKey, signature, challenge) {
-    const response = await fetch(`${API_BASE}/auth/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ publicKey, signature, challenge })
+    const data = await apiClient.post(API_ROUTES.AUTH.LOGIN, {
+      publicKey,
+      signature,
+      challenge
     });
-
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new Error(error.message || 'Login failed');
-    }
-
-    const data = await response.json();
     this.storeTokens(data);
     this.scheduleTokenRefresh();
     this.notifyListeners('login', data);
@@ -74,10 +66,9 @@ class AuthService {
    * Login with party ID (simplified flow for existing wallets)
    */
   async loginWithParty(partyId, walletPublicKey) {
-    const response = await fetch(`${API_BASE}/auth/session`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ partyId, publicKey: walletPublicKey })
+    const response = await apiClient.post(API_ROUTES.AUTH.SESSION, {
+      partyId,
+      publicKey: walletPublicKey
     });
 
     if (!response.ok) {
@@ -109,18 +100,9 @@ class AuthService {
 
     this.refreshPromise = (async () => {
       try {
-        const response = await fetch(`${API_BASE}/auth/refresh`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ refreshToken })
+        const data = await apiClient.post(API_ROUTES.AUTH.REFRESH, {
+          refreshToken
         });
-
-        if (!response.ok) {
-          const error = await response.json().catch(() => ({}));
-          throw new Error(error.message || 'Token refresh failed');
-        }
-
-        const data = await response.json();
         this.storeTokens(data);
         this.scheduleTokenRefresh();
         console.log('[AuthService] Tokens refreshed successfully');
@@ -143,13 +125,12 @@ class AuthService {
     // Notify backend to invalidate refresh token
     if (refreshToken) {
       try {
-        await fetch(`${API_BASE}/auth/logout`, {
-          method: 'POST',
-          headers: { 
-            'Content-Type': 'application/json',
+        await apiClient.post(API_ROUTES.AUTH.LOGOUT, {
+          refreshToken
+        }, {
+          headers: {
             'Authorization': `Bearer ${this.getAccessToken()}`
-          },
-          body: JSON.stringify({ refreshToken })
+          }
         });
       } catch (error) {
         console.warn('[AuthService] Logout request failed:', error.message);
@@ -304,24 +285,34 @@ class AuthService {
       ...(accessToken ? { 'Authorization': `Bearer ${accessToken}` } : {})
     };
 
-    let response = await fetch(url, { ...options, headers });
-
-    // If 401, try refresh once and retry
-    if (response.status === 401) {
-      try {
-        await this.refreshTokens();
-        const newToken = this.getAccessToken();
-        response = await fetch(url, {
-          ...options,
-          headers: { ...headers, 'Authorization': `Bearer ${newToken}` }
-        });
-      } catch (refreshError) {
-        this.notifyListeners('authError', { error: refreshError });
-        throw refreshError;
+    try {
+      const response = await apiClient({
+        url,
+        method: options.method || 'GET',
+        data: options.body ? JSON.parse(options.body) : options.data,
+        headers
+      });
+      return { ok: true, status: 200, json: async () => response, ...response };
+    } catch (error) {
+      // If 401, try refresh once and retry
+      if (error.response?.status === 401) {
+        try {
+          await this.refreshTokens();
+          const newToken = this.getAccessToken();
+          const retryResponse = await apiClient({
+            url,
+            method: options.method || 'GET',
+            data: options.body ? JSON.parse(options.body) : options.data,
+            headers: { ...headers, 'Authorization': `Bearer ${newToken}` }
+          });
+          return { ok: true, status: 200, json: async () => retryResponse, ...retryResponse };
+        } catch (refreshError) {
+          this.notifyListeners('authError', { error: refreshError });
+          throw refreshError;
+        }
       }
+      throw error;
     }
-
-    return response;
   }
 
   /**

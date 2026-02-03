@@ -5,6 +5,7 @@ import { TrendingUp, TrendingDown, Wallet } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { normalizeDamlMap } from '../../utils/daml';
 import { fetchContract } from '../../services/cantonApi';
+import { apiClient, API_ROUTES } from '@/config/config';
 
 /**
  * Portfolio View Component - Shows user's positions across all trading pairs
@@ -41,16 +42,7 @@ export default function PortfolioView({ partyId, cantonApi }) {
         balances = normalizeDamlMap(account?.payload?.balances);
       }
 
-      const API_BASE = import.meta.env.VITE_API_BASE_URL || 
-        (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
-      const tradesResponse = await fetch(
-        `${API_BASE}/trades/user/${encodeURIComponent(partyId)}?limit=500`,
-        { method: 'GET' }
-      );
-      if (!tradesResponse.ok) {
-        throw new Error(`Failed to fetch trades: ${tradesResponse.statusText}`);
-      }
-      const tradesJson = await tradesResponse.json().catch(() => ({}));
+      const tradesJson = await apiClient.get(API_ROUTES.TRADES.GET_USER(partyId, 500));
       const tradesPayload = tradesJson?.data ?? tradesJson;
       const trades = tradesPayload?.trades || [];
       const userTrades = trades.filter(t => {

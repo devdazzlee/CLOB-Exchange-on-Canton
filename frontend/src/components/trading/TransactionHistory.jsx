@@ -4,6 +4,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
 import { Button } from '../ui/button';
 import { TrendingUp, TrendingDown, Download, Filter } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { apiClient, API_ROUTES } from '@/config/config';
 
 /**
  * Transaction History Component - Shows user's trade history
@@ -22,16 +23,7 @@ export default function TransactionHistory({ partyId, cantonApi }) {
     
     setLoading(true);
     try {
-      const API_BASE = import.meta.env.VITE_API_BASE_URL || 
-        (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
-      const response = await fetch(
-        `${API_BASE}/trades/user/${encodeURIComponent(partyId)}?limit=500`,
-        { method: 'GET' }
-      );
-      if (!response.ok) {
-        throw new Error(`Failed to fetch trades: ${response.statusText}`);
-      }
-      const json = await response.json().catch(() => ({}));
+      const json = await apiClient.get(API_ROUTES.TRADES.GET_USER(partyId, 500));
       const payload = json?.data ?? json;
       const trades = payload?.trades || [];
       
