@@ -46,26 +46,32 @@ router.get('/offers/:partyId', asyncHandler(async (req, res) => {
 
 /**
  * POST /api/transfers/accept
- * Accept a transfer offer
+ * Accept a transfer offer (Splice Token Standard or custom)
  * 
- * Body: { offerContractId, partyId }
+ * Body: { offerContractId, partyId, templateId? }
+ * 
+ * templateId is optional - if not provided, will be discovered automatically
+ * For Splice offers, use: splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:TransferOffer
  */
 router.post('/accept', asyncHandler(async (req, res) => {
-  const { offerContractId, partyId } = req.body;
+  const { offerContractId, partyId, templateId } = req.body;
   
   if (!offerContractId || !partyId) {
     throw new ValidationError('offerContractId and partyId are required');
   }
   
   console.log(`[Transfers] Accepting offer ${offerContractId.substring(0, 20)}... for ${partyId.substring(0, 30)}...`);
+  if (templateId) {
+    console.log(`[Transfers] Using template: ${templateId}`);
+  }
   
   const adminToken = await tokenProvider.getServiceToken();
   const transferService = getTransferOfferService();
   await transferService.initialize();
   
-  const result = await transferService.acceptTransferOffer(offerContractId, partyId, adminToken);
+  const result = await transferService.acceptTransferOffer(offerContractId, partyId, adminToken, templateId);
   
-  return success(res, result, 'Transfer offer accepted');
+  return success(res, result, 'Transfer offer accepted successfully');
 }));
 
 /**

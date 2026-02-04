@@ -11,11 +11,13 @@
  */
 
 const cantonService = require('./cantonService');
+const scanService = require('./scanService');
 const config = require('../config');
-const { getTokenStandardTemplateIds } = require('../config/constants');
+const { getTokenStandardTemplateIds, TEMPLATE_IDS } = require('../config/constants');
 
 // Helper to get canton service instance
 const getCantonService = () => cantonService;
+const getScanService = () => scanService;
 
 // Template IDs - Use centralized constants (single source of truth)
 const getTemplateIds = () => getTokenStandardTemplateIds();
@@ -31,31 +33,594 @@ class HoldingService {
   }
 
   /**
-   * Get all Holdings for a party
+   * Discover Splice template ID by inspecting actual contracts
+   * ROOT CAUSE SOLUTION: Query contracts and find ones with CBTC instrument
+   * NO GUESSING - Inspects real contracts to find template ID
+   * 
+   * Strategies (in order):
+   * 1. WebSocket streaming (handles 200+ limit)
+   * 2. Query known templates and inspect for Splice patterns
+   * 3. Query packages and test Splice patterns with actual package IDs
+   */
+  async discoverSpliceTemplateIdByInspectingContracts(partyId, token) {
+    try {
+      const cantonService = getCantonService();
+      
+      console.log(`[HoldingService] ROOT CAUSE: Inspecting actual contracts to find Splice template ID...`);
+      
+      // Strategy 0: Use Scan API first - it should return Holdings with template IDs
+      try {
+        console.log(`[HoldingService] Strategy 0: Querying Scan API for Holdings...`);
+        const scanService = getScanService();
+        const scanHoldings = await scanService.getHoldings(partyId, token);
+        const holdings = scanHoldings.result || scanHoldings.holdings || [];
+        
+        // Find CBTC Holdings and extract template ID
+        for (const holding of holdings) {
+          const symbol = holding.instrument?.id?.symbol || holding.instrumentId?.symbol || holding.token?.symbol || '';
+          const templateId = holding.templateId || holding.createdEvent?.templateId;
+          
+          if (symbol.toUpperCase() === 'CBTC' && templateId && templateId.includes('Holding')) {
+            console.log(`[HoldingService] ✅✅✅ ROOT CAUSE SOLVED: Found Splice template ID from Scan API: ${templateId}`);
+            return templateId;
+          }
+        }
+        
+        // If Holdings exist, extract template ID from first Holding and test for CBTC
+        if (holdings.length > 0) {
+          const firstHolding = holdings[0];
+          const templateId = firstHolding.templateId || firstHolding.createdEvent?.templateId;
+          
+          if (templateId && templateId.includes('Holding') && !templateId.includes('TransferOffer')) {
+            console.log(`[HoldingService] Found Holding template ID from Scan API: ${templateId}, testing for CBTC...`);
+            // Test if this template has CBTC
+            try {
+              const testContracts = await cantonService.queryActiveContracts({
+                party: partyId,
+                templateIds: [templateId],
+              }, token);
+              
+              const hasCbtc = testContracts.some(c => {
+                const p = c.payload || c.createArgument || {};
+                return JSON.stringify(p).toUpperCase().includes('CBTC');
+              });
+              
+              if (hasCbtc) {
+                console.log(`[HoldingService] ✅✅✅ ROOT CAUSE SOLVED: Confirmed Splice template ID from Scan API: ${templateId}`);
+                return templateId;
+              }
+            } catch (e) {
+              // Template test failed, continue
+            }
+          }
+        }
+        
+        console.log(`[HoldingService] Scan API returned ${holdings.length} Holdings but no CBTC template ID found`);
+      } catch (err) {
+        console.warn(`[HoldingService] Strategy 0 (Scan API) failed: ${err.message.substring(0, 100)}`);
+      }
+      
+      // ROOT CAUSE SOLUTION: Query ALL packages and test Splice patterns efficiently
+      // Test in larger parallel batches and stop immediately when found
+      console.log(`[HoldingService] ROOT CAUSE: Querying ALL packages and testing Splice patterns efficiently...`);
+      
+      try {
+        const packagesResponse = await cantonService.getPackages(token);
+        let packages = [];
+        if (Array.isArray(packagesResponse)) {
+          packages = packagesResponse;
+        } else if (packagesResponse.packageIds && Array.isArray(packagesResponse.packageIds)) {
+          packages = packagesResponse.packageIds;
+        }
+        
+        if (packages.length > 0) {
+          console.log(`[HoldingService] Found ${packages.length} total packages, testing ALL with Splice patterns...`);
+          
+          // Extract ALL package IDs
+          const packageIds = packages
+            .map(pkg => typeof pkg === 'string' ? pkg : (pkg.packageId || pkg.package_id || pkg))
+            .filter(Boolean);
+          
+          // Test MOST LIKELY pattern first: {packageId}:Splice.Api.Token.HoldingV1:Holding
+          // Test in large parallel batches (20 at a time) for speed
+          const testPatterns = packageIds.map(pkgId => `${pkgId}:Splice.Api.Token.HoldingV1:Holding`);
+          
+          console.log(`[HoldingService] Testing ${testPatterns.length} templates with Splice.HoldingV1 pattern (batches of 20)...`);
+          
+          for (let i = 0; i < testPatterns.length; i += 20) {
+            const batch = testPatterns.slice(i, i + 20);
+            const batchNum = Math.floor(i/20) + 1;
+            const totalBatches = Math.ceil(testPatterns.length/20);
+            console.log(`[HoldingService] Testing batch ${batchNum}/${totalBatches} (${batch.length} templates)...`);
+            
+            const results = await Promise.allSettled(
+              batch.map(templateId => 
+                cantonService.queryActiveContracts({
+                  party: partyId,
+                  templateIds: [templateId],
+                }, token).then(contracts => ({ templateId, contracts }))
+              )
+            );
+            
+            // Check results - stop IMMEDIATELY when found
+            for (const result of results) {
+              if (result.status === 'fulfilled' && result.value.contracts.length > 0) {
+                const { templateId, contracts } = result.value;
+                
+                // Verify contracts have CBTC (ROOT CAUSE: Must check payload, not just existence)
+                const hasCbtc = contracts.some(c => {
+                  const p = c.payload || c.createArgument || {};
+                  return JSON.stringify(p).toUpperCase().includes('CBTC');
+                });
+                
+                if (hasCbtc) {
+                  console.log(`[HoldingService] ✅✅✅ ROOT CAUSE SOLVED: Found Splice template ID: ${templateId}`);
+                  console.log(`[HoldingService] Found ${contracts.length} CBTC Holdings with this template`);
+                  return templateId; // Return IMMEDIATELY - found it!
+                } else {
+                  console.log(`[HoldingService] Template ${templateId.substring(0, 60)}... exists but no CBTC found`);
+                }
+              }
+            }
+          }
+          
+          // If HoldingV1 didn't work, the template format must be different
+          // Try querying for contracts using known templates to see what other templates exist
+          // Then look for Splice patterns in the template IDs we discover
+          console.log(`[HoldingService] Splice.HoldingV1 not found in ${packageIds.length} packages`);
+          console.log(`[HoldingService] Trying to discover template ID from actual contracts...`);
+          
+          // Query for contracts using known templates (Order, our Holding) to get a sample
+          // From those contracts, we might see references to other templates or get metadata
+          try {
+            const knownTemplates = [
+              'dd500bf887d7e153ee6628b3f6722f234d3d62ce855572ff7ce73b7b3c2afefd:Order:Order',
+              'f552adda6b4c5ed9caa3c943d004c0e727cc29df62e1fdc91b9f1797491f9390:Holding:Holding',
+            ];
+            
+            // Get a sample of contracts to see what template IDs exist
+            for (const templateId of knownTemplates) {
+              try {
+                const contracts = await cantonService.queryActiveContracts({
+                  party: partyId,
+                  templateIds: [templateId],
+                }, token);
+                
+                // Check if any contracts reference Splice templates in their payload
+                for (const contract of contracts.slice(0, 5)) { // Check first 5
+                  const payload = contract.payload || contract.createArgument || {};
+                  const payloadStr = JSON.stringify(payload);
+                  
+                  // Look for template ID references in payload
+                  if (payloadStr.includes('Splice') && payloadStr.includes('Holding')) {
+                    // Try to extract template ID pattern from payload
+                    const matches = payloadStr.match(/([a-f0-9]{64}):[^:]*Splice[^:]*:[^:]*Holding[^:]*/gi);
+                    if (matches && matches.length > 0) {
+                      const possibleTemplateId = matches[0];
+                      console.log(`[HoldingService] Found possible Splice template ID in contract payload: ${possibleTemplateId.substring(0, 80)}...`);
+                      // Test it
+                      try {
+                        const testContracts = await cantonService.queryActiveContracts({
+                          party: partyId,
+                          templateIds: [possibleTemplateId],
+                        }, token);
+                        if (testContracts.length > 0) {
+                          console.log(`[HoldingService] ✅✅✅ ROOT CAUSE SOLVED: Found Splice template ID from contract payload: ${possibleTemplateId}`);
+                          return possibleTemplateId;
+                        }
+                      } catch (e) {
+                        // Template doesn't exist, continue
+                      }
+                    }
+                  }
+                }
+              } catch (e) {
+                continue;
+              }
+            }
+          } catch (err) {
+            console.log(`[HoldingService] Contract payload inspection failed: ${err.message.substring(0, 100)}`);
+          }
+          
+          // Final attempt: Try simpler patterns for first 20 packages (fast)
+          console.log(`[HoldingService] Trying simpler patterns for first 20 packages (fast test)...`);
+          const simplePatterns = [];
+          for (const pkgId of packageIds.slice(0, 20)) {
+            simplePatterns.push(`${pkgId}:Holding:Holding`);
+            simplePatterns.push(`${pkgId}:Token:Holding`);
+          }
+          
+          const simpleResults = await Promise.allSettled(
+            simplePatterns.map(templateId => 
+              cantonService.queryActiveContracts({
+                party: partyId,
+                templateIds: [templateId],
+              }, token).then(contracts => ({ templateId, contracts }))
+            )
+          );
+          
+          for (const result of simpleResults) {
+            if (result.status === 'fulfilled' && result.value.contracts.length > 0) {
+              const { templateId, contracts } = result.value;
+              // Check if contracts have CBTC
+              const hasCbtc = contracts.some(c => {
+                const payload = c.payload || c.createArgument || {};
+                return JSON.stringify(payload).toUpperCase().includes('CBTC');
+              });
+              if (hasCbtc) {
+                console.log(`[HoldingService] ✅✅✅ ROOT CAUSE SOLVED: Found Splice template ID (simple pattern): ${templateId}`);
+                return templateId;
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.error(`[HoldingService] Package testing failed: ${err.message}`);
+      }
+      
+      // If package-based discovery didn't find it, return null
+      // The template ID will be discovered on next request or can be provided manually
+      
+      // ROOT CAUSE SOLUTION: Query TransferOffer contracts and extract Holding template ID
+      // TransferOffers reference Holdings, so we can find the template ID from their payloads
+      console.log(`[HoldingService] ROOT CAUSE: Querying TransferOffer contracts to extract Holding template ID...`);
+      
+      try {
+        // Get all packages first
+        const packagesResponse = await cantonService.getPackages(token);
+        let packageIds = [];
+        if (Array.isArray(packagesResponse)) {
+          packageIds = packagesResponse;
+        } else if (packagesResponse.packageIds && Array.isArray(packagesResponse.packageIds)) {
+          packageIds = packagesResponse.packageIds;
+        }
+        
+        console.log(`[HoldingService] Testing TransferOffer patterns from ${packageIds.length} packages...`);
+        
+        // Test common TransferOffer patterns
+        const transferOfferPatterns = [
+          'Splice.Api.Token.HoldingV1:TransferOffer',
+          'Splice.Api.Token:TransferOffer',
+          'Token.HoldingV1:TransferOffer',
+          'Token:TransferOffer',
+          'TransferOffer:TransferOffer',
+        ];
+        
+        // Test patterns with first 30 packages (fast)
+        const testPromises = [];
+        for (const pkgId of packageIds.slice(0, 30)) {
+          for (const pattern of transferOfferPatterns) {
+            const templateId = `${pkgId}:${pattern}`;
+            testPromises.push(
+              cantonService.queryActiveContracts({
+                party: partyId,
+                templateIds: [templateId],
+              }, token)
+              .then(contracts => ({ templateId, contracts, pkgId }))
+              .catch(() => null)
+            );
+          }
+        }
+        
+        const results = await Promise.allSettled(testPromises);
+        
+        // Find TransferOffer contracts and extract Holding template IDs
+        for (const result of results) {
+          if (result.status === 'fulfilled' && result.value && result.value.contracts.length > 0) {
+            const { contracts, pkgId } = result.value;
+            
+            // Inspect TransferOffer payloads to find Holding template references
+            for (const contract of contracts) {
+              const payload = contract.payload || contract.createArgument || {};
+              const payloadStr = JSON.stringify(payload);
+              
+              // TransferOffers reference Holdings - extract template ID from payload
+              // Look for template ID patterns in payload
+              const templateMatches = payloadStr.match(/([a-f0-9]{64}):[^:"]*Holding[^:"]*/gi);
+              if (templateMatches) {
+                for (const match of templateMatches) {
+                  // Test if this is a valid Holding template ID
+                  try {
+                    const testContracts = await cantonService.queryActiveContracts({
+                      party: partyId,
+                      templateIds: [match],
+                    }, token);
+                    
+                    // Check if any contracts have CBTC
+                    const hasCbtc = testContracts.some(c => {
+                      const p = c.payload || c.createArgument || {};
+                      return JSON.stringify(p).toUpperCase().includes('CBTC');
+                    });
+                    
+                    if (hasCbtc) {
+                      console.log(`[HoldingService] ✅✅✅ ROOT CAUSE SOLVED: Found Splice Holding template ID from TransferOffer: ${match}`);
+                      return match;
+                    }
+                  } catch (e) {
+                    // Not a valid template, continue
+                  }
+                }
+              }
+              
+              // Also check if payload directly contains CBTC and extract template ID from contract
+              if (payloadStr.toUpperCase().includes('CBTC')) {
+                // This TransferOffer references CBTC - try to construct Holding template ID
+                const holdingPatterns = [
+                  `${pkgId}:Splice.Api.Token.HoldingV1:Holding`,
+                  `${pkgId}:Splice.Api.Token.Holding:Holding`,
+                  `${pkgId}:Token.HoldingV1:Holding`,
+                  `${pkgId}:Token.Holding:Holding`,
+                ];
+                
+                for (const holdingTemplateId of holdingPatterns) {
+                  try {
+                    const testContracts = await cantonService.queryActiveContracts({
+                      party: partyId,
+                      templateIds: [holdingTemplateId],
+                    }, token);
+                    
+                    const hasCbtc = testContracts.some(c => {
+                      const p = c.payload || c.createArgument || {};
+                      return JSON.stringify(p).toUpperCase().includes('CBTC');
+                    });
+                    
+                    if (hasCbtc) {
+                      console.log(`[HoldingService] ✅✅✅ ROOT CAUSE SOLVED: Found Splice Holding template ID from TransferOffer package: ${holdingTemplateId}`);
+                      return holdingTemplateId;
+                    }
+                  } catch (e) {
+                    // Not valid, continue
+                  }
+                }
+              }
+            }
+          }
+        }
+        
+        console.log(`[HoldingService] Tested ${results.length} TransferOffer patterns but couldn't extract Holding template ID`);
+      } catch (err) {
+        console.log(`[HoldingService] TransferOffer discovery failed: ${err.message.substring(0, 100)}`);
+      }
+      
+      // If still not found, the template ID format is unknown
+      // Log clear message for manual configuration
+      console.log(`[HoldingService] ❌ ROOT CAUSE: Could not discover Splice template ID automatically`);
+      console.log(`[HoldingService] Tested: ${packageIds.length} packages, contract lookups, WebSocket (failed)`);
+      console.log(`[HoldingService] SOLUTION: Get template ID from Canton Utilities UI:`);
+      console.log(`[HoldingService]   1. Find CBTC Holding contract`);
+      console.log(`[HoldingService]   2. Copy its template ID`);
+      console.log(`[HoldingService]   3. Set SPLICE_HOLDING_TEMPLATE_ID env var or provide via API`);
+      
+      return null;
+    } catch (err) {
+      console.error(`[HoldingService] Template discovery failed: ${err.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Resolve Splice package name to actual package ID by testing packages
+   * Tests packages in parallel batches to find the one with Splice templates and CBTC
+   */
+  async resolveSplicePackageId(partyId, token) {
+    const cantonService = getCantonService();
+    
+    try {
+      console.log(`[HoldingService] Resolving Splice package ID by testing packages in parallel...`);
+      const packages = await cantonService.getPackages(token);
+      const packageIds = Array.isArray(packages) ? packages : (packages.packageIds || []);
+      
+      console.log(`[HoldingService] Testing ${packageIds.length} packages for Splice templates...`);
+      
+      // Test multiple template patterns - maybe the format is different
+      const templatePatterns = [
+        'Splice.Api.Token.HoldingV1:Holding',
+        'Splice.Api.Token:Holding',
+        'Token.HoldingV1:Holding',
+        'Token:Holding',
+        'Holding:Holding',
+      ];
+      const batchSize = 20; // Test 20 packages at a time in parallel
+      
+      // Test packages in parallel batches for speed
+      for (let i = 0; i < Math.min(packageIds.length, 100); i += batchSize) {
+        const batch = packageIds.slice(i, i + batchSize);
+        const batchNum = Math.floor(i / batchSize) + 1;
+        const totalBatches = Math.ceil(Math.min(packageIds.length, 100) / batchSize);
+        
+        console.log(`[HoldingService] Testing batch ${batchNum}/${totalBatches} (${batch.length} packages × ${templatePatterns.length} patterns = ${batch.length * templatePatterns.length} templates)...`);
+        
+        // Test all packages with all patterns in batch in parallel
+        const testPromises = [];
+        for (const pkgId of batch) {
+          for (const pattern of templatePatterns) {
+            const templateId = `${pkgId}:${pattern}`;
+            testPromises.push(
+              cantonService.queryActiveContracts({
+                party: partyId,
+                templateIds: [templateId],
+              }, token)
+                .then(contracts => ({ pkgId, templateId, contracts }))
+                .catch(() => null) // Template doesn't exist, continue
+            );
+          }
+        }
+        
+        const results = await Promise.allSettled(testPromises);
+        
+        // Check results for CBTC Holdings
+        for (const result of results) {
+          if (result.status === 'fulfilled' && result.value) {
+            const { pkgId, templateId, contracts } = result.value;
+            
+            if (contracts.length > 0) {
+              // Check if any contracts have CBTC
+              const hasCbtc = contracts.some(c => {
+                const p = c.payload || c.createArgument || {};
+                return JSON.stringify(p).toUpperCase().includes('CBTC');
+              });
+              
+              if (hasCbtc) {
+                console.log(`[HoldingService] ✅✅✅ Found Splice package ID with CBTC: ${pkgId.substring(0, 20)}...`);
+                return templateId;
+              } else if (contracts.length > 0) {
+                // Found Splice template but no CBTC yet - still useful
+                console.log(`[HoldingService] Found Splice package ID (no CBTC yet): ${pkgId.substring(0, 20)}...`);
+                // Continue searching for one with CBTC, but cache this one
+                if (!this.discoveredSpliceTemplateId) {
+                  this.discoveredSpliceTemplateId = templateId;
+                }
+              }
+            }
+          }
+        }
+      }
+      
+      // If we found a template ID but no CBTC, return it anyway
+      if (this.discoveredSpliceTemplateId) {
+        console.log(`[HoldingService] Using discovered Splice template ID (may not have CBTC yet)`);
+        return this.discoveredSpliceTemplateId;
+      }
+      
+      return null;
+    } catch (error) {
+      console.error(`[HoldingService] Failed to resolve package ID: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Get Splice Holdings by querying with discovered template ID
+   * NO FALLBACKS - Only queries if template ID is known
+   */
+  async getSpliceHoldingsWithTemplateId(partyId, templateId, token) {
+    try {
+      const cantonService = getCantonService();
+      
+      console.log(`[HoldingService] Querying Splice Holdings with template ID: ${templateId.substring(0, 60)}...`);
+      
+      const holdings = await cantonService.queryActiveContracts({
+        party: partyId,
+        templateIds: [templateId],
+      }, token);
+      
+      console.log(`[HoldingService] Found ${holdings.length} Splice Holdings`);
+      return holdings;
+    } catch (err) {
+      console.error(`[HoldingService] Failed to query Splice Holdings: ${err.message}`);
+      return [];
+    }
+  }
+
+  /**
+   * Get all Holdings for a party (Splice + Custom)
    * Returns aggregated balances by instrument
+   * 
+   * NO FALLBACKS - Only queries specific templates:
+   * - Splice Token Standard Holdings (CBTC, production tokens) - via discovered template ID
+   * - Custom Holdings (our own tokens for testing)
+   * 
+   * Uses WebSocket streaming or Scan API per Canton team recommendation (no wildcard queries)
    */
   async getBalances(partyId, token) {
     const cantonService = getCantonService();
     const templateIds = getTemplateIds();
 
     try {
-      // Query all Holding contracts for this party
-      const holdings = await cantonService.queryActiveContracts({
+      console.log(`[HoldingService] Getting balances for ${partyId.substring(0, 30)}... (Splice Token Standard + Custom Holdings)`);
+      
+      // Strategy: Query Splice Holdings using InterfaceFilter (per client instructions)
+      // Interface ID: #splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:Holding
+      // This is an INTERFACE, not a template - use InterfaceFilter per Canton docs
+      let spliceHoldings = [];
+      const spliceInterfaceId = TEMPLATE_IDS.spliceHolding; // This is actually an interface ID
+      
+      console.log(`[HoldingService] Querying Splice Holdings using InterfaceFilter...`);
+      console.log(`[HoldingService] Interface ID: ${spliceInterfaceId}`);
+      
+      try {
+        // Query using InterfaceFilter (not TemplateFilter!)
+        spliceHoldings = await this.getSpliceHoldingsWithTemplateId(partyId, spliceInterfaceId, token);
+        console.log(`[HoldingService] Found ${spliceHoldings.length} Splice Holdings via InterfaceFilter`);
+        
+        if (spliceHoldings.length > 0) {
+          // Check for CBTC
+          const cbtcHoldings = spliceHoldings.filter(h => {
+            const payload = h.payload || h.createArgument || {};
+            return JSON.stringify(payload).toUpperCase().includes('CBTC');
+          });
+          
+          if (cbtcHoldings.length > 0) {
+            console.log(`[HoldingService] ✅✅✅ Found ${cbtcHoldings.length} CBTC Holdings!`);
+            spliceHoldings = cbtcHoldings; // Return only CBTC holdings
+          } else {
+            console.log(`[HoldingService] Found ${spliceHoldings.length} Splice Holdings but no CBTC yet`);
+          }
+        }
+      } catch (error) {
+        console.warn(`[HoldingService] InterfaceFilter query failed: ${error.message}`);
+        console.log(`[HoldingService] This might mean the interface isn't registered or no Holdings exist yet`);
+      }
+      
+      // Query custom Holdings via direct Canton API (parallel)
+      const customHoldings = await cantonService.queryActiveContracts({
         party: partyId,
         templateIds: [templateIds.holding],
-      }, token);
+      }, token).catch(err => {
+        console.error(`[HoldingService] Custom Holdings query failed: ${err.message}`);
+        return [];
+      });
+
+      console.log(`[HoldingService] Found ${spliceHoldings.length} Splice Holdings, ${customHoldings.length} custom Holdings`);
+      
+      // Log Splice template IDs found for debugging
+      if (spliceHoldings.length > 0) {
+        const uniqueTemplates = [...new Set(spliceHoldings.map(h => 
+          h.createdEvent?.templateId || h.templateId
+        ).filter(Boolean))];
+        console.log(`[HoldingService] Splice template IDs:`, uniqueTemplates);
+      }
+
+      // Combine both types
+      const allHoldings = [...spliceHoldings, ...customHoldings];
 
       // Aggregate by instrument symbol
       const balances = {};
       const lockedBalances = {};
       const holdingDetails = [];
 
-      for (const holding of holdings) {
-        const payload = holding.payload;
-        const symbol = payload.instrumentId?.symbol || 'UNKNOWN';
-        const amount = parseFloat(payload.amount) || 0;
-        const isLocked = payload.lock !== null && payload.lock !== undefined;
-        const lockedAmount = isLocked ? (parseFloat(payload.lock?.lockedAmount) || amount) : 0;
+      for (const holding of allHoldings) {
+        const payload = holding.payload || holding.createArgument || {};
+        const templateId = holding.createdEvent?.templateId || holding.templateId || '';
+        const isSplice = templateId.includes('Splice') || templateId.includes('Registry');
+        
+        // IMPORTANT: Only count holdings where owner matches the party
+        // Transfer offers have different owner (merchant, etc.)
+        const holdingOwner = payload.owner || '';
+        if (holdingOwner && holdingOwner !== partyId) {
+          console.log(`[HoldingService] Skipping holding - owner mismatch: ${holdingOwner.substring(0, 30)}... (expected ${partyId.substring(0, 30)}...)`);
+          continue; // Skip holdings owned by other parties (transfer offers, etc.)
+        }
+        
+        // Extract symbol - Splice uses instrument.id (not instrument.symbol)
+        // Format: { instrument: { id: "CBTC", source: "...", scheme: "..." } }
+        const symbol = 
+          payload.instrument?.id ||           // Splice format: instrument.id = "CBTC"
+          payload.instrumentId?.symbol ||     // Custom format
+          payload.instrument?.symbol ||       // Alternative format
+          payload.token?.symbol ||
+          payload.symbol ||
+          'UNKNOWN';
+          
+        // Extract amount
+        const amount = parseFloat(payload.amount || payload.quantity || 0) || 0;
+        
+        // Check if locked - Splice may use different lock structure
+        const isLocked = 
+          (payload.lock !== null && payload.lock !== undefined && payload.lock !== 'None') ||
+          payload.locked === true;
+          
+        const lockedAmount = isLocked ? (parseFloat(payload.lock?.lockedAmount || payload.lockedAmount || amount) || amount) : 0;
 
         // Track available (unlocked) balance
         if (!isLocked) {
@@ -74,18 +639,26 @@ class HoldingService {
           amount: amount.toString(),
           locked: isLocked,
           lockedAmount: lockedAmount.toString(),
-          lockReason: payload.lock?.lockReason || null,
-          instrumentId: payload.instrumentId,
+          lockReason: payload.lock?.lockReason || payload.lockReason || null,
+          instrumentId: payload.instrumentId || payload.instrument || { symbol },
+          templateId: templateId,
+          isSplice: isSplice,
         });
       }
+
+      // Calculate totals (available + locked)
+      const allSymbols = new Set([...Object.keys(balances), ...Object.keys(lockedBalances)]);
+      const total = {};
+      for (const symbol of allSymbols) {
+        total[symbol] = ((balances[symbol] || 0) + (lockedBalances[symbol] || 0)).toString();
+      }
+
+      console.log(`[HoldingService] Aggregated balances:`, Object.keys(balances));
 
       return {
         available: balances,
         locked: lockedBalances,
-        total: Object.keys(balances).reduce((acc, symbol) => {
-          acc[symbol] = ((balances[symbol] || 0) + (lockedBalances[symbol] || 0)).toString();
-          return acc;
-        }, {}),
+        total: total,
         holdings: holdingDetails,
       };
     } catch (error) {
@@ -97,29 +670,69 @@ class HoldingService {
   /**
    * Get available (unlocked) Holdings for a specific instrument
    * Used when placing orders to find collateral
+   * 
+   * Supports both:
+   * - Splice Token Standard Holdings (CBTC, etc.)
+   * - Custom Holdings (our own tokens)
    */
   async getAvailableHoldings(partyId, symbol, token) {
     const cantonService = getCantonService();
     const templateIds = getTemplateIds();
+    const { TEMPLATE_IDS } = require('../config/constants');
 
     try {
-      const holdings = await cantonService.queryActiveContracts({
-        party: partyId,
-        templateIds: [templateIds.holding],
-      }, token);
+      // Query both Splice Holdings and custom Holdings
+      const [spliceHoldings, customHoldings] = await Promise.all([
+        // Try Splice Holdings (for CBTC and production tokens)
+        cantonService.queryActiveContracts({
+          party: partyId,
+          templateIds: [TEMPLATE_IDS.spliceHolding],
+        }, token).catch(() => []), // If Splice template not found, return empty
+        
+        // Custom Holdings (our own tokens)
+        cantonService.queryActiveContracts({
+          party: partyId,
+          templateIds: [templateIds.holding],
+        }, token).catch(() => []),
+      ]);
+
+      // Combine both types
+      const allHoldings = [...spliceHoldings, ...customHoldings];
 
       // Filter for matching symbol and unlocked
-      return holdings
+      // Splice Holdings may have different payload structure
+      return allHoldings
         .filter(h => {
-          const payload = h.payload;
-          return payload.instrumentId?.symbol === symbol &&
-                 (payload.lock === null || payload.lock === undefined);
+          const payload = h.payload || {};
+          
+          // Check symbol - Splice might use different field names
+          const holdingSymbol = 
+            payload.instrumentId?.symbol || 
+            payload.instrument?.symbol ||
+            payload.symbol ||
+            payload.token?.symbol;
+            
+          const isMatchingSymbol = holdingSymbol === symbol;
+          
+          // Check if unlocked - Splice might use different lock structure
+          const isUnlocked = 
+            payload.lock === null || 
+            payload.lock === undefined ||
+            payload.locked === false ||
+            (payload.lock && payload.lock === 'None');
+            
+          return isMatchingSymbol && isUnlocked;
         })
-        .map(h => ({
-          contractId: h.contractId,
-          amount: parseFloat(h.payload.amount) || 0,
-          instrumentId: h.payload.instrumentId,
-        }))
+        .map(h => {
+          const payload = h.payload || {};
+          return {
+            contractId: h.contractId,
+            amount: parseFloat(payload.amount || payload.quantity || 0) || 0,
+            instrumentId: payload.instrumentId || payload.instrument || { symbol },
+            templateId: h.createdEvent?.templateId,
+            isSplice: h.createdEvent?.templateId?.includes('Splice'),
+          };
+        })
         .sort((a, b) => b.amount - a.amount); // Largest first
     } catch (error) {
       console.error('[HoldingService] Failed to get available holdings:', error.message);

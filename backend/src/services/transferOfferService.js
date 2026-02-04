@@ -103,72 +103,95 @@ class TransferOfferService {
   }
 
   /**
-   * Accept a transfer offer
+   * Accept a transfer offer (Splice Token Standard)
    * This creates a new Holding for the receiving party
+   * 
+   * Supports both:
+   * - Splice Token Standard: splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:TransferOffer
+   * - Custom templates: Our own TransferOffer templates
    * 
    * @param {string} offerContractId - The transfer offer contract ID
    * @param {string} partyId - The party accepting the offer
    * @param {string} token - Admin token
+   * @param {string} templateId - Optional template ID (if known, speeds up acceptance)
    * @returns {Object} Result of accepting the offer
    */
-  async acceptTransferOffer(offerContractId, partyId, token) {
+  async acceptTransferOffer(offerContractId, partyId, token, templateId = null) {
     await this.initialize();
     
     try {
       console.log(`[TransferOfferService] Accepting transfer offer: ${offerContractId.substring(0, 20)}...`);
       
-      // First, fetch the offer to understand its structure
-      const contracts = await this.cantonService.queryActiveContracts({
-        party: partyId,
-        templateIds: [],
-      }, token);
+      let offerTemplateId = templateId;
       
-      const offer = contracts.find(c => c.contractId === offerContractId);
-      
-      if (!offer) {
-        throw new Error(`Transfer offer not found: ${offerContractId}`);
+      // If template ID not provided, fetch the offer to discover it
+      if (!offerTemplateId) {
+        const contracts = await this.cantonService.queryActiveContracts({
+          party: partyId,
+          templateIds: [],
+        }, token);
+        
+        const offer = contracts.find(c => c.contractId === offerContractId);
+        
+        if (!offer) {
+          throw new Error(`Transfer offer not found: ${offerContractId}`);
+        }
+        
+        offerTemplateId = offer.createdEvent?.templateId;
       }
       
-      const templateId = offer.createdEvent?.templateId;
-      console.log(`[TransferOfferService] Offer template: ${templateId}`);
+      console.log(`[TransferOfferService] Offer template: ${offerTemplateId}`);
       
       // Determine the accept choice name based on template
-      // Different token standards use different choice names
+      // Splice Token Standard uses different choice names
       const acceptChoiceNames = [
-        'Accept',
+        'Accept',  // Most common
         'TransferOffer_Accept', 
         'AcceptTransfer',
-        'Accept_TransferOffer'
+        'Accept_TransferOffer',
+        'Splice.Api.Token.HoldingV1.TransferOffer_Accept', // Splice full path
       ];
       
       let result = null;
+      let lastError = null;
+      
       for (const choiceName of acceptChoiceNames) {
         try {
+          console.log(`[TransferOfferService] Trying choice: ${choiceName}`);
+          
+          // For Splice, only the receiver needs to authorize
           result = await this.cantonService.exerciseChoice({
             token,
-            templateId: templateId,
+            templateId: offerTemplateId,
             contractId: offerContractId,
             choice: choiceName,
             choiceArgument: {},
-            actAsParty: [partyId, OPERATOR_PARTY_ID],
+            actAsParty: [partyId], // Only receiver needs to authorize
           });
+          
           console.log(`[TransferOfferService] ✅ Accepted with choice: ${choiceName}`);
           break;
         } catch (e) {
-          if (e.message.includes('unknown choice') || e.message.includes('No such choice')) {
+          lastError = e;
+          if (e.message.includes('unknown choice') || 
+              e.message.includes('No such choice') ||
+              e.message.includes('choice not found')) {
+            console.log(`[TransferOfferService] Choice ${choiceName} not found, trying next...`);
             continue; // Try next choice name
           }
+          // Other errors (like authorization) should be thrown
           throw e;
         }
       }
       
       if (!result) {
-        throw new Error('Could not find valid accept choice for this transfer offer');
+        throw new Error(`Could not find valid accept choice. Last error: ${lastError?.message || 'unknown'}`);
       }
       
       return {
         success: true,
         offerContractId,
+        templateId: offerTemplateId,
         result,
       };
       

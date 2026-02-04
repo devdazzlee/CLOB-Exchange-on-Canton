@@ -51,12 +51,30 @@ const TOKEN_STANDARD_PACKAGE_ID = 'f552adda6b4c5ed9caa3c943d004c0e727cc29df62e1f
  */
 const LEGACY_PACKAGE_ID = 'dd500bf887d7e153ee6628b3f6722f234d3d62ce855572ff7ce73b7b3c2afefd';
 
+/**
+ * Splice Token Standard Package ID
+ * Production-ready token standard used by Canton DevNet
+ * 
+ * Template: splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:Holding
+ * This is what CBTC and other production tokens use
+ * 
+ * NOTE: Package ID needs to be discovered from Canton or provided by client
+ * For now, we'll use template name format and let services discover it
+ */
+const SPLICE_PACKAGE_NAME = 'splice-api-token-holding-v1';
+
 // =============================================================================
 // TEMPLATE IDS - Pre-built template ID strings for easy use
 // =============================================================================
 
 const TEMPLATE_IDS = {
-  // Token Standard Templates (NEW)
+  // Splice Token Standard Templates (PRODUCTION - Use for CBTC, etc.)
+  // Format: #splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:Holding
+  // Using "#" prefix allows querying without package ID (Canton feature)
+  spliceHolding: `#${SPLICE_PACKAGE_NAME}:Splice.Api.Token.HoldingV1:Holding`,
+  spliceTransferOffer: `#${SPLICE_PACKAGE_NAME}:Splice.Api.Token.HoldingV1:TransferOffer`,
+  
+  // Custom Token Standard Templates (for our own tokens - testing only)
   instrument: `${TOKEN_STANDARD_PACKAGE_ID}:Instrument:Instrument`,
   tradingPair: `${TOKEN_STANDARD_PACKAGE_ID}:Instrument:TradingPair`,
   holding: `${TOKEN_STANDARD_PACKAGE_ID}:Holding:Holding`,

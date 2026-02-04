@@ -34,8 +34,15 @@ function normalizeTemplateId(templateId) {
     return templateId;
   }
   
-  // If string format, parse it into object
+  // If string format, check if it uses "#" prefix (package name format)
+  // Canton allows "#package-name:Module:Entity" format - keep as string
   if (typeof templateId === "string") {
+    // If it starts with "#", it's using package name format - return as-is (string)
+    if (templateId.startsWith("#")) {
+      return templateId; // Keep as string for API
+    }
+    
+    // Otherwise, parse into object format
     const parts = templateId.split(":");
     if (parts.length === 3) {
       return {
@@ -354,6 +361,45 @@ class CantonService {
   }
 
   /**
+   * Get all packages
+   * GET /v2/packages
+   */
+  async getPackages(token) {
+    const url = `${this.jsonApiBase}/v2/packages`;
+
+    console.log(`[CantonService] GET ${url}`);
+
+    const res = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`
+      }
+    });
+
+    if (!res.ok) {
+      const error = parseCantonError(await res.text(), res.status);
+      console.error(`[CantonService] ❌ Get packages failed:`, error);
+      throw new Error(error.message);
+    }
+
+    const result = await res.json();
+    // Handle different response formats
+    // Canton returns { packageIds: [...] } not a direct array
+    let packages = [];
+    if (Array.isArray(result)) {
+      packages = result;
+    } else if (result.packageIds && Array.isArray(result.packageIds)) {
+      packages = result.packageIds;
+    } else if (result.packages && Array.isArray(result.packages)) {
+      packages = result.packages;
+    }
+    
+    console.log(`[CantonService] ✅ Found ${packages.length || 0} packages`);
+    return packages;
+  }
+
+  /**
    * Lookup a single contract by contract ID
    * POST /v2/contracts/lookup
    */
@@ -396,7 +442,7 @@ class CantonService {
    * Note: activeAtOffset is required. If not provided, fetches from ledger-end first.
    * Supports pagination to handle large result sets (Canton has 200 element limit)
    */
-  async queryActiveContracts({ party, templateIds = [], activeAtOffset = null, verbose = false, pageSize = 100, pageToken = null }, token) {
+  async queryActiveContracts({ party, templateIds = [], interfaceIds = [], activeAtOffset = null, verbose = false, pageSize = 100, pageToken = null }, token) {
     const url = `${this.jsonApiBase}/v2/state/active-contracts`;
 
     // If activeAtOffset not provided, fetch from ledger-end (required field)
@@ -418,19 +464,45 @@ class CantonService {
     const filter = {};
     
     if (party) {
-      filter.filtersByParty = {
-        [party]: templateIds.length > 0 ? {
-          // Use cumulative format with identifierFilter -> TemplateFilter
-          cumulative: templateIds.map(t => ({
-            identifierFilter: {
-              TemplateFilter: {
-                value: {
-                  templateId: typeof t === 'string' ? t : `${t.packageId}:${t.moduleName}:${t.entityName}`,
-                  includeCreatedEventBlob: false
-                }
+      // Separate interfaces from templates (interfaces start with "#")
+      const allIds = [...interfaceIds, ...templateIds];
+      const interfaces = allIds.filter(t => typeof t === 'string' && t.startsWith('#'));
+      const templates = allIds.filter(t => !(typeof t === 'string' && t.startsWith('#')));
+      
+      const filters = [];
+      
+      // Add interface filters (per client instructions - use InterfaceFilter)
+      if (interfaces.length > 0) {
+        filters.push(...interfaces.map(interfaceId => ({
+          identifierFilter: {
+            InterfaceFilter: {
+              value: {
+                interfaceId: interfaceId, // Keep as string with # prefix
+                includeCreatedEventBlob: true,
+                includeInterfaceView: true
               }
             }
-          }))
+          }
+        })));
+      }
+      
+      // Add template filters
+      if (templates.length > 0) {
+        filters.push(...templates.map(t => ({
+          identifierFilter: {
+            TemplateFilter: {
+              value: {
+                templateId: typeof t === 'string' ? t : `${t.packageId}:${t.moduleName}:${t.entityName}`,
+                includeCreatedEventBlob: false
+              }
+            }
+          }
+        })));
+      }
+      
+      filter.filtersByParty = {
+        [party]: filters.length > 0 ? {
+          cumulative: filters
         } : {
           // Wildcard filter for all templates
           cumulative: [{
@@ -446,8 +518,31 @@ class CantonService {
       };
     } else {
       // If no party specified, use filtersForAnyParty
-      filter.filtersForAnyParty = templateIds.length > 0 ? {
-        cumulative: templateIds.map(t => ({
+      // Separate interfaces from templates
+      const allIds = [...interfaceIds, ...templateIds];
+      const interfaces = allIds.filter(t => typeof t === 'string' && t.startsWith('#'));
+      const templates = allIds.filter(t => !(typeof t === 'string' && t.startsWith('#')));
+      
+      const filters = [];
+      
+      // Add interface filters
+      if (interfaces.length > 0) {
+        filters.push(...interfaces.map(interfaceId => ({
+          identifierFilter: {
+            InterfaceFilter: {
+              value: {
+                interfaceId: interfaceId,
+                includeCreatedEventBlob: true,
+                includeInterfaceView: true
+              }
+            }
+          }
+        })));
+      }
+      
+      // Add template filters
+      if (templates.length > 0) {
+        filters.push(...templates.map(t => ({
           identifierFilter: {
             TemplateFilter: {
               value: {
@@ -456,7 +551,11 @@ class CantonService {
               }
             }
           }
-        }))
+        })));
+      }
+      
+      filter.filtersForAnyParty = filters.length > 0 ? {
+        cumulative: filters
       } : {
         cumulative: [{
           identifierFilter: {
@@ -547,30 +646,86 @@ class CantonService {
    * NOTE: Canton has a 200 TOTAL element limit before pagination.
    * This method is kept for smaller result sets that need paging.
    */
-  async queryActiveContractsPaginated({ party, templateIds = [], activeAtOffset, verbose = false }, token) {
+  async queryActiveContractsPaginated({ party, templateIds = [], activeAtOffset = null, verbose = false }, token) {
     const allContracts = [];
     let pageToken = null;
     const pageSize = 50; // Small page size
     let iterations = 0;
     const maxIterations = 10; // Safety limit
     
+    // If activeAtOffset not provided, fetch from ledger-end (required field)
+    let effectiveOffset = activeAtOffset;
+    if (effectiveOffset === null || effectiveOffset === undefined) {
+      try {
+        effectiveOffset = await this.getLedgerEndOffset(token);
+        console.log(`[CantonService] Paginated query using ledger-end offset: ${effectiveOffset}`);
+      } catch (error) {
+        console.warn(`[CantonService] Failed to get ledger-end for pagination, using 0:`, error.message);
+        effectiveOffset = '0';
+      }
+    }
+    
+    // Ensure offset is a string (Canton API requires string)
+    if (typeof effectiveOffset === 'number') {
+      effectiveOffset = effectiveOffset.toString();
+    }
+    
     do {
       const url = `${this.jsonApiBase}/v2/state/active-contracts`;
       
       const filter = {};
       if (party) {
-        filter.filtersByParty = {
-          [party]: templateIds.length > 0 ? {
-            cumulative: templateIds.map(t => ({
+        // Separate interfaces from templates
+        // Interfaces start with "#" prefix
+        const allIds = [...interfaceIds, ...templateIds];
+        const interfaces = allIds.filter(t => typeof t === 'string' && t.startsWith('#'));
+        const templates = allIds.filter(t => !(typeof t === 'string' && t.startsWith('#')));
+        
+        console.log(`[CantonService] Separated: ${interfaces.length} interfaces, ${templates.length} templates`);
+        if (interfaces.length > 0) {
+          console.log(`[CantonService] Interface IDs:`, interfaces);
+        }
+        
+        const filters = [];
+        
+        // Add interface filters FIRST (per client instructions)
+        if (interfaces.length > 0) {
+          filters.push(...interfaces.map(interfaceId => {
+            console.log(`[CantonService] Adding InterfaceFilter for: ${interfaceId}`);
+            return {
+              identifierFilter: {
+                InterfaceFilter: {
+                  value: {
+                    interfaceId: interfaceId, // Keep as string with # prefix
+                    includeCreatedEventBlob: true,
+                    includeInterfaceView: true
+                  }
+                }
+              }
+            };
+          }));
+        }
+        
+        // Add template filters
+        if (templates.length > 0) {
+          filters.push(...templates.map(t => {
+            const normalized = normalizeTemplateId(t);
+            return {
               identifierFilter: {
                 TemplateFilter: {
                   value: {
-                    templateId: normalizeTemplateId(t),
+                    templateId: normalized,
                     includeCreatedEventBlob: false
                   }
                 }
               }
-            }))
+            };
+          }));
+        }
+        
+        filter.filtersByParty = {
+          [party]: filters.length > 0 ? {
+            cumulative: filters
           } : {
             cumulative: [{
               identifierFilter: {
@@ -580,17 +735,46 @@ class CantonService {
           }
         };
       } else {
-        filter.filtersForAnyParty = templateIds.length > 0 ? {
-          cumulative: templateIds.map(t => ({
+        // Separate interfaces from templates for filtersForAnyParty
+        const interfaces = [...interfaceIds, ...templateIds.filter(t => typeof t === 'string' && t.startsWith('#'))];
+        const templates = templateIds.filter(t => !(typeof t === 'string' && t.startsWith('#')));
+        
+        const filters = [];
+        
+        // Add interface filters
+        if (interfaces.length > 0) {
+          filters.push(...interfaces.map(interfaceId => ({
+            identifierFilter: {
+              InterfaceFilter: {
+                value: {
+                  interfaceId: interfaceId,
+                  includeCreatedEventBlob: true,
+                  includeInterfaceView: true
+                }
+              }
+            }
+          })));
+        }
+        
+        // Add template filters
+        if (templates.length > 0) {
+          filters.push(...templates.map(t => {
+            const normalized = normalizeTemplateId(t);
+            return {
             identifierFilter: {
               TemplateFilter: {
                 value: {
-                  templateId: normalizeTemplateId(t),
+                    templateId: normalized,
                   includeCreatedEventBlob: false
                 }
               }
             }
-          }))
+            };
+          }));
+        }
+        
+        filter.filtersForAnyParty = filters.length > 0 ? {
+          cumulative: filters
         } : {
           cumulative: [{
             identifierFilter: {
@@ -603,12 +787,18 @@ class CantonService {
       const body = {
         filter,
         verbose,
-        activeAtOffset,
+        activeAtOffset: effectiveOffset,
         pageSize,
       };
       
       if (pageToken) {
         body.pageToken = pageToken;
+      }
+
+      // Log request body for debugging (especially for InterfaceFilter)
+      if (templateIds.some(t => typeof t === 'string' && t.startsWith('#')) || interfaceIds.length > 0) {
+        console.log(`[CantonService] 🔍 Request body (InterfaceFilter):`);
+        console.log(JSON.stringify(body, null, 2));
       }
 
       const res = await fetch(url, {
@@ -620,21 +810,57 @@ class CantonService {
         body: JSON.stringify(body)
       });
 
+      let result;
       if (!res.ok) {
         const errorText = await res.text();
-        // Check for 200 element limit - this is expected, not an error
+        // Check for 200 element limit - try to parse response anyway, might have pageToken
         if (errorText.includes('JSON_API_MAXIMUM_LIST_ELEMENTS_NUMBER_REACHED')) {
-          console.log(`[CantonService] ℹ️ 200+ contracts found. Using cached data.`);
-          return allContracts; // Return what we have so far
+          console.log(`[CantonService] ℹ️ 200+ contracts found. Attempting to continue pagination...`);
+          try {
+            result = JSON.parse(errorText);
+            // If we got contracts and a pageToken, continue
+            if (result.activeContracts && result.nextPageToken) {
+              pageToken = result.nextPageToken;
+              // Process the contracts we got
+              const rawContracts = result.activeContracts || [];
+              const contracts = rawContracts.map(item => {
+                if (item.contractEntry?.JsActiveContract) {
+                  const activeContract = item.contractEntry.JsActiveContract;
+                  const createdEvent = activeContract.createdEvent || {};
+                  return {
+                    contractId: createdEvent.contractId,
+                    templateId: createdEvent.templateId,
+                    payload: createdEvent.createArgument,
+                    createArgument: createdEvent.createArgument,
+                    signatories: createdEvent.signatories,
+                    observers: createdEvent.observers,
+                    witnessParties: createdEvent.witnessParties,
+                    offset: createdEvent.offset,
+                    synchronizerId: activeContract.synchronizerId,
+                    createdAt: createdEvent.createdAt,
+                    createdEvent: createdEvent
+                  };
+                }
+                return item;
+              });
+              allContracts.push(...contracts);
+              iterations++;
+              continue; // Continue to next iteration with pageToken
+            }
+          } catch (parseErr) {
+            // Can't parse, return what we have
+            console.log(`[CantonService] Cannot parse error response, returning ${allContracts.length} contracts`);
+            return allContracts;
+          }
         }
         console.error(`[CantonService] Paginated query failed:`, errorText);
         break;
       }
 
-      const result = await res.json();
+      result = await res.json();
       const rawContracts = result.activeContracts || result || [];
       
-      // Normalize Canton JSON API v2 response format
+      // Normalize Canton JSON API v2 response format (same as regular query)
       const contracts = rawContracts.map(item => {
         if (item.contractEntry?.JsActiveContract) {
           const activeContract = item.contractEntry.JsActiveContract;
@@ -642,18 +868,25 @@ class CantonService {
           return {
             contractId: createdEvent.contractId,
             templateId: createdEvent.templateId,
-            payload: createdEvent.createArgument,
+            payload: createdEvent.createArgument, // The actual contract data
             createArgument: createdEvent.createArgument,
             signatories: createdEvent.signatories,
             observers: createdEvent.observers,
-            synchronizerId: activeContract.synchronizerId
+            witnessParties: createdEvent.witnessParties,
+            offset: createdEvent.offset,
+            synchronizerId: activeContract.synchronizerId,
+            createdAt: createdEvent.createdAt,
+            // Add createdEvent for compatibility
+            createdEvent: createdEvent
           };
         }
+        // Fallback for other response formats
         return item;
       });
       
       allContracts.push(...contracts);
       
+      // Check for next page token
       pageToken = result.nextPageToken || null;
       iterations++;
       
@@ -662,7 +895,258 @@ class CantonService {
     } while (pageToken && iterations < maxIterations);
     
     console.log(`[CantonService] ✅ Paginated query complete: ${allContracts.length} total contracts`);
+    
+    console.log(`[CantonService] ✅ Paginated query complete: ${allContracts.length} total contracts`);
     return allContracts;
+  }
+
+  /**
+   * Stream active contracts via WebSocket (recommended for 200+ contracts)
+   * Uses ws://host/v2/state/active-contracts WebSocket endpoint
+   * 
+   * Per Canton team: "You can use either ledger-api or websockets for streaming active contracts"
+   */
+  async streamActiveContracts({ party, templateIds = [], activeAtOffset = null, verbose = true }, token) {
+    return new Promise((resolve, reject) => {
+      const WebSocket = require('ws');
+      
+      // Convert HTTP URL to WebSocket URL
+      const wsUrl = this.jsonApiBase.replace(/^http/, 'ws') + '/v2/state/active-contracts';
+      
+      // Get ledger-end offset if not provided
+      let effectiveOffset = activeAtOffset;
+      if (!effectiveOffset) {
+        this.getLedgerEndOffset(token).then(offset => {
+          effectiveOffset = offset;
+          startStream();
+        }).catch(reject);
+      } else {
+        startStream();
+      }
+      
+      function startStream() {
+        // WebSocket authentication: Use subprotocol jwt.token.{JWT_TOKEN}
+        // Per Canton AsyncAPI spec: Sec-WebSocket-Protocol: jwt.token.{token}
+        let ws;
+        try {
+          const wsProtocol = `jwt.token.${token}`;
+          ws = new WebSocket(wsUrl, [wsProtocol]);
+        } catch (err) {
+          // If subprotocol fails, try without (some servers don't require it)
+          console.log(`[CantonService] WebSocket subprotocol failed, trying without...`);
+          ws = new WebSocket(wsUrl);
+        }
+        
+        const allContracts = [];
+        let requestSent = false;
+        let timeoutId = null;
+        
+        // Build filter and request outside handlers so they're accessible everywhere
+        const filter = {};
+        if (party) {
+          filter.filtersByParty = {
+            [party]: templateIds.length > 0 ? {
+              cumulative: templateIds.map(t => {
+                const templateIdStr = typeof t === 'string' ? t : `${t.packageId}:${t.moduleName}:${t.entityName}`;
+                // If starts with "#", it's an INTERFACE, use InterfaceFilter
+                if (templateIdStr.startsWith("#")) {
+                  return {
+                    identifierFilter: {
+                      InterfaceFilter: {
+                        value: {
+                          interfaceId: templateIdStr,
+                          includeCreatedEventBlob: true,
+                          includeInterfaceView: true
+                        }
+                      }
+                    }
+                  };
+                }
+                // Regular template - use TemplateFilter
+                return {
+                  identifierFilter: {
+                    TemplateFilter: {
+                      value: {
+                        templateId: templateIdStr,
+                        includeCreatedEventBlob: false
+                      }
+                    }
+                  }
+                };
+              })
+            } : {
+              cumulative: [{
+                identifierFilter: {
+                  WildcardFilter: { value: { includeCreatedEventBlob: false } }
+                }
+              }]
+            }
+          };
+        }
+        
+        const request = {
+          filter,
+          verbose,
+          activeAtOffset: typeof effectiveOffset === 'number' ? effectiveOffset.toString() : effectiveOffset
+        };
+        
+        ws.on('open', () => {
+          console.log(`[CantonService] WebSocket connected for active contracts stream`);
+          ws.send(JSON.stringify(request));
+          requestSent = true;
+        });
+        
+        let messageCount = 0;
+        let lastMessageTime = Date.now();
+        
+        ws.on('message', (data) => {
+          try {
+            messageCount++;
+            lastMessageTime = Date.now();
+            const message = JSON.parse(data.toString());
+            
+            // Handle error response
+            if (message.code) {
+              console.error(`[CantonService] WebSocket error response:`, message);
+              ws.close();
+              reject(new Error(message.message || message.cause || 'WebSocket error'));
+              return;
+            }
+            
+            // Handle contract entry - check all possible response formats
+            const contractEntry = message.contractEntry || message;
+            
+            if (contractEntry.JsActiveContract) {
+              const activeContract = contractEntry.JsActiveContract;
+              const createdEvent = activeContract.createdEvent || {};
+              allContracts.push({
+                contractId: createdEvent.contractId,
+                templateId: createdEvent.templateId,
+                payload: createdEvent.createArgument,
+                createArgument: createdEvent.createArgument,
+                signatories: createdEvent.signatories,
+                observers: createdEvent.observers,
+                witnessParties: createdEvent.witnessParties,
+                offset: createdEvent.offset,
+                synchronizerId: activeContract.synchronizerId,
+                createdAt: createdEvent.createdAt,
+                createdEvent: createdEvent
+              });
+              
+              if (messageCount % 50 === 0) {
+                console.log(`[CantonService] WebSocket: received ${messageCount} messages, ${allContracts.length} contracts so far`);
+              }
+            }
+            
+            // Check for end marker (JsEmpty, JsIncompleteAssigned, JsIncompleteUnassigned)
+            if (contractEntry.JsEmpty || contractEntry.JsIncompleteAssigned || contractEntry.JsIncompleteUnassigned) {
+              console.log(`[CantonService] ✅ WebSocket stream end marker received: ${allContracts.length} contracts`);
+              ws.close();
+              resolve(allContracts);
+              return;
+            }
+          } catch (err) {
+            console.error(`[CantonService] WebSocket message parse error:`, err.message);
+            console.error(`[CantonService] Raw message:`, data.toString().substring(0, 200));
+          }
+        });
+        
+        // Timeout after 60 seconds (longer for large streams)
+        timeoutId = setTimeout(() => {
+          if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CLOSING) {
+            console.log(`[CantonService] WebSocket timeout after 60s: ${allContracts.length} contracts received`);
+            ws.close();
+            if (allContracts.length > 0) {
+              resolve(allContracts);
+            } else {
+              reject(new Error('WebSocket stream timeout - no contracts received'));
+            }
+          }
+        }, 60000);
+        
+        ws.on('error', (error) => {
+          // If subprotocol error, try without subprotocol
+          if (error.message && error.message.includes('subprotocol')) {
+            console.log(`[CantonService] WebSocket subprotocol error, retrying without subprotocol...`);
+            clearTimeout(timeoutId);
+            // Retry without subprotocol (might work if server doesn't require it)
+            const wsRetry = new WebSocket(wsUrl);
+            setupWebSocketHandlers(wsRetry, request, resolve, reject);
+            return;
+          }
+          console.error(`[CantonService] WebSocket connection error:`, error.message);
+          clearTimeout(timeoutId);
+          reject(error);
+        });
+        
+        // Helper function to setup handlers (for retry)
+        function setupWebSocketHandlers(wsInstance, requestObj, resolveFn, rejectFn) {
+          const allContractsRetry = [];
+          let requestSentRetry = false;
+          let timeoutIdRetry = null;
+          
+          wsInstance.on('open', () => {
+            wsInstance.send(JSON.stringify(requestObj));
+            requestSentRetry = true;
+          });
+          
+          wsInstance.on('message', (data) => {
+            try {
+              const message = JSON.parse(data.toString());
+              if (message.contractEntry?.JsActiveContract) {
+                const activeContract = message.contractEntry.JsActiveContract;
+                const createdEvent = activeContract.createdEvent || {};
+                allContractsRetry.push({
+                  contractId: createdEvent.contractId,
+                  templateId: createdEvent.templateId,
+                  payload: createdEvent.createArgument,
+                  createArgument: createdEvent.createArgument,
+                  createdEvent: createdEvent
+                });
+              }
+              if (message.contractEntry?.JsEmpty) {
+                wsInstance.close();
+                resolveFn(allContractsRetry);
+              }
+            } catch (err) {
+              // Ignore parse errors
+            }
+          });
+          
+          wsInstance.on('close', () => {
+            if (requestSentRetry && allContractsRetry.length > 0) {
+              resolveFn(allContractsRetry);
+            }
+          });
+          
+          timeoutIdRetry = setTimeout(() => {
+            wsInstance.close();
+            if (allContractsRetry.length > 0) {
+              resolveFn(allContractsRetry);
+            } else {
+              rejectFn(new Error('WebSocket timeout'));
+            }
+          }, 60000);
+        }
+        
+        ws.on('close', (code, reason) => {
+          clearTimeout(timeoutId);
+          console.log(`[CantonService] WebSocket closed: code=${code}, reason=${reason?.toString() || 'none'}, contracts=${allContracts.length}`);
+          if (requestSent) {
+            if (allContracts.length > 0) {
+              resolve(allContracts);
+            } else if (code === 1000) {
+              // Normal closure - stream completed (even if empty)
+              resolve(allContracts);
+            } else {
+              reject(new Error(`WebSocket closed unexpectedly: code=${code}`));
+            }
+          } else {
+            reject(new Error('WebSocket closed before request sent'));
+          }
+        });
+      }
+    });
   }
 
   /**
