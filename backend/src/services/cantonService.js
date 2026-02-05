@@ -279,7 +279,8 @@ class CantonService {
     choiceArgument = {},
     readAs = [],
     commandId = null,
-    synchronizerId = null
+    synchronizerId = null,
+    disclosedContracts = null
   }) {
     const actAs = Array.isArray(actAsParty) ? actAsParty : [actAsParty];
 
@@ -314,7 +315,9 @@ class CantonService {
             choice,
             choiceArgument
           }
-        }]
+        }],
+        // Include disclosed contracts if provided (needed for Splice Token Standard transfers)
+        ...(disclosedContracts && disclosedContracts.length > 0 && { disclosedContracts })
       }
     };
 

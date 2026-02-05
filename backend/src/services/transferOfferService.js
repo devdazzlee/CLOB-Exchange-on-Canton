@@ -162,14 +162,12 @@ class TransferOfferService {
    * Accept a transfer offer (Splice Token Standard TransferInstruction)
    * This creates a new Holding for the receiving party
    * 
-   * Supports:
-   * - Splice Token Standard TransferInstruction: Accept choice
-   * - Custom templates with Accept/AcceptTransfer choices
+   * Uses the Canton Wallet SDK to get proper disclosed contracts for Splice transfers.
    * 
    * @param {string} offerContractId - The transfer offer contract ID
    * @param {string} partyId - The party accepting the offer
    * @param {string} token - Admin token
-   * @param {string} templateId - Optional template ID (if known, speeds up acceptance)
+   * @param {string} templateId - Optional template ID (if known)
    * @returns {Object} Result of accepting the offer
    */
   async acceptTransferOffer(offerContractId, partyId, token, templateId = null) {
@@ -178,104 +176,155 @@ class TransferOfferService {
     try {
       console.log(`[TransferOfferService] Accepting transfer offer: ${offerContractId.substring(0, 30)}...`);
       
-      let offerTemplateId = templateId;
-      let isSplice = false;
-      
-      // If template ID not provided, fetch the offer to discover it
-      if (!offerTemplateId) {
-        // Try InterfaceFilter first (for Splice)
-        try {
-          const spliceOffers = await this.cantonService.queryActiveContracts({
-            party: partyId,
-            interfaceIds: ['#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction'],
-          }, token);
-          
-          const offer = spliceOffers.find(c => c.contractId === offerContractId);
-          if (offer) {
-            offerTemplateId = offer.createdEvent?.templateId || offer.templateId;
-            isSplice = true;
-            console.log(`[TransferOfferService] Found Splice TransferInstruction: ${offerTemplateId}`);
-          }
-        } catch (e) {
-          console.log(`[TransferOfferService] Splice interface query failed, trying fallback...`);
-        }
+      // Try using the Wallet SDK first (handles disclosed contracts automatically)
+      try {
+        const walletSdkService = require('./walletSdkService');
+        console.log('[TransferOfferService] Attempting accept via Wallet SDK...');
         
-        // Fallback: Query all contracts
-        if (!offerTemplateId) {
-          const contracts = await this.cantonService.queryActiveContracts({
-            party: partyId,
-            templateIds: [],
-          }, token);
+        const sdkResult = await walletSdkService.acceptTransfer(offerContractId, partyId);
+        
+        if (sdkResult.success && sdkResult.disclosedContracts) {
+          // SDK gave us the command and disclosed contracts, execute via JSON API
+          console.log(`[TransferOfferService] Got ${sdkResult.disclosedContracts.length} disclosed contracts from SDK`);
           
-          const offer = contracts.find(c => c.contractId === offerContractId);
+          const result = await this.cantonService.exerciseChoice({
+            token,
+            templateId: '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.TransferInstructionV1:TransferInstruction',
+            contractId: offerContractId,
+            choice: 'TransferInstruction_Accept',
+            choiceArgument: sdkResult.command?.choiceArgument || {
+              extraArgs: {
+                context: { values: {} },
+                meta: { values: {} }
+              }
+            },
+            actAsParty: [partyId],
+            disclosedContracts: sdkResult.disclosedContracts,
+          });
           
-          if (!offer) {
-            throw new Error(`Transfer offer not found: ${offerContractId}`);
+          console.log('[TransferOfferService] ✅ Accepted via SDK + JSON API');
+          return {
+            success: true,
+            offerContractId,
+            usedSdk: true,
+            result,
+          };
+        } else if (sdkResult.success && sdkResult.result) {
+          // SDK executed it directly
+          console.log('[TransferOfferService] ✅ Accepted directly via SDK');
+          return {
+            success: true,
+            offerContractId,
+            usedSdk: true,
+            result: sdkResult.result,
+          };
+        }
+      } catch (sdkError) {
+        console.log(`[TransferOfferService] SDK method failed: ${sdkError.message?.substring(0, 100)}`);
+      }
+      
+      // Fallback: Direct JSON API approach
+      console.log('[TransferOfferService] Fallback to direct JSON API...');
+      
+      const TRANSFER_INSTRUCTION_INTERFACE = '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.TransferInstructionV1:TransferInstruction';
+      
+      let offerTemplateId = templateId;
+      let interfaceId = null;
+      let offerContract = null;
+      
+      // Query the contract to get its interface view
+      try {
+        const contracts = await this.cantonService.queryActiveContracts({
+          party: partyId,
+          interfaceIds: [`#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction`],
+        }, token);
+        
+        offerContract = contracts.find(c => c.contractId === offerContractId);
+        if (offerContract) {
+          const interfaceView = offerContract.createdEvent?.interfaceViews?.[0];
+          if (interfaceView) {
+            interfaceId = interfaceView.interfaceId;
           }
-          
-          offerTemplateId = offer.createdEvent?.templateId || offer.templateId;
-          isSplice = offerTemplateId?.toLowerCase().includes('splice');
+          offerTemplateId = offerContract.createdEvent?.templateId || offerContract.templateId;
+        }
+      } catch (e) {
+        console.log(`[TransferOfferService] InterfaceFilter query failed: ${e.message.substring(0, 100)}`);
+      }
+      
+      if (!offerContract) {
+        const contracts = await this.cantonService.queryActiveContracts({
+          party: partyId,
+          templateIds: [],
+        }, token);
+        
+        offerContract = contracts.find(c => c.contractId === offerContractId);
+        if (offerContract) {
+          offerTemplateId = offerContract.createdEvent?.templateId || offerContract.templateId;
         }
       }
       
-      console.log(`[TransferOfferService] Offer template: ${offerTemplateId} (Splice: ${isSplice})`);
+      if (!offerContract) {
+        throw new Error(`Transfer offer not found: ${offerContractId}`);
+      }
       
-      // Determine the accept choice name based on template
-      // Splice Token Standard TransferInstruction uses "Accept" choice
-      const acceptChoiceNames = [
-        'Accept',  // Splice standard
-        'TransferInstruction_Accept',  // Alternative
-        'TransferOffer_Accept', 
-        'AcceptTransfer',
-        'Accept_TransferOffer',
-      ];
+      // Try different template IDs and choice names
+      const templateIds = [interfaceId, TRANSFER_INSTRUCTION_INTERFACE, offerTemplateId].filter(Boolean);
+      const choiceNames = ['TransferInstruction_Accept', 'Accept'];
       
       let result = null;
       let lastError = null;
       
-      for (const choiceName of acceptChoiceNames) {
-        try {
-          console.log(`[TransferOfferService] Trying choice: ${choiceName}`);
-          
-          // For Splice TransferInstruction, only the receiver needs to authorize
-          result = await this.cantonService.exerciseChoice({
-            token,
-            templateId: offerTemplateId,
-            contractId: offerContractId,
-            choice: choiceName,
-            choiceArgument: {},
-            actAsParty: [partyId], // Only receiver needs to authorize
-          });
-          
-          console.log(`[TransferOfferService] ✅ Accepted with choice: ${choiceName}`);
-          break;
-        } catch (e) {
-          lastError = e;
-          const errorMsg = e.message?.toLowerCase() || '';
-          if (errorMsg.includes('unknown choice') || 
-              errorMsg.includes('no such choice') ||
-              errorMsg.includes('choice not found') ||
-              errorMsg.includes('cnedchoice')) {
-            console.log(`[TransferOfferService] Choice ${choiceName} not found, trying next...`);
-            continue; // Try next choice name
+      for (const tryTemplateId of templateIds) {
+        for (const choiceName of choiceNames) {
+          try {
+            result = await this.cantonService.exerciseChoice({
+              token,
+              templateId: tryTemplateId,
+              contractId: offerContractId,
+              choice: choiceName,
+              choiceArgument: {
+                extraArgs: { context: { values: {} }, meta: { values: {} } }
+              },
+              actAsParty: [partyId],
+            });
+            
+            console.log(`[TransferOfferService] ✅ Accepted with ${choiceName}`);
+            return { success: true, offerContractId, templateId: tryTemplateId, choiceUsed: choiceName, result };
+          } catch (e) {
+            lastError = e;
+            // Try without extraArgs
+            try {
+              result = await this.cantonService.exerciseChoice({
+                token,
+                templateId: tryTemplateId,
+                contractId: offerContractId,
+                choice: choiceName,
+                choiceArgument: {},
+                actAsParty: [partyId],
+              });
+              
+              return { success: true, offerContractId, templateId: tryTemplateId, choiceUsed: choiceName, result };
+            } catch (e2) {
+              lastError = e2;
+            }
           }
-          // Other errors (like authorization) - log but continue trying
-          console.log(`[TransferOfferService] Choice ${choiceName} failed: ${e.message.substring(0, 100)}`);
-          continue;
         }
       }
       
-      if (!result) {
-        throw new Error(`Could not accept transfer offer. Last error: ${lastError?.message || 'No valid accept choice found'}`);
+      // Check if it's a "missing context" error - provide helpful message
+      if (lastError?.message?.includes('Missing context entry')) {
+        throw new Error(
+          `This Splice transfer requires disclosed contracts that are only available through the Registry API. ` +
+          `Please accept this transfer via the WolfEdge Utilities UI at https://utilities.dev.canton.wolfedgelabs.com/ ` +
+          `(login → Registry → Transfers tab → Accept the pending transfer)`
+        );
       }
       
-      return {
-        success: true,
-        offerContractId,
-        templateId: offerTemplateId,
-        isSplice,
-        result,
-      };
+      throw new Error(
+        `Could not accept transfer offer. ` +
+        `Please try accepting via the WolfEdge Utilities UI at https://utilities.dev.canton.wolfedgelabs.com/. ` +
+        `Error: ${lastError?.message || 'Unknown'}`
+      );
       
     } catch (error) {
       console.error('[TransferOfferService] Failed to accept transfer offer:', error.message);
