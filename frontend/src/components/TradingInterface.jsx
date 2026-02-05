@@ -652,7 +652,8 @@ export default function TradingInterface({ partyId }) {
     if (!partyId) return;
     
     try {
-      if (showLoader && !hasLoadedBalanceRef.current) {
+      // Always show loading when explicitly requested (e.g., refresh button)
+      if (showLoader) {
         setBalanceLoading(true);
       }
       console.log('[Balance V2] Loading Holdings-based balance for party:', partyId);

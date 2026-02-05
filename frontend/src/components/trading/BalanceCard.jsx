@@ -49,13 +49,10 @@ export default function BalanceCard({ balance = {}, loading, onRefresh }) {
             size="icon"
             onClick={onRefresh}
             disabled={loading}
-            className="h-8 w-8"
+            className="h-8 w-8 hover:bg-primary/10 transition-colors"
+            title="Refresh balance"
           >
-            {loading ? (
-              <Loader2 className="h-4 w-4 animate-spin text-primary" />
-            ) : (
-              <RefreshCw className="h-4 w-4 text-muted-foreground" />
-            )}
+            <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin text-primary' : 'text-muted-foreground hover:text-primary'} transition-colors`} />
           </Button>
         </div>
       </CardHeader>
