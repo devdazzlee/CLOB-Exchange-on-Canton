@@ -22,8 +22,8 @@ import {
 } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
 import { Button } from '../ui/button';
-import { useToast } from '../ui/use-toast';
-import apiClient from '../../services/apiClient';
+import { useToast } from '../ui/toast';
+import { apiClient } from '../../config/config';
 
 export default function TransferOffers({ partyId, onTransferAccepted }) {
   const [offers, setOffers] = useState([]);
@@ -41,7 +41,7 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
     
     try {
       console.log('[TransferOffers] Fetching offers for:', partyId.substring(0, 30));
-      const response = await apiClient.get(`/api/transfers/offers/${encodeURIComponent(partyId)}`);
+      const response = await apiClient.get(`/transfers/offers/${encodeURIComponent(partyId)}`);
       
       if (response.success) {
         setOffers(response.data?.offers || []);
@@ -75,7 +75,7 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
     try {
       console.log('[TransferOffers] Accepting offer:', offer.contractId.substring(0, 30));
       
-      const response = await apiClient.post('/api/transfers/accept', {
+      const response = await apiClient.post('/transfers/accept', {
         offerContractId: offer.contractId,
         partyId: partyId,
         templateId: offer.templateId,
