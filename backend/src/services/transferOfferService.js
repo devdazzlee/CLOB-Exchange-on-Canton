@@ -36,10 +36,14 @@ class TransferOfferService {
   }
 
   /**
-   * Query for pending transfer offers for a party
+   * Query for pending transfer offers (TransferInstruction contracts) for a party
    * Transfer offers can come from:
    * - Canton utilities faucet (CBTC, etc.)
    * - Other users sending tokens
+   * 
+   * In Splice Token Standard, transfers are 2-step:
+   * 1. Sender creates a TransferInstruction (the "offer")
+   * 2. Receiver exercises Accept choice on the TransferInstruction
    * 
    * @param {string} partyId - The party to check for offers
    * @param {string} token - Admin token for Canton API
@@ -49,52 +53,104 @@ class TransferOfferService {
     await this.initialize();
     
     try {
-      console.log(`[TransferOfferService] Querying transfer offers for: ${partyId.substring(0, 30)}...`);
+      console.log(`[TransferOfferService] Querying transfer offers (TransferInstructions) for: ${partyId.substring(0, 30)}...`);
       
-      // Query for any contracts where this party is an observer or receiver
-      // The Splice/Canton token standard uses different offer templates
-      const possibleTemplates = [
-        // Splice Token Standard templates (these may vary by deployment)
-        'Splice.TokenStandard:TransferOffer:TransferOffer',
-        'Splice.TokenStandard.Fungible:TransferOffer:TransferOffer',
-        'Splice.Wallet:TransferOffer:TransferOffer',
-        // Try with wildcards via separate query
-      ];
+      let allOffers = [];
       
-      // First, get all contracts visible to this party
-      const allContracts = await this.cantonService.queryActiveContracts({
-        party: partyId,
-        templateIds: [],  // Wildcard - get all templates
-      }, token);
+      // Method 1: Query using Splice TransferInstruction Interface (# prefix)
+      // This is the proper way to find all TransferInstruction contracts
+      try {
+        console.log(`[TransferOfferService] Trying InterfaceFilter for TransferInstruction...`);
+        const spliceOffers = await this.cantonService.queryActiveContracts({
+          party: partyId,
+          interfaceIds: ['#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction'],
+        }, token);
+        console.log(`[TransferOfferService] InterfaceFilter found ${spliceOffers.length} TransferInstructions`);
+        allOffers.push(...spliceOffers);
+      } catch (e) {
+        console.log(`[TransferOfferService] InterfaceFilter query failed: ${e.message.substring(0, 100)}`);
+      }
       
-      console.log(`[TransferOfferService] Found ${allContracts.length} total contracts`);
-      
-      // Filter for anything that looks like a transfer offer
-      const transferOffers = allContracts.filter(contract => {
-        const templateId = contract.createdEvent?.templateId || '';
-        const payload = contract.payload || {};
+      // Method 2: Fallback - Query all contracts and filter
+      if (allOffers.length === 0) {
+        console.log(`[TransferOfferService] Fallback: querying all contracts...`);
         
-        // Check if template looks like a transfer offer
-        const isTransferOffer = 
-          templateId.toLowerCase().includes('transfer') ||
-          templateId.toLowerCase().includes('offer') ||
-          payload.receiver === partyId ||
-          payload.recipient === partyId;
+        const allContracts = await this.cantonService.queryActiveContracts({
+          party: partyId,
+          templateIds: [],  // Wildcard - get all templates
+        }, token);
+        
+        console.log(`[TransferOfferService] Found ${allContracts.length} total contracts`);
+        
+        // Filter for transfer-related contracts
+        const transferContracts = allContracts.filter(contract => {
+          const templateId = (contract.createdEvent?.templateId || contract.templateId || '').toLowerCase();
+          const payload = contract.payload || {};
           
-        return isTransferOffer;
+          // Check if template looks like a transfer offer/instruction
+          const isTransferOffer = 
+            templateId.includes('transfer') ||
+            templateId.includes('instruction') ||
+            templateId.includes('offer') ||
+            payload.receiver === partyId ||
+            payload.recipient === partyId;
+            
+          return isTransferOffer;
+        });
+        
+        allOffers.push(...transferContracts);
+      }
+      
+      console.log(`[TransferOfferService] Found ${allOffers.length} potential transfer offers`);
+      
+      // Map to a consistent format
+      return allOffers.map(contract => {
+        const payload = contract.payload || contract.interfaceView || {};
+        const templateId = contract.createdEvent?.templateId || contract.templateId || '';
+        
+        // Handle nested transfer data structure (e.g., payload.transfer.amount)
+        // Splice/Canton uses: { transfer: { sender, receiver, amount, instrumentId: { id: "CBTC" } } }
+        const transferData = payload.transfer || {};
+        
+        // Extract token info - check nested structures first
+        let tokenSymbol = transferData.instrumentId?.id ||
+                          transferData.instrument?.id ||
+                          payload.instrument?.id || 
+                          payload.instrumentId?.id || 
+                          payload.token || 
+                          payload.asset ||
+                          'Unknown';
+        
+        // Extract amount - check nested transfer data first
+        let amount = transferData.amount || 
+                     payload.amount || 
+                     payload.quantity || 
+                     '0';
+        
+        // Extract sender/receiver - check nested structure first
+        let sender = transferData.sender || 
+                     payload.sender || 
+                     payload.provider || 
+                     payload.from || 
+                     'unknown';
+        
+        let receiver = transferData.receiver || 
+                       payload.receiver || 
+                       payload.recipient || 
+                       payload.to || 
+                       partyId;
+        
+        return {
+          contractId: contract.contractId,
+          templateId: templateId,
+          payload: payload,
+          sender: sender,
+          receiver: receiver,
+          amount: amount,
+          token: tokenSymbol,
+          isSplice: templateId.toLowerCase().includes('splice') || !!contract.interfaceView,
+        };
       });
-      
-      console.log(`[TransferOfferService] Found ${transferOffers.length} potential transfer offers`);
-      
-      return transferOffers.map(contract => ({
-        contractId: contract.contractId,
-        templateId: contract.createdEvent?.templateId,
-        payload: contract.payload,
-        sender: contract.payload?.sender || contract.payload?.provider || 'unknown',
-        receiver: contract.payload?.receiver || contract.payload?.recipient || partyId,
-        amount: contract.payload?.amount || contract.payload?.quantity,
-        token: contract.payload?.token || contract.payload?.instrumentId?.symbol,
-      }));
       
     } catch (error) {
       console.error('[TransferOfferService] Failed to get transfer offers:', error.message);
@@ -103,12 +159,12 @@ class TransferOfferService {
   }
 
   /**
-   * Accept a transfer offer (Splice Token Standard)
+   * Accept a transfer offer (Splice Token Standard TransferInstruction)
    * This creates a new Holding for the receiving party
    * 
-   * Supports both:
-   * - Splice Token Standard: splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:TransferOffer
-   * - Custom templates: Our own TransferOffer templates
+   * Supports:
+   * - Splice Token Standard TransferInstruction: Accept choice
+   * - Custom templates with Accept/AcceptTransfer choices
    * 
    * @param {string} offerContractId - The transfer offer contract ID
    * @param {string} partyId - The party accepting the offer
@@ -120,36 +176,58 @@ class TransferOfferService {
     await this.initialize();
     
     try {
-      console.log(`[TransferOfferService] Accepting transfer offer: ${offerContractId.substring(0, 20)}...`);
+      console.log(`[TransferOfferService] Accepting transfer offer: ${offerContractId.substring(0, 30)}...`);
       
       let offerTemplateId = templateId;
+      let isSplice = false;
       
       // If template ID not provided, fetch the offer to discover it
       if (!offerTemplateId) {
-        const contracts = await this.cantonService.queryActiveContracts({
-          party: partyId,
-          templateIds: [],
-        }, token);
-        
-        const offer = contracts.find(c => c.contractId === offerContractId);
-        
-        if (!offer) {
-          throw new Error(`Transfer offer not found: ${offerContractId}`);
+        // Try InterfaceFilter first (for Splice)
+        try {
+          const spliceOffers = await this.cantonService.queryActiveContracts({
+            party: partyId,
+            interfaceIds: ['#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction'],
+          }, token);
+          
+          const offer = spliceOffers.find(c => c.contractId === offerContractId);
+          if (offer) {
+            offerTemplateId = offer.createdEvent?.templateId || offer.templateId;
+            isSplice = true;
+            console.log(`[TransferOfferService] Found Splice TransferInstruction: ${offerTemplateId}`);
+          }
+        } catch (e) {
+          console.log(`[TransferOfferService] Splice interface query failed, trying fallback...`);
         }
         
-        offerTemplateId = offer.createdEvent?.templateId;
+        // Fallback: Query all contracts
+        if (!offerTemplateId) {
+          const contracts = await this.cantonService.queryActiveContracts({
+            party: partyId,
+            templateIds: [],
+          }, token);
+          
+          const offer = contracts.find(c => c.contractId === offerContractId);
+          
+          if (!offer) {
+            throw new Error(`Transfer offer not found: ${offerContractId}`);
+          }
+          
+          offerTemplateId = offer.createdEvent?.templateId || offer.templateId;
+          isSplice = offerTemplateId?.toLowerCase().includes('splice');
+        }
       }
       
-      console.log(`[TransferOfferService] Offer template: ${offerTemplateId}`);
+      console.log(`[TransferOfferService] Offer template: ${offerTemplateId} (Splice: ${isSplice})`);
       
       // Determine the accept choice name based on template
-      // Splice Token Standard uses different choice names
+      // Splice Token Standard TransferInstruction uses "Accept" choice
       const acceptChoiceNames = [
-        'Accept',  // Most common
+        'Accept',  // Splice standard
+        'TransferInstruction_Accept',  // Alternative
         'TransferOffer_Accept', 
         'AcceptTransfer',
         'Accept_TransferOffer',
-        'Splice.Api.Token.HoldingV1.TransferOffer_Accept', // Splice full path
       ];
       
       let result = null;
@@ -159,7 +237,7 @@ class TransferOfferService {
         try {
           console.log(`[TransferOfferService] Trying choice: ${choiceName}`);
           
-          // For Splice, only the receiver needs to authorize
+          // For Splice TransferInstruction, only the receiver needs to authorize
           result = await this.cantonService.exerciseChoice({
             token,
             templateId: offerTemplateId,
@@ -173,25 +251,29 @@ class TransferOfferService {
           break;
         } catch (e) {
           lastError = e;
-          if (e.message.includes('unknown choice') || 
-              e.message.includes('No such choice') ||
-              e.message.includes('choice not found')) {
+          const errorMsg = e.message?.toLowerCase() || '';
+          if (errorMsg.includes('unknown choice') || 
+              errorMsg.includes('no such choice') ||
+              errorMsg.includes('choice not found') ||
+              errorMsg.includes('cnedchoice')) {
             console.log(`[TransferOfferService] Choice ${choiceName} not found, trying next...`);
             continue; // Try next choice name
           }
-          // Other errors (like authorization) should be thrown
-          throw e;
+          // Other errors (like authorization) - log but continue trying
+          console.log(`[TransferOfferService] Choice ${choiceName} failed: ${e.message.substring(0, 100)}`);
+          continue;
         }
       }
       
       if (!result) {
-        throw new Error(`Could not find valid accept choice. Last error: ${lastError?.message || 'unknown'}`);
+        throw new Error(`Could not accept transfer offer. Last error: ${lastError?.message || 'No valid accept choice found'}`);
       }
       
       return {
         success: true,
         offerContractId,
         templateId: offerTemplateId,
+        isSplice,
         result,
       };
       

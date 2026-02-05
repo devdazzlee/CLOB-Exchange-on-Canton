@@ -16,6 +16,7 @@ import GlobalTrades from './trading/GlobalTrades';
 import TransactionHistory from './trading/TransactionHistory';
 import PortfolioView from './trading/PortfolioView';
 import MarketData from './trading/MarketData';
+import TransferOffers from './trading/TransferOffers';
 
 // Import skeleton components
 import OrderBookSkeleton from './trading/OrderBookSkeleton';
@@ -301,6 +302,27 @@ export default function TradingInterface({ partyId }) {
     
     return result;
   }, [partyId, toast, setOrders, setBalance]);
+
+  // Handle when a transfer offer is accepted - refresh balances
+  const handleTransferAccepted = useCallback(async (offer) => {
+    console.log('[TradingInterface] Transfer accepted:', offer);
+    toast.success(`Received ${offer.amount} ${offer.token}!`);
+    
+    // Refresh balance after accepting transfer
+    try {
+      const balanceData = await balanceService.getBalances(partyId);
+      if (balanceData.available) {
+        const dynamicBalance = {};
+        Object.keys(balanceData.available).forEach(token => {
+          dynamicBalance[token] = balanceData.available[token]?.toString() || '0.0';
+        });
+        setBalance(dynamicBalance);
+        console.log('[TradingInterface] Balance refreshed after transfer:', dynamicBalance);
+      }
+    } catch (e) {
+      console.warn('[TradingInterface] Failed to refresh balance after transfer:', e);
+    }
+  }, [partyId, toast, setBalance]);
 
 
   // === PHASE 2: ALL USEEFFECT HOOKS - NO CONDITIONALS ===
@@ -804,6 +826,12 @@ export default function TradingInterface({ partyId }) {
             onMintTokens={handleMintTokens}
             mintingLoading={mintingLoading}
             />
+
+          {/* Transfer Offers - Accept incoming tokens (CBTC from faucet, etc.) */}
+          <TransferOffers
+            partyId={partyId}
+            onTransferAccepted={handleTransferAccepted}
+          />
           
           {/* Balance Card */}
           {/* {balanceLoading ? (
