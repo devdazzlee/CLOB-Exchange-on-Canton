@@ -114,16 +114,23 @@ class OrderBookService {
 
     /**
      * Get all order books - DIRECTLY from Canton API
+     * Includes Splice Token Standard pairs (CBTC, CC)
      */
     async getAllOrderBooks() {
-        const pairs = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'];
+        // All supported trading pairs - includes Splice Token Standard tokens
+        const pairs = [
+            'BTC/USDT',    // Standard BTC pair
+            'ETH/USDT',    // Standard ETH pair
+            'SOL/USDT',    // Standard SOL pair
+            'CBTC/USDT',   // Canton BTC (Splice Token Standard)
+            'CC/CBTC',     // Canton Coin / Canton BTC
+        ];
         const orderBooks = [];
         
         for (const pair of pairs) {
             const book = await this.getOrderBook(pair);
-            if (book.buyOrders.length > 0 || book.sellOrders.length > 0) {
-                orderBooks.push(book);
-            }
+            // Include all pairs, even if empty (so they show in dropdown)
+            orderBooks.push(book);
         }
         
         return orderBooks;

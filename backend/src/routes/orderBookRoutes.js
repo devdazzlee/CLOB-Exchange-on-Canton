@@ -12,6 +12,9 @@ router.get('/', orderBookController.getAll);
 // GET /api/trades - Get all recent trades
 router.get('/trades', orderBookController.getAllTrades);
 
+// POST /api/orderbooks/:tradingPair - Create OrderBook (Admin)
+router.post('/:tradingPair', orderBookController.create);
+
 // GET /api/orderbooks/:tradingPair - Get OrderBook by trading pair
 router.get('/:tradingPair', orderBookController.getByTradingPair);
 

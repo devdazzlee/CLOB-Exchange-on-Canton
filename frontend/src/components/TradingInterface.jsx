@@ -38,12 +38,14 @@ export default function TradingInterface({ partyId }) {
   const heartbeatRef = useRef(Date.now());
   
   const [tradingPair, setTradingPair] = useState('BTC/USDT');
-  const [availablePairs, setAvailablePairs] = useState(['BTC/USDT']);
+  // Trading pairs loaded from API - no hardcoding
+  const [availablePairs, setAvailablePairs] = useState([]);
   const [orderType, setOrderType] = useState('BUY');
   const [orderMode, setOrderMode] = useState('LIMIT');
   const [price, setPrice] = useState('');
   const [quantity, setQuantity] = useState('');
-  const [balance, setBalance] = useState({ BTC: '0.0', USDT: '0.0', ETH: '0.0', SOL: '0.0' });
+  // Dynamic balance object - will be populated from API (includes CBTC)
+  const [balance, setBalance] = useState({});
   const [balanceLoading, setBalanceLoading] = useState(false);
   const isMintingRef = useRef(false);
   const lastMintAtRef = useRef(0);
@@ -97,17 +99,17 @@ export default function TradingInterface({ partyId }) {
           details: 'BTC: 10 | USDT: 100,000 | ETH: 100 | SOL: 1,000'
         });
         
-        // Refresh balance from V2 Holdings
+        // Refresh balance from V2 Holdings (includes CBTC)
         setTimeout(async () => {
           try {
             const balanceData = await balanceService.getBalances(partyId);
             if (balanceData.available) {
-              setBalance({
-                BTC: balanceData.available.BTC?.toString() || '0.0',
-                USDT: balanceData.available.USDT?.toString() || '0.0',
-                ETH: balanceData.available.ETH?.toString() || '0.0',
-                SOL: balanceData.available.SOL?.toString() || '0.0'
+              // Dynamic balance - show ALL tokens from API (including CBTC)
+              const dynamicBalance = {};
+              Object.keys(balanceData.available).forEach(token => {
+                dynamicBalance[token] = balanceData.available[token]?.toString() || '0.0';
               });
+              setBalance(dynamicBalance);
               console.log('[Mint V2] Balance refreshed from Holdings:', balanceData.available);
             }
           } catch (err) {
@@ -199,16 +201,16 @@ export default function TradingInterface({ partyId }) {
           })));
       } catch (e) { console.error('[Refresh] User orders error:', e); }
       
-      // Refresh balance from V2 Holdings
+      // Refresh balance from V2 Holdings (includes CBTC)
       try {
         const balanceData = await balanceService.getBalances(partyId);
         if (balanceData.available) {
-          setBalance({
-            BTC: balanceData.available.BTC?.toString() || '0.0',
-            USDT: balanceData.available.USDT?.toString() || '0.0',
-            ETH: balanceData.available.ETH?.toString() || '0.0',
-            SOL: balanceData.available.SOL?.toString() || '0.0'
+          // Dynamic balance - show ALL tokens from API
+          const dynamicBalance = {};
+          Object.keys(balanceData.available).forEach(token => {
+            dynamicBalance[token] = balanceData.available[token]?.toString() || '0.0';
           });
+          setBalance(dynamicBalance);
         }
       } catch (e) { console.error('[Refresh] Balance error:', e); }
       
@@ -282,16 +284,16 @@ export default function TradingInterface({ partyId }) {
       console.warn('[Cancel Order] Failed to refresh orders:', e);
     }
     
-    // Refresh balance from V2 Holdings
+    // Refresh balance from V2 Holdings (includes CBTC)
     try {
       const balanceData = await balanceService.getBalances(partyId);
       if (balanceData.available) {
-        setBalance({
-          BTC: balanceData.available.BTC?.toString() || '0.0',
-          USDT: balanceData.available.USDT?.toString() || '0.0',
-          ETH: balanceData.available.ETH?.toString() || '0.0',
-          SOL: balanceData.available.SOL?.toString() || '0.0'
+        // Dynamic balance - show ALL tokens from API
+        const dynamicBalance = {};
+        Object.keys(balanceData.available).forEach(token => {
+          dynamicBalance[token] = balanceData.available[token]?.toString() || '0.0';
         });
+        setBalance(dynamicBalance);
       }
     } catch (e) {
       console.warn('[Cancel Order] Failed to refresh balance:', e);
@@ -633,34 +635,34 @@ export default function TradingInterface({ partyId }) {
         }
         console.log('[Balance V2] Loading Holdings-based balance for party:', partyId);
         
-        // TOKEN STANDARD V2: Load balance from Holding contracts
+        // TOKEN STANDARD V2: Load balance from Holding contracts (includes CBTC)
         try {
           const balanceData = await balanceService.getBalances(partyId);
           
-          if (balanceData.available) {
-              setBalance({
-              BTC: balanceData.available.BTC?.toString() || '0.0',
-              USDT: balanceData.available.USDT?.toString() || '0.0',
-              ETH: balanceData.available.ETH?.toString() || '0.0',
-              SOL: balanceData.available.SOL?.toString() || '0.0'
+          if (balanceData.available && Object.keys(balanceData.available).length > 0) {
+            // Dynamic balance - show ALL tokens from API (including CBTC, CC, etc.)
+            const dynamicBalance = {};
+            Object.keys(balanceData.available).forEach(token => {
+              dynamicBalance[token] = balanceData.available[token]?.toString() || '0.0';
             });
-            console.log('[Balance V2] Holdings balance loaded:', balanceData.available);
+            setBalance(dynamicBalance);
+            console.log('[Balance V2] Holdings balance loaded:', dynamicBalance);
               hasLoadedBalanceRef.current = true;
               return;
             }
           
-          // No Holdings found - show zero balance
-          console.log('[Balance V2] No Holdings found - user needs to mint tokens');
-          setBalance({ BTC: '0.0', USDT: '0.0', ETH: '0.0', SOL: '0.0' });
+          // No Holdings found - show empty balance (no hardcoded defaults)
+          console.log('[Balance V2] No Holdings found - user needs to mint tokens or accept transfers');
+          setBalance({});
           hasLoadedBalanceRef.current = true;
         } catch (balanceError) {
           console.error('[Balance V2] Holdings fetch failed:', balanceError);
-          setBalance({ BTC: '0.0', USDT: '0.0', ETH: '0.0', SOL: '0.0' });
+          setBalance({});
           hasLoadedBalanceRef.current = true;
         }
       } catch (error) {
         console.error('[Balance V2] Failed to load balance:', error);
-        setBalance({ BTC: '0.0', USDT: '0.0', ETH: '0.0', SOL: '0.0' });
+        setBalance({});
         hasLoadedBalanceRef.current = true;
       } finally {
         setBalanceLoading(false);

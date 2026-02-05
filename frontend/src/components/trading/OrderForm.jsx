@@ -197,6 +197,9 @@ export default function OrderForm({
                     'BTC': { symbol: '₿', color: 'text-primary' },
                     'ETH': { symbol: 'Ξ', color: 'text-[#627EEA]' },
                     'SOL': { symbol: '◎', color: 'text-[#14F195]' },
+                    'CBTC': { symbol: '₵', color: 'text-[#F7931A]' }, // Canton BTC
+                    'CC': { symbol: '◈', color: 'text-[#6366F1]' }, // Canton Coin
+                    'USDT': { symbol: '$', color: 'text-[#26A17B]' },
                   };
                   const icon = icons[base] || { symbol: base[0], color: 'text-foreground' };
                   
