@@ -92,31 +92,11 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
           onTransferAccepted(offer);
         }
       } else {
-        // Check if it needs to be done through Utilities UI
-        if (response.error?.includes('Utilities UI') || response.error?.includes('utilities.dev.canton')) {
-          toast.warning(
-            `Splice transfers require additional credentials. Please accept via WolfEdge Utilities UI.`,
-            { duration: 8000 }
-          );
-          // Open the utilities UI in a new tab
-          window.open('https://utilities.dev.canton.wolfedgelabs.com/', '_blank');
-        } else {
-          throw new Error(response.error || 'Failed to accept transfer');
-        }
+        throw new Error(response.error || 'Failed to accept transfer');
       }
     } catch (err) {
       console.error('[TransferOffers] Accept error:', err);
-      
-      // Check for Splice-specific errors
-      if (err.message?.includes('Utilities UI') || err.message?.includes('disclosedContracts')) {
-        toast.warning(
-          `This transfer requires accepting through the WolfEdge Utilities UI.`,
-          { duration: 8000 }
-        );
-        window.open('https://utilities.dev.canton.wolfedgelabs.com/', '_blank');
-      } else {
-        toast.error(`Failed to accept: ${err.message?.substring(0, 100)}`);
-      }
+      toast.error(`Failed to accept: ${err.message?.substring(0, 100)}`);
     } finally {
       setAccepting(null);
     }
@@ -236,48 +216,23 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
                       </div>
                     </div>
                     
-                    {/* Accept via Utilities UI */}
+                    {/* Accept button */}
                     <div className="flex items-center gap-2">
-                      {offer.isSplice ? (
-                        // Splice transfers require Utilities UI
-                        <a
-                          href="https://utilities.dev.canton.wolfedgelabs.com/"
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1 h-8 px-3 bg-primary hover:bg-primary/90 text-primary-foreground rounded-md text-sm font-medium"
-                        >
-                          <ExternalLink className="w-4 h-4" />
-                          Accept in Utilities
-                        </a>
-                      ) : (
-                        // Non-Splice transfers can be accepted directly
-                        <>
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            className="h-8 w-8 p-0 hover:bg-destructive/20 hover:text-destructive"
-                            disabled={isAccepting}
-                            title="Reject"
-                          >
-                            <X className="w-4 h-4" />
-                          </Button>
-                          <Button
-                            size="sm"
-                            className="h-8 px-3 bg-primary hover:bg-primary/90"
-                            onClick={() => handleAccept(offer)}
-                            disabled={isAccepting}
-                          >
-                            {isAccepting ? (
-                              <Loader2 className="w-4 h-4 animate-spin" />
-                            ) : (
-                              <>
-                                <Check className="w-4 h-4 mr-1" />
-                                Accept
-                              </>
-                            )}
-                          </Button>
-                        </>
-                      )}
+                      <Button
+                        size="sm"
+                        className="h-8 px-3 bg-primary hover:bg-primary/90"
+                        onClick={() => handleAccept(offer)}
+                        disabled={isAccepting}
+                      >
+                        {isAccepting ? (
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                        ) : (
+                          <>
+                            <Check className="w-4 h-4 mr-1" />
+                            Accept
+                          </>
+                        )}
+                      </Button>
                     </div>
                   </div>
                   
@@ -297,21 +252,7 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
         
         {/* Help text */}
         <div className="text-xs text-muted-foreground text-center pt-2 border-t border-border">
-          <p>Canton uses 2-step transfers. Accept offers to receive tokens.</p>
-          {offers.some(o => o.isSplice) && (
-            <p className="mt-1 text-yellow-500">
-              💡 CBTC/Splice transfers must be accepted via{' '}
-              <a 
-                href="https://utilities.dev.canton.wolfedgelabs.com/" 
-                target="_blank"
-                rel="noopener noreferrer"
-                className="underline hover:text-yellow-400"
-              >
-                WolfEdge Utilities
-              </a>
-              {' '}(Registry → Transfers)
-            </p>
-          )}
+          <p>Canton uses 2-step transfers. Click Accept to receive tokens.</p>
         </div>
       </CardContent>
     </Card>

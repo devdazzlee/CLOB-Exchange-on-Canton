@@ -17,6 +17,7 @@ import TransactionHistory from './trading/TransactionHistory';
 import PortfolioView from './trading/PortfolioView';
 import MarketData from './trading/MarketData';
 import TransferOffers from './trading/TransferOffers';
+import BalanceCard from './trading/BalanceCard';
 
 // Import skeleton components
 import OrderBookSkeleton from './trading/OrderBookSkeleton';
@@ -646,50 +647,53 @@ export default function TradingInterface({ partyId }) {
     return () => clearInterval(ordersInterval);
   }, [partyId]);
 
-  // Load balance from Holdings (Token Standard V2)
-  useEffect(() => {
+  // Load balance from Holdings (Token Standard V2) - useCallback so it can be called from child components
+  const loadBalance = useCallback(async (showLoader = false) => {
     if (!partyId) return;
-
-    const loadBalance = async (showLoader = false) => {
+    
+    try {
+      if (showLoader && !hasLoadedBalanceRef.current) {
+        setBalanceLoading(true);
+      }
+      console.log('[Balance V2] Loading Holdings-based balance for party:', partyId);
+      
+      // TOKEN STANDARD V2: Load balance from Holding contracts (includes CBTC)
       try {
-        if (showLoader && !hasLoadedBalanceRef.current) {
-          setBalanceLoading(true);
-        }
-        console.log('[Balance V2] Loading Holdings-based balance for party:', partyId);
+        const balanceData = await balanceService.getBalances(partyId);
         
-        // TOKEN STANDARD V2: Load balance from Holding contracts (includes CBTC)
-        try {
-          const balanceData = await balanceService.getBalances(partyId);
-          
-          if (balanceData.available && Object.keys(balanceData.available).length > 0) {
-            // Dynamic balance - show ALL tokens from API (including CBTC, CC, etc.)
-            const dynamicBalance = {};
-            Object.keys(balanceData.available).forEach(token => {
-              dynamicBalance[token] = balanceData.available[token]?.toString() || '0.0';
-            });
-            setBalance(dynamicBalance);
-            console.log('[Balance V2] Holdings balance loaded:', dynamicBalance);
-              hasLoadedBalanceRef.current = true;
-              return;
-            }
-          
-          // No Holdings found - show empty balance (no hardcoded defaults)
-          console.log('[Balance V2] No Holdings found - user needs to mint tokens or accept transfers');
-          setBalance({});
+        if (balanceData.available && Object.keys(balanceData.available).length > 0) {
+          // Dynamic balance - show ALL tokens from API (including CBTC, CC, etc.)
+          const dynamicBalance = {};
+          Object.keys(balanceData.available).forEach(token => {
+            dynamicBalance[token] = balanceData.available[token]?.toString() || '0.0';
+          });
+          setBalance(dynamicBalance);
+          console.log('[Balance V2] Holdings balance loaded:', dynamicBalance);
           hasLoadedBalanceRef.current = true;
-        } catch (balanceError) {
-          console.error('[Balance V2] Holdings fetch failed:', balanceError);
-          setBalance({});
-          hasLoadedBalanceRef.current = true;
+          return;
         }
-      } catch (error) {
-        console.error('[Balance V2] Failed to load balance:', error);
+        
+        // No Holdings found - show empty balance (no hardcoded defaults)
+        console.log('[Balance V2] No Holdings found - user needs to mint tokens or accept transfers');
         setBalance({});
         hasLoadedBalanceRef.current = true;
-      } finally {
-        setBalanceLoading(false);
+      } catch (balanceError) {
+        console.error('[Balance V2] Holdings fetch failed:', balanceError);
+        setBalance({});
+        hasLoadedBalanceRef.current = true;
       }
-    };
+    } catch (error) {
+      console.error('[Balance V2] Failed to load balance:', error);
+      setBalance({});
+      hasLoadedBalanceRef.current = true;
+    } finally {
+      setBalanceLoading(false);
+    }
+  }, [partyId]);
+
+  // Effect to load balance on mount and periodically
+  useEffect(() => {
+    if (!partyId) return;
 
     // Add keyboard shortcut for minting (Ctrl+M)
     const handleKeyPress = (event) => {
@@ -708,7 +712,7 @@ export default function TradingInterface({ partyId }) {
       clearInterval(balanceInterval);
       window.removeEventListener('keydown', handleKeyPress);
     };
-  }, [partyId]);
+  }, [partyId, loadBalance]);
 
   // === PHASE 4: ALL USEMEMO HOOKS - NO CONDITIONALS ===
   const memoizedModal = useMemo(() => <ModalComponent />, [ModalComponent]);
@@ -827,76 +831,18 @@ export default function TradingInterface({ partyId }) {
             mintingLoading={mintingLoading}
             />
 
+          {/* Balance Card - Shows all token holdings including CBTC */}
+          <BalanceCard
+            balance={balance}
+            loading={balanceLoading}
+            onRefresh={() => loadBalance(true)}
+          />
+          
           {/* Transfer Offers - Accept incoming tokens (CBTC from faucet, etc.) */}
           <TransferOffers
             partyId={partyId}
             onTransferAccepted={handleTransferAccepted}
           />
-          
-          {/* Balance Card */}
-          {/* {balanceLoading ? (
-            <div className="bg-card border border-border rounded-lg p-4">
-              <div className="animate-pulse">
-                <div className="h-6 bg-muted rounded mb-4"></div>
-                <div className="space-y-3">
-                  {[1, 2, 3].map((i) => (
-                    <div key={i} className="flex items-center justify-between p-3 bg-muted/50 rounded-lg">
-                      <div className="flex items-center space-x-3">
-                        <div className="w-8 h-8 bg-muted rounded-full"></div>
-                        <div>
-                          <div className="h-4 bg-muted rounded w-16 mb-1"></div>
-                          <div className="h-3 bg-muted rounded w-12"></div>
-                        </div>
-                      </div>
-                      <div className="text-right">
-                        <div className="h-4 bg-muted rounded w-20 mb-1"></div>
-                        <div className="h-3 bg-muted rounded w-8"></div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          ) : (
-            <div className="space-y-4">
-              <div className="bg-card border border-border rounded-lg p-4">
-                <div className="flex items-center justify-between mb-4">
-                  <h3 className="text-lg font-semibold">Balances</h3>
-                  <button
-                    onClick={(e) => {
-                      e.preventDefault();
-                      console.log('[Mint] Button clicked directly!');
-                      handleMintTokens();
-                    }}
-                    className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white text-sm font-bold rounded-md transition-colors shadow-lg hover:shadow-xl transform hover:scale-105"
-                    title="Mint test tokens"
-                    style={{ cursor: 'pointer', zIndex: 1000 }}
-                  >
-                    🪙 Mint Test Tokens
-                  </button>
-                </div>
-                <div className="space-y-3">
-                  {Object.entries(balance).map(([token, amount]) => (
-                    <div key={token} className="flex items-center justify-between p-3 bg-muted/50 rounded-lg">
-                      <div className="flex items-center space-x-3">
-                        <div className="w-8 h-8 bg-primary/20 rounded-full flex items-center justify-center text-xs font-bold">
-                          {token.substring(0, 2)}
-                        </div>
-                        <div>
-                          <div className="font-medium">{token}</div>
-                          <div className="text-sm text-muted-foreground">Available</div>
-                        </div>
-                      </div>
-                      <div className="text-right">
-                        <div className="font-mono font-semibold">{parseFloat(amount).toLocaleString()}</div>
-                        <div className="text-sm text-muted-foreground">{token}</div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          )} */}
         </div>
 
         {/* Price Chart - Full Width */}

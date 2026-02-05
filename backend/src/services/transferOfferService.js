@@ -11,7 +11,7 @@
  */
 
 const config = require('../config');
-const { getTokenStandardTemplateIds, OPERATOR_PARTY_ID } = require('../config/constants');
+const { getTokenStandardTemplateIds, OPERATOR_PARTY_ID, REGISTRY_BACKEND_API, TEMPLATE_IDS } = require('../config/constants');
 const tokenProvider = require('./tokenProvider');
 
 // Get canton service instance
@@ -162,7 +162,8 @@ class TransferOfferService {
    * Accept a transfer offer (Splice Token Standard TransferInstruction)
    * This creates a new Holding for the receiving party
    * 
-   * Uses the Canton Wallet SDK to get proper disclosed contracts for Splice transfers.
+   * Uses the Registry Backend API to get disclosed contracts for Splice transfers.
+   * API: https://api.utilities.digitalasset-dev.com/api/token-standard
    * 
    * @param {string} offerContractId - The transfer offer contract ID
    * @param {string} partyId - The party accepting the offer
@@ -173,66 +174,16 @@ class TransferOfferService {
   async acceptTransferOffer(offerContractId, partyId, token, templateId = null) {
     await this.initialize();
     
+    const registryBackendApi = REGISTRY_BACKEND_API || 'https://api.utilities.digitalasset-dev.com/api/token-standard';
+    const TRANSFER_INSTRUCTION_INTERFACE = TEMPLATE_IDS.spliceTransferInstructionInterfaceId || '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.TransferInstructionV1:TransferInstruction';
+    
     try {
       console.log(`[TransferOfferService] Accepting transfer offer: ${offerContractId.substring(0, 30)}...`);
       
-      // Try using the Wallet SDK first (handles disclosed contracts automatically)
-      try {
-        const walletSdkService = require('./walletSdkService');
-        console.log('[TransferOfferService] Attempting accept via Wallet SDK...');
-        
-        const sdkResult = await walletSdkService.acceptTransfer(offerContractId, partyId);
-        
-        if (sdkResult.success && sdkResult.disclosedContracts) {
-          // SDK gave us the command and disclosed contracts, execute via JSON API
-          console.log(`[TransferOfferService] Got ${sdkResult.disclosedContracts.length} disclosed contracts from SDK`);
-          
-          const result = await this.cantonService.exerciseChoice({
-            token,
-            templateId: '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.TransferInstructionV1:TransferInstruction',
-            contractId: offerContractId,
-            choice: 'TransferInstruction_Accept',
-            choiceArgument: sdkResult.command?.choiceArgument || {
-              extraArgs: {
-                context: { values: {} },
-                meta: { values: {} }
-              }
-            },
-            actAsParty: [partyId],
-            disclosedContracts: sdkResult.disclosedContracts,
-          });
-          
-          console.log('[TransferOfferService] ✅ Accepted via SDK + JSON API');
-          return {
-            success: true,
-            offerContractId,
-            usedSdk: true,
-            result,
-          };
-        } else if (sdkResult.success && sdkResult.result) {
-          // SDK executed it directly
-          console.log('[TransferOfferService] ✅ Accepted directly via SDK');
-          return {
-            success: true,
-            offerContractId,
-            usedSdk: true,
-            result: sdkResult.result,
-          };
-        }
-      } catch (sdkError) {
-        console.log(`[TransferOfferService] SDK method failed: ${sdkError.message?.substring(0, 100)}`);
-      }
-      
-      // Fallback: Direct JSON API approach
-      console.log('[TransferOfferService] Fallback to direct JSON API...');
-      
-      const TRANSFER_INSTRUCTION_INTERFACE = '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.TransferInstructionV1:TransferInstruction';
-      
-      let offerTemplateId = templateId;
-      let interfaceId = null;
+      // First, get the transfer offer details to find the admin party (registrar)
+      let adminPartyId = null;
       let offerContract = null;
       
-      // Query the contract to get its interface view
       try {
         const contracts = await this.cantonService.queryActiveContracts({
           party: partyId,
@@ -241,90 +192,73 @@ class TransferOfferService {
         
         offerContract = contracts.find(c => c.contractId === offerContractId);
         if (offerContract) {
-          const interfaceView = offerContract.createdEvent?.interfaceViews?.[0];
-          if (interfaceView) {
-            interfaceId = interfaceView.interfaceId;
-          }
-          offerTemplateId = offerContract.createdEvent?.templateId || offerContract.templateId;
+          // Extract admin from the transfer details
+          const payload = offerContract.payload || offerContract.createdEvent?.createArgument || {};
+          const transfer = payload.transfer || payload;
+          adminPartyId = transfer.instrumentId?.admin || payload.provider || payload.registrar;
+          console.log(`[TransferOfferService] Found admin party: ${adminPartyId?.substring(0, 30)}...`);
         }
       } catch (e) {
-        console.log(`[TransferOfferService] InterfaceFilter query failed: ${e.message.substring(0, 100)}`);
+        console.log(`[TransferOfferService] Could not query transfer details: ${e.message.substring(0, 80)}`);
       }
       
-      if (!offerContract) {
-        const contracts = await this.cantonService.queryActiveContracts({
-          party: partyId,
-          templateIds: [],
-        }, token);
-        
-        offerContract = contracts.find(c => c.contractId === offerContractId);
-        if (offerContract) {
-          offerTemplateId = offerContract.createdEvent?.templateId || offerContract.templateId;
-        }
+      // Default to CBTC network if we couldn't find the admin
+      if (!adminPartyId) {
+        adminPartyId = 'cbtc-network::12202a83c6f4082217c175e29bc53da5f2703ba2675778ab99217a5a881a949203ff';
+        console.log('[TransferOfferService] Using default CBTC admin party');
       }
       
-      if (!offerContract) {
-        throw new Error(`Transfer offer not found: ${offerContractId}`);
+      // Call Registry Backend API to get choice context and disclosed contracts
+      console.log('[TransferOfferService] Fetching choice context from Registry Backend API...');
+      const adminEncoded = encodeURIComponent(adminPartyId);
+      const contextUrl = `${registryBackendApi}/v0/registrars/${adminEncoded}/registry/transfer-instruction/v1/${offerContractId}/choice-contexts/accept`;
+      
+      const contextResponse = await fetch(contextUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
+      });
+      
+      if (!contextResponse.ok) {
+        const errorText = await contextResponse.text();
+        console.log(`[TransferOfferService] Registry API error: ${contextResponse.status} - ${errorText.substring(0, 100)}`);
+        throw new Error(`Registry API returned ${contextResponse.status}`);
       }
       
-      // Try different template IDs and choice names
-      const templateIds = [interfaceId, TRANSFER_INSTRUCTION_INTERFACE, offerTemplateId].filter(Boolean);
-      const choiceNames = ['TransferInstruction_Accept', 'Accept'];
+      const contextData = await contextResponse.json();
+      console.log(`[TransferOfferService] Got ${contextData.disclosedContracts?.length || 0} disclosed contracts`);
       
-      let result = null;
-      let lastError = null;
+      // Prepare disclosed contracts in the format Canton expects
+      const disclosedContracts = (contextData.disclosedContracts || []).map(dc => ({
+        templateId: dc.templateId,
+        contractId: dc.contractId,
+        createdEventBlob: dc.createdEventBlob,
+        synchronizerId: '',
+      }));
       
-      for (const tryTemplateId of templateIds) {
-        for (const choiceName of choiceNames) {
-          try {
-            result = await this.cantonService.exerciseChoice({
-              token,
-              templateId: tryTemplateId,
-              contractId: offerContractId,
-              choice: choiceName,
-              choiceArgument: {
-                extraArgs: { context: { values: {} }, meta: { values: {} } }
-              },
-              actAsParty: [partyId],
-            });
-            
-            console.log(`[TransferOfferService] ✅ Accepted with ${choiceName}`);
-            return { success: true, offerContractId, templateId: tryTemplateId, choiceUsed: choiceName, result };
-          } catch (e) {
-            lastError = e;
-            // Try without extraArgs
-            try {
-              result = await this.cantonService.exerciseChoice({
-                token,
-                templateId: tryTemplateId,
-                contractId: offerContractId,
-                choice: choiceName,
-                choiceArgument: {},
-                actAsParty: [partyId],
-              });
-              
-              return { success: true, offerContractId, templateId: tryTemplateId, choiceUsed: choiceName, result };
-            } catch (e2) {
-              lastError = e2;
-            }
+      // Execute the accept choice with the context and disclosed contracts
+      const result = await this.cantonService.exerciseChoice({
+        token,
+        templateId: TRANSFER_INSTRUCTION_INTERFACE,
+        contractId: offerContractId,
+        choice: 'TransferInstruction_Accept',
+        choiceArgument: {
+          extraArgs: {
+            context: contextData.choiceContextData,
+            meta: { values: {} }
           }
-        }
-      }
+        },
+        actAsParty: [partyId],
+        disclosedContracts,
+      });
       
-      // Check if it's a "missing context" error - provide helpful message
-      if (lastError?.message?.includes('Missing context entry')) {
-        throw new Error(
-          `This Splice transfer requires disclosed contracts that are only available through the Registry API. ` +
-          `Please accept this transfer via the WolfEdge Utilities UI at https://utilities.dev.canton.wolfedgelabs.com/ ` +
-          `(login → Registry → Transfers tab → Accept the pending transfer)`
-        );
-      }
-      
-      throw new Error(
-        `Could not accept transfer offer. ` +
-        `Please try accepting via the WolfEdge Utilities UI at https://utilities.dev.canton.wolfedgelabs.com/. ` +
-        `Error: ${lastError?.message || 'Unknown'}`
-      );
+      console.log('[TransferOfferService] ✅ Transfer accepted successfully!');
+      return {
+        success: true,
+        offerContractId,
+        usedRegistryApi: true,
+        result,
+      };
       
     } catch (error) {
       console.error('[TransferOfferService] Failed to accept transfer offer:', error.message);

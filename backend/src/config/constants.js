@@ -30,6 +30,11 @@ const CANTON_ADMIN_API = process.env.CANTON_ADMIN_API || 'http://65.108.40.104:3
 const DEFAULT_SYNCHRONIZER_ID = process.env.DEFAULT_SYNCHRONIZER_ID || 
   'global-domain::1220be58c29e65de40bf273be1dc2b266d43a9a002ea5b18955aeef7aac881bb471a';
 
+// Registry Backend API - Used for Splice Token Standard operations (transfer accept, etc.)
+// Provides choice context and disclosed contracts needed for Splice transfers
+const REGISTRY_BACKEND_API = process.env.REGISTRY_BACKEND_API || 
+  'https://api.utilities.digitalasset-dev.com/api/token-standard';
+
 // =============================================================================
 // PACKAGE IDS - Update these when deploying new DARs
 // =============================================================================
@@ -73,6 +78,11 @@ const TEMPLATE_IDS = {
   // Using "#" prefix allows querying without package ID (Canton feature)
   spliceHolding: `#${SPLICE_PACKAGE_NAME}:Splice.Api.Token.HoldingV1:Holding`,
   spliceTransferOffer: `#${SPLICE_PACKAGE_NAME}:Splice.Api.Token.HoldingV1:TransferOffer`,
+  
+  // Splice Transfer Instruction interface (for accepting transfer offers)
+  // This is the INTERFACE ID (not template ID) - used to exercise TransferInstruction_Accept
+  spliceTransferInstruction: `#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction`,
+  spliceTransferInstructionInterfaceId: '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.TransferInstructionV1:TransferInstruction',
   
   // Custom Token Standard Templates (for our own tokens - testing only)
   instrument: `${TOKEN_STANDARD_PACKAGE_ID}:Instrument:Instrument`,
@@ -204,6 +214,7 @@ module.exports = {
   CANTON_JSON_API_BASE,
   CANTON_ADMIN_API,
   DEFAULT_SYNCHRONIZER_ID,
+  REGISTRY_BACKEND_API,
   
   // Package IDs
   TOKEN_STANDARD_PACKAGE_ID,
