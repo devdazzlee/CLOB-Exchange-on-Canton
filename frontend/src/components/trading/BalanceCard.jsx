@@ -11,6 +11,7 @@ const TOKEN_CONFIG = {
   SOL: { name: 'Solana', symbol: '◎', color: 'text-[#14F195]', bgColor: 'bg-[#14F195]/20', borderColor: 'border-[#14F195]/40', decimals: 8 },
   CBTC: { name: 'Canton BTC', symbol: '₵', color: 'text-[#F7931A]', bgColor: 'bg-[#F7931A]/20', borderColor: 'border-[#F7931A]/40', decimals: 8 },
   CC: { name: 'Canton Coin', symbol: '◈', color: 'text-[#6366F1]', bgColor: 'bg-[#6366F1]/20', borderColor: 'border-[#6366F1]/40', decimals: 8 },
+  Amulet: { name: 'Amulet (CC)', symbol: '♦', color: 'text-[#A855F7]', bgColor: 'bg-[#A855F7]/20', borderColor: 'border-[#A855F7]/40', decimals: 10 },
 };
 
 function getTokenConfig(symbol) {

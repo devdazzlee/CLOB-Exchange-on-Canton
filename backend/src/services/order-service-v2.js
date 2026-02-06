@@ -19,7 +19,7 @@ const { getHoldingService } = require('./holdingService');
 const { getSettlementService } = require('./settlementService');
 const { getInstrumentService } = require('./instrumentService');
 const config = require('../config');
-const { getTokenStandardTemplateIds } = require('../config/constants');
+const { getTokenStandardTemplateIds, TEMPLATE_IDS } = require('../config/constants');
 const tokenProvider = require('./tokenProvider');
 const crypto = require('crypto');
 
@@ -103,65 +103,84 @@ class OrderServiceV2 {
       // Use the largest holding (or combine if needed)
       const holdingToLock = holdings[0]; // Already sorted by amount descending
 
-      // 3. Lock the holding for this order
-      console.log(`[OrderServiceV2] Locking ${requiredAmount} ${lockSymbol} for order ${orderId}`);
+      // Check if this is a Splice holding (CBTC, Amulet, etc.)
+      // Splice holdings use different templates and cannot be locked with our custom Lock choice
+      const isSpliceHolding = holdingToLock.isSplice || 
+        holdingToLock.templateId?.includes('Splice') || 
+        holdingToLock.templateId?.includes('Registry');
       
-      const lockResult = await holdingService.lockHolding(
-        holdingToLock.contractId,
-        operatorPartyId, // Lock holder is the exchange operator
-        `order-${orderId}`,
-        requiredAmount,
-        partyId,
-        adminToken
-      );
+      let lockedHoldingCid = null;
 
-      // Extract the locked holding contract ID from transaction events
-      const events = lockResult.transaction?.events || lockResult.events || [];
-      const lockedHoldingCid = events.find(e => 
-        e.created?.templateId?.includes('Holding') || 
-        e.CreatedEvent?.templateId?.includes('Holding')
-      )?.created?.contractId || 
-      events.find(e => e.CreatedEvent)?.CreatedEvent?.contractId;
+      if (isSpliceHolding) {
+        // For Splice holdings (CBTC, CC), skip locking - use trust-based orders for now
+        // In production, this would use the DvP Settlement flow from Splice Token Standard
+        console.log(`[OrderServiceV2] Splice holding detected - skipping lock (trust-based order)`);
+        console.log(`[OrderServiceV2] Reference holding: ${holdingToLock.contractId.substring(0, 30)}...`);
+        lockedHoldingCid = holdingToLock.contractId; // Reference the unlocked holding
+      } else {
+        // 3. Lock the holding for this order (custom holdings only)
+        console.log(`[OrderServiceV2] Locking ${requiredAmount} ${lockSymbol} for order ${orderId}`);
+        
+        const lockResult = await holdingService.lockHolding(
+          holdingToLock.contractId,
+          operatorPartyId, // Lock holder is the exchange operator
+          `order-${orderId}`,
+          requiredAmount,
+          partyId,
+          adminToken
+        );
 
-      if (!lockedHoldingCid) {
-        console.error('[OrderServiceV2] Lock result:', JSON.stringify(lockResult, null, 2));
-        throw new Error('Failed to lock holding for order - no contract ID in response');
+        // Extract the locked holding contract ID from transaction events
+        const events = lockResult.transaction?.events || lockResult.events || [];
+        lockedHoldingCid = events.find(e => 
+          e.created?.templateId?.includes('Holding') || 
+          e.CreatedEvent?.templateId?.includes('Holding')
+        )?.created?.contractId || 
+        events.find(e => e.CreatedEvent)?.CreatedEvent?.contractId;
+
+        if (!lockedHoldingCid) {
+          console.error('[OrderServiceV2] Lock result:', JSON.stringify(lockResult, null, 2));
+          throw new Error('Failed to lock holding for order - no contract ID in response');
+        }
+
+        console.log(`[OrderServiceV2] Holding locked: ${lockedHoldingCid.substring(0, 30)}...`);
       }
-
-      console.log(`[OrderServiceV2] Holding locked: ${lockedHoldingCid.substring(0, 30)}...`);
 
       // 4. Create the OrderV3 contract
       const instrumentService = getInstrumentService();
       const baseInstrumentId = instrumentService.getInstrumentId(baseSymbol);
       const quoteInstrumentId = instrumentService.getInstrumentId(quoteSymbol);
 
-      // Daml-LF JSON encoding for variants: { "tag": "Name", "value": {} } for constructors without data
+      // Legacy Order template arguments (from dd500bf8... Order.daml)
+      // Uses simple strings instead of variants
       const orderArgs = {
         orderId,
-        operator: operatorPartyId,
         owner: partyId,
-        side: side.toUpperCase() === 'BUY' ? { tag: 'Buy', value: {} } : { tag: 'Sell', value: {} },
-        orderType: type.toUpperCase() === 'MARKET' 
-          ? { tag: 'Market', value: {} } 
-          : { tag: 'Limit', value: {} },
-        baseInstrumentId,
-        quoteInstrumentId,
-        price: price ? price.toString() : null, // Optional Decimal - null or string
+        operator: operatorPartyId,
+        orderType: side.toUpperCase(), // "BUY" or "SELL" - side in template
+        orderMode: type.toUpperCase(), // "LIMIT" or "MARKET"
+        tradingPair,
+        price: price ? price.toString() : null, // Optional Decimal
         quantity: quantity.toString(),
-        filledQuantity: '0',
-        lockedHoldingCid,
-        lockedAmount: requiredAmount.toString(),
-        status: { tag: 'Open', value: {} },
-        createdAt: new Date().toISOString(),
-        expiresAt: null,
+        filled: '0',
+        status: 'OPEN',
+        timestamp: new Date().toISOString(),
+        allocationCid: lockedHoldingCid || '', // Reference to locked holding (placeholder)
       };
 
+      // Use the legacy Order template (already deployed on Canton)
+      // OrderV3 isn't deployed yet, so fall back to legacy Order
+      const orderTemplateId = TEMPLATE_IDS.order; // This is the legacy Order:Order template
+      console.log(`[OrderServiceV2] Using legacy Order template: ${orderTemplateId.substring(0, 40)}...`);
+      
+      // The Order template has `signatory owner`, so we need the user party to authorize
+      // We submit as both operator (admin token) AND user party
       const orderResult = await cantonService.createContractWithTransaction({
         token: adminToken,
-        actAsParty: operatorPartyId,
-        templateId: templateIds.order,
+        actAsParty: [operatorPartyId, partyId], // Both operator and user need to authorize
+        templateId: orderTemplateId,
         createArguments: orderArgs,
-        readAs: [partyId],
+        readAs: [partyId, operatorPartyId],
         synchronizerId,
       });
 

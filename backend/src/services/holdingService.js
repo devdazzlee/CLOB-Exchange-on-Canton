@@ -705,8 +705,10 @@ class HoldingService {
         .filter(h => {
           const payload = h.payload || {};
           
-          // Check symbol - Splice might use different field names
+          // Check symbol - Splice Holdings use instrument.id, custom use instrumentId.symbol
           const holdingSymbol = 
+            payload.instrument?.id ||           // Splice CBTC uses this
+            payload.instrumentId?.id ||         // Alternative Splice format
             payload.instrumentId?.symbol || 
             payload.instrument?.symbol ||
             payload.symbol ||
@@ -725,12 +727,20 @@ class HoldingService {
         })
         .map(h => {
           const payload = h.payload || {};
+          // Template ID can be on createdEvent or directly on the contract
+          const tplId = h.createdEvent?.templateId || h.templateId || '';
+          const isSpliceHolding = tplId.includes('Splice') || tplId.includes('Registry') || tplId.includes('Utility');
+          
+          if (isSpliceHolding) {
+            console.log(`[HoldingService] getAvailableHoldings: Found Splice holding for ${symbol}`);
+          }
+          
           return {
             contractId: h.contractId,
             amount: parseFloat(payload.amount || payload.quantity || 0) || 0,
             instrumentId: payload.instrumentId || payload.instrument || { symbol },
-            templateId: h.createdEvent?.templateId,
-            isSplice: h.createdEvent?.templateId?.includes('Splice'),
+            templateId: tplId,
+            isSplice: isSpliceHolding,
           };
         })
         .sort((a, b) => b.amount - a.amount); // Largest first

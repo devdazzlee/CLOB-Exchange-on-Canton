@@ -5,13 +5,25 @@
  * including accepting transfer instructions with proper disclosed contracts.
  */
 
-const { WalletSDKImpl, createKeyPair } = require('@canton-network/wallet-sdk');
 const constants = require('../config/constants');
+
+// Lazy load SDK to avoid import errors if not installed
+let WalletSDKImpl = null;
+let sdkLoadError = null;
+
+try {
+  const walletSdk = require('@canton-network/wallet-sdk');
+  WalletSDKImpl = walletSdk.WalletSDKImpl;
+} catch (e) {
+  sdkLoadError = e.message;
+  console.log('[WalletSdkService] SDK package not available:', e.message);
+}
 
 class WalletSdkService {
   constructor() {
     this.sdk = null;
     this.initialized = false;
+    this.initError = sdkLoadError;
   }
 
   /**
@@ -19,6 +31,12 @@ class WalletSdkService {
    */
   async initialize() {
     if (this.initialized) return;
+    if (this.initError) return; // Already failed
+
+    if (!WalletSDKImpl) {
+      this.initError = 'SDK not loaded';
+      return;
+    }
 
     try {
       console.log('[WalletSdkService] Initializing Canton Wallet SDK...');
@@ -27,31 +45,26 @@ class WalletSdkService {
       const jsonApiUrl = constants.cantonJsonApi || 'http://65.108.40.104:31539';
       const scanProxyUrl = constants.scanProxyUrl || 'http://65.108.40.104:8088';
       
+      // Auth token from environment
+      const adminToken = process.env.ADMIN_TOKEN || constants.adminToken;
+      
       // Create SDK instance with custom configuration for WolfEdge devnet
       this.sdk = new WalletSDKImpl().configure({
         logger: console,
-        // Custom auth factory for WolfEdge Keycloak
-        authFactory: async () => ({
-          getAccessToken: async () => {
-            // Get token from Keycloak
-            const tokenUrl = 'https://keycloak.wolfedgelabs.com:8443/realms/canton-devnet/protocol/openid-connect/token';
-            const response = await fetch(tokenUrl, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-              body: new URLSearchParams({
-                grant_type: 'client_credentials',
-                client_id: constants.keycloakClientId || 'Sesnp3u6udkFF983rfprvsBbx3X3mBpw',
-                client_secret: constants.keycloakClientSecret || 'mEGBw5Td3OUSanQoGeNMWg2nnPxq1VYc',
-                scope: 'daml_ledger_api',
-              }),
-            });
-            const data = await response.json();
-            return data.access_token;
-          },
+        // Auth factory that returns the proper interface
+        authFactory: () => ({
+          // Return an auth client that provides the token
+          getUserToken: async () => adminToken,
+          getAccessToken: async () => adminToken,
+          loginSilent: async () => {},
+          logout: async () => {},
         }),
         // Custom ledger factory for WolfEdge JSON API
         ledgerFactory: () => ({
-          url: jsonApiUrl + '/api/json-api',
+          url: jsonApiUrl,
+          headers: {
+            'Authorization': `Bearer ${adminToken}`,
+          },
         }),
         // Token standard factory for registry lookups
         tokenStandardFactory: () => ({
@@ -65,6 +78,7 @@ class WalletSdkService {
       this.initialized = true;
     } catch (error) {
       console.error('[WalletSdkService] Failed to initialize SDK:', error.message);
+      this.initError = error.message;
       // Don't throw - allow fallback to direct API
     }
   }

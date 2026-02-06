@@ -11,7 +11,7 @@
  */
 
 const config = require('../config');
-const { getTokenStandardTemplateIds, OPERATOR_PARTY_ID, REGISTRY_BACKEND_API, TEMPLATE_IDS } = require('../config/constants');
+const { getTokenStandardTemplateIds, OPERATOR_PARTY_ID, DSO_PARTY_ID, REGISTRY_BACKEND_API, VALIDATOR_SCAN_PROXY_API, TEMPLATE_IDS } = require('../config/constants');
 const tokenProvider = require('./tokenProvider');
 
 // Get canton service instance
@@ -21,6 +21,19 @@ const getCantonService = () => {
     cantonServiceInstance = require('./cantonService');
   }
   return cantonServiceInstance;
+};
+
+// Wallet SDK for Amulet acceptance
+let walletSdkService = null;
+const getWalletSdkService = () => {
+  if (!walletSdkService) {
+    try {
+      walletSdkService = require('./walletSdkService');
+    } catch (e) {
+      console.log('[TransferOfferService] Wallet SDK not available:', e.message);
+    }
+  }
+  return walletSdkService;
 };
 
 class TransferOfferService {
@@ -179,6 +192,162 @@ class TransferOfferService {
     
     try {
       console.log(`[TransferOfferService] Accepting transfer offer: ${offerContractId.substring(0, 30)}...`);
+      console.log(`[TransferOfferService] Template ID: ${templateId?.substring(0, 60)}...`);
+      
+      // Check if this is an Amulet transfer (uses different template)
+      const isAmuletTransfer = templateId?.includes('AmuletTransferInstruction') || templateId?.includes('Amulet');
+      
+      // For Amulet transfers, use the Validator Scan Proxy API (NOT Registry Backend API)
+      // Amulet/CC comes from the DSO, not utility registrars
+      if (isAmuletTransfer) {
+        console.log('[TransferOfferService] Detected Amulet transfer - using Validator Scan Proxy API');
+        
+        const validatorScanProxyApi = VALIDATOR_SCAN_PROXY_API || 'https://validator.dev.canton.wolfedgelabs.com/api/validator';
+        const adminToken = token; // The JWT token for API calls
+        
+        let lastError = null;
+        
+        try {
+          // Step 1: Get AmuletRules contract from Scan Proxy
+          // Endpoint: GET /v0/scan-proxy/amulet-rules
+          console.log('[TransferOfferService] Step 1: Fetching AmuletRules from Scan Proxy...');
+          const amuletRulesUrl = `${validatorScanProxyApi}/v0/scan-proxy/amulet-rules`;
+          
+          const amuletRulesResponse = await fetch(amuletRulesUrl, {
+            method: 'GET',
+            headers: { 
+              'Authorization': `Bearer ${adminToken}`,
+              'Accept': 'application/json'
+            },
+          });
+          
+          if (!amuletRulesResponse.ok) {
+            const errorText = await amuletRulesResponse.text();
+            console.log(`[TransferOfferService] AmuletRules fetch failed: ${amuletRulesResponse.status} - ${errorText.substring(0, 100)}`);
+            throw new Error(`Failed to get AmuletRules: ${amuletRulesResponse.status}`);
+          }
+          
+          const amuletRulesData = await amuletRulesResponse.json();
+          console.log('[TransferOfferService] ✅ Got AmuletRules contract');
+          
+          // Step 2: Get Accept choice context from Scan Proxy
+          // Endpoint: POST /v0/scan-proxy/registry/transfer-instruction/v1/{contractId}/choice-contexts/accept
+          console.log('[TransferOfferService] Step 2: Fetching Accept context from Scan Proxy...');
+          const acceptContextUrl = `${validatorScanProxyApi}/v0/scan-proxy/registry/transfer-instruction/v1/${offerContractId}/choice-contexts/accept`;
+          
+          const acceptContextResponse = await fetch(acceptContextUrl, {
+            method: 'POST',
+            headers: { 
+              'Authorization': `Bearer ${adminToken}`,
+              'Content-Type': 'application/json',
+              'Accept': 'application/json'
+            },
+            body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
+          });
+          
+          if (!acceptContextResponse.ok) {
+            const errorText = await acceptContextResponse.text();
+            console.log(`[TransferOfferService] Accept context fetch failed: ${acceptContextResponse.status} - ${errorText.substring(0, 100)}`);
+            throw new Error(`Failed to get Accept context: ${acceptContextResponse.status}`);
+          }
+          
+          const acceptContextData = await acceptContextResponse.json();
+          console.log(`[TransferOfferService] ✅ Got Accept context with ${acceptContextData.disclosedContracts?.length || 0} disclosed contracts`);
+          
+          // Step 3: Prepare disclosed contracts (include AmuletRules if not already present)
+          const disclosedContracts = (acceptContextData.disclosedContracts || []).map(dc => ({
+            templateId: dc.templateId,
+            contractId: dc.contractId,
+            createdEventBlob: dc.createdEventBlob,
+            synchronizerId: dc.synchronizerId || '',
+          }));
+          
+          // Add AmuletRules to disclosed contracts if it has createdEventBlob
+          if (amuletRulesData.createdEventBlob && !disclosedContracts.find(dc => dc.contractId === amuletRulesData.contractId)) {
+            disclosedContracts.push({
+              templateId: amuletRulesData.templateId,
+              contractId: amuletRulesData.contractId,
+              createdEventBlob: amuletRulesData.createdEventBlob,
+              synchronizerId: '',
+            });
+          }
+          
+          // Step 4: Prepare choice context with amulet-rules key
+          const choiceContextData = acceptContextData.choiceContextData || acceptContextData.choiceContext?.choiceContextData || { values: {} };
+          
+          // Ensure amulet-rules is in the context if we have it from the amuletRulesData
+          if (amuletRulesData.contractId && (!choiceContextData.values || !choiceContextData.values['amulet-rules'])) {
+            if (!choiceContextData.values) choiceContextData.values = {};
+            choiceContextData.values['amulet-rules'] = {
+              tag: 'AV_ContractId',
+              value: amuletRulesData.contractId,
+            };
+          }
+          
+          // Step 5: Execute the Accept choice
+          console.log('[TransferOfferService] Step 3: Executing TransferInstruction_Accept...');
+          const result = await this.cantonService.exerciseChoice({
+            token,
+            templateId: TRANSFER_INSTRUCTION_INTERFACE,
+            contractId: offerContractId,
+            choice: 'TransferInstruction_Accept',
+            choiceArgument: {
+              extraArgs: {
+                context: choiceContextData,
+                meta: { values: {} }
+              }
+            },
+            actAsParty: [partyId],
+            disclosedContracts,
+          });
+          
+          console.log('[TransferOfferService] ✅ Amulet transfer accepted successfully via Validator Scan Proxy!');
+          return {
+            success: true,
+            offerContractId,
+            usedValidatorScanProxy: true,
+            isAmulet: true,
+            result,
+          };
+          
+        } catch (scanProxyError) {
+          lastError = scanProxyError;
+          console.log(`[TransferOfferService] Validator Scan Proxy approach failed: ${scanProxyError.message}`);
+        }
+        
+        // Fallback: Try Wallet SDK for Amulet
+        const sdkService = getWalletSdkService();
+        if (sdkService) {
+          try {
+            console.log('[TransferOfferService] Trying Wallet SDK for Amulet acceptance...');
+            const sdkResult = await sdkService.acceptTransfer(offerContractId, partyId);
+            
+            if (sdkResult.success) {
+              console.log('[TransferOfferService] ✅ Amulet transfer accepted via Wallet SDK!');
+              return {
+                success: true,
+                offerContractId,
+                usedSdk: true,
+                isAmulet: true,
+                result: sdkResult.result,
+              };
+            }
+            console.log(`[TransferOfferService] SDK acceptance failed: ${sdkResult.error}`);
+          } catch (sdkErr) {
+            console.log(`[TransferOfferService] Wallet SDK error: ${sdkErr.message.substring(0, 80)}`);
+          }
+        }
+        
+        // All attempts failed
+        console.error('[TransferOfferService] All Amulet accept attempts failed');
+        
+        // Provide a clear error message
+        const errorDetails = lastError?.message?.substring(0, 120) || 'Unknown error';
+        
+        throw new Error(`Amulet (CC) transfer acceptance failed. ${errorDetails}. Please verify the Validator Scan Proxy API is accessible.`);
+      }
+      
+      // For CBTC and other Splice transfers, use the Registry Backend API
       
       // First, get the transfer offer details to find the admin party (registrar)
       let adminPartyId = null;
@@ -237,6 +406,9 @@ class TransferOfferService {
       }));
       
       // Execute the accept choice with the context and disclosed contracts
+      // Handle both response formats: choiceContextData directly or nested in choiceContext
+      const choiceContextData = contextData.choiceContextData || contextData.choiceContext?.choiceContextData;
+      
       const result = await this.cantonService.exerciseChoice({
         token,
         templateId: TRANSFER_INSTRUCTION_INTERFACE,
@@ -244,7 +416,7 @@ class TransferOfferService {
         choice: 'TransferInstruction_Accept',
         choiceArgument: {
           extraArgs: {
-            context: contextData.choiceContextData,
+            context: choiceContextData,
             meta: { values: {} }
           }
         },

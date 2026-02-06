@@ -35,6 +35,17 @@ const DEFAULT_SYNCHRONIZER_ID = process.env.DEFAULT_SYNCHRONIZER_ID ||
 const REGISTRY_BACKEND_API = process.env.REGISTRY_BACKEND_API || 
   'https://api.utilities.digitalasset-dev.com/api/token-standard';
 
+// Validator Scan Proxy API - Used for Amulet/CC transfers
+// This is the BFT proxy to the Scan API, exposed by the Validator App
+// For Amulet transfers: GET /v0/scan-proxy/amulet-rules and POST /v0/scan-proxy/registry/transfer-instruction/v1/{id}/choice-contexts/accept
+// CONFIRMED WORKING: https://wallet.validator.dev.canton.wolfedgelabs.com/api/validator/v0/scan-proxy/amulet-rules
+const VALIDATOR_SCAN_PROXY_API = process.env.VALIDATOR_SCAN_PROXY_API || 
+  'https://wallet.validator.dev.canton.wolfedgelabs.com/api/validator';
+
+// DSO Party ID - Required for Amulet transfers
+const DSO_PARTY_ID = process.env.DSO_PARTY_ID || 
+  'DSO::1220be58c29e65de40bf273be1dc2b266d43a9a002ea5b18955aeef7aac881bb471a';
+
 // =============================================================================
 // PACKAGE IDS - Update these when deploying new DARs
 // =============================================================================
@@ -209,12 +220,14 @@ function getLegacyTemplateIds() {
 module.exports = {
   // Party IDs
   OPERATOR_PARTY_ID,
+  DSO_PARTY_ID,
   
   // Canton Endpoints
   CANTON_JSON_API_BASE,
   CANTON_ADMIN_API,
   DEFAULT_SYNCHRONIZER_ID,
   REGISTRY_BACKEND_API,
+  VALIDATOR_SCAN_PROXY_API,
   
   // Package IDs
   TOKEN_STANDARD_PACKAGE_ID,
