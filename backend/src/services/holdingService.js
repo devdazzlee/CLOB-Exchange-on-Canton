@@ -571,7 +571,22 @@ class HoldingService {
         return [];
       });
 
-      console.log(`[HoldingService] Found ${spliceHoldings.length} Splice Holdings, ${customHoldings.length} custom Holdings`);
+      // Query Amulet (CC/Canton Coin) contracts - uses different template and structure
+      let amuletHoldings = [];
+      try {
+        amuletHoldings = await cantonService.queryActiveContracts({
+          party: partyId,
+          templateIds: [TEMPLATE_IDS.amulet],
+        }, token).catch(() => []);
+        
+        if (amuletHoldings.length > 0) {
+          console.log(`[HoldingService] Found ${amuletHoldings.length} Amulet (CC) Holdings`);
+        }
+      } catch (err) {
+        console.warn(`[HoldingService] Amulet query failed: ${err.message}`);
+      }
+
+      console.log(`[HoldingService] Found ${spliceHoldings.length} Splice Holdings, ${customHoldings.length} custom Holdings, ${amuletHoldings.length} Amulet Holdings`);
       
       // Log Splice template IDs found for debugging
       if (spliceHoldings.length > 0) {
@@ -581,8 +596,8 @@ class HoldingService {
         console.log(`[HoldingService] Splice template IDs:`, uniqueTemplates);
       }
 
-      // Combine both types
-      const allHoldings = [...spliceHoldings, ...customHoldings];
+      // Combine all holding types (Splice, Custom, and Amulet)
+      const allHoldings = [...spliceHoldings, ...customHoldings, ...amuletHoldings];
 
       // Aggregate by instrument symbol
       const balances = {};
@@ -593,6 +608,7 @@ class HoldingService {
         const payload = holding.payload || holding.createArgument || {};
         const templateId = holding.createdEvent?.templateId || holding.templateId || '';
         const isSplice = templateId.includes('Splice') || templateId.includes('Registry');
+        const isAmulet = templateId.includes('Splice.Amulet');
         
         // IMPORTANT: Only count holdings where owner matches the party
         // Transfer offers have different owner (merchant, etc.)
@@ -602,18 +618,31 @@ class HoldingService {
           continue; // Skip holdings owned by other parties (transfer offers, etc.)
         }
         
-        // Extract symbol - Splice uses instrument.id (not instrument.symbol)
-        // Format: { instrument: { id: "CBTC", source: "...", scheme: "..." } }
-        const symbol = 
-          payload.instrument?.id ||           // Splice format: instrument.id = "CBTC"
-          payload.instrumentId?.symbol ||     // Custom format
-          payload.instrument?.symbol ||       // Alternative format
-          payload.token?.symbol ||
-          payload.symbol ||
-          'UNKNOWN';
+        // Extract symbol - different format for Amulet vs Splice Holdings
+        // Amulet: symbol is always "CC" (Canton Coin)
+        // Splice Holdings: instrument.id = "CBTC"
+        // Custom: instrumentId.symbol
+        let symbol;
+        if (isAmulet) {
+          symbol = 'CC'; // Amulet is always Canton Coin
+        } else {
+          symbol = 
+            payload.instrument?.id ||           // Splice format: instrument.id = "CBTC"
+            payload.instrumentId?.symbol ||     // Custom format
+            payload.instrument?.symbol ||       // Alternative format
+            payload.token?.symbol ||
+            payload.symbol ||
+            'UNKNOWN';
+        }
           
-        // Extract amount
-        const amount = parseFloat(payload.amount || payload.quantity || 0) || 0;
+        // Extract amount - Amulet uses amount.initialAmount, others use amount directly
+        let amount;
+        if (isAmulet && payload.amount?.initialAmount) {
+          // Amulet has { amount: { initialAmount: "10.0", createdAt: ..., ratePerRound: ... } }
+          amount = parseFloat(payload.amount.initialAmount) || 0;
+        } else {
+          amount = parseFloat(payload.amount || payload.quantity || 0) || 0;
+        }
         
         // Check if locked - Splice may use different lock structure
         const isLocked = 
@@ -643,6 +672,7 @@ class HoldingService {
           instrumentId: payload.instrumentId || payload.instrument || { symbol },
           templateId: templateId,
           isSplice: isSplice,
+          isAmulet: isAmulet,
         });
       }
 
@@ -681,8 +711,8 @@ class HoldingService {
     const { TEMPLATE_IDS } = require('../config/constants');
 
     try {
-      // Query both Splice Holdings and custom Holdings
-      const [spliceHoldings, customHoldings] = await Promise.all([
+      // Query Splice Holdings, Custom Holdings, and Amulet (CC) Holdings in parallel
+      const [spliceHoldings, customHoldings, amuletHoldings] = await Promise.all([
         // Try Splice Holdings (for CBTC and production tokens)
         cantonService.queryActiveContracts({
           party: partyId,
@@ -694,29 +724,42 @@ class HoldingService {
           party: partyId,
           templateIds: [templateIds.holding],
         }, token).catch(() => []),
+        
+        // Amulet (CC/Canton Coin) Holdings - only query if looking for CC
+        symbol === 'CC' ? cantonService.queryActiveContracts({
+          party: partyId,
+          templateIds: [TEMPLATE_IDS.amulet],
+        }, token).catch(() => []) : Promise.resolve([]),
       ]);
 
-      // Combine both types
-      const allHoldings = [...spliceHoldings, ...customHoldings];
+      // Combine all types
+      const allHoldings = [...spliceHoldings, ...customHoldings, ...amuletHoldings];
 
       // Filter for matching symbol and unlocked
-      // Splice Holdings may have different payload structure
+      // Different templates have different payload structures
       return allHoldings
         .filter(h => {
           const payload = h.payload || {};
+          const templateId = h.createdEvent?.templateId || h.templateId || '';
+          const isAmulet = templateId.includes('Splice.Amulet');
           
-          // Check symbol - Splice Holdings use instrument.id, custom use instrumentId.symbol
-          const holdingSymbol = 
-            payload.instrument?.id ||           // Splice CBTC uses this
-            payload.instrumentId?.id ||         // Alternative Splice format
-            payload.instrumentId?.symbol || 
-            payload.instrument?.symbol ||
-            payload.symbol ||
-            payload.token?.symbol;
+          // Check symbol - Amulet is always CC, Splice uses instrument.id, custom uses instrumentId.symbol
+          let holdingSymbol;
+          if (isAmulet) {
+            holdingSymbol = 'CC'; // Amulet is always Canton Coin
+          } else {
+            holdingSymbol = 
+              payload.instrument?.id ||           // Splice CBTC uses this
+              payload.instrumentId?.id ||         // Alternative Splice format
+              payload.instrumentId?.symbol || 
+              payload.instrument?.symbol ||
+              payload.symbol ||
+              payload.token?.symbol;
+          }
             
           const isMatchingSymbol = holdingSymbol === symbol;
           
-          // Check if unlocked - Splice might use different lock structure
+          // Check if unlocked - Splice/Amulet might use different lock structure
           const isUnlocked = 
             payload.lock === null || 
             payload.lock === undefined ||
@@ -730,17 +773,29 @@ class HoldingService {
           // Template ID can be on createdEvent or directly on the contract
           const tplId = h.createdEvent?.templateId || h.templateId || '';
           const isSpliceHolding = tplId.includes('Splice') || tplId.includes('Registry') || tplId.includes('Utility');
+          const isAmulet = tplId.includes('Splice.Amulet');
           
-          if (isSpliceHolding) {
+          if (isAmulet) {
+            console.log(`[HoldingService] getAvailableHoldings: Found Amulet (CC) holding for ${symbol}`);
+          } else if (isSpliceHolding) {
             console.log(`[HoldingService] getAvailableHoldings: Found Splice holding for ${symbol}`);
+          }
+          
+          // Extract amount - Amulet uses amount.initialAmount, others use amount directly
+          let amount;
+          if (isAmulet && payload.amount?.initialAmount) {
+            amount = parseFloat(payload.amount.initialAmount) || 0;
+          } else {
+            amount = parseFloat(payload.amount || payload.quantity || 0) || 0;
           }
           
           return {
             contractId: h.contractId,
-            amount: parseFloat(payload.amount || payload.quantity || 0) || 0,
+            amount: amount,
             instrumentId: payload.instrumentId || payload.instrument || { symbol },
             templateId: tplId,
             isSplice: isSpliceHolding,
+            isAmulet: isAmulet,
           };
         })
         .sort((a, b) => b.amount - a.amount); // Largest first

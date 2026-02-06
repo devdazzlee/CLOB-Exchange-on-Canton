@@ -35,16 +35,26 @@ const DEFAULT_SYNCHRONIZER_ID = process.env.DEFAULT_SYNCHRONIZER_ID ||
 const REGISTRY_BACKEND_API = process.env.REGISTRY_BACKEND_API || 
   'https://api.utilities.digitalasset-dev.com/api/token-standard';
 
-// Validator Scan Proxy API - Used for Amulet/CC transfers
-// This is the BFT proxy to the Scan API, exposed by the Validator App
-// For Amulet transfers: GET /v0/scan-proxy/amulet-rules and POST /v0/scan-proxy/registry/transfer-instruction/v1/{id}/choice-contexts/accept
-// CONFIRMED WORKING: https://wallet.validator.dev.canton.wolfedgelabs.com/api/validator/v0/scan-proxy/amulet-rules
+// Scan Proxy API - Used for Amulet/CC transfers (accept, send, reject)
+// This is the client's Scan Proxy on WolfEdge infrastructure
+// For Amulet transfers: POST /api/scan/v0/amulet-rules
+// CONFIRMED WORKING: http://65.108.40.104:8088/api/scan/v0/amulet-rules
+const SCAN_PROXY_API = process.env.SCAN_PROXY_API || 
+  'http://65.108.40.104:8088';
+
+// Legacy Validator Scan Proxy (alternative, requires auth)
 const VALIDATOR_SCAN_PROXY_API = process.env.VALIDATOR_SCAN_PROXY_API || 
   'https://wallet.validator.dev.canton.wolfedgelabs.com/api/validator';
 
 // DSO Party ID - Required for Amulet transfers
 const DSO_PARTY_ID = process.env.DSO_PARTY_ID || 
   'DSO::1220be58c29e65de40bf273be1dc2b266d43a9a002ea5b18955aeef7aac881bb471a';
+
+// Amulet (Canton Coin/CC) Package ID - For querying Amulet token holdings
+// Template: Splice.Amulet:Amulet
+// Discovered from user's active contracts on WolfEdge DevNet
+const AMULET_PACKAGE_ID = process.env.AMULET_PACKAGE_ID || 
+  '67fac2f853bce8dbf0b9817bb5ba7c59f10e8120b7c808696f7010e5f0c8a791';
 
 // =============================================================================
 // PACKAGE IDS - Update these when deploying new DARs
@@ -90,6 +100,11 @@ const TEMPLATE_IDS = {
   spliceHolding: `#${SPLICE_PACKAGE_NAME}:Splice.Api.Token.HoldingV1:Holding`,
   spliceTransferOffer: `#${SPLICE_PACKAGE_NAME}:Splice.Api.Token.HoldingV1:TransferOffer`,
   
+  // Amulet (Canton Coin / CC) Template - Direct token holdings on Canton Network
+  // Symbol: CC (Canton Coin) - shown as "Amulet" in WolfEdge wallet
+  // Amount is in payload.amount.initialAmount (not just payload.amount)
+  amulet: `${AMULET_PACKAGE_ID}:Splice.Amulet:Amulet`,
+  
   // Splice Transfer Instruction interface (for accepting transfer offers)
   // This is the INTERFACE ID (not template ID) - used to exercise TransferInstruction_Accept
   spliceTransferInstruction: `#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction`,
@@ -122,6 +137,8 @@ const TRADING_PAIRS = [
   { pair: 'BTC/USDT', baseAsset: 'BTC', quoteAsset: 'USDT' },
   { pair: 'ETH/USDT', baseAsset: 'ETH', quoteAsset: 'USDT' },
   { pair: 'SOL/USDT', baseAsset: 'SOL', quoteAsset: 'USDT' },
+  // CC (Canton Coin / Amulet) pairs using CBTC as quote
+  { pair: 'CC/CBTC', baseAsset: 'CC', quoteAsset: 'CBTC' },
 ];
 
 // =============================================================================
@@ -133,6 +150,9 @@ const SUPPORTED_TOKENS = {
   USDT: { symbol: 'USDT', name: 'Tether USD', decimals: 6 },
   ETH: { symbol: 'ETH', name: 'Ethereum', decimals: 18 },
   SOL: { symbol: 'SOL', name: 'Solana', decimals: 9 },
+  // Splice/Canton tokens
+  CC: { symbol: 'CC', name: 'Canton Coin (Amulet)', decimals: 10 },
+  CBTC: { symbol: 'CBTC', name: 'Canton BTC', decimals: 10 },
 };
 
 // =============================================================================
@@ -227,11 +247,13 @@ module.exports = {
   CANTON_ADMIN_API,
   DEFAULT_SYNCHRONIZER_ID,
   REGISTRY_BACKEND_API,
+  SCAN_PROXY_API,
   VALIDATOR_SCAN_PROXY_API,
   
   // Package IDs
   TOKEN_STANDARD_PACKAGE_ID,
   LEGACY_PACKAGE_ID,
+  AMULET_PACKAGE_ID,
   
   // Template IDs
   TEMPLATE_IDS,

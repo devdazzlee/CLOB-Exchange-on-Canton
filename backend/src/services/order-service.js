@@ -100,7 +100,29 @@ class OrderService {
       throw new ValidationError(`Largest ${asset} Holding (${primaryHolding.amount}) is less than required (${amount}). Please consolidate your holdings.`);
     }
     
-    // 3. Lock the Holding for this order
+    // 3. Check if this is a Splice holding (CBTC, Amulet, etc.)
+    // Splice holdings use different templates and cannot be locked with our custom Lock choice
+    const isSpliceHolding = primaryHolding.isSplice || 
+      primaryHolding.templateId?.includes('Splice') || 
+      primaryHolding.templateId?.includes('Registry') ||
+      primaryHolding.templateId?.includes('Utility');
+    
+    if (isSpliceHolding) {
+      // For Splice holdings (CBTC, CC), skip locking - use trust-based orders for now
+      // In production, this would use the DvP Settlement flow from Splice Token Standard
+      console.log(`[OrderService] ⚠️ Splice holding detected (${asset}) - skipping lock (trust-based order)`);
+      console.log(`[OrderService] Reference holding: ${primaryHolding.contractId.substring(0, 30)}...`);
+      
+      return {
+        lockedHoldingCid: primaryHolding.contractId, // Reference the unlocked holding
+        lockedAmount: amount,
+        asset: asset,
+        isSpliceHolding: true,
+        skippedLock: true
+      };
+    }
+    
+    // 4. Lock the Holding for this order (custom holdings only)
     try {
       await holdingService.lockHolding(
         primaryHolding.contractId,
