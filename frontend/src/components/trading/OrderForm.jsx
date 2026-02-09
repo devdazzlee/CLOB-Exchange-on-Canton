@@ -115,29 +115,33 @@ export default function OrderForm({
     const errors = [];
     const warnings = [];
 
-    // Validation errors removed - handled by form submission
-
-    if (orderType === 'BUY') {
-      if (estimatedCost && estimatedCost > quoteBalance) {
-        errors.push(`Insufficient ${quoteToken} balance`);
-      }
-      if (orderMode === 'LIMIT' && price && bestAsk && parseFloat(price) > parseFloat(bestAsk) * 1.05) {
-        warnings.push('Limit price is significantly above market price');
-      }
-    } else {
-      const qty = parseFloat(quantity) || 0;
-      if (qty > baseBalance) {
-        errors.push(`Insufficient ${baseToken} balance`);
-      }
-      if (orderMode === 'LIMIT' && price && bestBid && parseFloat(price) < parseFloat(bestBid) * 0.95) {
-        warnings.push('Limit price is significantly below market price');
-      }
+    // Required field checks
+    const qty = parseFloat(quantity) || 0;
+    if (!quantity || qty <= 0) {
+      errors.push('Quantity is required');
+    }
+    if (orderMode === 'LIMIT' && (!price || parseFloat(price) <= 0)) {
+      errors.push('Price is required for limit orders');
     }
 
-    // Minimum order size check - removed 10 USDT minimum
-    // if (estimatedCost && estimatedCost < 10) {
-    //   warnings.push('Order size is below minimum (10 USDT)');
-    // }
+    // Balance checks (only if quantity is valid)
+    if (qty > 0) {
+      if (orderType === 'BUY') {
+        if (estimatedCost && estimatedCost > quoteBalance) {
+          errors.push(`Insufficient ${quoteToken} balance (need ${estimatedCost.toFixed(2)}, have ${quoteBalance.toFixed(2)})`);
+        }
+        if (orderMode === 'LIMIT' && price && bestAsk && parseFloat(price) > parseFloat(bestAsk) * 1.05) {
+          warnings.push('Limit price is significantly above market price');
+        }
+      } else {
+        if (qty > baseBalance) {
+          errors.push(`Insufficient ${baseToken} balance (need ${qty.toFixed(8)}, have ${baseBalance.toFixed(8)})`);
+        }
+        if (orderMode === 'LIMIT' && price && bestBid && parseFloat(price) < parseFloat(bestBid) * 0.95) {
+          warnings.push('Limit price is significantly below market price');
+        }
+      }
+    }
 
     return { errors, warnings, isValid: errors.length === 0 };
   }, [orderType, orderMode, price, quantity, estimatedCost, baseBalance, quoteBalance, baseToken, quoteToken, bestBid, bestAsk]);

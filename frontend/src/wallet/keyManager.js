@@ -78,18 +78,37 @@ export async function mnemonicToKeyPair(mnemonic) {
 }
 
 /**
+ * Get the browser's native Web Crypto API.
+ * We use window.crypto explicitly to avoid Node.js crypto polyfill interference
+ * from bundled packages (e.g. buffer) that may shadow the bare `crypto` global.
+ */
+function getWebCrypto() {
+  const wc = (typeof window !== 'undefined' && window.crypto)
+    || (typeof globalThis !== 'undefined' && globalThis.crypto);
+  if (!wc || !wc.subtle) {
+    throw new Error(
+      'Web Crypto API is not available. This can happen if the page is served over plain HTTP ' +
+      '(not HTTPS or localhost). Please access the app via https:// or http://localhost.'
+    );
+  }
+  return wc;
+}
+
+/**
  * Encrypt a private key using AES-GCM
  * @param {Uint8Array} privateKey - Private key to encrypt
  * @param {string} password - Password for encryption
  * @returns {Promise<string>} Encrypted private key as base64 string
  */
 export async function encryptPrivateKey(privateKey, password) {
+  const webCrypto = getWebCrypto();
+
   // Convert password to key using PBKDF2
   const encoder = new TextEncoder();
   const passwordData = encoder.encode(password);
-  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const salt = webCrypto.getRandomValues(new Uint8Array(16));
   
-  const keyMaterial = await crypto.subtle.importKey(
+  const keyMaterial = await webCrypto.subtle.importKey(
     'raw',
     passwordData,
     'PBKDF2',
@@ -97,7 +116,7 @@ export async function encryptPrivateKey(privateKey, password) {
     ['deriveBits', 'deriveKey']
   );
   
-  const key = await crypto.subtle.deriveKey(
+  const key = await webCrypto.subtle.deriveKey(
     {
       name: 'PBKDF2',
       salt: salt,
@@ -111,10 +130,10 @@ export async function encryptPrivateKey(privateKey, password) {
   );
   
   // Generate IV
-  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const iv = webCrypto.getRandomValues(new Uint8Array(12));
   
   // Encrypt the private key
-  const encrypted = await crypto.subtle.encrypt(
+  const encrypted = await webCrypto.subtle.encrypt(
     {
       name: 'AES-GCM',
       iv: iv
@@ -140,6 +159,8 @@ export async function encryptPrivateKey(privateKey, password) {
  * @returns {Promise<Uint8Array>} Decrypted private key
  */
 export async function decryptPrivateKey(encryptedKey, password) {
+  const webCrypto = getWebCrypto();
+
   // Convert from base64
   const combined = Uint8Array.from(atob(encryptedKey), c => c.charCodeAt(0));
   
@@ -152,7 +173,7 @@ export async function decryptPrivateKey(encryptedKey, password) {
   const encoder = new TextEncoder();
   const passwordData = encoder.encode(password);
   
-  const keyMaterial = await crypto.subtle.importKey(
+  const keyMaterial = await webCrypto.subtle.importKey(
     'raw',
     passwordData,
     'PBKDF2',
@@ -160,7 +181,7 @@ export async function decryptPrivateKey(encryptedKey, password) {
     ['deriveBits', 'deriveKey']
   );
   
-  const key = await crypto.subtle.deriveKey(
+  const key = await webCrypto.subtle.deriveKey(
     {
       name: 'PBKDF2',
       salt: salt,
@@ -175,7 +196,7 @@ export async function decryptPrivateKey(encryptedKey, password) {
   
   // Decrypt the private key
   try {
-    const decrypted = await crypto.subtle.decrypt(
+    const decrypted = await webCrypto.subtle.decrypt(
       {
         name: 'AES-GCM',
         iv: iv

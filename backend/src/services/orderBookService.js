@@ -8,6 +8,7 @@
  */
 
 const config = require('../config');
+const { LEGACY_PACKAGE_ID } = require('../config/constants');
 const cantonService = require('./cantonService');
 const tokenProvider = require('./tokenProvider');
 
@@ -36,11 +37,14 @@ class OrderBookService {
         try {
             const token = await tokenProvider.getServiceToken();
             
-            // Query Order contracts from Canton
-            // cantonService now properly parses the nested JsActiveContract response
+            // Query Order contracts from Canton (both new and legacy packages)
+            const templateIds = [`${packageId}:Order:Order`];
+            if (LEGACY_PACKAGE_ID && LEGACY_PACKAGE_ID !== packageId) {
+                templateIds.push(`${LEGACY_PACKAGE_ID}:Order:Order`);
+            }
             const contracts = await cantonService.queryActiveContracts({
                 party: operatorPartyId,
-                templateIds: [`${packageId}:Order:Order`],
+                templateIds,
                 pageSize: 200
             }, token);
 
@@ -60,11 +64,17 @@ class OrderBookService {
                     continue;
                 }
                 
+                // Handle Optional price from Daml (could be {Some: "..."} or direct value)
+                let rawPrice = payload.price;
+                if (rawPrice && typeof rawPrice === 'object' && rawPrice.Some !== undefined) {
+                    rawPrice = rawPrice.Some;
+                }
+                
                 const order = {
                     contractId: c.contractId,
                     orderId: payload.orderId,
                     owner: payload.owner,
-                    price: payload.price, // Already normalized (not wrapped in {Some:...})
+                    price: rawPrice,
                     quantity: parseFloat(payload.quantity || 0),
                     filled: parseFloat(payload.filled || 0),
                     remaining: parseFloat(payload.quantity || 0) - parseFloat(payload.filled || 0),

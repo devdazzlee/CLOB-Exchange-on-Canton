@@ -528,9 +528,43 @@ class OrderService {
     }
 
     // First, get the order details to know what was locked
+    // Use queryActiveContracts (more reliable than lookupContract which needs readers)
     let orderDetails = null;
     try {
-      orderDetails = await this.getOrder(orderContractId);
+      const legacyPackageId = config.canton.packageIds?.legacy;
+      const templateIdsToQuery = [`${packageId}:Order:Order`];
+      if (legacyPackageId && legacyPackageId !== packageId) {
+        templateIdsToQuery.push(`${legacyPackageId}:Order:Order`);
+      }
+      const contracts = await cantonService.queryActiveContracts({
+        party: partyId,
+        templateIds: templateIdsToQuery,
+        pageSize: 200
+      }, token);
+      
+      const matchingContract = (Array.isArray(contracts) ? contracts : [])
+        .find(c => c.contractId === orderContractId);
+      
+      if (matchingContract) {
+        const payload = matchingContract.payload || matchingContract.createArgument || {};
+        orderDetails = {
+          contractId: orderContractId,
+          orderId: payload.orderId,
+          owner: payload.owner,
+          tradingPair: payload.tradingPair,
+          orderType: payload.orderType,
+          orderMode: payload.orderMode,
+          price: payload.price?.Some || payload.price,
+          quantity: payload.quantity,
+          filled: payload.filled || '0',
+          status: payload.status,
+          timestamp: payload.timestamp,
+          allocationCid: payload.allocationCid || null
+        };
+        console.log(`[OrderService] Found order details: ${orderDetails.orderId}, allocationCid: ${orderDetails.allocationCid?.substring(0, 30) || 'none'}...`);
+      } else {
+        console.warn(`[OrderService] Order ${orderContractId.substring(0, 30)}... not found in active contracts`);
+      }
     } catch (e) {
       console.warn('[OrderService] Could not fetch order details before cancel:', e.message);
     }
@@ -544,6 +578,8 @@ class OrderService {
         console.warn('[OrderService] Could not unlock Holding:', unlockErr.message);
         // Continue with cancellation even if unlock fails
       }
+    } else {
+      console.log('[OrderService] No allocationCid on order - skipping unlock');
     }
 
     // Exercise CancelOrder choice on the Order contract
@@ -583,6 +619,31 @@ class OrderService {
     }
 
     console.log(`[OrderService] ✅ Order cancelled: ${orderContractId}`);
+
+    // If we didn't unlock before cancel (because we couldn't find order details),
+    // try to extract allocationCid from the archived event and unlock now
+    if (!orderDetails?.allocationCid && result?.transaction?.events) {
+      const archivedEvent = result.transaction.events.find(e => 
+        e.archived?.contractId === orderContractId
+      );
+      if (!archivedEvent) {
+        // Try to find allocationCid from the created (cancelled) order event
+        const createdEvent = result.transaction.events.find(e => 
+          e.created?.templateId?.includes('Order') && 
+          e.created?.createArguments?.status === 'CANCELLED'
+        );
+        const fallbackAllocationCid = createdEvent?.created?.createArguments?.allocationCid;
+        if (fallbackAllocationCid) {
+          console.log(`[OrderService] Found allocationCid from cancel result: ${fallbackAllocationCid.substring(0, 30)}...`);
+          try {
+            await this.unlockHoldingsForOrder(token, partyId, fallbackAllocationCid);
+            console.log(`[OrderService] TOKEN STANDARD: Holding unlocked (from cancel result)`);
+          } catch (unlockErr) {
+            console.warn('[OrderService] Post-cancel unlock failed:', unlockErr.message);
+          }
+        }
+      }
+    }
 
     // Remove from UpdateStream (persistent storage)
     const updateStream = getUpdateStream();
@@ -743,7 +804,8 @@ class OrderService {
             quantity: payload.quantity,
             filled: payload.filled || '0',
             status: payload.status,
-            timestamp: payload.timestamp
+            timestamp: payload.timestamp,
+            allocationCid: payload.allocationCid || null
           };
         });
 

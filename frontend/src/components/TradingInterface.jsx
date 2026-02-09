@@ -165,6 +165,15 @@ export default function TradingInterface({ partyId }) {
       setPrice('');
       setQuantity('');
       
+      // Show success toast
+      toast.success(
+        `${orderData.orderType} ${orderData.quantity} ${orderData.tradingPair?.split('/')[0] || ''} @ ${orderData.orderMode === 'MARKET' ? 'Market Price' : orderData.price}`, 
+        {
+          title: `✅ ${orderData.orderType} Order Placed`,
+          duration: 5000
+        }
+      );
+      
       // Show success modal
       setLastOrderData({
         orderId: result.data?.orderId,
@@ -475,6 +484,31 @@ export default function TradingInterface({ partyId }) {
           return;
         }
         
+        // Handle TRADE_EXECUTED event - update order book and user orders in real-time
+        if (data?.type === 'TRADE_EXECUTED') {
+          console.log('[WebSocket] Trade executed:', data.buyOrderId, 'vs', data.sellOrderId);
+          // Order book will be refreshed by the next poll or full update
+          // But we need to remove/update the matched orders immediately for responsiveness
+          setOrderBook(prev => ({
+            buys: (prev.buys || []).filter(o => o.orderId !== data.buyOrderId),
+            sells: (prev.sells || []).filter(o => o.orderId !== data.sellOrderId)
+          }));
+          return;
+        }
+        
+        // Handle ORDER_CANCELLED event
+        if (data?.type === 'ORDER_CANCELLED') {
+          console.log('[WebSocket] Order cancelled:', data.orderId);
+          setOrderBook(prev => ({
+            buys: (prev.buys || []).filter(o => o.orderId !== data.orderId && o.contractId !== data.contractId),
+            sells: (prev.sells || []).filter(o => o.orderId !== data.orderId && o.contractId !== data.contractId)
+          }));
+          if (data.owner === partyId) {
+            setOrders(prev => prev.filter(o => o.id !== data.orderId && o.contractId !== data.contractId));
+          }
+          return;
+        }
+        
         // Handle full order book update
         if (data?.tradingPair === tradingPair) {
           setOrderBook({
@@ -504,17 +538,63 @@ export default function TradingInterface({ partyId }) {
             return [data, ...prev.slice(0, 49)];
           });
           
-          // If current user was involved in the trade, update their orders
+          // If current user was involved in the trade, show toast and refresh
           if (data.buyer === partyId || data.seller === partyId) {
-            console.log('[WebSocket] User involved in trade, refreshing orders');
-            // Remove filled orders from user's order list
-            setOrders(prev => prev.filter(order => {
-              // Remove if this order was filled
-              if (order.id === data.buyOrderId || order.id === data.sellOrderId) {
-                return false;
+            const isBuyer = data.buyer === partyId;
+            const side = isBuyer ? 'BUY' : 'SELL';
+            const qty = parseFloat(data.quantity || 0);
+            const price = parseFloat(data.price || 0);
+            const [base] = tradingPair.split('/');
+
+            console.log(`[WebSocket] 🎯 User's ${side} order matched! ${qty} ${base} @ ${price}`);
+
+            // Show trade executed toast
+            toast.success(
+              `${qty} ${base} @ ${price.toLocaleString()} — ${(qty * price).toLocaleString()} USDT`, 
+              {
+                title: `🎯 ${side} Order Filled!`,
+                duration: 6000
               }
-              return true;
-            }));
+            );
+            
+            // Refresh user's orders from backend (handles partial fills correctly)
+            (async () => {
+              try {
+                const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
+                const ordersList = ordersData?.data?.orders || [];
+                setOrders(ordersList.map(order => ({
+                  id: order.orderId || order.contractId,
+                  contractId: order.contractId,
+                  type: order.orderType,
+                  mode: order.orderMode,
+                  price: order.price,
+                  quantity: order.quantity,
+                  filled: order.filled || '0',
+                  status: order.status,
+                  tradingPair: order.tradingPair,
+                  timestamp: order.timestamp
+                })));
+              } catch (e) {
+                console.warn('[WebSocket] Failed to refresh orders after trade:', e);
+              }
+            })();
+            
+            // Refresh balance after trade
+            (async () => {
+              try {
+                const balanceData = await balanceService.getBalances(partyId);
+                if (balanceData.available) {
+                  const dynamicBalance = {};
+                  Object.keys(balanceData.available).forEach(token => {
+                    dynamicBalance[token] = balanceData.available[token]?.toString() || '0.0';
+                  });
+                  setBalance(dynamicBalance);
+                  console.log('[WebSocket] Balance refreshed after trade');
+                }
+              } catch (e) {
+                console.warn('[WebSocket] Failed to refresh balance after trade:', e);
+              }
+            })();
           }
         }
       } catch (err) {

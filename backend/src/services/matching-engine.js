@@ -520,24 +520,36 @@ class MatchingEngine {
     }
 
     // ═══════════════════════════════════════════════════
-    // STEP 4: Broadcast trade via WebSocket
+    // STEP 4: Record trade and broadcast via WebSocket
     // ═══════════════════════════════════════════════════
+    const tradeRecord = {
+      tradeId: tradeContractId || `trade-${Date.now()}`,
+      tradingPair,
+      buyer: buyOrder.owner,
+      seller: sellOrder.owner,
+      price: matchPrice.toString(),
+      quantity: matchQty.toString(),
+      buyOrderId: buyOrder.orderId,
+      sellOrderId: sellOrder.orderId,
+      timestamp: new Date().toISOString(),
+      settlementType: 'DvP',
+    };
+
+    // Add to UpdateStream for persistence (so trades API can serve it)
+    try {
+      const { getUpdateStream } = require('./cantonUpdateStream');
+      const updateStream = getUpdateStream();
+      if (updateStream && typeof updateStream.addTrade === 'function') {
+        updateStream.addTrade(tradeRecord);
+      }
+    } catch (e) {
+      // Non-critical
+    }
+
+    // Broadcast via WebSocket for real-time UI updates
     if (global.broadcastWebSocket) {
-      const tradeData = {
-        type: 'NEW_TRADE',
-        tradeId: tradeContractId || `trade-${Date.now()}`,
-        tradingPair,
-        buyer: buyOrder.owner,
-        seller: sellOrder.owner,
-        price: matchPrice.toString(),
-        quantity: matchQty.toString(),
-        buyOrderId: buyOrder.orderId,
-        sellOrderId: sellOrder.orderId,
-        timestamp: new Date().toISOString(),
-        settlementType: 'DvP',
-      };
-      global.broadcastWebSocket(`trades:${tradingPair}`, tradeData);
-      global.broadcastWebSocket('trades:all', tradeData);
+      global.broadcastWebSocket(`trades:${tradingPair}`, { type: 'NEW_TRADE', ...tradeRecord });
+      global.broadcastWebSocket('trades:all', { type: 'NEW_TRADE', ...tradeRecord });
       global.broadcastWebSocket(`orderbook:${tradingPair}`, {
         type: 'TRADE_EXECUTED',
         buyOrderId: buyOrder.orderId,

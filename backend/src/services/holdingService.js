@@ -676,6 +676,69 @@ class HoldingService {
         });
       }
 
+      // ── Deduct amounts committed in OPEN orders (for Splice holdings that can't be locked on-chain) ──
+      // Splice holdings (CBTC, CC) skip the on-chain lock, so the balance API still sees
+      // them as "available". We fix this by querying the user's OPEN orders and moving the
+      // committed amount from available → locked.
+      try {
+        const { TEMPLATE_IDS: tplIds } = require('../config/constants');
+        const orderTemplateIds = [tplIds.orderNew, tplIds.order].filter(Boolean);
+        // Deduplicate in case both point to the same value
+        const uniqueOrderTemplates = [...new Set(orderTemplateIds)];
+
+        const orderContracts = await cantonService.queryActiveContracts({
+          party: partyId,
+          templateIds: uniqueOrderTemplates,
+        }, token).catch(() => []);
+
+        const openOrders = (Array.isArray(orderContracts) ? orderContracts : []).filter(c => {
+          const p = c.payload || {};
+          return p.owner === partyId && p.status === 'OPEN';
+        });
+
+        if (openOrders.length > 0) {
+          console.log(`[HoldingService] Found ${openOrders.length} OPEN orders – computing committed amounts`);
+        }
+
+        for (const c of openOrders) {
+          const p = c.payload || {};
+          const pair = p.tradingPair || '';
+          const [baseAsset, quoteAsset] = pair.split('/');
+          if (!baseAsset || !quoteAsset) continue;
+
+          const qty = parseFloat(p.quantity || 0);
+          const filled = parseFloat(p.filled || 0);
+          const remaining = qty - filled;
+          if (remaining <= 0) continue;
+
+          const priceVal = parseFloat(
+            typeof p.price === 'object' && p.price?.Some !== undefined ? p.price.Some : p.price
+          ) || 0;
+
+          // Determine which asset is committed
+          let commitAsset, commitAmount;
+          if (p.orderType === 'BUY') {
+            commitAsset = quoteAsset;
+            commitAmount = priceVal > 0 ? remaining * priceVal : remaining; // Market orders w/o price
+          } else {
+            commitAsset = baseAsset;
+            commitAmount = remaining;
+          }
+
+          if (commitAmount > 0 && balances[commitAsset] !== undefined) {
+            // Move from available to locked
+            const deduction = Math.min(commitAmount, balances[commitAsset] || 0);
+            if (deduction > 0) {
+              balances[commitAsset] = (balances[commitAsset] || 0) - deduction;
+              lockedBalances[commitAsset] = (lockedBalances[commitAsset] || 0) + deduction;
+            }
+          }
+        }
+      } catch (orderQueryErr) {
+        console.warn(`[HoldingService] Could not query orders for balance deduction: ${orderQueryErr.message}`);
+        // Non-fatal – balance will just not reflect order commitments
+      }
+
       // Calculate totals (available + locked)
       const allSymbols = new Set([...Object.keys(balances), ...Object.keys(lockedBalances)]);
       const total = {};
@@ -683,7 +746,13 @@ class HoldingService {
         total[symbol] = ((balances[symbol] || 0) + (lockedBalances[symbol] || 0)).toString();
       }
 
-      console.log(`[HoldingService] Aggregated balances:`, Object.keys(balances));
+      // Round available to avoid floating point display issues
+      for (const sym of Object.keys(balances)) {
+        if (balances[sym] < 0.000000001) balances[sym] = 0; // clamp near-zero to 0
+      }
+
+      console.log(`[HoldingService] Aggregated balances (after order deductions):`, 
+        Object.entries(balances).map(([s, a]) => `${s}: ${a}`).join(', '));
 
       return {
         available: balances,
