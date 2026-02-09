@@ -185,13 +185,19 @@ export default function TradingInterface({ partyId }) {
       });
       setShowOrderSuccess(true);
       
-      // Refresh order book
+      // Wait briefly for Canton to fully commit the new order before refreshing
+      await new Promise(r => setTimeout(r, 800));
+
+      // Refresh order book using the same aggregated format as initial load
       try {
-        const bookData = await apiClient.get(API_ROUTES.ORDERBOOK.GET(tradingPair));
+        const bookData = await getGlobalOrderBook(orderData.tradingPair || tradingPair);
+        if (bookData) {
           setOrderBook({
-            buys: bookData.data?.raw?.buyOrders || [],
-            sells: bookData.data?.raw?.sellOrders || []
+            buys: bookData.buyOrders || [],
+            sells: bookData.sellOrders || []
           });
+          console.log('[Refresh] Order book updated:', bookData.buyOrdersCount, 'buys,', bookData.sellOrdersCount, 'sells');
+        }
       } catch (e) { console.error('[Refresh] Order book error:', e); }
       
       // Refresh user orders
@@ -230,6 +236,19 @@ export default function TradingInterface({ partyId }) {
         const tradesData = await apiClient.get(API_ROUTES.TRADES.GET(tradingPair, 50));
         setTrades(tradesData?.data?.trades || []);
       } catch (e) { console.error('[Refresh] Trades error:', e); }
+
+      // Second refresh after 2 more seconds (catches any Canton propagation delay)
+      setTimeout(async () => {
+        try {
+          const bookData2 = await getGlobalOrderBook(orderData.tradingPair || tradingPair);
+          if (bookData2) {
+            setOrderBook({
+              buys: bookData2.buyOrders || [],
+              sells: bookData2.sellOrders || []
+            });
+          }
+        } catch (_) { /* silent retry */ }
+      }, 2000);
       
     } catch (error) {
       console.error('[Place Order] Failed:', error);
@@ -275,6 +294,9 @@ export default function TradingInterface({ partyId }) {
     console.log('[Cancel Order] Order cancelled:', result);
     toast.success('Order cancelled successfully! Funds unlocked.');
     
+    // Wait for Canton to propagate the cancellation
+    await new Promise(r => setTimeout(r, 800));
+    
     // Refresh orders list
     try {
       const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
@@ -295,6 +317,19 @@ export default function TradingInterface({ partyId }) {
       console.warn('[Cancel Order] Failed to refresh orders:', e);
     }
     
+    // Refresh order book (cancelled order should be removed)
+    try {
+      const bookData = await getGlobalOrderBook(tradingPair);
+      if (bookData) {
+        setOrderBook({
+          buys: bookData.buyOrders || [],
+          sells: bookData.sellOrders || []
+        });
+      }
+    } catch (e) {
+      console.warn('[Cancel Order] Failed to refresh order book:', e);
+    }
+    
     // Refresh balance from V2 Holdings (includes CBTC)
     try {
       const balanceData = await balanceService.getBalances(partyId);
@@ -311,7 +346,7 @@ export default function TradingInterface({ partyId }) {
     }
     
     return result;
-  }, [partyId, toast, setOrders, setBalance]);
+  }, [partyId, tradingPair, toast, setOrders, setBalance]);
 
   // Handle when a transfer offer is accepted - refresh balances
   const handleTransferAccepted = useCallback(async (offer) => {
@@ -946,6 +981,7 @@ export default function TradingInterface({ partyId }) {
               orderBook={orderBook}
               loading={orderBookLoading}
               tradingPair={tradingPair}
+              userOrders={orders}
             />
 
             {/* Active Orders */}

@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { TrendingUp, TrendingDown, RefreshCw, Loader2, Globe, CheckCircle2 } from 'lucide-react';
 import { Button } from '../ui/button';
@@ -16,12 +17,42 @@ export default function OrderBookCard({
   orderBook, 
   loading, 
   onRefresh,
+  userOrders = [],
   // DEPRECATED: These props are no longer used in Global OrderBook model
   onCreateOrderBook, 
   creatingOrderBook 
 }) {
   const isEmpty = orderBook.buys.length === 0 && orderBook.sells.length === 0;
   const isConnectedToGlobalMarket = true; // Always connected to global market
+
+  // Build a map of user's orders by price+side for quick lookup
+  // Key: "BUY|<roundedPrice>" or "SELL|<roundedPrice>"  Value: { count, totalQty }
+  // Uses multiple precision levels (2..8) so we match regardless of aggregation rounding
+  const myOrdersByPrice = useMemo(() => {
+    const map = {};
+    for (const o of userOrders) {
+      if (o.status !== 'OPEN' || o.tradingPair !== tradingPair) continue;
+      const side = (o.type || '').toUpperCase();
+      const p = parseFloat(o.price || 0);
+      if (!p) continue;
+      const remaining = parseFloat(o.quantity || 0) - parseFloat(o.filled || 0);
+      // Index at multiple precisions so we match the aggregated price string
+      for (let prec = 0; prec <= 8; prec++) {
+        const key = `${side}|${p.toFixed(prec)}`;
+        if (!map[key]) map[key] = { count: 0, totalQty: 0 };
+        map[key].count += 1;
+        map[key].totalQty += remaining;
+      }
+    }
+    return map;
+  }, [userOrders, tradingPair]);
+
+  const getMyInfo = (price, side) => {
+    // The aggregated order book price comes as a string like "0.10" or "51000.00"
+    const priceStr = String(price);
+    const key = `${side}|${priceStr}`;
+    return myOrdersByPrice[key] || null;
+  };
 
   // Calculate cumulative depth for visualization
   const calculateDepth = (orders) => {
@@ -127,6 +158,7 @@ export default function OrderBookCard({
                         <th className="text-left py-3 px-3 text-xs font-semibold text-muted-foreground uppercase tracking-wide">Price</th>
                         <th className="text-right py-3 px-3 text-xs font-semibold text-muted-foreground uppercase tracking-wide">Quantity</th>
                         <th className="text-right py-3 px-3 text-xs font-semibold text-muted-foreground uppercase tracking-wide">Total</th>
+                        <th className="w-8 py-3 px-1 text-center text-xs font-semibold text-muted-foreground uppercase tracking-wide">My</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -134,15 +166,18 @@ export default function OrderBookCard({
                         {sellOrdersWithDepth.length > 0 ? (
                           sellOrdersWithDepth.map((order, i) => {
                             const depthPercent = maxDepth > 0 ? (order.cumulative / maxDepth) * 100 : 0;
+                            const myInfo = getMyInfo(order.price, 'SELL');
                             return (
                               <motion.tr
                                 key={i}
                                 initial={{ opacity: 0, x: -10 }}
                                 animate={{ opacity: 1, x: 0 }}
                                 exit={{ opacity: 0 }}
-                                className="border-b border-border/50 hover:bg-card transition-colors cursor-pointer relative"
+                                className={`border-b border-border/50 hover:bg-card transition-colors cursor-pointer relative ${myInfo ? 'ring-1 ring-inset ring-primary/30' : ''}`}
                                 style={{
-                                  background: `linear-gradient(to left, rgba(239, 68, 68, 0.1) ${depthPercent}%, transparent ${depthPercent}%)`
+                                  background: myInfo
+                                    ? `linear-gradient(to left, rgba(239, 68, 68, 0.18) ${depthPercent}%, rgba(99, 102, 241, 0.06) ${depthPercent}%)`
+                                    : `linear-gradient(to left, rgba(239, 68, 68, 0.1) ${depthPercent}%, transparent ${depthPercent}%)`
                                 }}
                               >
                                 <td className="py-2.5 px-3 text-destructive font-mono text-sm font-medium">
@@ -154,12 +189,19 @@ export default function OrderBookCard({
                                 <td className="py-2.5 px-3 text-right text-muted-foreground text-sm">
                                   {order.price !== null && order.remaining != null ? (parseFloat(order.price) * parseFloat(order.remaining)).toLocaleString(undefined, { maximumFractionDigits: 2 }) : '-'}
                                 </td>
+                                <td className="w-8 py-2.5 px-1 text-center">
+                                  {myInfo && (
+                                    <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-primary/20 text-primary text-[10px] font-bold" title={`You have ${myInfo.count} order(s) here`}>
+                                      {myInfo.count}
+                                    </span>
+                                  )}
+                                </td>
                               </motion.tr>
                             );
                           })
                         ) : (
                           <tr>
-                            <td colSpan="3" className="py-8 text-center text-muted-foreground text-sm">No sell orders</td>
+                            <td colSpan="4" className="py-8 text-center text-muted-foreground text-sm">No sell orders</td>
                           </tr>
                         )}
                       </AnimatePresence>
@@ -181,6 +223,7 @@ export default function OrderBookCard({
                         <th className="text-left py-3 px-3 text-xs font-semibold text-muted-foreground uppercase tracking-wide">Price</th>
                         <th className="text-right py-3 px-3 text-xs font-semibold text-muted-foreground uppercase tracking-wide">Quantity</th>
                         <th className="text-right py-3 px-3 text-xs font-semibold text-muted-foreground uppercase tracking-wide">Total</th>
+                        <th className="w-8 py-3 px-1 text-center text-xs font-semibold text-muted-foreground uppercase tracking-wide">My</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -188,15 +231,18 @@ export default function OrderBookCard({
                         {buyOrdersWithDepth.length > 0 ? (
                           buyOrdersWithDepth.map((order, i) => {
                             const depthPercent = maxDepth > 0 ? (order.cumulative / maxDepth) * 100 : 0;
+                            const myInfo = getMyInfo(order.price, 'BUY');
                             return (
                               <motion.tr
                                 key={i}
                                 initial={{ opacity: 0, x: 10 }}
                                 animate={{ opacity: 1, x: 0 }}
                                 exit={{ opacity: 0 }}
-                                className="border-b border-border/50 hover:bg-card transition-colors cursor-pointer"
+                                className={`border-b border-border/50 hover:bg-card transition-colors cursor-pointer ${myInfo ? 'ring-1 ring-inset ring-primary/30' : ''}`}
                                 style={{
-                                  background: `linear-gradient(to right, rgba(34, 197, 94, 0.1) ${depthPercent}%, transparent ${depthPercent}%)`
+                                  background: myInfo
+                                    ? `linear-gradient(to right, rgba(34, 197, 94, 0.18) ${depthPercent}%, rgba(99, 102, 241, 0.06) ${depthPercent}%)`
+                                    : `linear-gradient(to right, rgba(34, 197, 94, 0.1) ${depthPercent}%, transparent ${depthPercent}%)`
                                 }}
                               >
                                 <td className="py-2.5 px-3 text-success font-mono text-sm font-medium">
@@ -208,12 +254,19 @@ export default function OrderBookCard({
                                 <td className="py-2.5 px-3 text-right text-muted-foreground text-sm">
                                   {order.price !== null && order.remaining != null ? (parseFloat(order.price) * parseFloat(order.remaining)).toLocaleString(undefined, { maximumFractionDigits: 2 }) : '-'}
                                 </td>
+                                <td className="w-8 py-2.5 px-1 text-center">
+                                  {myInfo && (
+                                    <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-primary/20 text-primary text-[10px] font-bold" title={`You have ${myInfo.count} order(s) here`}>
+                                      {myInfo.count}
+                                    </span>
+                                  )}
+                                </td>
                               </motion.tr>
                             );
                           })
                         ) : (
                           <tr>
-                            <td colSpan="3" className="py-8 text-center text-muted-foreground text-sm">No buy orders</td>
+                            <td colSpan="4" className="py-8 text-center text-muted-foreground text-sm">No buy orders</td>
                           </tr>
                         )}
                       </AnimatePresence>
