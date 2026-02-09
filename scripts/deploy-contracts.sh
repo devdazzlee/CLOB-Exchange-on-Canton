@@ -80,3 +80,6 @@ fi
 
 echo ""
 echo -e "${GREEN}✅ Contract deployment complete!${NC}"
+
+
+
