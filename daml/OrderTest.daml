@@ -114,6 +114,7 @@ testPartialFill = script do
   _ <- submit operator do
     exerciseCmd orderCid FillOrder with
       fillQuantity = 1.0
+      newAllocationCid = None
   
   order <- query @Order alice
   assert (length order == 1)
@@ -145,6 +146,7 @@ testCompleteFill = script do
   _ <- submit operator do
     exerciseCmd orderCid FillOrder with
       fillQuantity = 0.5
+      newAllocationCid = None
   
   order <- query @Order alice
   assert (length order == 1)

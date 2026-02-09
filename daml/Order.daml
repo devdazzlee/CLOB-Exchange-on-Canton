@@ -48,10 +48,12 @@ template Order
         create this with status = "CANCELLED"
 
     -- Fill the order (partially or fully)
-    -- Note: Actual execution happens in MasterOrderBook:MatchOrders via Allocation_ExecuteTransfer
+    -- For partial fills, newAllocationCid carries the updated locked Holding reference
+    -- (the original is archived during DvP settlement, change is re-locked)
     choice FillOrder : ()
       with
         fillQuantity : Decimal
+        newAllocationCid : Optional Text  -- Updated locked holding CID after partial DvP (None = keep existing)
       controller operator
       do
         assert (status == "OPEN")
@@ -60,10 +62,14 @@ template Order
         
         let newFilled = filled + fillQuantity
         let newStatus = if newFilled >= quantity then "FILLED" else "OPEN"
+        let updatedAllocationCid = case newAllocationCid of
+              Some cid -> cid
+              None -> allocationCid
         
         _ <- create this with
           filled = newFilled
           status = newStatus
+          allocationCid = updatedAllocationCid
         return ()
 
     -- Get remaining quantity to fill

@@ -130,13 +130,19 @@ class OrderServiceV2 {
           adminToken
         );
 
-        // Extract the locked holding contract ID from transaction events
-        const events = lockResult.transaction?.events || lockResult.events || [];
-        lockedHoldingCid = events.find(e => 
-          e.created?.templateId?.includes('Holding') || 
-          e.CreatedEvent?.templateId?.includes('Holding')
-        )?.created?.contractId || 
-        events.find(e => e.CreatedEvent)?.CreatedEvent?.contractId;
+        // holdingService.lockHolding returns { result, newLockedHoldingCid }
+        lockedHoldingCid = lockResult.newLockedHoldingCid;
+
+        // Fallback: try to extract from raw transaction events if not returned directly
+        if (!lockedHoldingCid) {
+          const rawResult = lockResult.result || lockResult;
+          const events = rawResult?.transaction?.events || rawResult?.events || [];
+          lockedHoldingCid = events.find(e => 
+            e.created?.templateId?.includes('Holding') || 
+            e.CreatedEvent?.templateId?.includes('Holding')
+          )?.created?.contractId || 
+          events.find(e => e.CreatedEvent)?.CreatedEvent?.contractId;
+        }
 
         if (!lockedHoldingCid) {
           console.error('[OrderServiceV2] Lock result:', JSON.stringify(lockResult, null, 2));
@@ -168,10 +174,9 @@ class OrderServiceV2 {
         allocationCid: lockedHoldingCid || '', // Reference to locked holding (placeholder)
       };
 
-      // Use the legacy Order template (already deployed on Canton)
-      // OrderV3 isn't deployed yet, so fall back to legacy Order
-      const orderTemplateId = TEMPLATE_IDS.order; // This is the legacy Order:Order template
-      console.log(`[OrderServiceV2] Using legacy Order template: ${orderTemplateId.substring(0, 40)}...`);
+      // Use the new Order template (v2.1.0 with Optional newAllocationCid in FillOrder)
+      const orderTemplateId = TEMPLATE_IDS.orderNew || TEMPLATE_IDS.order;
+      console.log(`[OrderServiceV2] Using Order template: ${orderTemplateId.substring(0, 40)}...`);
       
       // The Order template has `signatory owner`, so we need the user party to authorize
       // We submit as both operator (admin token) AND user party
@@ -229,24 +234,86 @@ class OrderServiceV2 {
     console.log(`[OrderServiceV2] Cancelling order: ${orderContractId.substring(0, 30)}...`);
 
     try {
-      // Exercise the Order_Cancel choice
-      const result = await cantonService.exerciseChoice({
-        token: adminToken,
-        templateId: templateIds.order,
-        contractId: orderContractId,
-        choice: 'Order_Cancel',
-        choiceArgument: {
-          reason: 'User requested cancellation',
-        },
-        actAsParty: partyId,
-      });
+      // First, fetch the order to get its allocationCid (locked holding) BEFORE cancellation
+      let orderAllocationCid = null;
+      try {
+        const templateIdsToQuery = [templateIds.order];
+        if (TEMPLATE_IDS.order && TEMPLATE_IDS.order !== templateIds.order) {
+          templateIdsToQuery.push(TEMPLATE_IDS.order);
+        }
+        const allOrders = await cantonService.queryActiveContracts({
+          party: operatorPartyId,
+          templateIds: templateIdsToQuery,
+        }, adminToken);
+        const orderContract = allOrders.find(c => c.contractId === orderContractId);
+        if (orderContract) {
+          orderAllocationCid = orderContract.payload?.allocationCid;
+          console.log(`[OrderServiceV2] Order has allocationCid: ${orderAllocationCid?.substring(0, 30)}...`);
+        }
+      } catch (fetchErr) {
+        console.warn(`[OrderServiceV2] Could not fetch order before cancel: ${fetchErr.message.substring(0, 60)}`);
+      }
 
-      // Extract the unlocked holding
-      const unlockedHoldingCid = result.events?.find(e =>
-        e.created?.templateId?.includes('Holding')
-      )?.created?.contractId;
+      // Exercise the CancelOrder choice - try new template first, fallback to legacy
+      let result;
+      try {
+        result = await cantonService.exerciseChoice({
+          token: adminToken,
+          templateId: templateIds.order,
+          contractId: orderContractId,
+          choice: 'CancelOrder',
+          choiceArgument: {},
+          actAsParty: [operatorPartyId, partyId],
+          readAs: [operatorPartyId, partyId],
+        });
+      } catch (newErr) {
+        console.log(`[OrderServiceV2] Cancel with new template failed, trying legacy: ${newErr.message.substring(0, 60)}`);
+        result = await cantonService.exerciseChoice({
+          token: adminToken,
+          templateId: TEMPLATE_IDS.order,
+          contractId: orderContractId,
+          choice: 'CancelOrder',
+          choiceArgument: {},
+          actAsParty: [operatorPartyId, partyId],
+          readAs: [operatorPartyId, partyId],
+        });
+      }
 
-      console.log(`[OrderServiceV2] Order cancelled, holding unlocked: ${unlockedHoldingCid?.substring(0, 30)}...`);
+      // CancelOrder archives the old order and creates a new one with status=CANCELLED
+      // Now we need to unlock the holding that was locked for this order
+      const lockedHoldingCid = orderAllocationCid;
+
+      let unlockedHoldingCid = null;
+      if (lockedHoldingCid && lockedHoldingCid !== '') {
+        try {
+          console.log(`[OrderServiceV2] Unlocking holding: ${lockedHoldingCid.substring(0, 30)}...`);
+          const unlockResult = await cantonService.exerciseChoice({
+            token: adminToken,
+            templateId: templateIds.holding || TEMPLATE_IDS.holding,
+            contractId: lockedHoldingCid,
+            choice: 'Holding_Unlock',
+            choiceArgument: {},
+            actAsParty: [partyId, operatorPartyId],
+            readAs: [operatorPartyId, partyId],
+          });
+          const unlockEvents = unlockResult?.transaction?.events || unlockResult?.events || [];
+          for (const ev of unlockEvents) {
+            const created = ev.created || ev.CreatedEvent || ev;
+            const tplId = typeof created?.templateId === 'string' ? created.templateId : '';
+            if (tplId.includes('Holding') && created?.contractId) {
+              unlockedHoldingCid = created.contractId;
+              break;
+            }
+          }
+          console.log(`[OrderServiceV2] ✅ Holding unlocked: ${unlockedHoldingCid?.substring(0, 30)}...`);
+        } catch (unlockErr) {
+          console.warn(`[OrderServiceV2] ⚠️ Holding unlock failed (may already be archived): ${unlockErr.message.substring(0, 80)}`);
+        }
+      } else {
+        console.log('[OrderServiceV2] No allocationCid found on order - skipping unlock');
+      }
+
+      console.log(`[OrderServiceV2] Order cancelled successfully`);
 
       return {
         success: true,
@@ -269,9 +336,14 @@ class OrderServiceV2 {
     const operatorPartyId = config.canton?.operatorPartyId || process.env.OPERATOR_PARTY_ID;
 
     try {
+      // Query BOTH new and legacy Order templates for backward compatibility
+      const templateIdsToQuery = [templateIds.order];
+      if (TEMPLATE_IDS.order && TEMPLATE_IDS.order !== templateIds.order) {
+        templateIdsToQuery.push(TEMPLATE_IDS.order); // Add legacy
+      }
       const contracts = await cantonService.queryActiveContracts({
         party: operatorPartyId,
-        templateIds: [templateIds.order],
+        templateIds: templateIdsToQuery,
       }, adminToken);
 
       // Filter by owner
@@ -290,17 +362,17 @@ class OrderServiceV2 {
         contractId: c.contractId,
         orderId: c.payload.orderId,
         owner: c.payload.owner,
-        tradingPair: `${c.payload.baseInstrumentId?.symbol}/${c.payload.quoteInstrumentId?.symbol}`,
-        side: c.payload.side?.tag || c.payload.side,
-        type: c.payload.orderType?.tag || c.payload.orderType,
+        tradingPair: c.payload.tradingPair || `${c.payload.baseInstrumentId?.symbol}/${c.payload.quoteInstrumentId?.symbol}`,
+        side: c.payload.orderType?.tag || c.payload.orderType || c.payload.side?.tag || c.payload.side,
+        type: c.payload.orderMode?.tag || c.payload.orderMode || c.payload.orderType?.tag || c.payload.type,
         price: c.payload.price?.Some || c.payload.price,
         quantity: c.payload.quantity,
-        filledQuantity: c.payload.filledQuantity,
-        remaining: (parseFloat(c.payload.quantity) - parseFloat(c.payload.filledQuantity)).toString(),
+        filledQuantity: c.payload.filled || c.payload.filledQuantity || '0',
+        remaining: (parseFloat(c.payload.quantity) - parseFloat(c.payload.filled || c.payload.filledQuantity || 0)).toString(),
         status: c.payload.status?.tag || c.payload.status,
-        lockedHoldingCid: c.payload.lockedHoldingCid,
-        lockedAmount: c.payload.lockedAmount,
-        createdAt: c.payload.createdAt,
+        allocationCid: c.payload.allocationCid,
+        lockedHoldingCid: c.payload.lockedHoldingCid || c.payload.allocationCid,
+        createdAt: c.payload.createdAt || c.payload.timestamp,
         tokenStandard: true,
       }));
     } catch (error) {
@@ -318,9 +390,14 @@ class OrderServiceV2 {
     const operatorPartyId = config.canton?.operatorPartyId || process.env.OPERATOR_PARTY_ID;
 
     try {
+      // Query BOTH new and legacy Order templates for backward compatibility
+      const templateIdsToQuery = [templateIds.order];
+      if (TEMPLATE_IDS.order && TEMPLATE_IDS.order !== templateIds.order) {
+        templateIdsToQuery.push(TEMPLATE_IDS.order); // Add legacy
+      }
       const contracts = await cantonService.queryActiveContracts({
         party: operatorPartyId,
-        templateIds: [templateIds.order],
+        templateIds: templateIdsToQuery,
       }, adminToken);
 
       // Filter by trading pair and open status

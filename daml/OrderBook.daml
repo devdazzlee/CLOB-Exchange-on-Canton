@@ -137,8 +137,8 @@ matchFirstPair tradingPair userAccountsOpt buyList sellList =
         None -> return None
       
       -- Fill both orders
-      _ <- exercise buyCid Order.FillOrder with fillQuantity = tradeQuantity
-      _ <- exercise sellCid Order.FillOrder with fillQuantity = tradeQuantity
+      _ <- exercise buyCid Order.FillOrder with fillQuantity = tradeQuantity; newAllocationCid = None
+      _ <- exercise sellCid Order.FillOrder with fillQuantity = tradeQuantity; newAllocationCid = None
       
       -- Create trade record
       now <- getTime

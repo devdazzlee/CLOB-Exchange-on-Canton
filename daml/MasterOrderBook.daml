@@ -110,8 +110,8 @@ executeMatch buyCid buyOrder sellCid sellOrder = do
   -- For now, we execute for minQty and handle remainders by creating new orders
   
   -- Update order fill status (this will mark orders as FILLED if tradeQuantity equals remaining)
-  _ <- exercise buyCid Order.FillOrder with fillQuantity = tradeQuantity
-  _ <- exercise sellCid Order.FillOrder with fillQuantity = tradeQuantity
+  _ <- exercise buyCid Order.FillOrder with fillQuantity = tradeQuantity; newAllocationCid = None
+  _ <- exercise sellCid Order.FillOrder with fillQuantity = tradeQuantity; newAllocationCid = None
   
   -- Create trade record
   now <- getTime

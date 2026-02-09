@@ -61,13 +61,16 @@ const AMULET_PACKAGE_ID = process.env.AMULET_PACKAGE_ID ||
 // =============================================================================
 
 /**
- * Token Standard Package (clob-wolfedge-tokens v2.0.0)
- * Contains: Instrument, Holding, Settlement, OrderV3
+ * Token Standard Package (clob-wolfedge-tokens v2.1.0)
+ * Contains: Instrument, Holding, Settlement, Order, OrderV3
  * 
  * Key feature: Holding contract has custodian-only signatory
  * This allows operator to mint tokens for external parties.
+ * 
+ * v2.1.0 changes: FillOrder choice now has Optional newAllocationCid
+ * for partial fill allocation tracking (DvP settlement)
  */
-const TOKEN_STANDARD_PACKAGE_ID = 'f552adda6b4c5ed9caa3c943d004c0e727cc29df62e1fdc91b9f1797491f9390';
+const TOKEN_STANDARD_PACKAGE_ID = process.env.TOKEN_STANDARD_PACKAGE_ID || 'd1b3cb28a5acfad74fe8bdc53b30f167907dfa0d1b22251bbb007b9cf1dc7feb';
 
 /**
  * Legacy Package (clob-exchange v1.0.0)
@@ -110,7 +113,7 @@ const TEMPLATE_IDS = {
   spliceTransferInstruction: `#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction`,
   spliceTransferInstructionInterfaceId: '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.TransferInstructionV1:TransferInstruction',
   
-  // Custom Token Standard Templates (for our own tokens - testing only)
+  // Custom Token Standard Templates (clob-wolfedge-tokens v2.1.0)
   instrument: `${TOKEN_STANDARD_PACKAGE_ID}:Instrument:Instrument`,
   tradingPair: `${TOKEN_STANDARD_PACKAGE_ID}:Instrument:TradingPair`,
   holding: `${TOKEN_STANDARD_PACKAGE_ID}:Holding:Holding`,
@@ -121,7 +124,11 @@ const TEMPLATE_IDS = {
   trade: `${TOKEN_STANDARD_PACKAGE_ID}:Settlement:Trade`,
   batchSettlement: `${TOKEN_STANDARD_PACKAGE_ID}:Settlement:BatchSettlement`,
   
-  // Legacy Templates (for backward compatibility)
+  // Order template from new package (v2.1.0) - supports partial fill allocation tracking
+  // Uses Optional newAllocationCid in FillOrder for DvP remainder handling
+  orderNew: `${TOKEN_STANDARD_PACKAGE_ID}:Order:Order`,
+  
+  // Legacy Templates (clob-exchange v1.0.0 - for backward compatibility)
   userAccount: `${LEGACY_PACKAGE_ID}:UserAccount:UserAccount`,
   order: `${LEGACY_PACKAGE_ID}:Order:Order`,
   legacyTrade: `${LEGACY_PACKAGE_ID}:Trade:Trade`,
@@ -212,7 +219,7 @@ function getTokenStandardTemplateIds() {
     holding: TEMPLATE_IDS.holding,
     transferProposal: TEMPLATE_IDS.transferProposal,
     mintRequest: TEMPLATE_IDS.mintRequest,
-    order: TEMPLATE_IDS.orderV3,
+    order: TEMPLATE_IDS.orderNew,
     settlement: TEMPLATE_IDS.settlement,
     trade: TEMPLATE_IDS.trade,
     batchSettlement: TEMPLATE_IDS.batchSettlement,

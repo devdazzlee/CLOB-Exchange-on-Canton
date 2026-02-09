@@ -78,9 +78,14 @@ const config = {
     // Add packageIds for validation compatibility
     get packageIds() {
       return {
-        clobExchange: this.packageId || this.packageName, // Prefer package-id format
-        userAccount: this.packageId || this.packageName,  // Prefer package-id format
-        tokenStandard: this.tokenStandardPackageId        // Token Standard package
+        // For Order creation/matching: use new package (v2.1.0 with FillOrder partial fill support)
+        clobExchange: this.tokenStandardPackageId,
+        // For UserAccount: keep using legacy package
+        userAccount: this.packageId || this.packageName,
+        // Token Standard package (Holding, Settlement, etc.)
+        tokenStandard: this.tokenStandardPackageId,
+        // Legacy package (for querying old orders that haven't been matched yet)
+        legacy: this.packageId || LEGACY_PACKAGE_ID,
       };
     },
 

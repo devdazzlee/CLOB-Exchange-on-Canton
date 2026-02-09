@@ -124,7 +124,7 @@ class OrderService {
     
     // 4. Lock the Holding for this order (custom holdings only)
     try {
-      await holdingService.lockHolding(
+      const lockResult = await holdingService.lockHolding(
         primaryHolding.contractId,
         operatorPartyId,        // Lock holder (operator manages order matching)
         `ORDER:${orderId}`,     // Lock reason references the order
@@ -133,10 +133,16 @@ class OrderService {
         token
       );
       
-      console.log(`[OrderService] ✅ Holding ${primaryHolding.contractId.substring(0, 20)}... locked for ${amount} ${asset}`);
+      // CRITICAL: Use the NEW locked Holding contract ID, not the original (now archived) one!
+      // After Holding_Lock, the original contract is consumed and a new locked one is created.
+      const lockedCid = lockResult.newLockedHoldingCid || primaryHolding.contractId;
+      
+      console.log(`[OrderService] ✅ Holding locked for ${amount} ${asset}`);
+      console.log(`[OrderService]    Original CID: ${primaryHolding.contractId.substring(0, 25)}... (ARCHIVED)`);
+      console.log(`[OrderService]    Locked CID:   ${lockedCid.substring(0, 25)}... (ACTIVE)`);
       
       return {
-        lockedHoldingCid: primaryHolding.contractId,
+        lockedHoldingCid: lockedCid,
         lockedAmount: amount,
         asset: asset
       };
@@ -545,15 +551,36 @@ class OrderService {
     // 1. Assert the order is OPEN
     // 2. Release any locked funds (via Allocation cancel)
     // 3. Create new Order contract with status = CANCELLED
-    const result = await cantonService.exerciseChoice({
-      token,
-      actAsParty: partyId, // Owner cancels their own order
-      templateId: `${packageId}:Order:Order`,
-      contractId: orderContractId,
-      choice: 'CancelOrder',
-      choiceArgument: {},
-      readAs: [operatorPartyId, partyId]
-    });
+    // Try with new package first, fallback to legacy if contract was created with old package
+    let result;
+    try {
+      result = await cantonService.exerciseChoice({
+        token,
+        actAsParty: partyId, // Owner cancels their own order
+        templateId: `${packageId}:Order:Order`,
+        contractId: orderContractId,
+        choice: 'CancelOrder',
+        choiceArgument: {},
+        readAs: [operatorPartyId, partyId]
+      });
+    } catch (cancelErr) {
+      // If new package fails, try legacy package
+      const legacyPackageId = config.canton.packageIds?.legacy;
+      if (legacyPackageId && legacyPackageId !== packageId) {
+        console.log(`[OrderService] Retrying cancel with legacy package...`);
+        result = await cantonService.exerciseChoice({
+          token,
+          actAsParty: partyId,
+          templateId: `${legacyPackageId}:Order:Order`,
+          contractId: orderContractId,
+          choice: 'CancelOrder',
+          choiceArgument: {},
+          readAs: [operatorPartyId, partyId]
+        });
+      } else {
+        throw cancelErr;
+      }
+    }
 
     console.log(`[OrderService] ✅ Order cancelled: ${orderContractId}`);
 
@@ -655,9 +682,15 @@ class OrderService {
     try {
       // Query as the USER's party - this returns only THEIR contracts
       // Each user has < 200 contracts, so no limit issue
+      // Query BOTH new and legacy packages to show all user orders
+      const legacyPackageId = config.canton.packageIds?.legacy;
+      const templateIdsToQuery = [`${packageId}:Order:Order`];
+      if (legacyPackageId && legacyPackageId !== packageId) {
+        templateIdsToQuery.push(`${legacyPackageId}:Order:Order`);
+      }
       const contracts = await cantonService.queryActiveContracts({
         party: partyId,  // Query as USER, not operator
-        templateIds: [`${packageId}:Order:Order`],
+        templateIds: templateIdsToQuery,
         pageSize: limit
       }, token);
 

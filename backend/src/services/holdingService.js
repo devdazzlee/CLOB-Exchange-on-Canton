@@ -735,13 +735,20 @@ class HoldingService {
       // Combine all types
       const allHoldings = [...spliceHoldings, ...customHoldings, ...amuletHoldings];
 
-      // Filter for matching symbol and unlocked
+      // Filter for matching symbol, owner, and unlocked
       // Different templates have different payload structures
       return allHoldings
         .filter(h => {
           const payload = h.payload || {};
           const templateId = h.createdEvent?.templateId || h.templateId || '';
           const isAmulet = templateId.includes('Splice.Amulet');
+          
+          // CRITICAL: Only return holdings owned by this party
+          // The query may return holdings where we're custodian but not owner
+          const holdingOwner = payload.owner || payload.holder;
+          if (holdingOwner && holdingOwner !== partyId) {
+            return false; // Skip holdings owned by other parties
+          }
           
           // Check symbol - Amulet is always CC, Splice uses instrument.id, custom uses instrumentId.symbol
           let holdingSymbol;
@@ -950,8 +957,45 @@ class HoldingService {
         actAsParty: [ownerPartyId, lockHolder],
       });
 
+      // CRITICAL: Extract the NEW locked Holding contract ID from the transaction response.
+      // After Holding_Lock, the original contract is ARCHIVED and a new locked one is created.
+      // We must return the NEW contract ID, not the original (now archived) one.
+      let newLockedHoldingCid = null;
+      const events = result?.transaction?.events || [];
+      for (const event of events) {
+        const created = event.created || event.CreatedEvent;
+        if (created?.contractId) {
+          const tplId = created.templateId || '';
+          const tplStr = typeof tplId === 'string' ? tplId :
+            `${tplId.packageId || ''}:${tplId.moduleName || ''}:${tplId.entityName || ''}`;
+          
+          // Find the locked Holding (the one with a lock set)
+          if (tplStr.includes('Holding') && !tplStr.includes('Transfer')) {
+            const args = created.createArgument || created.createArguments || {};
+            // The locked holding will have lock != null
+            if (args.lock !== null && args.lock !== undefined) {
+              newLockedHoldingCid = created.contractId;
+              console.log(`[HoldingService] ✅ New locked Holding CID: ${newLockedHoldingCid.substring(0, 30)}...`);
+              break;
+            }
+          }
+        }
+      }
+
+      // Fallback: if we couldn't parse events, use first created contract
+      if (!newLockedHoldingCid) {
+        for (const event of events) {
+          const created = event.created || event.CreatedEvent;
+          if (created?.contractId) {
+            newLockedHoldingCid = created.contractId;
+            console.log(`[HoldingService] ⚠️ Using first created event as locked Holding CID: ${newLockedHoldingCid.substring(0, 30)}...`);
+            break;
+          }
+        }
+      }
+
       console.log('[HoldingService] ✅ Holding locked for:', lockReason);
-      return result;
+      return { result, newLockedHoldingCid };
     } catch (error) {
       console.error('[HoldingService] ❌ Failed to lock holding:', error.message);
       throw error;

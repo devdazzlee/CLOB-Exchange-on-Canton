@@ -1,198 +1,174 @@
 /**
  * Matching Engine Bot
- * Continuously monitors the order book and executes matches when buy/sell orders overlap
- *
- * This is the critical off-chain automation that makes the exchange work:
- * - FIFO Execution: Price-time priority
- * - Partial Fills: Handles mismatched sizes
- * - Self-Trade Prevention: Checks owner before matching
+ * 
+ * Core exchange functionality - matches buy/sell orders and settles trades.
+ * 
+ * Flow:
+ * 1. Poll Canton for OPEN Order contracts every N seconds
+ * 2. Separate into buys/sells per trading pair
+ * 3. Sort by price-time priority (FIFO)
+ * 4. Find crossing orders (buy price >= sell price)
+ * 5. For each match:
+ *    a. Create SettlementInstruction (references locked Holdings)
+ *    b. Execute Settlement_Execute (atomic DvP swap)
+ *    c. FillOrder on both Order contracts (update filled/status)
+ * 6. Broadcast trades via WebSocket
  * 
  * Uses Canton JSON Ledger API v2:
  * - POST /v2/state/active-contracts - Query orders
  * - POST /v2/commands/submit-and-wait-for-transaction - Execute matches
+ * 
+ * Self-trade prevention: DISABLED per client request
  */
 
-const CantonAdmin = require('./canton-admin');
 const cantonService = require('./cantonService');
 const config = require('../config');
-const { getUpdateStream } = require('./cantonUpdateStream');
-const { extractTradesFromEvents } = require('./trade-utils');
 const { getSettlementService } = require('./settlementService');
-
-// TOKEN STANDARD: Always use DvP Settlement with Holdings
-// Legacy UserAccount-based settlement has been removed per client requirement
-const USE_DvP_SETTLEMENT = true;
-
-// NO IN-MEMORY CACHE - All trades are stored on Canton ledger as Trade contracts
-function recordTradesFromResult(result) {
-  const trades = extractTradesFromEvents(result?.events);
-  if (trades.length === 0) return [];
-
-  trades.forEach((trade) => {
-    // Broadcast via WebSocket for real-time UI updates
-    if (global.broadcastWebSocket) {
-      global.broadcastWebSocket(`trades:${trade.tradingPair}`, {
-        type: 'NEW_TRADE',
-        ...trade,
-      });
-      global.broadcastWebSocket('trades:all', {
-        type: 'NEW_TRADE',
-        ...trade,
-      });
-    }
-  });
-
-  return trades;
-}
+const tokenProvider = require('./tokenProvider');
 
 class MatchingEngine {
   constructor() {
-    this.cantonAdmin = new CantonAdmin();
     this.isRunning = false;
-    this.pollingInterval = 2000; // Poll every 2 seconds
+    this.pollingInterval = parseInt(config.matchingEngine?.intervalMs) || 2000;
     this.matchingInProgress = false;
-    this.lastProcessedOrders = new Set();
     this.adminToken = null;
     this.tokenExpiry = null;
+    this.tradingPairs = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'CC/CBTC'];
+    // Track holding CIDs that are known to be archived/stale
+    // Prevents retrying the same stale orders every cycle
+    this.staleHoldings = new Set();
+    this.staleHoldingsLastClear = Date.now();
+    this.STALE_CACHE_TTL = 120000; // Clear stale cache every 2 minutes
   }
 
   /**
-   * Get admin token with caching
+   * Get admin token with caching (refreshes every 25 min)
    */
   async getAdminToken() {
     if (this.adminToken && this.tokenExpiry && Date.now() < this.tokenExpiry) {
       return this.adminToken;
     }
-
     console.log('[MatchingEngine] Refreshing admin token...');
-    this.adminToken = await this.cantonAdmin.getAdminToken();
-    this.tokenExpiry = Date.now() + (25 * 60 * 1000); // 25 minutes (token expires in 30)
-    console.log('[MatchingEngine] Admin token refreshed successfully');
+    this.adminToken = await tokenProvider.getServiceToken();
+    this.tokenExpiry = Date.now() + (25 * 60 * 1000);
     return this.adminToken;
   }
 
-  /**
-   * Invalidate cached token (call on 401 errors)
-   */
   invalidateToken() {
-    console.log('[MatchingEngine] Invalidating cached token due to auth error');
     this.adminToken = null;
     this.tokenExpiry = null;
   }
 
-  /**
-   * Start the matching engine
-   */
   async start() {
     if (this.isRunning) {
       console.log('[MatchingEngine] Already running');
       return;
     }
-
     this.isRunning = true;
-    console.log('[MatchingEngine] Starting matching engine...');
-    console.log('[MatchingEngine] Polling interval:', this.pollingInterval, 'ms');
-
-    // Start the matching loop
+    console.log(`[MatchingEngine] Started (interval: ${this.pollingInterval}ms, pairs: ${this.tradingPairs.join(', ')})`);
     this.matchLoop();
   }
 
-  /**
-   * Stop the matching engine
-   */
   stop() {
-    console.log('[MatchingEngine] Stopping matching engine...');
+    console.log('[MatchingEngine] Stopping...');
     this.isRunning = false;
   }
 
-  /**
-   * Main matching loop
-   */
   async matchLoop() {
     while (this.isRunning) {
       try {
         await this.runMatchingCycle();
       } catch (error) {
-        console.error('[MatchingEngine] Error in matching cycle:', error.message);
+        console.error('[MatchingEngine] Cycle error:', error.message);
+        if (error.message?.includes('401') || error.message?.includes('security-sensitive')) {
+          this.invalidateToken();
+        }
       }
-
-      // Wait before next cycle
-      await this.sleep(this.pollingInterval);
+      await new Promise(r => setTimeout(r, this.pollingInterval));
     }
-
     console.log('[MatchingEngine] Stopped');
   }
 
   /**
-   * Run one matching cycle - DIRECTLY queries Canton API
+   * Run one matching cycle across all trading pairs
    */
   async runMatchingCycle() {
-    if (this.matchingInProgress) {
-      return; // Skip if already processing
-    }
+    if (this.matchingInProgress) return;
 
     try {
       this.matchingInProgress = true;
+      const token = await this.getAdminToken();
 
-      // Get admin token
-      const adminToken = await this.getAdminToken();
-
-      // Query Canton DIRECTLY for Order contracts (no cache)
-      const tradingPairs = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT'];
-      
-      for (const pair of tradingPairs) {
-        await this.processOrderBookFromCanton(pair, adminToken);
+      for (const pair of this.tradingPairs) {
+        await this.processOrdersForPair(pair, token);
       }
     } catch (error) {
-      console.error('[MatchingEngine] Error in matching cycle:', error.message);
-      // Invalidate token on 401 errors so it gets refreshed next cycle
-      if (error.message?.includes('401') || error.message?.includes('security-sensitive') || error.message?.includes('Unauthorized')) {
+      if (error.message?.includes('401') || error.message?.includes('security-sensitive')) {
         this.invalidateToken();
       }
+      throw error;
     } finally {
       this.matchingInProgress = false;
     }
   }
   
   /**
-   * Process order book by querying Canton DIRECTLY
+   * Process orders for a single trading pair
    */
-  async processOrderBookFromCanton(tradingPair, adminToken) {
-    try {
+  async processOrdersForPair(tradingPair, token) {
       const packageId = config.canton.packageIds?.clobExchange;
       const operatorPartyId = config.canton.operatorPartyId;
       
-      if (!packageId || !operatorPartyId) {
-        return;
+    if (!packageId || !operatorPartyId) return;
+
+    try {
+      // Query Canton for active Order contracts from BOTH packages
+      // New package (v2.1.0): supports FillOrder with newAllocationCid for partial fills
+      // Legacy package: older orders without partial fill allocation tracking
+      const legacyPackageId = config.canton.packageIds?.legacy;
+      const templateIdsToQuery = [`${packageId}:Order:Order`];
+      if (legacyPackageId && legacyPackageId !== packageId) {
+        templateIdsToQuery.push(`${legacyPackageId}:Order:Order`);
       }
-      
-      // Query Canton for Order contracts
+
       const contracts = await cantonService.queryActiveContracts({
         party: operatorPartyId,
-        templateIds: [`${packageId}:Order:Order`],
+        templateIds: templateIdsToQuery,
         pageSize: 200
-      }, adminToken);
+      }, token);
       
-      if (!contracts || contracts.length === 0) {
-        return;
-      }
+      if (!contracts || contracts.length === 0) return;
       
-      // Filter by trading pair and OPEN status
+      // Parse and filter orders for this pair
       const buyOrders = [];
       const sellOrders = [];
       
       for (const c of contracts) {
         const payload = c.payload || c.createArgument || {};
         
-        if (payload.tradingPair !== tradingPair || payload.status !== 'OPEN') {
-          continue;
-        }
-        
-        // Handle price: null for MARKET orders, keep as null to distinguish from 0
+        if (payload.tradingPair !== tradingPair || payload.status !== 'OPEN') continue;
+
         const rawPrice = payload.price;
-        const parsedPrice = rawPrice !== null && rawPrice !== undefined && rawPrice !== '' 
-          ? parseFloat(rawPrice) 
-          : null;
+        // Handle DAML Optional: could be { Some: "123" } or direct string or null
+        let parsedPrice = null;
+        if (rawPrice !== null && rawPrice !== undefined && rawPrice !== '') {
+          if (typeof rawPrice === 'object' && rawPrice.Some !== undefined) {
+            parsedPrice = parseFloat(rawPrice.Some);
+          } else {
+            parsedPrice = parseFloat(rawPrice);
+          }
+          if (isNaN(parsedPrice)) parsedPrice = null;
+        }
+
+        const qty = parseFloat(payload.quantity) || 0;
+        const filled = parseFloat(payload.filled) || 0;
+        const remaining = qty - filled;
+
+        if (remaining <= 0) continue;
+
+        // Detect which package this contract belongs to
+        const contractTemplateId = c.templateId || `${packageId}:Order:Order`;
+        const isNewPackage = contractTemplateId.startsWith(packageId);
         
         const order = {
           contractId: c.contractId,
@@ -200,14 +176,17 @@ class MatchingEngine {
           owner: payload.owner,
           orderType: payload.orderType,
           orderMode: payload.orderMode || 'LIMIT',
-          price: parsedPrice,  // null for MARKET orders
-          quantity: parseFloat(payload.quantity) || 0,
-          filled: parseFloat(payload.filled) || 0,
-          remaining: (parseFloat(payload.quantity) || 0) - (parseFloat(payload.filled) || 0),
+          price: parsedPrice,
+          quantity: qty,
+          filled: filled,
+          remaining: remaining,
           timestamp: payload.timestamp,
-          // TOKEN STANDARD: Include locked Holding reference for DvP settlement
-          allocationCid: payload.allocationCid || null,
-          lockedHoldingCid: payload.allocationCid || null  // allocationCid contains the Holding CID
+          tradingPair: payload.tradingPair,
+          // Locked Holding CID for DvP settlement
+          lockedHoldingCid: payload.allocationCid || null,
+          // Track which package/templateId this order was created with
+          templateId: contractTemplateId,
+          isNewPackage: isNewPackage,
         };
         
         if (payload.orderType === 'BUY') {
@@ -217,218 +196,339 @@ class MatchingEngine {
         }
       }
       
-      if (buyOrders.length === 0 || sellOrders.length === 0) {
-        return; // No matches possible
-      }
-      
-      console.log(`[MatchingEngine] ${tradingPair}: ${buyOrders.length} buys, ${sellOrders.length} sells`);
-      
-      // Sort orders: buys by price (highest first, MARKET first), sells by price (lowest first, MARKET first)
-      const sortedBuys = buyOrders.sort((a, b) => {
-        // MARKET orders (null price) have highest priority
+      if (buyOrders.length === 0 || sellOrders.length === 0) return;
+
+      // Count orders with locked holdings (eligible for DvP matching)
+      const lockedBuys = buyOrders.filter(o => o.lockedHoldingCid && o.lockedHoldingCid !== '').length;
+      const lockedSells = sellOrders.filter(o => o.lockedHoldingCid && o.lockedHoldingCid !== '').length;
+
+      // Sort: buys by highest price first (MARKET first), sells by lowest price first (MARKET first)
+      buyOrders.sort((a, b) => {
         if (a.price === null && b.price !== null) return -1;
         if (a.price !== null && b.price === null) return 1;
         if (a.price === null && b.price === null) return new Date(a.timestamp) - new Date(b.timestamp);
-        // For LIMIT orders: higher price first
         if (b.price !== a.price) return b.price - a.price;
-        // Same price: earlier timestamp wins
         return new Date(a.timestamp) - new Date(b.timestamp);
       });
-      
-      const sortedSells = sellOrders.sort((a, b) => {
-        // MARKET orders (null price) have highest priority
+
+      sellOrders.sort((a, b) => {
         if (a.price === null && b.price !== null) return -1;
         if (a.price !== null && b.price === null) return 1;
         if (a.price === null && b.price === null) return new Date(a.timestamp) - new Date(b.timestamp);
-        // For LIMIT orders: lower price first
         if (a.price !== b.price) return a.price - b.price;
-        // Same price: earlier timestamp wins
         return new Date(a.timestamp) - new Date(b.timestamp);
       });
-      
-      // Log best bid/ask for debugging
-      if (sortedBuys.length > 0 && sortedSells.length > 0) {
-        const bestBuy = sortedBuys[0];
-        const bestSell = sortedSells[0];
-        const buyPriceDisplay = bestBuy.price !== null ? bestBuy.price : 'MARKET';
-        const sellPriceDisplay = bestSell.price !== null ? bestSell.price : 'MARKET';
-        
-        console.log(`[MatchingEngine] Best BUY: ${buyPriceDisplay} qty=${bestBuy.remaining} owner=${bestBuy.owner.substring(0, 25)}...`);
-        console.log(`[MatchingEngine] Best SELL: ${sellPriceDisplay} qty=${bestSell.remaining} owner=${bestSell.owner.substring(0, 25)}...`);
-        
-        // Check why they might not match
-        const canCross = (bestBuy.price === null) || (bestSell.price === null) || (bestBuy.price >= bestSell.price);
-        if (canCross) {
-          console.log(`[MatchingEngine] 📊 Prices can match (buy=${buyPriceDisplay}, sell=${sellPriceDisplay})`);
-          if (bestBuy.owner === bestSell.owner) {
-            console.log(`[MatchingEngine] ⚠️ Same owner - self-trade (now allowed)`);
-          }
-        } else {
-          const spread = bestSell.price - bestBuy.price;
-          console.log(`[MatchingEngine] No spread cross: ${buyPriceDisplay} < ${sellPriceDisplay} (spread: ${spread.toFixed(2)})`);
-        }
-      }
-      
-      // Find and execute matches
-      await this.findAndExecuteMatches(tradingPair, sortedBuys, sortedSells, adminToken);
+
+      console.log(`[MatchingEngine] ${tradingPair}: ${buyOrders.length} buys (${lockedBuys} locked), ${sellOrders.length} sells (${lockedSells} locked)`);
+
+      // Find and execute ONE match per cycle (contract IDs become stale after match)
+      await this.findAndExecuteOneMatch(tradingPair, buyOrders, sellOrders, token);
       
     } catch (error) {
-      console.error(`[MatchingEngine] Error processing ${tradingPair}:`, error.message);
-      // Invalidate token on 401 errors so it gets refreshed next cycle
-      if (error.message?.includes('401') || error.message?.includes('security-sensitive') || error.message?.includes('Unauthorized')) {
+      if (error.message?.includes('401') || error.message?.includes('security-sensitive')) {
         this.invalidateToken();
+      }
+      // Don't log every cycle if just no orders
+      if (!error.message?.includes('No contracts found')) {
+        console.error(`[MatchingEngine] Error for ${tradingPair}:`, error.message);
       }
     }
   }
   
   /**
-   * Find and execute matching orders
+   * Find ONE crossing match and execute it
+   * Only one per cycle because contract IDs change after exercise
+   * 
+   * CRITICAL: Only matches orders where BOTH sides have locked Holdings.
+   * Orders without locked Holdings (allocationCid) are skipped.
+   * This ensures every match triggers real DvP settlement with token transfer.
    */
-  async findAndExecuteMatches(tradingPair, buyOrders, sellOrders, adminToken) {
-    let matchCount = 0;
-    
-    outerLoop:
+  async findAndExecuteOneMatch(tradingPair, buyOrders, sellOrders, token) {
+    // Periodically clear stale holding cache so re-placed orders get retried
+    if (Date.now() - this.staleHoldingsLastClear > this.STALE_CACHE_TTL) {
+      if (this.staleHoldings.size > 0) {
+        console.log(`[MatchingEngine] 🗑️ Clearing ${this.staleHoldings.size} stale holding entries`);
+      }
+      this.staleHoldings.clear();
+      this.staleHoldingsLastClear = Date.now();
+    }
+
     for (const buyOrder of buyOrders) {
       for (const sellOrder of sellOrders) {
-        // Skip if already filled (or processed this cycle)
-        if (buyOrder.remaining <= 0 || sellOrder.remaining <= 0) {
+        if (buyOrder.remaining <= 0 || sellOrder.remaining <= 0) continue;
+
+        // REQUIREMENT: Both sides must have locked Holdings for DvP settlement
+        const buyHasLock = buyOrder.lockedHoldingCid && buyOrder.lockedHoldingCid !== '';
+        const sellHasLock = sellOrder.lockedHoldingCid && sellOrder.lockedHoldingCid !== '';
+
+        if (!buyHasLock || !sellHasLock) continue;
+
+        // Skip orders with known-stale holding CIDs (from previous failed settlements)
+        if (this.staleHoldings.has(buyOrder.lockedHoldingCid) ||
+            this.staleHoldings.has(sellOrder.lockedHoldingCid)) {
           continue;
         }
         
-        // Self-trade prevention DISABLED per client request
-        // Market will handle it naturally
-        
-        // Check if orders match
-        // Handle MARKET orders (price is null) - they match at the counterparty's price
+        // Check if orders cross
         const buyPrice = buyOrder.price;
         const sellPrice = sellOrder.price;
-        
-        // Determine if orders can match:
-        // - LIMIT vs LIMIT: buyPrice >= sellPrice
-        // - MARKET BUY vs LIMIT SELL: always matches at sellPrice
-        // - LIMIT BUY vs MARKET SELL: always matches at buyPrice
-        // - MARKET vs MARKET: match at 0 (edge case, shouldn't happen normally)
         let canMatch = false;
         let matchPrice = 0;
-        
+
         if (buyPrice !== null && sellPrice !== null) {
-          // Both are LIMIT orders
           if (buyPrice >= sellPrice) {
             canMatch = true;
-            matchPrice = sellPrice; // Use sell price (maker-taker model)
+            matchPrice = sellPrice; // Maker-taker: use sell (maker) price
           }
         } else if (buyPrice === null && sellPrice !== null) {
-          // MARKET BUY vs LIMIT SELL - always matches at sell price
           canMatch = true;
           matchPrice = sellPrice;
         } else if (buyPrice !== null && sellPrice === null) {
-          // LIMIT BUY vs MARKET SELL - always matches at buy price
           canMatch = true;
           matchPrice = buyPrice;
-        } else {
-          // Both MARKET orders - skip (shouldn't match MARKET vs MARKET)
-          canMatch = false;
         }
-        
-        if (canMatch && matchPrice > 0) {
-          const matchQty = Math.min(buyOrder.remaining, sellOrder.remaining);
+
+        if (!canMatch || matchPrice <= 0) continue;
+
+        const matchQty = Math.min(buyOrder.remaining, sellOrder.remaining);
+        const roundedQty = Math.round(matchQty * 100000000) / 100000000;
+
+        console.log(`[MatchingEngine] ✅ MATCH: BUY ${buyPrice !== null ? buyPrice : 'MARKET'} x ${buyOrder.remaining} ↔ SELL ${sellPrice !== null ? sellPrice : 'MARKET'} x ${sellOrder.remaining}`);
+        console.log(`[MatchingEngine]    Fill: ${roundedQty} @ ${matchPrice}`);
+        console.log(`[MatchingEngine]    Buyer Holding: ${buyOrder.lockedHoldingCid.substring(0, 30)}...`);
+        console.log(`[MatchingEngine]    Seller Holding: ${sellOrder.lockedHoldingCid.substring(0, 30)}...`);
+        console.log(`[MatchingEngine]    DvP Settlement REQUIRED (both sides locked)`);
+
+        try {
+          await this.executeMatch(tradingPair, buyOrder, sellOrder, roundedQty, matchPrice, token);
+          return; // One match per cycle - exit
+        } catch (error) {
+          console.error(`[MatchingEngine] ❌ Match execution failed:`, error.message);
           
-          console.log(`[MatchingEngine] ✅ MATCH FOUND:`);
-          console.log(`  Buy: ${buyOrder.contractId.substring(0, 20)}... @${buyPrice !== null ? buyPrice : 'MARKET'} qty=${buyOrder.remaining}`);
-          console.log(`  Sell: ${sellOrder.contractId.substring(0, 20)}... @${sellPrice !== null ? sellPrice : 'MARKET'} qty=${sellOrder.remaining}`);
-          console.log(`  Match: ${matchQty} @${matchPrice}`);
-          console.log(`  Settlement: DvP (Token Standard with Holdings)`);
-          
-          try {
-            // TOKEN STANDARD: Always use DvP settlement with Holdings
-            await this.executeDvPSettlement(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, adminToken);
-            matchCount++;
-            
-            // IMPORTANT: After FillOrder, the contract IDs change (DAML archives old, creates new)
-            // Mark these orders as "processed this cycle" to avoid CONTRACT_NOT_FOUND errors
-            // Next cycle will fetch fresh contract IDs from Canton
-            buyOrder.remaining = 0;  // Mark as fully processed this cycle
-            sellOrder.remaining = 0;
-            
-            // Break out of both loops - contract IDs are now stale
-            // Next cycle will fetch fresh contract IDs from Canton
-            break outerLoop;
-          } catch (error) {
-            console.error(`[MatchingEngine] Failed to execute match:`, error.message);
-            // Mark orders as processed to avoid retrying with stale contract IDs
-            buyOrder.remaining = 0;
-            break outerLoop;
+          // If DvP failed because a holding was not found (archived/stale),
+          // remember the specific stale holding CID so we don't retry it
+          if (error.message?.includes('could not be found') || 
+              error.message?.includes('CONTRACT_NOT_FOUND') ||
+              error.message?.includes('WRONGLY_TYPED_CONTRACT')) {
+            // Try to identify WHICH holding was stale from the error message
+            const errMsg = error.message || '';
+            let markedAny = false;
+            if (buyOrder.lockedHoldingCid && errMsg.includes(buyOrder.lockedHoldingCid.substring(0, 30))) {
+              this.staleHoldings.add(buyOrder.lockedHoldingCid);
+              console.log(`[MatchingEngine] ⏭️ Buyer holding stale: ${buyOrder.lockedHoldingCid.substring(0, 25)}... (order: ${buyOrder.orderId})`);
+              markedAny = true;
+            }
+            if (sellOrder.lockedHoldingCid && errMsg.includes(sellOrder.lockedHoldingCid.substring(0, 30))) {
+              this.staleHoldings.add(sellOrder.lockedHoldingCid);
+              console.log(`[MatchingEngine] ⏭️ Seller holding stale: ${sellOrder.lockedHoldingCid.substring(0, 25)}... (order: ${sellOrder.orderId})`);
+              markedAny = true;
+            }
+            if (!markedAny) {
+              // Couldn't identify which — mark both to be safe
+              this.staleHoldings.add(buyOrder.lockedHoldingCid);
+              this.staleHoldings.add(sellOrder.lockedHoldingCid);
+              console.log(`[MatchingEngine] ⏭️ Unknown stale holding, marked both (cache: ${this.staleHoldings.size})`);
+            }
+            console.log(`[MatchingEngine] Stale cache size: ${this.staleHoldings.size}`);
+            continue;
           }
+          return; // For other errors, stop matching this cycle
         }
       }
     }
-    
-    if (matchCount > 0) {
-      console.log(`[MatchingEngine] ✅ Executed ${matchCount} matches for ${tradingPair}`);
-    }
   }
-  
-  /**
-   * Round quantity to avoid floating point precision issues
-   * Canton Decimal(10) supports max 10 decimal places
-   */
-  roundQuantity(qty) {
-    // Round to 8 decimal places to avoid precision issues
-    return Math.round(qty * 100000000) / 100000000;
-  }
-  
-  // REMOVED: executeFillOrders - Token Standard uses DvP Settlement instead
-  // All order matching now goes through executeDvPSettlement()
 
   /**
-   * Execute match using DvP (Delivery vs Payment) atomic settlement
+   * Execute a match: Settlement (DvP token swap) + FillOrder on both orders
    * 
-   * This uses the new token standard with Holdings:
-   * - Both parties' locked Holdings are swapped atomically
-   * - Either both succeed or both rollback
-   * - No partial state possible
-   * 
-   * Requirements:
-   * - OrderV3 contracts (with lockedHoldingCid field)
-   * - Holding contracts (locked for each order)
-   * - SettlementInstruction template
+   * For partial fills: after DvP settlement archives the original locked holding,
+   * we must re-lock the remainder holding and update the order's allocationCid
+   * so the order can continue being matched in subsequent cycles.
    */
-  async executeDvPSettlement(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, adminToken) {
-    const settlementService = getSettlementService();
+  async executeMatch(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, token) {
+    const packageId = config.canton.packageIds?.clobExchange;
+    const operatorPartyId = config.canton.operatorPartyId;
     const [baseSymbol, quoteSymbol] = tradingPair.split('/');
     const quoteAmount = matchQty * matchPrice;
-    
-    console.log(`[MatchingEngine] 🔄 Executing DvP settlement...`);
-    console.log(`  Base: ${matchQty} ${baseSymbol}`);
-    console.log(`  Quote: ${quoteAmount} ${quoteSymbol}`);
-    console.log(`  Buyer: ${buyOrder.owner.substring(0, 30)}...`);
-    console.log(`  Seller: ${sellOrder.owner.substring(0, 30)}...`);
-    
+
+    // ═══════════════════════════════════════════════════
+    // STEP 1: DvP Settlement (atomic token swap) - REQUIRED
+    // ═══════════════════════════════════════════════════
+    let tradeContractId = null;
+    let createdHoldings = [];
+
+    console.log(`[MatchingEngine] 🔄 DvP Settlement: ${matchQty} ${baseSymbol} ↔ ${quoteAmount} ${quoteSymbol}`);
     try {
-      // Execute atomic settlement via SettlementService
+      const settlementService = getSettlementService();
       const result = await settlementService.settleMatch({
-        buyOrder: {
-          ...buyOrder,
-          tradingPair,
-          lockedHoldingCid: buyOrder.lockedHoldingCid || buyOrder.holdingCid,
-        },
-        sellOrder: {
-          ...sellOrder,
-          tradingPair,
-          lockedHoldingCid: sellOrder.lockedHoldingCid || sellOrder.holdingCid,
-        },
+        buyOrder: { ...buyOrder, tradingPair },
+        sellOrder: { ...sellOrder, tradingPair },
         fillQuantity: matchQty,
         fillPrice: matchPrice,
-      }, adminToken);
+      }, token);
+
+      tradeContractId = result.tradeContractId;
+      createdHoldings = result.createdHoldings || [];
+      console.log(`[MatchingEngine] ✅ DvP complete: Trade ${tradeContractId?.substring(0, 25)}...`);
+    } catch (settleError) {
+      console.error(`[MatchingEngine] ❌ DvP Settlement failed: ${settleError.message}`);
+      throw new Error(`DvP settlement failed: ${settleError.message}`);
+    }
+
+    // ═══════════════════════════════════════════════════
+    // STEP 2: Handle partial fills - Re-lock remainder holdings
+    // 
+    // After DvP, the original locked holdings are archived. Settlement creates
+    // UNLOCKED remainder holdings for any excess. For partial fills, we must:
+    // 1. Find the remainder holding (same owner, same asset, unlocked)
+    // 2. Lock it for the remaining order quantity
+    // 3. Pass the new locked CID to FillOrder via newAllocationCid
+    // ═══════════════════════════════════════════════════
+    const buyIsPartial = buyOrder.remaining > matchQty;
+    const sellIsPartial = sellOrder.remaining > matchQty;
+
+    let buyNewAllocationCid = null;
+    let sellNewAllocationCid = null;
+
+    if (buyIsPartial || sellIsPartial) {
+      console.log(`[MatchingEngine] 🔄 Partial fill detected - re-locking remainder holdings...`);
+      const holdingTemplateId = config.constants?.TEMPLATE_IDS?.holding ||
+        `${packageId}:Holding:Holding`;
       
-      console.log(`[MatchingEngine] ✅ DvP Settlement complete: Trade ${result.tradeContractId}`);
-      
-      // Broadcast trade
-      const tradeRecord = {
-        tradeId: result.tradeContractId,
+      // For buyer partial fill: remainder is in quoteSymbol (e.g., USDT change)
+      if (buyIsPartial) {
+        const buyRemainder = createdHoldings.find(h => 
+          h.owner === buyOrder.owner && h.symbol === quoteSymbol && !h.locked);
+        if (buyRemainder) {
+          try {
+            console.log(`[MatchingEngine]    Locking buyer remainder: ${buyRemainder.amount} ${quoteSymbol}`);
+            const lockResult = await cantonService.exerciseChoice({
+              token,
+              templateId: holdingTemplateId,
+              contractId: buyRemainder.contractId,
+              choice: 'Holding_Lock',
+              choiceArgument: {
+                lockHolder: operatorPartyId,
+                lockReason: `ORDER:${buyOrder.orderId}`,
+                lockAmount: buyRemainder.amount.toString(),
+              },
+              actAsParty: [buyOrder.owner, operatorPartyId],
+              readAs: [operatorPartyId],
+            });
+            // Extract new locked holding CID from transaction events
+            const events = lockResult?.transaction?.events || [];
+            for (const event of events) {
+              const created = event.created || event.CreatedEvent;
+              if (created?.contractId && created.createArgument?.lock) {
+                buyNewAllocationCid = created.contractId;
+                console.log(`[MatchingEngine]    ✅ Buyer remainder locked: ${buyNewAllocationCid.substring(0, 25)}...`);
+                break;
+              }
+            }
+          } catch (lockErr) {
+            console.error(`[MatchingEngine]    ⚠️ Failed to re-lock buyer remainder: ${lockErr.message}`);
+          }
+        } else {
+          console.log(`[MatchingEngine]    ⚠️ No buyer remainder holding found in settlement events`);
+        }
+      }
+
+      // For seller partial fill: remainder is in baseSymbol (e.g., BTC change)
+      if (sellIsPartial) {
+        const sellRemainder = createdHoldings.find(h => 
+          h.owner === sellOrder.owner && h.symbol === baseSymbol && !h.locked);
+        if (sellRemainder) {
+          try {
+            console.log(`[MatchingEngine]    Locking seller remainder: ${sellRemainder.amount} ${baseSymbol}`);
+            const lockResult = await cantonService.exerciseChoice({
+              token,
+              templateId: holdingTemplateId,
+              contractId: sellRemainder.contractId,
+              choice: 'Holding_Lock',
+              choiceArgument: {
+                lockHolder: operatorPartyId,
+                lockReason: `ORDER:${sellOrder.orderId}`,
+                lockAmount: sellRemainder.amount.toString(),
+              },
+              actAsParty: [sellOrder.owner, operatorPartyId],
+              readAs: [operatorPartyId],
+            });
+            // Extract new locked holding CID
+            const events = lockResult?.transaction?.events || [];
+            for (const event of events) {
+              const created = event.created || event.CreatedEvent;
+              if (created?.contractId && created.createArgument?.lock) {
+                sellNewAllocationCid = created.contractId;
+                console.log(`[MatchingEngine]    ✅ Seller remainder locked: ${sellNewAllocationCid.substring(0, 25)}...`);
+                break;
+              }
+            }
+          } catch (lockErr) {
+            console.error(`[MatchingEngine]    ⚠️ Failed to re-lock seller remainder: ${lockErr.message}`);
+          }
+        } else {
+          console.log(`[MatchingEngine]    ⚠️ No seller remainder holding found in settlement events`);
+        }
+      }
+    }
+
+    // ═══════════════════════════════════════════════════
+    // STEP 3: FillOrder on both Order contracts
+    // For partial fills, pass newAllocationCid to update the order's reference
+    // ═══════════════════════════════════════════════════
+    console.log(`[MatchingEngine] 📝 Filling orders...`);
+
+    // Fill buy order
+    try {
+      const buyFillArg = { fillQuantity: matchQty.toString() };
+      if (buyOrder.isNewPackage) {
+        // Pass the new locked holding CID if partial fill, or null (None) for full fill
+        buyFillArg.newAllocationCid = buyNewAllocationCid ? buyNewAllocationCid : null;
+      }
+      await cantonService.exerciseChoice({
+        token,
+        actAsParty: operatorPartyId,
+        templateId: buyOrder.templateId || `${packageId}:Order:Order`,
+        contractId: buyOrder.contractId,
+        choice: 'FillOrder',
+        choiceArgument: buyFillArg,
+        readAs: [operatorPartyId, buyOrder.owner],
+      });
+      console.log(`[MatchingEngine] ✅ Buy order filled: ${buyOrder.orderId}${buyIsPartial ? ' (partial)' : ' (complete)'}`);
+    } catch (fillError) {
+      console.error(`[MatchingEngine] ❌ Buy FillOrder failed: ${fillError.message}`);
+    }
+
+    // Fill sell order
+    try {
+      const sellFillArg = { fillQuantity: matchQty.toString() };
+      if (sellOrder.isNewPackage) {
+        sellFillArg.newAllocationCid = sellNewAllocationCid ? sellNewAllocationCid : null;
+      }
+      await cantonService.exerciseChoice({
+        token,
+        actAsParty: operatorPartyId,
+        templateId: sellOrder.templateId || `${packageId}:Order:Order`,
+        contractId: sellOrder.contractId,
+        choice: 'FillOrder',
+        choiceArgument: sellFillArg,
+        readAs: [operatorPartyId, sellOrder.owner],
+      });
+      console.log(`[MatchingEngine] ✅ Sell order filled: ${sellOrder.orderId}${sellIsPartial ? ' (partial)' : ' (complete)'}`);
+    } catch (fillError) {
+      console.error(`[MatchingEngine] ❌ Sell FillOrder failed: ${fillError.message}`);
+    }
+
+    // ═══════════════════════════════════════════════════
+    // STEP 4: Broadcast trade via WebSocket
+    // ═══════════════════════════════════════════════════
+    if (global.broadcastWebSocket) {
+      const tradeData = {
+        type: 'NEW_TRADE',
+        tradeId: tradeContractId || `trade-${Date.now()}`,
+        tradingPair,
         buyer: buyOrder.owner,
         seller: sellOrder.owner,
-        tradingPair,
         price: matchPrice.toString(),
         quantity: matchQty.toString(),
         buyOrderId: buyOrder.orderId,
@@ -436,648 +536,27 @@ class MatchingEngine {
         timestamp: new Date().toISOString(),
         settlementType: 'DvP',
       };
-      
-      if (global.broadcastWebSocket) {
-        global.broadcastWebSocket(`trades:${tradingPair}`, {
-          type: 'NEW_TRADE',
-          ...tradeRecord
-        });
-        global.broadcastWebSocket('trades:all', {
-          type: 'NEW_TRADE',
-          ...tradeRecord
-        });
-        global.broadcastWebSocket(`orderbook:${tradingPair}`, {
-          type: 'DVP_SETTLEMENT',
-          buyOrderId: buyOrder.orderId,
-          sellOrderId: sellOrder.orderId,
-          fillQuantity: matchQty,
-          fillPrice: matchPrice,
-        });
-      }
-      
-      return result;
-    } catch (error) {
-      console.error(`[MatchingEngine] ❌ DvP Settlement failed:`, error.message);
-      
-      // If DvP fails, try to cancel the settlement and return locked funds
-      // This is automatic in the Settlement contract - on failure, nothing changes
-      console.log(`[MatchingEngine] Holdings remain locked - manual unlock may be required`);
-      
-      throw error;
-    }
-  }
-  
-  // REMOVED: updateBalancesAfterTrade - Token Standard uses DvP Settlement instead
-  
-  /**
-   * Process order book from UpdateStream (persistent storage)
-   */
-  async processOrderBookFromUpdateStream(tradingPair, buyOrders, sellOrders, adminToken) {
-    try {
-      if (buyOrders.length === 0 || sellOrders.length === 0) {
-        return; // No matches possible
-      }
-      
-      // Sort orders by price-time priority
-      const sortedBuys = this.sortBuyOrders(buyOrders.map(o => ({
-        contractId: o.contractId,
-        orderId: o.orderId,
-        owner: o.owner,
-        orderType: 'BUY',
-        orderMode: o.orderMode || 'LIMIT',
-        price: o.price,
-        quantity: parseFloat(o.quantity) || 0,
-        filled: parseFloat(o.filled) || 0,
-        status: o.status || 'OPEN',
-        timestamp: o.timestamp
-      })));
-      
-      const sortedSells = this.sortSellOrders(sellOrders.map(o => ({
-        contractId: o.contractId,
-        orderId: o.orderId,
-        owner: o.owner,
-        orderType: 'SELL',
-        orderMode: o.orderMode || 'LIMIT',
-        price: o.price,
-        quantity: parseFloat(o.quantity) || 0,
-        filled: parseFloat(o.filled) || 0,
-        status: o.status || 'OPEN',
-        timestamp: o.timestamp
-      })));
-      
-      // Find matches
-      const matches = this.findMatches(sortedBuys, sortedSells);
-      
-      if (matches.length === 0) {
-        return;
-      }
-      
-      console.log(`[MatchingEngine] Found ${matches.length} potential matches for ${tradingPair}`);
-      
-      // Execute each match
-      for (const match of matches) {
-        await this.executeMatchDirect(match, tradingPair, adminToken);
-      }
-    } catch (error) {
-      console.error(`[MatchingEngine] Error processing UpdateStream order book:`, error.message);
-    }
-  }
-
-  /**
-   * Process order book from ReadModel cache
-   */
-  async processOrderBookFromCache(cachedBook, adminToken) {
-    try {
-      const tradingPair = cachedBook.pair;
-      const buyOrders = cachedBook.bids || [];
-      const sellOrders = cachedBook.asks || [];
-      
-      if (buyOrders.length === 0 || sellOrders.length === 0) {
-        return; // No matches possible
-      }
-      
-      console.log(`[MatchingEngine] Processing cached order book: ${tradingPair} (${buyOrders.length} buys, ${sellOrders.length} sells)`);
-      
-      // Sort orders by price-time priority
-      const sortedBuys = this.sortBuyOrders(buyOrders.map(o => ({
-        contractId: o.contractId,
-        owner: o.owner,
-        orderType: 'BUY',
-        orderMode: o.orderMode || 'LIMIT',
-        price: o.price,
-        quantity: o.quantity,
-        filled: o.filled || 0,
-        status: 'OPEN',
-        timestamp: o.timestamp
-      })));
-      
-      const sortedSells = this.sortSellOrders(sellOrders.map(o => ({
-        contractId: o.contractId,
-        owner: o.owner,
-        orderType: 'SELL',
-        orderMode: o.orderMode || 'LIMIT',
-        price: o.price,
-        quantity: o.quantity,
-        filled: o.filled || 0,
-        status: 'OPEN',
-        timestamp: o.timestamp
-      })));
-      
-      // Find matches
-      const matches = this.findMatches(sortedBuys, sortedSells);
-      
-      if (matches.length === 0) {
-        return;
-      }
-      
-      console.log(`[MatchingEngine] Found ${matches.length} potential matches for ${tradingPair}`);
-      
-      // Execute matches via direct order choice (not MasterOrderBook)
-      for (const match of matches) {
-        await this.executeMatchDirect(match, tradingPair, adminToken);
-      }
-    } catch (error) {
-      console.error('[MatchingEngine] Error processing cached order book:', error.message);
-    }
-  }
-  
-  /**
-   * Execute a match directly using Order contracts
-   */
-  async executeMatchDirect(match, tradingPair, adminToken) {
-    try {
-      const { buyOrder, sellOrder } = match;
-      
-      // Self-trade prevention DISABLED per client request
-      // Market will handle it naturally
-      
-      // Calculate match quantity (minimum of remaining quantities)
-      const buyRemaining = (parseFloat(buyOrder.quantity) || 0) - (parseFloat(buyOrder.filled) || 0);
-      const sellRemaining = (parseFloat(sellOrder.quantity) || 0) - (parseFloat(sellOrder.filled) || 0);
-      const matchQuantity = Math.min(buyRemaining, sellRemaining);
-      
-      // Match price (use sell price for maker-taker model)
-      const matchPrice = parseFloat(sellOrder.price) || parseFloat(buyOrder.price) || 0;
-      
-      if (matchQuantity <= 0 || matchPrice <= 0) {
-        console.log(`[MatchingEngine] Invalid match: qty=${matchQuantity}, price=${matchPrice}`);
-        return;
-      }
-      
-      console.log(`[MatchingEngine] Executing match: BUY ${buyOrder.contractId?.substring(0, 15)}... @ ${matchPrice} x ${matchQuantity}`);
-      
-      // Update orders in ReadModel cache
-      const { getReadModelService } = require('./readModelService');
-      const readModel = getReadModelService();
-      
-      // Add trade to UpdateStream for persistence AND in-memory store
-      const tradeId = `trade-${Date.now()}-${Math.random().toString(36).substring(7)}`;
-      const tradeData = {
-        tradeId,
-        tradingPair,
-        buyer: buyOrder.owner,
-        seller: sellOrder.owner,
-        price: matchPrice.toString(),
-        quantity: matchQuantity.toString(),
-        buyOrderId: buyOrder.orderId || buyOrder.contractId,
-        sellOrderId: sellOrder.orderId || sellOrder.contractId,
-        timestamp: new Date().toISOString()
-      };
-      
-      // Create Trade contract on Canton (NO IN-MEMORY CACHE)
-      try {
-        const packageId = config.canton.packageIds?.clobExchange;
-        const operatorPartyId = config.canton.operatorPartyId;
-        const adminToken = await this.getAdminToken();
-        
-        await cantonService.createContractWithTransaction({
-          token: adminToken,
-          actAsParty: [operatorPartyId, buyOrder.owner, sellOrder.owner],
-          templateId: `${packageId}:Trade:Trade`,
-          createArguments: tradeData,
-          readAs: [operatorPartyId, buyOrder.owner, sellOrder.owner]
-        });
-        console.log(`[MatchingEngine] ✅ Trade contract created on Canton: ${tradeId}`);
-      } catch (tradeContractError) {
-        console.error(`[MatchingEngine] Failed to create Trade contract:`, tradeContractError.message);
-      }
-      
-      // Broadcast trade via WebSocket for real-time UI updates
-      if (global.broadcastWebSocket) {
-        const tradeData = {
-          type: 'NEW_TRADE',
-          tradeId,
-          tradingPair,
-          buyer: buyOrder.owner,
-          seller: sellOrder.owner,
-          price: matchPrice.toString(),
-          quantity: matchQuantity.toString(),
-          buyOrderId: buyOrder.orderId || buyOrder.contractId,
-          sellOrderId: sellOrder.orderId || sellOrder.contractId,
-          timestamp: new Date().toISOString()
-        };
-        
-        global.broadcastWebSocket(`trades:${tradingPair}`, tradeData);
-        global.broadcastWebSocket('trades:all', tradeData);
-        console.log(`[MatchingEngine] 📡 Trade broadcasted via WebSocket`);
-      }
-      
-      // Update ReadModel cache
-      if (readModel) {
-        // Mark orders as filled/partially filled in cache
-        const buyFilled = (parseFloat(buyOrder.filled) || 0) + matchQuantity;
-        const sellFilled = (parseFloat(sellOrder.filled) || 0) + matchQuantity;
-        
-        if (buyFilled >= parseFloat(buyOrder.quantity)) {
-          readModel.removeOrder(buyOrder.contractId);
-        }
-        if (sellFilled >= parseFloat(sellOrder.quantity)) {
-          readModel.removeOrder(sellOrder.contractId);
-        }
-      }
-      
-    } catch (error) {
-      console.error(`[MatchingEngine] Error executing match:`, error.message);
-    }
-  }
-
-  /**
-   * Process a single order book
-   */
-  async processOrderBook(orderBook, adminToken) {
-    try {
-      const contractId = orderBook.contractId;
-      const payload = orderBook.payload;
-      const operator = payload.operator;
-      const tradingPair = payload.tradingPair;
-
-      console.log(`[MatchingEngine] Processing order book: ${tradingPair}`);
-
-      // Get all orders for this order book
-      const buyOrderCids = payload.buyOrders || [];
-      const sellOrderCids = payload.sellOrders || [];
-
-      if (buyOrderCids.length === 0 || sellOrderCids.length === 0) {
-        return; // No matches possible
-      }
-
-      // Fetch full order details
-      const buyOrders = await this.fetchOrders(buyOrderCids, adminToken);
-      const sellOrders = await this.fetchOrders(sellOrderCids, adminToken);
-
-      // Sort orders by price-time priority
-      const sortedBuys = this.sortBuyOrders(buyOrders);
-      const sortedSells = this.sortSellOrders(sellOrders);
-
-      // Find matches
-      const matches = this.findMatches(sortedBuys, sortedSells);
-
-      if (matches.length === 0) {
-        return;
-      }
-
-      console.log(`[MatchingEngine] Found ${matches.length} potential matches for ${tradingPair}`);
-
-      // Execute matches
-      for (const match of matches) {
-        await this.executeMatch(contractId, match, operator, adminToken);
-      }
-    } catch (error) {
-      console.error('[MatchingEngine] Error processing order book:', error.message);
-    }
-  }
-
-  /**
-   * Get ledger end offset
-   */
-  async getLedgerEndOffset(adminToken) {
-    const response = await fetch(`${config.canton.jsonApiBase}/v2/state/ledger-end`, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${adminToken}`,
-        'Content-Type': 'application/json',
-      },
-    });
-
-    if (!response.ok) {
-      throw new Error(`Failed to get ledger end: ${response.status}`);
-    }
-
-    const data = await response.json();
-    return data.offset || data.ledgerEnd || '0';
-  }
-
-  /**
-   * Query active contracts by template using Canton JSON API v2 format
-   * POST /v2/state/active-contracts
-   * https://docs.digitalasset.com/build/3.5/reference/json-api/openapi.html
-   */
-  async queryContracts(templateId, adminToken, limit = 100) {
-    // Get current ledger end
-    const activeAtOffset = await this.getLedgerEndOffset(adminToken);
-
-    // Use actual operator party ID from config
-    const operatorPartyId = config.canton.operatorPartyId;
-
-    // Canton JSON API v2 filter format - use templateFilters (NOT inclusive/templateIds)
-    const response = await fetch(`${config.canton.jsonApiBase}/v2/state/active-contracts`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${adminToken}`,
-      },
-      body: JSON.stringify({
-        filter: {
-          filtersByParty: {
-            [operatorPartyId]: {
-              // Canton JSON API v2 uses templateFilters array
-              templateFilters: [{
-                templateId: templateId,
-                includeCreatedEventBlob: false
-              }]
-            }
-          }
-        },
-        verbose: false,
-        activeAtOffset: activeAtOffset,
-        pageSize: limit
-      }),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      
-      // Handle 200 element limit gracefully
-      if (errorText.includes('JSON_API_MAXIMUM_LIST_ELEMENTS_NUMBER_REACHED')) {
-        console.log('[MatchingEngine] ℹ️ 200+ contracts found, using smaller page size');
-        return []; // Return empty - let caller handle
-      }
-      
-      console.error('[MatchingEngine] Query error details:', {
-        status: response.status,
-        statusText: response.statusText,
-        errorText: errorText.substring(0, 200),
-        templateId: templateId,
-        operatorPartyId: operatorPartyId
+      global.broadcastWebSocket(`trades:${tradingPair}`, tradeData);
+      global.broadcastWebSocket('trades:all', tradeData);
+      global.broadcastWebSocket(`orderbook:${tradingPair}`, {
+        type: 'TRADE_EXECUTED',
+        buyOrderId: buyOrder.orderId,
+        sellOrderId: sellOrder.orderId,
+        fillQuantity: matchQty,
+        fillPrice: matchPrice,
       });
-      throw new Error(`Failed to query contracts: ${response.status}`);
     }
 
-    const data = await response.json();
-    const contracts = data.activeContracts || [];
-
-    console.log(`[MatchingEngine] Found ${contracts.length} contracts for template`);
-
-    return contracts.map(c => ({
-      contractId: c.contractId || c.contract_id,
-      payload: c.payload || c.argument || c.createArgument,
-    }));
+    console.log(`[MatchingEngine] ═══ Match complete: ${matchQty} ${baseSymbol} @ ${matchPrice} ${quoteSymbol} ═══`);
   }
 
-  getMasterOrderBookTemplateId() {
-    const packageId = config.canton.packageIds?.clobExchange || config.canton.packageIds?.masterOrderBook;
-    if (!packageId) {
-      throw new Error('Missing package ID for MasterOrderBook template');
-    }
-    return {
-      packageId,
-      moduleName: 'MasterOrderBook',
-      entityName: 'MasterOrderBook',
-    };
-  }
-
-  /**
-   * Fetch order contracts
-   */
-  async fetchOrders(orderCids, adminToken) {
-    const orders = [];
-
-    for (const cid of orderCids) {
-      try {
-        const order = await this.fetchContract(cid, adminToken);
-        if (order) {
-          orders.push({
-            contractId: cid,
-            ...order.payload,
-          });
-        }
-      } catch (error) {
-        console.warn('[MatchingEngine] Failed to fetch order:', cid, error.message);
-      }
-    }
-
-    return orders;
-  }
-
-  /**
-   * Fetch single contract using correct endpoint
-   */
-  async fetchContract(contractId, adminToken) {
-    // Use centralized config - NO HARDCODED FALLBACKS
-    const cantonApiBase = config.canton.jsonApiBase;
-    if (!cantonApiBase) {
-      throw new Error('CANTON_JSON_LEDGER_API_BASE is required');
-    }
-
-    const response = await fetch(`${cantonApiBase}/v2/contracts/lookup`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${adminToken}`,
-      },
-      body: JSON.stringify({
-        contractId: contractId,
-      }),
-    });
-
-    if (!response.ok) {
-      console.warn('[MatchingEngine] Failed to fetch contract:', contractId, response.status);
-      return null;
-    }
-
-    const data = await response.json();
-    return {
-      contractId: data.contractId || contractId,
-      payload: data.payload || data.argument,
-    };
-  }
-
-  /**
-   * Sort buy orders (highest price first, then earliest timestamp)
-   */
-  sortBuyOrders(orders) {
-    return orders.sort((a, b) => {
-      // Market orders (no price) have highest priority
-      if (!a.price && b.price) return -1;
-      if (a.price && !b.price) return 1;
-      if (!a.price && !b.price) {
-        return new Date(a.timestamp) - new Date(b.timestamp);
-      }
-
-      // Higher price has priority
-      const priceA = parseFloat(a.price);
-      const priceB = parseFloat(b.price);
-
-      if (priceA > priceB) return -1;
-      if (priceA < priceB) return 1;
-
-      // Same price: earlier timestamp wins
-      return new Date(a.timestamp) - new Date(b.timestamp);
-    });
-  }
-
-  /**
-   * Sort sell orders (lowest price first, then earliest timestamp)
-   */
-  sortSellOrders(orders) {
-    return orders.sort((a, b) => {
-      // Market orders (no price) have highest priority
-      if (!a.price && b.price) return -1;
-      if (a.price && !b.price) return 1;
-      if (!a.price && !b.price) {
-        return new Date(a.timestamp) - new Date(b.timestamp);
-      }
-
-      // Lower price has priority
-      const priceA = parseFloat(a.price);
-      const priceB = parseFloat(b.price);
-
-      if (priceA < priceB) return -1;
-      if (priceA > priceB) return 1;
-
-      // Same price: earlier timestamp wins
-      return new Date(a.timestamp) - new Date(b.timestamp);
-    });
-  }
-
-  /**
-   * Find matching orders
-   * NOTE: Self-trade prevention DISABLED per client request - market handles it naturally
-   */
-  findMatches(buyOrders, sellOrders) {
-    const matches = [];
-
-    for (const buyOrder of buyOrders) {
-      for (const sellOrder of sellOrders) {
-        // Self-trade prevention DISABLED per client request
-        // Market will handle it naturally
-
-        // Check if orders can match
-        if (this.canOrdersMatch(buyOrder, sellOrder)) {
-          matches.push({
-            buyOrderCid: buyOrder.contractId,
-            sellOrderCid: sellOrder.contractId,
-            buyOrder,
-            sellOrder,
-          });
-
-          // For now, only match one pair per cycle to avoid conflicts
-          // In production, you might want to batch multiple non-conflicting matches
-          break;
-        }
-      }
-
-      if (matches.length > 0) break;
-    }
-
-    return matches;
-  }
-
-  /**
-   * Check if two orders can match
-   */
-  canOrdersMatch(buyOrder, sellOrder) {
-    // Both must have remaining quantity
-    const buyRemaining = parseFloat(buyOrder.quantity) - parseFloat(buyOrder.filled || 0);
-    const sellRemaining = parseFloat(sellOrder.quantity) - parseFloat(sellOrder.filled || 0);
-
-    if (buyRemaining <= 0 || sellRemaining <= 0) {
-      return false;
-    }
-
-    // Check price overlap
-    if (buyOrder.price && sellOrder.price) {
-      const buyPrice = parseFloat(buyOrder.price);
-      const sellPrice = parseFloat(sellOrder.price);
-      return buyPrice >= sellPrice;
-    }
-
-    // Market orders always match
-    return true;
-  }
-
-  /**
-   * Execute a match
-   */
-  async executeMatch(orderBookCid, match, operator, adminToken) {
-    try {
-      console.log('[MatchingEngine] Executing match:');
-      console.log('  Buy Order:', match.buyOrderCid.substring(0, 20) + '...');
-      console.log('  Sell Order:', match.sellOrderCid.substring(0, 20) + '...');
-
-      // Call MatchOrders choice on OrderBook using proper exerciseChoice
-      const result = await cantonService.exerciseChoice({
-        token: adminToken,
-        actAsParty: operator,
-        templateId: this.getMasterOrderBookTemplateId(),
-        contractId: orderBookCid,
-        choice: 'MatchOrders',
-        choiceArgument: {
-          buyCid: match.buyOrderCid,
-          sellCid: match.sellOrderCid,
-        },
-        readAs: [operator],
-      });
-
-      console.log('[MatchingEngine] ✓ Match executed successfully');
-
-      recordTradesFromResult(result);
-
-      // Emit WebSocket event for real-time updates
-      this.emitMatchEvent(match, result);
-
-      // Mark as processed
-      this.lastProcessedOrders.add(match.buyOrderCid);
-      this.lastProcessedOrders.add(match.sellOrderCid);
-
-      // Clean up old entries (keep last 1000)
-      if (this.lastProcessedOrders.size > 1000) {
-        const arr = Array.from(this.lastProcessedOrders);
-        this.lastProcessedOrders = new Set(arr.slice(-1000));
-      }
-    } catch (error) {
-      console.error('[MatchingEngine] Error executing match:', error.message);
-    }
-  }
-
-  /**
-   * Emit match event via WebSocket
-   */
-  emitMatchEvent(match, result) {
-    try {
-      // Use global broadcast function if available
-      if (global.broadcastWebSocket) {
-        const tradingPair = match.buyOrder.tradingPair || 'UNKNOWN';
-
-        // Broadcast to orderbook channel
-        global.broadcastWebSocket(`orderbook:${tradingPair}`, {
-          type: 'MATCH',
-          buyOrderCid: match.buyOrderCid,
-          sellOrderCid: match.sellOrderCid,
-          timestamp: new Date().toISOString(),
-        });
-
-        // Broadcast to trades channel
-        global.broadcastWebSocket(`trades:${tradingPair}`, {
-          type: 'NEW_TRADE',
-          tradingPair: tradingPair,
-          timestamp: new Date().toISOString(),
-        });
-
-        console.log('[MatchingEngine] ✓ WebSocket events emitted');
-      }
-    } catch (error) {
-      console.error('[MatchingEngine] Error emitting WebSocket event:', error.message);
-    }
-  }
-
-  /**
-   * Sleep helper
-   */
-  sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  /**
-   * Update polling interval
-   */
   setPollingInterval(ms) {
     this.pollingInterval = ms;
-    console.log('[MatchingEngine] Polling interval updated to:', ms, 'ms');
+    console.log(`[MatchingEngine] Polling interval: ${ms}ms`);
   }
 }
 
-// Singleton instance
+// Singleton
 let matchingEngineInstance = null;
 
 function getMatchingEngine() {
