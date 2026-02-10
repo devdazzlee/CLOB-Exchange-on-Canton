@@ -187,7 +187,7 @@ export default function TradingInterface({ partyId }) {
       
       // Wait briefly for Canton to fully commit the new order before refreshing
       await new Promise(r => setTimeout(r, 800));
-
+      
       // Refresh order book using the same aggregated format as initial load
       try {
         const bookData = await getGlobalOrderBook(orderData.tradingPair || tradingPair);
@@ -519,28 +519,50 @@ export default function TradingInterface({ partyId }) {
           return;
         }
         
-        // Handle TRADE_EXECUTED event - update order book and user orders in real-time
+        // Handle TRADE_EXECUTED event - refresh order book from backend
+        // We refresh instead of locally removing because partial fills should
+        // keep the order in the book with reduced quantity
         if (data?.type === 'TRADE_EXECUTED') {
           console.log('[WebSocket] Trade executed:', data.buyOrderId, 'vs', data.sellOrderId);
-          // Order book will be refreshed by the next poll or full update
-          // But we need to remove/update the matched orders immediately for responsiveness
-          setOrderBook(prev => ({
-            buys: (prev.buys || []).filter(o => o.orderId !== data.buyOrderId),
-            sells: (prev.sells || []).filter(o => o.orderId !== data.sellOrderId)
-          }));
+          // Small delay for Canton propagation, then fetch fresh aggregated data
+          setTimeout(async () => {
+            try {
+              const freshBook = await getGlobalOrderBook(tradingPair);
+              if (freshBook) {
+                setOrderBook({
+                  buys: freshBook.buyOrders || [],
+                  sells: freshBook.sellOrders || []
+                });
+              }
+            } catch (e) {
+              console.warn('[WebSocket] Failed to refresh order book after trade:', e);
+            }
+          }, 800);
           return;
         }
         
-        // Handle ORDER_CANCELLED event
+        // Handle ORDER_CANCELLED event — refresh from API so aggregated levels update
         if (data?.type === 'ORDER_CANCELLED') {
           console.log('[WebSocket] Order cancelled:', data.orderId);
-          setOrderBook(prev => ({
-            buys: (prev.buys || []).filter(o => o.orderId !== data.orderId && o.contractId !== data.contractId),
-            sells: (prev.sells || []).filter(o => o.orderId !== data.orderId && o.contractId !== data.contractId)
-          }));
+          // Remove from user's local orders immediately for snappy UX
           if (data.owner === partyId) {
             setOrders(prev => prev.filter(o => o.id !== data.orderId && o.contractId !== data.contractId));
           }
+          // Refresh the full aggregated order book from API (aggregated levels don't have orderId)
+          setTimeout(async () => {
+            try {
+              const freshBook = await getGlobalOrderBook(tradingPair);
+              if (freshBook) {
+                setOrderBook({
+                  buys: freshBook.buyOrders || [],
+                  sells: freshBook.sellOrders || []
+                });
+                console.log('[WebSocket] Order book refreshed after ORDER_CANCELLED');
+              }
+            } catch (e) {
+              console.warn('[WebSocket] Failed to refresh order book after cancel:', e);
+            }
+          }, 800);
           return;
         }
         
@@ -579,13 +601,13 @@ export default function TradingInterface({ partyId }) {
             const side = isBuyer ? 'BUY' : 'SELL';
             const qty = parseFloat(data.quantity || 0);
             const price = parseFloat(data.price || 0);
-            const [base] = tradingPair.split('/');
+            const [base, quote] = tradingPair.split('/');
 
             console.log(`[WebSocket] 🎯 User's ${side} order matched! ${qty} ${base} @ ${price}`);
 
             // Show trade executed toast
             toast.success(
-              `${qty} ${base} @ ${price.toLocaleString()} — ${(qty * price).toLocaleString()} USDT`, 
+              `${qty} ${base} @ ${price.toLocaleString()} — ${(qty * price).toLocaleString()} ${quote || 'USDT'}`, 
               {
                 title: `🎯 ${side} Order Filled!`,
                 duration: 6000
@@ -765,12 +787,12 @@ export default function TradingInterface({ partyId }) {
   // Load balance from Holdings (Token Standard V2) - useCallback so it can be called from child components
   const loadBalance = useCallback(async (showLoader = false) => {
     if (!partyId) return;
-    
-    try {
+
+      try {
       // Always show loading when explicitly requested (e.g., refresh button)
       if (showLoader) {
-        setBalanceLoading(true);
-      }
+          setBalanceLoading(true);
+        }
       console.log('[Balance V2] Loading Holdings-based balance for party:', partyId);
       
       // TOKEN STANDARD V2: Load balance from Holding contracts (includes CBTC)
@@ -785,26 +807,26 @@ export default function TradingInterface({ partyId }) {
           });
           setBalance(dynamicBalance);
           console.log('[Balance V2] Holdings balance loaded:', dynamicBalance);
-          hasLoadedBalanceRef.current = true;
-          return;
-        }
+              hasLoadedBalanceRef.current = true;
+              return;
+            }
         
         // No Holdings found - show empty balance (no hardcoded defaults)
         console.log('[Balance V2] No Holdings found - user needs to mint tokens or accept transfers');
         setBalance({});
-        hasLoadedBalanceRef.current = true;
-      } catch (balanceError) {
+          hasLoadedBalanceRef.current = true;
+        } catch (balanceError) {
         console.error('[Balance V2] Holdings fetch failed:', balanceError);
         setBalance({});
-        hasLoadedBalanceRef.current = true;
-      }
-    } catch (error) {
+          hasLoadedBalanceRef.current = true;
+        }
+      } catch (error) {
       console.error('[Balance V2] Failed to load balance:', error);
       setBalance({});
-      hasLoadedBalanceRef.current = true;
-    } finally {
-      setBalanceLoading(false);
-    }
+        hasLoadedBalanceRef.current = true;
+      } finally {
+        setBalanceLoading(false);
+      }
   }, [partyId]);
 
   // Effect to load balance on mount and periodically

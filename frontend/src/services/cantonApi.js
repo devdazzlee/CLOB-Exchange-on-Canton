@@ -156,7 +156,8 @@ export async function getAvailableTradingPairs(_party = null) {
 
 export async function getGlobalOrderBook(tradingPair) {
   // Use aggregated order book endpoint (Milestone 3)
-  const res = await fetch(`${API_BASE_URL}/orderbooks/${encodeURIComponent(tradingPair)}?aggregate=true&precision=2&depth=50`, { 
+  // Use precision=8 so small prices (e.g. 0.005 vs 0.009) aren't incorrectly merged
+  const res = await fetch(`${API_BASE_URL}/orderbooks/${encodeURIComponent(tradingPair)}?aggregate=true&precision=8&depth=50`, { 
     method: 'GET' 
   });
   const json = await res.json().catch(() => ({}));
