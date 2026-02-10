@@ -734,6 +734,53 @@ class HoldingService {
             }
           }
         }
+        // ── Deduct FILLED amounts from Fill-Only orders (Splice holdings) ──
+        // Fill-Only mode mints new custom Holdings for recipients, but the original
+        // Splice holdings are never consumed. Orders tagged with allocationCid="FILL_ONLY"
+        // or empty allocationCid (older Splice orders) need their filled amounts deducted
+        // to prevent double-counting (original Splice holding + minted credit).
+        const filledNonDvpOrders = (Array.isArray(orderContracts) ? orderContracts : []).filter(c => {
+          const p = c.payload || {};
+          const filled = parseFloat(p.filled || 0);
+          // Orders that used Fill-Only matching:
+          // - allocationCid === "FILL_ONLY" (tagged by matching engine)
+          // - allocationCid is empty/NONE (Splice holdings that skipped lock)
+          const allocCid = p.allocationCid || '';
+          const isFillOnly = allocCid === 'FILL_ONLY' || allocCid === '' || allocCid === 'NONE';
+          return p.owner === partyId && filled > 0 && isFillOnly;
+        });
+
+        if (filledNonDvpOrders.length > 0) {
+          console.log(`[HoldingService] Found ${filledNonDvpOrders.length} Fill-Only orders with fills – deducting spent amounts`);
+        }
+
+        for (const c of filledNonDvpOrders) {
+          const p = c.payload || {};
+          const pair = p.tradingPair || '';
+          const [baseAsset, quoteAsset] = pair.split('/');
+          if (!baseAsset || !quoteAsset) continue;
+
+          const filled = parseFloat(p.filled || 0);
+          const priceVal = parseFloat(
+            typeof p.price === 'object' && p.price?.Some !== undefined ? p.price.Some : p.price
+          ) || 0;
+
+          // Determine which asset was SPENT in this trade
+          let debitAsset, debitAmount;
+          if (p.orderType === 'BUY') {
+            // Buyer spent quote asset (e.g., CBTC to buy CC)
+            debitAsset = quoteAsset;
+            debitAmount = priceVal > 0 ? filled * priceVal : filled;
+          } else {
+            // Seller spent base asset (e.g., CC to sell for CBTC)
+            debitAsset = baseAsset;
+            debitAmount = filled;
+          }
+
+          if (debitAmount > 0 && balances[debitAsset] !== undefined) {
+            balances[debitAsset] = (balances[debitAsset] || 0) - debitAmount;
+          }
+        }
       } catch (orderQueryErr) {
         console.warn(`[HoldingService] Could not query orders for balance deduction: ${orderQueryErr.message}`);
         // Non-fatal – balance will just not reflect order commitments

@@ -428,6 +428,36 @@ class MatchingEngine {
     }
 
     // ═══════════════════════════════════════════════════
+    // STEP 1b: Credit recipients with actual token holdings (Fill-Only only)
+    // 
+    // DvP atomically swaps Holdings, but Fill-Only mode doesn't move tokens.
+    // We mint new custom Holdings so balances actually change:
+    //   - Buyer receives baseAmount of base asset (e.g., CC they bought)
+    //   - Seller receives quoteAmount of quote asset (e.g., CBTC they received)
+    // The "debit" side is handled by balance calc deducting filled order amounts.
+    // ═══════════════════════════════════════════════════
+    if (!useDvP) {
+      try {
+        const { getHoldingService } = require('./holdingService');
+        const holdingService = getHoldingService();
+        await holdingService.initialize();
+
+        // Credit buyer with base asset (what they bought)
+        console.log(`[MatchingEngine] 💰 Crediting buyer with ${matchQty} ${baseSymbol}...`);
+        await holdingService.mintDirect(buyOrder.owner, baseSymbol, matchQty, token);
+        console.log(`[MatchingEngine] ✅ Buyer credited: +${matchQty} ${baseSymbol}`);
+
+        // Credit seller with quote asset (payment received)
+        console.log(`[MatchingEngine] 💰 Crediting seller with ${quoteAmount} ${quoteSymbol}...`);
+        await holdingService.mintDirect(sellOrder.owner, quoteSymbol, quoteAmount, token);
+        console.log(`[MatchingEngine] ✅ Seller credited: +${quoteAmount} ${quoteSymbol}`);
+      } catch (mintErr) {
+        console.error(`[MatchingEngine] ⚠️ Token credit failed (non-critical): ${mintErr.message}`);
+        // Trade record + order fills still succeeded - balance reconciled on next cycle
+      }
+    }
+
+    // ═══════════════════════════════════════════════════
     // STEP 2: Handle partial fills - Re-lock remainder holdings (DvP only)
     // 
     // After DvP, the original locked holdings are archived. Settlement creates
@@ -534,8 +564,13 @@ class MatchingEngine {
     try {
       const buyFillArg = { fillQuantity: matchQty.toString() };
       if (buyOrder.isNewPackage) {
-        // Pass the new locked holding CID if partial fill, or null (None) for full fill
-        buyFillArg.newAllocationCid = buyNewAllocationCid ? buyNewAllocationCid : null;
+        if (useDvP) {
+          // DvP: Pass the new locked holding CID if partial fill, or null (None) for full fill
+          buyFillArg.newAllocationCid = buyNewAllocationCid ? buyNewAllocationCid : null;
+        } else {
+          // Fill-Only: Tag the order so balance service knows tokens were exchanged
+          buyFillArg.newAllocationCid = 'FILL_ONLY';
+        }
       }
       await cantonService.exerciseChoice({
         token,
@@ -555,7 +590,11 @@ class MatchingEngine {
     try {
       const sellFillArg = { fillQuantity: matchQty.toString() };
       if (sellOrder.isNewPackage) {
-        sellFillArg.newAllocationCid = sellNewAllocationCid ? sellNewAllocationCid : null;
+        if (useDvP) {
+          sellFillArg.newAllocationCid = sellNewAllocationCid ? sellNewAllocationCid : null;
+        } else {
+          sellFillArg.newAllocationCid = 'FILL_ONLY';
+        }
       }
       await cantonService.exerciseChoice({
         token,
