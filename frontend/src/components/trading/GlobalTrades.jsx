@@ -42,10 +42,11 @@ export default function GlobalTrades({ tradingPair, limit = 50 }) {
   useEffect(() => {
     loadTrades();
     
-    // Set up polling for new trades (every 30 seconds)
+    // Poll for new trades — faster when WebSocket is unavailable (degraded mode)
+    const tradesPollMs = websocketService.isDegraded ? 5000 : 30000;
     const pollInterval = setInterval(() => {
       loadTrades();
-    }, 30000);
+    }, tradesPollMs);
 
     return () => {
       clearInterval(pollInterval);

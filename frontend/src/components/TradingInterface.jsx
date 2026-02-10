@@ -716,7 +716,8 @@ export default function TradingInterface({ partyId }) {
     websocketService.subscribe(`orderbook:${tradingPair}`, orderBookCallback);
     websocketService.subscribe(`trades:${tradingPair}`, tradeCallback);
 
-    // Poll order book (legacy API)
+    // Poll order book — faster when WebSocket is unavailable (degraded mode)
+    const pollInterval = websocketService.isDegraded ? 5000 : 30000;
     interval = setInterval(async () => {
       if (!isLoadingRef.current) {
         try {
@@ -732,7 +733,7 @@ export default function TradingInterface({ partyId }) {
           console.error('[TradingInterface] Failed to poll order book:', error);
         }
       }
-    }, 30000);
+    }, pollInterval);
 
     return () => {
       if (interval) clearInterval(interval);
@@ -747,7 +748,9 @@ export default function TradingInterface({ partyId }) {
 
     const loadUserOrders = async (isInitial = false) => {
       try {
-        const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
+        // Fetch all orders (not just OPEN) so we can see FILLED/CANCELLED transitions
+        // This is critical when WebSocket is unavailable (Vercel serverless)
+        const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId));
         const ordersList = ordersData?.data?.orders || [];
         
           const formattedOrders = ordersList.map(order => ({
@@ -758,7 +761,7 @@ export default function TradingInterface({ partyId }) {
             price: order.price,
             quantity: order.quantity,
             filled: order.filled || '0',
-          remaining: order.remaining,
+            remaining: order.remaining,
             status: order.status,
             tradingPair: order.tradingPair,
             timestamp: order.timestamp
@@ -779,7 +782,9 @@ export default function TradingInterface({ partyId }) {
     };
 
     loadUserOrders(true);
-    const ordersInterval = setInterval(() => loadUserOrders(false), 10000);
+    // Poll faster when WebSocket is unavailable
+    const ordersPollInterval = websocketService.isDegraded ? 5000 : 10000;
+    const ordersInterval = setInterval(() => loadUserOrders(false), ordersPollInterval);
     
     return () => clearInterval(ordersInterval);
   }, [partyId]);

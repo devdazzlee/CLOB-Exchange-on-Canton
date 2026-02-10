@@ -12,7 +12,8 @@ const TradingTest = ({ partyId }) => {
       setTestData('Component is working!');
       
       // Test API call
-      fetch('http://localhost:3001/api/orderbooks')
+      const apiBase = import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ? 'http://localhost:3001/api' : '/api');
+      fetch(`${apiBase}/orderbooks`)
         .then(res => res.json())
         .then(data => {
           console.log('[TradingTest] API response:', data);
