@@ -445,7 +445,7 @@ class CantonService {
    * Note: activeAtOffset is required. If not provided, fetches from ledger-end first.
    * Supports pagination to handle large result sets (Canton has 200 element limit)
    */
-  async queryActiveContracts({ party, templateIds = [], interfaceIds = [], activeAtOffset = null, verbose = false, pageSize = 100, pageToken = null }, token) {
+  async queryActiveContracts({ party, templateIds = [], interfaceIds = [], activeAtOffset = null, verbose = false, pageSize = 100, pageToken = null, _splitQuery = false }, token) {
     const url = `${this.jsonApiBase}/v2/state/active-contracts`;
 
     // If activeAtOffset not provided, fetch from ledger-end (required field)
@@ -492,14 +492,14 @@ class CantonService {
       // Add template filters
       if (templates.length > 0) {
         filters.push(...templates.map(t => ({
-          identifierFilter: {
-            TemplateFilter: {
-              value: {
-                templateId: typeof t === 'string' ? t : `${t.packageId}:${t.moduleName}:${t.entityName}`,
-                includeCreatedEventBlob: false
+            identifierFilter: {
+              TemplateFilter: {
+                value: {
+                  templateId: typeof t === 'string' ? t : `${t.packageId}:${t.moduleName}:${t.entityName}`,
+                  includeCreatedEventBlob: false
+                }
               }
             }
-          }
         })));
       }
       
@@ -572,20 +572,35 @@ class CantonService {
       };
     }
 
+    // ─── Pagination loop ─────────────────────────────────────────────────
+    // Canton JSON API v2 has a hard limit of ~200 total elements per response.
+    // We use a smaller pageSize and follow nextPageToken to get ALL results.
+    // ────────────────────────────────────────────────────────────────────
+    const allContracts = [];
+    let currentPageToken = pageToken || null;
+    let effectivePageSize = Math.min(pageSize, 100); // Cap at 100 to stay under 200 limit
+    let iterations = 0;
+    const maxIterations = 20; // Safety limit (20 × 100 = 2000 contracts max)
+    let loggedQuery = false;
+
+    // Use while(true) with explicit breaks so that 'continue' for page-size
+    // retries works correctly (a do-while condition would exit on null pageToken).
+    while (iterations < maxIterations) {
     const body = {
       filter: filter,
       verbose: verbose,
-      activeAtOffset: effectiveOffset, // Required field
-      pageSize: pageSize, // Limit results per page to avoid 200 element limit
-    };
-    
-    // Add page token for pagination
-    if (pageToken) {
-      body.pageToken = pageToken;
-    }
+        activeAtOffset: effectiveOffset,
+        pageSize: effectivePageSize,
+      };
+      
+      if (currentPageToken) {
+        body.pageToken = currentPageToken;
+      }
 
-    console.log(`[CantonService] POST ${url}`);
-    console.log(`[CantonService] Querying for party: ${party || 'any'}, templates: ${templateIds.join(', ') || 'all'}, offset: ${effectiveOffset}, pageSize: ${pageSize}`);
+      if (!loggedQuery) {
+        console.log(`[CantonService] Querying for party: ${party || 'any'}, templates: ${templateIds.join(', ') || 'all'}, offset: ${effectiveOffset}, pageSize: ${effectivePageSize}`);
+        loggedQuery = true;
+      }
 
     const res = await fetch(url, {
       method: "POST",
@@ -601,12 +616,48 @@ class CantonService {
     if (!res.ok) {
       const error = parseCantonError(text, res.status);
       
-      // Handle the 200 element limit gracefully - this is NOT an error, just a Canton limitation
-      // Canton JSON API has a hard limit of 200 total matching elements
+      // Handle the 200 element limit
       if (error.code === 'JSON_API_MAXIMUM_LIST_ELEMENTS_NUMBER_REACHED') {
-        console.log(`[CantonService] ℹ️ Query has 200+ contracts. Using cached data instead (Canton limit: 200)`);
-        // Return empty array - caller should use cached/ReadModel data
-        return [];
+        // If we have multiple templates, split into individual queries and merge
+        const currentTemplateIds = templateIds.filter(t => !(typeof t === 'string' && t.startsWith('#')));
+        if (currentTemplateIds.length > 1 && !body._splitQuery) {
+          console.log(`[CantonService] ℹ️ 200+ contracts with ${currentTemplateIds.length} templates. Splitting into individual queries...`);
+          const mergedResults = [];
+          for (const singleTemplate of currentTemplateIds) {
+            try {
+              const singleResult = await this.queryActiveContracts({
+                party, templateIds: [singleTemplate], interfaceIds: interfaceIds || [],
+                activeAtOffset: effectiveOffset, verbose, pageSize: effectivePageSize,
+                pageToken: null, _splitQuery: true
+              }, token);
+              if (Array.isArray(singleResult)) {
+                mergedResults.push(...singleResult);
+              }
+            } catch (splitErr) {
+              console.warn(`[CantonService] ⚠️ Split query for ${singleTemplate} failed: ${splitErr.message}`);
+            }
+          }
+          console.log(`[CantonService] ✅ Split query returned ${mergedResults.length} total contracts`);
+          return mergedResults;
+        }
+        
+        // Single template but still 200+ — try to get partial results
+        console.warn(`[CantonService] ⚠️ 200+ contracts for single template query (pageSize=${effectivePageSize}). Raw error: ${text.substring(0, 200)}`);
+        try {
+          const errorResult = JSON.parse(text);
+          const partialContracts = errorResult.activeContracts || [];
+          if (partialContracts.length > 0) {
+            allContracts.push(...this._normalizeContracts(partialContracts));
+            console.log(`[CantonService] 📋 Extracted ${partialContracts.length} partial contracts from error response`);
+          }
+          if (errorResult.nextPageToken) {
+            currentPageToken = errorResult.nextPageToken;
+            effectivePageSize = Math.min(effectivePageSize, 50);
+            iterations++;
+            continue;
+          }
+        } catch (_) { /* Can't parse error response */ }
+        break;
       }
       
       console.error(`[CantonService] ❌ Query failed:`, error);
@@ -615,19 +666,40 @@ class CantonService {
 
     const result = JSON.parse(text);
     const rawContracts = result.activeContracts || result || [];
-    console.log(`[CantonService] ✅ Found ${rawContracts.length || 0} contracts`);
+      
+      allContracts.push(...this._normalizeContracts(rawContracts));
+      
+      // Check for next page
+      currentPageToken = result.nextPageToken || null;
+      iterations++;
+      
+      if (currentPageToken) {
+        if (iterations > 1) {
+          console.log(`[CantonService] 📄 Page ${iterations}: +${rawContracts.length} contracts (total: ${allContracts.length})`);
+        }
+      } else {
+        // No more pages — exit loop
+        break;
+      }
+    }
 
-    // Canton JSON API v2 returns contracts wrapped in:
-    // [{workflowId, contractEntry: {JsActiveContract: {createdEvent: {...}, synchronizerId}}}]
-    // Normalize to a simple format for consumers
-    const contracts = rawContracts.map(item => {
+    console.log(`[CantonService] ✅ Found ${allContracts.length} contracts${iterations > 1 ? ` (${iterations} pages)` : ''}`);
+    return allContracts;
+  }
+
+  /**
+   * Normalize Canton JSON API v2 contract format to a simple flat format.
+   * Canton wraps contracts in: [{contractEntry: {JsActiveContract: {createdEvent: {...}}}}]
+   */
+  _normalizeContracts(rawContracts) {
+    return (Array.isArray(rawContracts) ? rawContracts : []).map(item => {
       if (item.contractEntry?.JsActiveContract) {
         const activeContract = item.contractEntry.JsActiveContract;
         const createdEvent = activeContract.createdEvent || {};
         return {
           contractId: createdEvent.contractId,
           templateId: createdEvent.templateId,
-          payload: createdEvent.createArgument, // The actual contract data
+          payload: createdEvent.createArgument,
           createArgument: createdEvent.createArgument,
           signatories: createdEvent.signatories,
           observers: createdEvent.observers,
@@ -637,11 +709,8 @@ class CantonService {
           createdAt: createdEvent.createdAt
         };
       }
-      // Fallback for other response formats
       return item;
     });
-
-    return contracts;
   }
   
   /**

@@ -219,9 +219,10 @@ class SettlementService {
   async settleMatch(match, adminToken) {
     const { buyOrder, sellOrder, fillQuantity, fillPrice } = match;
 
-    // Calculate amounts
-    const baseAmount = fillQuantity;
-    const quoteAmount = fillQuantity * fillPrice;
+    // Calculate amounts — use toFixed(10) to avoid JS floating point issues
+    // e.g. 0.07 * 0.04 = 0.0028000000000000004 in JS, but Daml needs exactly 0.0028
+    const baseAmount = parseFloat(parseFloat(fillQuantity).toFixed(10));
+    const quoteAmount = parseFloat((fillQuantity * fillPrice).toFixed(10));
 
     // Extract trading pair info
     const [baseSymbol, quoteSymbol] = buyOrder.tradingPair.split('/');
@@ -248,7 +249,7 @@ class SettlementService {
         quoteSymbol,
         baseAmount,
         quoteAmount,
-        price: fillPrice,
+        price: parseFloat(parseFloat(fillPrice).toFixed(10)),
         buyOrderId: buyOrder.orderId,
         sellOrderId: sellOrder.orderId,
         buyerHoldingCid: buyOrder.lockedHoldingCid,

@@ -82,8 +82,8 @@ class MatchingEngine {
         console.error('[MatchingEngine] Cycle error:', error.message);
         if (error.message?.includes('401') || error.message?.includes('security-sensitive')) {
           this.invalidateToken();
-        }
       }
+    }
       await new Promise(r => setTimeout(r, this.pollingInterval));
     }
     console.log('[MatchingEngine] Stopped');
@@ -162,7 +162,9 @@ class MatchingEngine {
 
         const qty = parseFloat(payload.quantity) || 0;
         const filled = parseFloat(payload.filled) || 0;
-        const remaining = qty - filled;
+        // Round remaining to 10 decimals to avoid JS floating point artifacts
+        // e.g., 1.0 - 0.8 = 0.19999999999999996 → 0.2
+        const remaining = parseFloat((qty - filled).toFixed(10));
 
         if (remaining <= 0) continue;
 
@@ -224,14 +226,14 @@ class MatchingEngine {
       // Find and execute ONE match per cycle (contract IDs become stale after match)
       await this.findAndExecuteOneMatch(tradingPair, buyOrders, sellOrders, token);
       
-    } catch (error) {
+          } catch (error) {
       if (error.message?.includes('401') || error.message?.includes('security-sensitive')) {
         this.invalidateToken();
-      }
+          }
       // Don't log every cycle if just no orders
       if (!error.message?.includes('No contracts found')) {
         console.error(`[MatchingEngine] Error for ${tradingPair}:`, error.message);
-      }
+        }
     }
   }
   
@@ -254,7 +256,7 @@ class MatchingEngine {
       this.staleHoldings.clear();
       this.staleHoldingsLastClear = Date.now();
     }
-
+    
     for (const buyOrder of buyOrders) {
       for (const sellOrder of sellOrders) {
         if (buyOrder.remaining <= 0 || sellOrder.remaining <= 0) continue;
@@ -292,7 +294,8 @@ class MatchingEngine {
         if (!canMatch || matchPrice <= 0) continue;
 
         const matchQty = Math.min(buyOrder.remaining, sellOrder.remaining);
-        const roundedQty = Math.round(matchQty * 100000000) / 100000000;
+        // Round to 10 decimal places (Canton Numeric 10 precision) to avoid floating point artifacts
+        const roundedQty = parseFloat(matchQty.toFixed(10));
 
         // Determine settlement mode
         const useDvP = buyHasLock && sellHasLock;
@@ -303,7 +306,7 @@ class MatchingEngine {
           console.log(`[MatchingEngine]    Buyer Holding: ${buyOrder.lockedHoldingCid.substring(0, 30)}...`);
           console.log(`[MatchingEngine]    Seller Holding: ${sellOrder.lockedHoldingCid.substring(0, 30)}...`);
           console.log(`[MatchingEngine]    Mode: DvP Settlement (both sides locked)`);
-        } else {
+    } else {
           console.log(`[MatchingEngine]    Mode: Fill-Only (buy locked: ${buyHasLock}, sell locked: ${sellHasLock})`);
         }
 
@@ -338,7 +341,7 @@ class MatchingEngine {
       }
     }
   }
-
+  
   /**
    * Execute a match: Settlement (DvP token swap) + FillOrder on both orders
    * 
@@ -351,11 +354,13 @@ class MatchingEngine {
    * so the order can continue being matched in subsequent cycles.
    */
   async executeMatch(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, token, useDvP = true) {
-    const packageId = config.canton.packageIds?.clobExchange;
-    const operatorPartyId = config.canton.operatorPartyId;
+        const packageId = config.canton.packageIds?.clobExchange;
+        const operatorPartyId = config.canton.operatorPartyId;
     const [baseSymbol, quoteSymbol] = tradingPair.split('/');
-    const quoteAmount = matchQty * matchPrice;
-
+    // Use string-based multiplication to avoid JavaScript floating point errors
+    // e.g., 0.1 * 0.05 = 0.005000000000000001 in JS, but we need exactly 0.005
+    const quoteAmount = parseFloat((matchQty * matchPrice).toFixed(10));
+    
     // ═══════════════════════════════════════════════════
     // STEP 1: DvP Settlement (atomic token swap) — only if both sides locked
     // ═══════════════════════════════════════════════════
@@ -382,7 +387,44 @@ class MatchingEngine {
       }
     } else {
       console.log(`[MatchingEngine] 📋 Fill-only mode: ${matchQty} ${baseSymbol} @ ${matchPrice} ${quoteSymbol} (no DvP)`);
-      tradeContractId = `trade-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+      
+      // Create Trade contract on Canton for record keeping (even without DvP settlement)
+      try {
+        const tradeId = `trade-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+        const tradeResult = await cantonService.createContract({
+          token,
+          templateId: `${packageId}:Settlement:Trade`,
+          createArguments: {
+            tradeId: tradeId,
+            operator: operatorPartyId,
+        buyer: buyOrder.owner,
+        seller: sellOrder.owner,
+            baseInstrumentId: {
+              issuer: operatorPartyId,
+              symbol: baseSymbol,
+              version: '1.0',
+            },
+            quoteInstrumentId: {
+              issuer: operatorPartyId,
+              symbol: quoteSymbol,
+              version: '1.0',
+            },
+            baseAmount: matchQty.toString(),
+            quoteAmount: quoteAmount.toString(),
+        price: matchPrice.toString(),
+            buyOrderId: buyOrder.orderId,
+            sellOrderId: sellOrder.orderId,
+            timestamp: new Date().toISOString(),
+          },
+          actAsParty: [operatorPartyId],
+          readAs: [operatorPartyId, buyOrder.owner, sellOrder.owner],
+        });
+        tradeContractId = tradeResult?.contractId || tradeId;
+        console.log(`[MatchingEngine] ✅ Trade record created: ${tradeContractId?.substring(0, 25)}...`);
+      } catch (tradeErr) {
+        console.warn(`[MatchingEngine] ⚠️ Trade record creation failed (non-critical): ${tradeErr.message}`);
+        tradeContractId = `trade-${Date.now()}`;
+      }
     }
 
     // ═══════════════════════════════════════════════════
@@ -557,10 +599,10 @@ class MatchingEngine {
     }
 
     // Broadcast via WebSocket for real-time UI updates
-    if (global.broadcastWebSocket) {
+      if (global.broadcastWebSocket) {
       global.broadcastWebSocket(`trades:${tradingPair}`, { type: 'NEW_TRADE', ...tradeRecord });
       global.broadcastWebSocket('trades:all', { type: 'NEW_TRADE', ...tradeRecord });
-      global.broadcastWebSocket(`orderbook:${tradingPair}`, {
+        global.broadcastWebSocket(`orderbook:${tradingPair}`, {
         type: 'TRADE_EXECUTED',
         buyOrderId: buyOrder.orderId,
         sellOrderId: sellOrder.orderId,

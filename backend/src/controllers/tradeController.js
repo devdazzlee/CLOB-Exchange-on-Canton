@@ -3,6 +3,11 @@
  * 
  * ALL DATA FROM CANTON API - NO IN-MEMORY CACHE
  * Queries Trade contracts directly from Canton ledger
+ * 
+ * Trade template is Settlement:Trade with fields:
+ *   tradeId, operator, buyer, seller, baseInstrumentId, quoteInstrumentId,
+ *   baseAmount, quoteAmount, price, buyOrderId, sellOrderId, timestamp
+ * Signatory: operator. Observer: buyer, seller.
  */
 
 const { success, error } = require('../utils/response');
@@ -15,68 +20,83 @@ class TradeController {
   /**
    * Query trades directly from Canton API
    * 
-   * Since Trade template has signatory buyer, seller (not operator),
-   * we need to query as the trade participants. We get the list of 
-   * known parties from UserAccount contracts and query trades for each.
+   * Trade contracts are signed by operator, so we query as operator.
+   * Template: Settlement:Trade (in the clobExchange package)
    */
   async queryTradesFromCanton(filterFn, limit = 50) {
     const token = await tokenProvider.getServiceToken();
     const packageId = config.canton.packageIds?.clobExchange;
+    const legacyPackageId = config.canton.packageIds?.legacy;
     const operatorPartyId = config.canton.operatorPartyId;
     
     if (!packageId) {
       throw new Error('CLOB_EXCHANGE_PACKAGE_ID not configured');
     }
 
-    // First, get all known parties from UserAccount contracts
-    const userAccounts = await cantonService.queryActiveContracts({
-      party: operatorPartyId,
-      templateIds: [`${packageId}:UserAccount:UserAccount`],
-      pageSize: 200
-    }, token);
+    // Query Trade contracts as operator (signatory on Trade template)
+    // Settlement:Trade exists ONLY in the current package (TOKEN_STANDARD_PACKAGE_ID)
+    // Trade:Trade exists ONLY in the legacy package (LEGACY_PACKAGE_ID)
+    // Canton API rejects the entire query if ANY template ID is invalid,
+    // so we must query each package's templates separately and merge results.
+    let contracts = [];
 
-    const knownParties = (Array.isArray(userAccounts) ? userAccounts : [])
-      .map(c => (c.payload || c.createArgument || {}).party)
-      .filter(Boolean);
+    // 1. Query current package for Settlement:Trade
+    try {
+      const currentPkgContracts = await cantonService.queryActiveContracts({
+        party: operatorPartyId,
+        templateIds: [`${packageId}:Settlement:Trade`],
+        pageSize: Math.min(limit * 2, 200)
+      }, token);
+      if (Array.isArray(currentPkgContracts)) {
+        contracts = contracts.concat(currentPkgContracts);
+      }
+    } catch (e) {
+      console.warn(`[TradeController] Settlement:Trade query failed: ${e.message}`);
+    }
 
-    // Query trades for each known party (they're signatories on Trade)
-    const allTradeContractIds = new Set();
-    const allTrades = [];
-
-    for (const partyId of knownParties) {
+    // 2. Query legacy package for Trade:Trade (if different package)
+    if (legacyPackageId && legacyPackageId !== packageId) {
       try {
-        const contracts = await cantonService.queryActiveContracts({
-          party: partyId,
-          templateIds: [`${packageId}:Trade:Trade`],
+        const legacyContracts = await cantonService.queryActiveContracts({
+          party: operatorPartyId,
+          templateIds: [`${legacyPackageId}:Trade:Trade`],
           pageSize: Math.min(limit * 2, 200)
         }, token);
-
-        for (const c of (Array.isArray(contracts) ? contracts : [])) {
-          // Dedupe by contractId
-          if (!allTradeContractIds.has(c.contractId)) {
-            allTradeContractIds.add(c.contractId);
-            const payload = c.payload || c.createArgument || {};
-            allTrades.push({
-              contractId: c.contractId,
-              tradeId: payload.tradeId,
-              tradingPair: payload.tradingPair,
-              buyer: payload.buyer,
-              seller: payload.seller,
-              price: payload.price,
-              quantity: payload.quantity,
-              buyOrderId: payload.buyOrderId,
-              sellOrderId: payload.sellOrderId,
-              timestamp: payload.timestamp
-            });
-          }
+        if (Array.isArray(legacyContracts)) {
+          contracts = contracts.concat(legacyContracts);
         }
       } catch (e) {
-        // Continue with other parties
-        console.error(`[TradeController] Failed to query trades for party ${partyId.substring(0, 30)}...:`, e.message);
+        console.warn(`[TradeController] Legacy Trade:Trade query failed: ${e.message}`);
       }
     }
 
-    // Apply filter, sort by timestamp, and limit
+    const allTrades = [];
+    for (const c of (Array.isArray(contracts) ? contracts : [])) {
+      const payload = c.payload || c.createArgument || {};
+      
+      // Derive tradingPair from instrument IDs
+      const baseSymbol = payload.baseInstrumentId?.symbol || '';
+      const quoteSymbol = payload.quoteInstrumentId?.symbol || '';
+      const tradingPair = (baseSymbol && quoteSymbol) 
+        ? `${baseSymbol}/${quoteSymbol}` 
+        : (payload.tradingPair || 'UNKNOWN');
+
+      allTrades.push({
+        contractId: c.contractId,
+        tradeId: payload.tradeId,
+        tradingPair,
+        buyer: payload.buyer,
+        seller: payload.seller,
+        price: payload.price,
+        quantity: payload.baseAmount || payload.quantity,
+        quoteAmount: payload.quoteAmount,
+        buyOrderId: payload.buyOrderId,
+        sellOrderId: payload.sellOrderId,
+        timestamp: payload.timestamp,
+      });
+    }
+
+    // Apply filter, sort by timestamp (newest first), and limit
     return allTrades
       .filter(filterFn || (() => true))
       .sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0))

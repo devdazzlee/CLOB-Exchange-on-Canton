@@ -148,12 +148,17 @@ class OrderBookService {
 
     /**
      * Get trades - DIRECTLY from Canton API
+     * 
+     * Trade template is Settlement:Trade with fields:
+     *   tradeId, operator, buyer, seller, baseInstrumentId, quoteInstrumentId,
+     *   baseAmount, quoteAmount, price, buyOrderId, sellOrderId, timestamp
      */
     async getTrades(tradingPair, limit = 50) {
         console.log(`[OrderBookService] Querying Canton DIRECTLY for trades: ${tradingPair}`);
         
         const token = await tokenProvider.getServiceToken();
         const packageId = config.canton.packageIds?.clobExchange;
+        const legacyPackageId = config.canton.packageIds?.legacy;
         const operatorPartyId = config.canton.operatorPartyId;
 
         if (!packageId || !operatorPartyId) {
@@ -161,30 +166,66 @@ class OrderBookService {
         }
 
         try {
-            const contracts = await cantonService.queryActiveContracts({
-                party: operatorPartyId,
-                templateIds: [`${packageId}:Trade:Trade`],
-                pageSize: limit
-            }, token);
+            // Settlement:Trade exists ONLY in current package (TOKEN_STANDARD_PACKAGE_ID)
+            // Trade:Trade exists ONLY in legacy package (LEGACY_PACKAGE_ID)
+            // Canton API rejects entire query if ANY template ID is invalid,
+            // so query each package separately and merge.
+            let contracts = [];
+
+            // 1. Current package: Settlement:Trade
+            try {
+                const currentContracts = await cantonService.queryActiveContracts({
+                    party: operatorPartyId,
+                    templateIds: [`${packageId}:Settlement:Trade`],
+                    pageSize: limit
+                }, token);
+                if (Array.isArray(currentContracts)) {
+                    contracts = contracts.concat(currentContracts);
+                }
+            } catch (e) {
+                console.warn(`[OrderBookService] Settlement:Trade query failed: ${e.message}`);
+            }
+
+            // 2. Legacy package: Trade:Trade (if different)
+            if (legacyPackageId && legacyPackageId !== packageId) {
+                try {
+                    const legacyContracts = await cantonService.queryActiveContracts({
+                        party: operatorPartyId,
+                        templateIds: [`${legacyPackageId}:Trade:Trade`],
+                        pageSize: limit
+                    }, token);
+                    if (Array.isArray(legacyContracts)) {
+                        contracts = contracts.concat(legacyContracts);
+                    }
+                } catch (e) {
+                    console.warn(`[OrderBookService] Legacy Trade:Trade query failed: ${e.message}`);
+                }
+            }
 
             const trades = (Array.isArray(contracts) ? contracts : [])
-                .filter(c => {
-                    const payload = c.payload || c.createArgument || {};
-                    return payload.tradingPair === tradingPair;
-                })
                 .map(c => {
                     const payload = c.payload || c.createArgument || {};
-        return {
+                    // Derive tradingPair from instrument IDs
+                    const baseSymbol = payload.baseInstrumentId?.symbol || '';
+                    const quoteSymbol = payload.quoteInstrumentId?.symbol || '';
+                    const pair = (baseSymbol && quoteSymbol)
+                        ? `${baseSymbol}/${quoteSymbol}`
+                        : (payload.tradingPair || '');
+                    return {
                         contractId: c.contractId,
                         tradeId: payload.tradeId,
-                        tradingPair: payload.tradingPair,
+                        tradingPair: pair,
                         buyer: payload.buyer,
                         seller: payload.seller,
                         price: payload.price,
-                        quantity: payload.quantity,
-                        timestamp: payload.timestamp
+                        quantity: payload.baseAmount || payload.quantity,
+                        quoteAmount: payload.quoteAmount,
+                        buyOrderId: payload.buyOrderId,
+                        sellOrderId: payload.sellOrderId,
+                        timestamp: payload.timestamp,
                     };
                 })
+                .filter(t => t.tradingPair === tradingPair)
                 .sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0))
                 .slice(0, limit);
 
