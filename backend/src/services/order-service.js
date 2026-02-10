@@ -573,16 +573,19 @@ class OrderService {
     }
 
     // TOKEN STANDARD: Unlock the Holding before cancelling
-    if (orderDetails?.allocationCid) {
+    // Only unlock if allocationCid is a real contract ID (not a marker like "FILL_ONLY", "NONE", or "")
+    const allocCid = orderDetails?.allocationCid || '';
+    const isRealAllocation = allocCid && allocCid !== 'FILL_ONLY' && allocCid !== 'NONE' && allocCid.length >= 40;
+    if (isRealAllocation) {
       try {
-        await this.unlockHoldingsForOrder(token, partyId, orderDetails.allocationCid);
+        await this.unlockHoldingsForOrder(token, partyId, allocCid);
         console.log(`[OrderService] TOKEN STANDARD: Holding unlocked for cancelled order`);
       } catch (unlockErr) {
         console.warn('[OrderService] Could not unlock Holding:', unlockErr.message);
         // Continue with cancellation even if unlock fails
       }
     } else {
-      console.log('[OrderService] No allocationCid on order - skipping unlock');
+      console.log(`[OrderService] No real allocationCid on order (${allocCid || 'empty'}) - skipping unlock`);
     }
 
     // Exercise CancelOrder choice on the Order contract
@@ -636,7 +639,9 @@ class OrderService {
           e.created?.createArguments?.status === 'CANCELLED'
         );
         const fallbackAllocationCid = createdEvent?.created?.createArguments?.allocationCid;
-        if (fallbackAllocationCid) {
+        const isFallbackReal = fallbackAllocationCid && fallbackAllocationCid !== 'FILL_ONLY' && 
+          fallbackAllocationCid !== 'NONE' && fallbackAllocationCid.length >= 40;
+        if (isFallbackReal) {
           console.log(`[OrderService] Found allocationCid from cancel result: ${fallbackAllocationCid.substring(0, 30)}...`);
           try {
             await this.unlockHoldingsForOrder(token, partyId, fallbackAllocationCid);

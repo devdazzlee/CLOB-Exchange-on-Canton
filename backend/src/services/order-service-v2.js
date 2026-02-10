@@ -284,7 +284,10 @@ class OrderServiceV2 {
       const lockedHoldingCid = orderAllocationCid;
 
       let unlockedHoldingCid = null;
-      if (lockedHoldingCid && lockedHoldingCid !== '') {
+      // Only unlock if allocationCid is a real contract ID (not a marker like "FILL_ONLY", "NONE")
+      const isRealLock = lockedHoldingCid && lockedHoldingCid !== '' && 
+        lockedHoldingCid !== 'FILL_ONLY' && lockedHoldingCid !== 'NONE' && lockedHoldingCid.length >= 40;
+      if (isRealLock) {
         try {
           console.log(`[OrderServiceV2] Unlocking holding: ${lockedHoldingCid.substring(0, 30)}...`);
           const unlockResult = await cantonService.exerciseChoice({

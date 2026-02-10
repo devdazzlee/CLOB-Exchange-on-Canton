@@ -185,7 +185,13 @@ class MatchingEngine {
           timestamp: payload.timestamp,
           tradingPair: payload.tradingPair,
           // Locked Holding CID for DvP settlement
-          lockedHoldingCid: payload.allocationCid || null,
+          // IMPORTANT: "FILL_ONLY", "NONE", and empty strings are markers, not real contract IDs.
+          // Only treat as locked if it looks like an actual Canton contract ID (hex, 128+ chars).
+          lockedHoldingCid: (() => {
+            const cid = payload.allocationCid || '';
+            if (!cid || cid === 'FILL_ONLY' || cid === 'NONE' || cid.length < 40) return null;
+            return cid;
+          })(),
           // Track which package/templateId this order was created with
           templateId: contractTemplateId,
           isNewPackage: isNewPackage,
