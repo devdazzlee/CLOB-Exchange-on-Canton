@@ -239,9 +239,11 @@ class MatchingEngine {
    * Find ONE crossing match and execute it
    * Only one per cycle because contract IDs change after exercise
    * 
-   * CRITICAL: Only matches orders where BOTH sides have locked Holdings.
-   * Orders without locked Holdings (allocationCid) are skipped.
-   * This ensures every match triggers real DvP settlement with token transfer.
+   * Matching modes:
+   * 1. DvP mode: Both sides have locked Holdings → full DvP settlement with atomic token swap
+   * 2. Fill-only mode: One or both sides lack locked Holdings (e.g., Splice/CC/CBTC tokens
+   *    that can't use custom Holding_Lock) → exercise FillOrder on both orders without DvP.
+   *    The operator ensures token settlement separately.
    */
   async findAndExecuteOneMatch(tradingPair, buyOrders, sellOrders, token) {
     // Periodically clear stale holding cache so re-placed orders get retried
@@ -257,17 +259,16 @@ class MatchingEngine {
       for (const sellOrder of sellOrders) {
         if (buyOrder.remaining <= 0 || sellOrder.remaining <= 0) continue;
 
-        // REQUIREMENT: Both sides must have locked Holdings for DvP settlement
+        // Self-trade prevention disabled per client request (comment at top of file)
+        // Uncomment the following to prevent self-trades:
+        // if (buyOrder.owner === sellOrder.owner) continue;
+
         const buyHasLock = buyOrder.lockedHoldingCid && buyOrder.lockedHoldingCid !== '';
         const sellHasLock = sellOrder.lockedHoldingCid && sellOrder.lockedHoldingCid !== '';
 
-        if (!buyHasLock || !sellHasLock) continue;
-
         // Skip orders with known-stale holding CIDs (from previous failed settlements)
-        if (this.staleHoldings.has(buyOrder.lockedHoldingCid) ||
-            this.staleHoldings.has(sellOrder.lockedHoldingCid)) {
-          continue;
-        }
+        if (buyHasLock && this.staleHoldings.has(buyOrder.lockedHoldingCid)) continue;
+        if (sellHasLock && this.staleHoldings.has(sellOrder.lockedHoldingCid)) continue;
         
         // Check if orders cross
         const buyPrice = buyOrder.price;
@@ -293,44 +294,44 @@ class MatchingEngine {
         const matchQty = Math.min(buyOrder.remaining, sellOrder.remaining);
         const roundedQty = Math.round(matchQty * 100000000) / 100000000;
 
+        // Determine settlement mode
+        const useDvP = buyHasLock && sellHasLock;
+
         console.log(`[MatchingEngine] ✅ MATCH: BUY ${buyPrice !== null ? buyPrice : 'MARKET'} x ${buyOrder.remaining} ↔ SELL ${sellPrice !== null ? sellPrice : 'MARKET'} x ${sellOrder.remaining}`);
         console.log(`[MatchingEngine]    Fill: ${roundedQty} @ ${matchPrice}`);
-        console.log(`[MatchingEngine]    Buyer Holding: ${buyOrder.lockedHoldingCid.substring(0, 30)}...`);
-        console.log(`[MatchingEngine]    Seller Holding: ${sellOrder.lockedHoldingCid.substring(0, 30)}...`);
-        console.log(`[MatchingEngine]    DvP Settlement REQUIRED (both sides locked)`);
+        if (useDvP) {
+          console.log(`[MatchingEngine]    Buyer Holding: ${buyOrder.lockedHoldingCid.substring(0, 30)}...`);
+          console.log(`[MatchingEngine]    Seller Holding: ${sellOrder.lockedHoldingCid.substring(0, 30)}...`);
+          console.log(`[MatchingEngine]    Mode: DvP Settlement (both sides locked)`);
+        } else {
+          console.log(`[MatchingEngine]    Mode: Fill-Only (buy locked: ${buyHasLock}, sell locked: ${sellHasLock})`);
+        }
 
         try {
-          await this.executeMatch(tradingPair, buyOrder, sellOrder, roundedQty, matchPrice, token);
+          await this.executeMatch(tradingPair, buyOrder, sellOrder, roundedQty, matchPrice, token, useDvP);
           return; // One match per cycle - exit
         } catch (error) {
           console.error(`[MatchingEngine] ❌ Match execution failed:`, error.message);
           
-          // If DvP failed because a holding was not found (archived/stale),
-          // remember the specific stale holding CID so we don't retry it
-          if (error.message?.includes('could not be found') || 
+          // If DvP failed, try Fill-Only as a fallback
+          // This handles Splice holdings (CC/CBTC) that can't be locked on-chain
+          if (useDvP && (error.message?.includes('could not be found') || 
               error.message?.includes('CONTRACT_NOT_FOUND') ||
-              error.message?.includes('WRONGLY_TYPED_CONTRACT')) {
-            // Try to identify WHICH holding was stale from the error message
-            const errMsg = error.message || '';
-            let markedAny = false;
-            if (buyOrder.lockedHoldingCid && errMsg.includes(buyOrder.lockedHoldingCid.substring(0, 30))) {
-              this.staleHoldings.add(buyOrder.lockedHoldingCid);
-              console.log(`[MatchingEngine] ⏭️ Buyer holding stale: ${buyOrder.lockedHoldingCid.substring(0, 25)}... (order: ${buyOrder.orderId})`);
-              markedAny = true;
+              error.message?.includes('WRONGLY_TYPED_CONTRACT') ||
+              error.message?.includes('DvP settlement failed'))) {
+            console.log(`[MatchingEngine] 🔄 DvP failed — retrying as Fill-Only...`);
+            try {
+              await this.executeMatch(tradingPair, buyOrder, sellOrder, roundedQty, matchPrice, token, false);
+              console.log(`[MatchingEngine] ✅ Fill-Only fallback succeeded`);
+              return; // Match succeeded
+            } catch (fallbackError) {
+              console.error(`[MatchingEngine] ❌ Fill-Only fallback also failed: ${fallbackError.message}`);
+              // Mark holdings as stale so we don't retry DvP on them
+              if (buyHasLock) this.staleHoldings.add(buyOrder.lockedHoldingCid);
+              if (sellHasLock) this.staleHoldings.add(sellOrder.lockedHoldingCid);
+              console.log(`[MatchingEngine] Stale cache size: ${this.staleHoldings.size}`);
+              continue;
             }
-            if (sellOrder.lockedHoldingCid && errMsg.includes(sellOrder.lockedHoldingCid.substring(0, 30))) {
-              this.staleHoldings.add(sellOrder.lockedHoldingCid);
-              console.log(`[MatchingEngine] ⏭️ Seller holding stale: ${sellOrder.lockedHoldingCid.substring(0, 25)}... (order: ${sellOrder.orderId})`);
-              markedAny = true;
-            }
-            if (!markedAny) {
-              // Couldn't identify which — mark both to be safe
-              this.staleHoldings.add(buyOrder.lockedHoldingCid);
-              this.staleHoldings.add(sellOrder.lockedHoldingCid);
-              console.log(`[MatchingEngine] ⏭️ Unknown stale holding, marked both (cache: ${this.staleHoldings.size})`);
-            }
-            console.log(`[MatchingEngine] Stale cache size: ${this.staleHoldings.size}`);
-            continue;
           }
           return; // For other errors, stop matching this cycle
         }
@@ -341,42 +342,51 @@ class MatchingEngine {
   /**
    * Execute a match: Settlement (DvP token swap) + FillOrder on both orders
    * 
+   * Two modes:
+   * - useDvP=true:  Full DvP settlement (requires locked holdings) + FillOrder
+   * - useDvP=false: Fill-only (exercise FillOrder on both orders, no token swap)
+   * 
    * For partial fills: after DvP settlement archives the original locked holding,
    * we must re-lock the remainder holding and update the order's allocationCid
    * so the order can continue being matched in subsequent cycles.
    */
-  async executeMatch(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, token) {
+  async executeMatch(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, token, useDvP = true) {
     const packageId = config.canton.packageIds?.clobExchange;
     const operatorPartyId = config.canton.operatorPartyId;
     const [baseSymbol, quoteSymbol] = tradingPair.split('/');
     const quoteAmount = matchQty * matchPrice;
 
     // ═══════════════════════════════════════════════════
-    // STEP 1: DvP Settlement (atomic token swap) - REQUIRED
+    // STEP 1: DvP Settlement (atomic token swap) — only if both sides locked
     // ═══════════════════════════════════════════════════
     let tradeContractId = null;
     let createdHoldings = [];
 
-    console.log(`[MatchingEngine] 🔄 DvP Settlement: ${matchQty} ${baseSymbol} ↔ ${quoteAmount} ${quoteSymbol}`);
-    try {
-      const settlementService = getSettlementService();
-      const result = await settlementService.settleMatch({
-        buyOrder: { ...buyOrder, tradingPair },
-        sellOrder: { ...sellOrder, tradingPair },
-        fillQuantity: matchQty,
-        fillPrice: matchPrice,
-      }, token);
+    if (useDvP) {
+      console.log(`[MatchingEngine] 🔄 DvP Settlement: ${matchQty} ${baseSymbol} ↔ ${quoteAmount} ${quoteSymbol}`);
+      try {
+        const settlementService = getSettlementService();
+        const result = await settlementService.settleMatch({
+          buyOrder: { ...buyOrder, tradingPair },
+          sellOrder: { ...sellOrder, tradingPair },
+          fillQuantity: matchQty,
+          fillPrice: matchPrice,
+        }, token);
 
-      tradeContractId = result.tradeContractId;
-      createdHoldings = result.createdHoldings || [];
-      console.log(`[MatchingEngine] ✅ DvP complete: Trade ${tradeContractId?.substring(0, 25)}...`);
-    } catch (settleError) {
-      console.error(`[MatchingEngine] ❌ DvP Settlement failed: ${settleError.message}`);
-      throw new Error(`DvP settlement failed: ${settleError.message}`);
+        tradeContractId = result.tradeContractId;
+        createdHoldings = result.createdHoldings || [];
+        console.log(`[MatchingEngine] ✅ DvP complete: Trade ${tradeContractId?.substring(0, 25)}...`);
+      } catch (settleError) {
+        console.error(`[MatchingEngine] ❌ DvP Settlement failed: ${settleError.message}`);
+        throw new Error(`DvP settlement failed: ${settleError.message}`);
+      }
+    } else {
+      console.log(`[MatchingEngine] 📋 Fill-only mode: ${matchQty} ${baseSymbol} @ ${matchPrice} ${quoteSymbol} (no DvP)`);
+      tradeContractId = `trade-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
     }
 
     // ═══════════════════════════════════════════════════
-    // STEP 2: Handle partial fills - Re-lock remainder holdings
+    // STEP 2: Handle partial fills - Re-lock remainder holdings (DvP only)
     // 
     // After DvP, the original locked holdings are archived. Settlement creates
     // UNLOCKED remainder holdings for any excess. For partial fills, we must:
@@ -390,7 +400,7 @@ class MatchingEngine {
     let buyNewAllocationCid = null;
     let sellNewAllocationCid = null;
 
-    if (buyIsPartial || sellIsPartial) {
+    if (useDvP && (buyIsPartial || sellIsPartial)) {
       console.log(`[MatchingEngine] 🔄 Partial fill detected - re-locking remainder holdings...`);
       const holdingTemplateId = config.constants?.TEMPLATE_IDS?.holding ||
         `${packageId}:Holding:Holding`;
@@ -532,7 +542,7 @@ class MatchingEngine {
       buyOrderId: buyOrder.orderId,
       sellOrderId: sellOrder.orderId,
       timestamp: new Date().toISOString(),
-      settlementType: 'DvP',
+      settlementType: useDvP ? 'DvP' : 'FillOnly',
     };
 
     // Add to UpdateStream for persistence (so trades API can serve it)

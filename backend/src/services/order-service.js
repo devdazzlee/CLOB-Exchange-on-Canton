@@ -330,7 +330,10 @@ class OrderService {
         timestamp: timestamp,
         operator: operatorPartyId,
         // TOKEN STANDARD: Store locked Holding reference
-        allocationCid: lockedHoldingInfo?.lockedHoldingCid || ''
+        // IMPORTANT: Only store allocationCid if holding was actually locked on-chain.
+        // Splice holdings (CC/CBTC) can't be locked, so store empty string to signal
+        // the matching engine to use fill-only mode (no DvP settlement).
+        allocationCid: (lockedHoldingInfo?.skippedLock ? '' : lockedHoldingInfo?.lockedHoldingCid) || ''
       },
       readAs: [operatorPartyId, partyId]
     });
