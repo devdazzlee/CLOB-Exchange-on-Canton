@@ -94,11 +94,15 @@ class OrderBookService {
             
             console.log(`[OrderBookService] Filtered: ${buyOrders.length} buys, ${sellOrders.length} sells for ${tradingPair}`);
 
+            // lastPrice should be from the most recent trade, NOT from order book
+            // For now, leave it null — the frontend derives market price from trades[]
+            // which is fetched separately via getTrades(). Using best bid as "lastPrice"
+            // was misleading (showed bid price as "market price" even without any trades).
             return {
                 tradingPair,
                 buyOrders,
                 sellOrders,
-                lastPrice: buyOrders[0]?.price || sellOrders[0]?.price || null,
+                lastPrice: null,
                 timestamp: new Date().toISOString(),
                 source: 'canton-api'
             };

@@ -2,7 +2,6 @@ import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { TrendingUp, TrendingDown } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
-import websocketService from '../../services/websocketService';
 import { cn } from '@/lib/utils';
 import { apiClient, API_ROUTES } from '@/config/config';
 
@@ -38,45 +37,16 @@ export default function GlobalTrades({ tradingPair, limit = 50 }) {
     }
   };
 
-  // Initial load
+  // Initial load + polling (no WebSocket — doesn't work on Vercel)
   useEffect(() => {
     loadTrades();
     
-    // Poll for new trades — faster when WebSocket is unavailable (degraded mode)
-    const tradesPollMs = websocketService.isDegraded ? 5000 : 30000;
+    // Poll every 5 seconds for fresh trade data
     const pollInterval = setInterval(() => {
-      loadTrades();
-    }, tradesPollMs);
+      if (!document.hidden) loadTrades();
+    }, 5000);
 
-    return () => {
-      clearInterval(pollInterval);
-    };
-  }, [tradingPair, limit]);
-
-  // Subscribe to WebSocket for real-time trade updates
-  useEffect(() => {
-    if (!websocketService.isConnected()) {
-      websocketService.connect();
-    }
-
-    const handleTradeUpdate = (data) => {
-      // Check if this trade is for our trading pair (or all pairs if no filter)
-      if (!tradingPair || data.tradingPair === tradingPair) {
-        setTrades(prev => {
-          // Add new trade at the beginning, remove duplicates, limit to 50
-          const newTrades = [data, ...prev.filter(t => t.tradeId !== data.tradeId)];
-          return newTrades.slice(0, limit);
-        });
-      }
-    };
-
-    // Subscribe to trades channel
-    const channel = tradingPair ? `trades:${tradingPair}` : 'trades:all';
-    websocketService.subscribe(channel, handleTradeUpdate);
-
-    return () => {
-      websocketService.unsubscribe(channel, handleTradeUpdate);
-    };
+    return () => clearInterval(pollInterval);
   }, [tradingPair, limit]);
 
   // Format time

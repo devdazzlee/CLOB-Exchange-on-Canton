@@ -52,13 +52,16 @@ export default function MarketData({ tradingPair, orderBook, trades = [] }) {
   const stats = calculate24hStats();
   const isPositive = stats.change >= 0;
 
-  // Get current price from order book or latest trade - REAL DATA ONLY
+  // Get current price — REAL DATA ONLY
+  // Priority: 1) Last trade price, 2) Mid-point of bid/ask, 3) Best bid or ask
   const bestBid = orderBook?.buys?.[0]?.price || null;
   const bestAsk = orderBook?.sells?.[0]?.price || null;
-  
-  const currentPrice = bestBid && bestAsk 
+  const midPrice = bestBid && bestAsk 
     ? (parseFloat(bestBid) + parseFloat(bestAsk)) / 2 
-    : parseFloat(bestBid) || parseFloat(bestAsk) || stats.lastPrice || 0;
+    : parseFloat(bestBid) || parseFloat(bestAsk) || 0;
+  
+  // Last trade price is the TRUE market price (like Binance/Hyperliquid)
+  const currentPrice = stats.lastPrice || midPrice || 0;
 
   const formatPrice = (price) => {
     if (!price || price === 0) return '0.00';

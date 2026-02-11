@@ -24,7 +24,6 @@ import OrderBookSkeleton from './trading/OrderBookSkeleton';
 import TradingPageSkeleton from './trading/TradingPageSkeleton';
 
 // Import services
-import websocketService from '../services/websocketService';
 import { getAvailableTradingPairs, getGlobalOrderBook } from '../services/cantonApi';
 import { apiClient, API_ROUTES } from '../config/config';
 // Token Standard V2 services
@@ -481,215 +480,25 @@ export default function TradingInterface({ partyId }) {
     };
 
     initializeData();
-      
-    if (websocketService && !websocketService.isConnected()) {
-      websocketService.connect();
-    }
   }, [partyId]);
 
   useEffect(() => {
     if (!partyId) return;
 
-    let interval = null;
-    let hasLoadedOrderBook = false;
-    
-    const orderBookCallback = (data) => {
-      try {
-        console.log('[WebSocket] Order book update received:', data?.type || 'FULL_UPDATE');
-        
-        // Handle NEW_ORDER event - add to user's orders if they own it
-        if (data?.type === 'NEW_ORDER') {
-          // Add to order book
-          if (data.tradingPair === tradingPair) {
-            setOrderBook(prev => {
-              const newOrder = {
-                contractId: data.contractId,
-                orderId: data.orderId,
-                price: data.price,
-                quantity: data.quantity,
-                remaining: data.remaining || data.quantity,
-                owner: data.owner,
-                timestamp: data.timestamp
-              };
-              
-              if (data.orderType === 'BUY') {
-                const newBuys = [...(prev.buys || []), newOrder]
-                  .sort((a, b) => parseFloat(b.price || 0) - parseFloat(a.price || 0));
-                return { ...prev, buys: newBuys };
-              } else {
-                const newSells = [...(prev.sells || []), newOrder]
-                  .sort((a, b) => parseFloat(a.price || 0) - parseFloat(b.price || 0));
-                return { ...prev, sells: newSells };
-              }
-            });
-            
-            // If this order belongs to the current user, add to their orders
-            if (data.owner === partyId) {
-              setOrders(prev => [{
-                id: data.orderId,
-                contractId: data.contractId,
-                type: data.orderType,
-                mode: data.orderMode,
-                price: data.price,
-                quantity: data.quantity,
-                filled: '0',
-                status: 'OPEN',
-                tradingPair: data.tradingPair,
-                timestamp: data.timestamp
-              }, ...prev]);
-              console.log('[WebSocket] Added new order to user orders:', data.orderId);
-            }
-          }
-          return;
-        }
-        
-        // Handle TRADE_EXECUTED event - refresh order book from backend
-        // We refresh instead of locally removing because partial fills should
-        // keep the order in the book with reduced quantity
-        if (data?.type === 'TRADE_EXECUTED') {
-          console.log('[WebSocket] Trade executed:', data.buyOrderId, 'vs', data.sellOrderId);
-          // Small delay for Canton propagation, then fetch fresh aggregated data
-          setTimeout(async () => {
-            try {
-              const freshBook = await getGlobalOrderBook(tradingPair);
-              if (freshBook) {
-                setOrderBook({
-                  buys: freshBook.buyOrders || [],
-                  sells: freshBook.sellOrders || []
-                });
-              }
-            } catch (e) {
-              console.warn('[WebSocket] Failed to refresh order book after trade:', e);
-            }
-          }, 800);
-          return;
-        }
-        
-        // Handle ORDER_CANCELLED event — refresh from API so aggregated levels update
-        if (data?.type === 'ORDER_CANCELLED') {
-          console.log('[WebSocket] Order cancelled:', data.orderId);
-          // Remove from user's local orders immediately for snappy UX
-          if (data.owner === partyId) {
-            setOrders(prev => prev.filter(o => o.id !== data.orderId && o.contractId !== data.contractId));
-          }
-          // Refresh the full aggregated order book from API (aggregated levels don't have orderId)
-          setTimeout(async () => {
-            try {
-              const freshBook = await getGlobalOrderBook(tradingPair);
-              if (freshBook) {
-                setOrderBook({
-                  buys: freshBook.buyOrders || [],
-                  sells: freshBook.sellOrders || []
-                });
-                console.log('[WebSocket] Order book refreshed after ORDER_CANCELLED');
-              }
-            } catch (e) {
-              console.warn('[WebSocket] Failed to refresh order book after cancel:', e);
-            }
-          }, 800);
-          return;
-        }
-        
-        // Handle full order book update
-        if (data?.tradingPair === tradingPair) {
-          setOrderBook({
-            buys: Array.isArray(data.buyOrders) ? data.buyOrders : [],
-            sells: Array.isArray(data.sellOrders) ? data.sellOrders : []
-          });
-          if (!hasLoadedOrderBook) {
-            setOrderBookLoading(false);
-            hasLoadedOrderBook = true;
-          }
-        }
-      } catch (err) {
-        console.error('[TradingInterface] Error in orderBook callback:', err);
-      }
-    };
+    // ═══════════════════════════════════════════════════════════════════
+    // POLLING-ONLY architecture (WebSocket removed — doesn't work on Vercel)
+    // ═══════════════════════════════════════════════════════════════════
+    //   Order book:  polled every 3s
+    //   Trades:      polled every 5s
+    //   (User orders & balance are polled in separate useEffects below)
+    // ═══════════════════════════════════════════════════════════════════
 
-    const tradeCallback = (data) => {
-      try {
-        console.log('[WebSocket] Trade received:', data?.tradeId);
-        if (data?.tradingPair === tradingPair) {
-          // Add to trades list
-          setTrades(prev => {
-            // Avoid duplicates
-            if (prev.some(t => t.tradeId === data.tradeId)) {
-              return prev;
-            }
-            return [data, ...prev.slice(0, 49)];
-          });
-          
-          // If current user was involved in the trade, show toast and refresh
-          if (data.buyer === partyId || data.seller === partyId) {
-            const isBuyer = data.buyer === partyId;
-            const side = isBuyer ? 'BUY' : 'SELL';
-            const qty = parseFloat(data.quantity || 0);
-            const price = parseFloat(data.price || 0);
-            const [base, quote] = tradingPair.split('/');
-
-            console.log(`[WebSocket] 🎯 User's ${side} order matched! ${qty} ${base} @ ${price}`);
-
-            // Show trade executed toast
-            toast.success(
-              `${qty} ${base} @ ${price.toLocaleString()} — ${(qty * price).toLocaleString()} ${quote || 'USDT'}`, 
-              {
-                title: `🎯 ${side} Order Filled!`,
-                duration: 6000
-              }
-            );
-            
-            // Refresh user's orders from backend (handles partial fills correctly)
-            (async () => {
-              try {
-                const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
-                const ordersList = ordersData?.data?.orders || [];
-                setOrders(ordersList.map(order => ({
-                  id: order.orderId || order.contractId,
-                  contractId: order.contractId,
-                  type: order.orderType,
-                  mode: order.orderMode,
-                  price: order.price,
-                  quantity: order.quantity,
-                  filled: order.filled || '0',
-                  status: order.status,
-                  tradingPair: order.tradingPair,
-                  timestamp: order.timestamp
-                })));
-              } catch (e) {
-                console.warn('[WebSocket] Failed to refresh orders after trade:', e);
-              }
-            })();
-            
-            // Refresh balance after trade
-            (async () => {
-              try {
-                const balanceData = await balanceService.getBalances(partyId);
-                if (balanceData.available) {
-                  const dynamicBalance = {};
-                  Object.keys(balanceData.available).forEach(token => {
-                    dynamicBalance[token] = balanceData.available[token]?.toString() || '0.0';
-                  });
-                  setBalance(dynamicBalance);
-                  console.log('[WebSocket] Balance refreshed after trade');
-                }
-              } catch (e) {
-                console.warn('[WebSocket] Failed to refresh balance after trade:', e);
-              }
-            })();
-          }
-        }
-      } catch (err) {
-        console.error('[TradingInterface] Error in trade callback:', err);
-      }
-    };
-
-    // Initial load — ALWAYS use fresh data from API
+    // ── Initial load: order book ──
     const loadInitialOrderBook = async () => {
       try {
         console.log('[TradingInterface] Loading initial order book for:', tradingPair);
         const bookData = await getGlobalOrderBook(tradingPair);
         if (bookData) {
-          // ALWAYS set fresh data — never keep stale ghost orders
           setOrderBook({
             buys: bookData.buyOrders || [],
             sells: bookData.sellOrders || []
@@ -703,20 +512,14 @@ export default function TradingInterface({ partyId }) {
         console.error('[TradingInterface] Failed to load initial order book:', error);
       } finally {
         setOrderBookLoading(false);
-        setTradesLoading(false);
-        hasLoadedOrderBook = true;
       }
     };
 
-    loadInitialOrderBook();
-    
-    // Load initial trades — ALWAYS use fresh data from API
+    // ── Initial load: trades ──
     const loadInitialTrades = async () => {
       try {
         const tradesData = await apiClient.get(API_ROUTES.TRADES.GET(tradingPair, 50));
         const tradesList = tradesData?.data?.trades || [];
-        
-        // Deduplicate by tradeId
         const seen = new Set();
         const uniqueTrades = tradesList.filter(t => {
           const key = t.tradeId || `${t.price}-${t.quantity}-${t.timestamp}`;
@@ -733,45 +536,31 @@ export default function TradingInterface({ partyId }) {
       }
     };
     
+    loadInitialOrderBook();
     loadInitialTrades();
 
-    if (!websocketService.isConnected()) {
-      websocketService.connect();
-    }
-
-    websocketService.subscribe(`orderbook:${tradingPair}`, orderBookCallback);
-    websocketService.subscribe(`trades:${tradingPair}`, tradeCallback);
-
-    // ═══ AGGRESSIVE POLLING ═══
-    // Poll frequently since WebSocket may not work on serverless (Vercel).
-    // CRITICAL: Always use fresh data — don't preserve old data when API returns empty,
-    // otherwise matched/cancelled orders will appear as "ghost orders" in the book.
-    interval = setInterval(async () => {
+    // ── Poll order book every 3s ──
+    const orderBookInterval = setInterval(async () => {
       if (document.hidden || isLoadingRef.current) return;
-      
         try {
           const bookData = await getGlobalOrderBook(tradingPair);
         if (bookData) {
-          // ALWAYS use fresh data from API — even if empty
-          // This ensures matched orders are removed from the book
           setOrderBook({
             buys: bookData.buyOrders || [],
             sells: bookData.sellOrders || []
           });
         }
         } catch (error) {
-        // Silent - don't spam console on every failed poll
+        // Silent — don't spam console on every failed poll
       }
-    }, 3000); // 3 seconds — fast enough for near-real-time without WebSocket
+    }, 3000);
 
-    // Poll trades every 5 seconds — ALWAYS use fresh data from API
+    // ── Poll trades every 5s ──
     const tradesInterval = setInterval(async () => {
       if (document.hidden) return;
       try {
         const tradesData = await apiClient.get(API_ROUTES.TRADES.GET(tradingPair, 50));
         const tradesList = tradesData?.data?.trades || [];
-        // CRITICAL FIX: Always set fresh data (even if empty) to remove stale trades
-        // Deduplicate by tradeId to prevent duplicates from re-matching bug
         const seen = new Set();
         const uniqueTrades = tradesList.filter(t => {
           const key = t.tradeId || `${t.price}-${t.quantity}-${t.timestamp}`;
@@ -786,10 +575,8 @@ export default function TradingInterface({ partyId }) {
     }, 5000);
 
     return () => {
-      if (interval) clearInterval(interval);
+      clearInterval(orderBookInterval);
       clearInterval(tradesInterval);
-      websocketService.unsubscribe(`orderbook:${tradingPair}`, orderBookCallback);
-      websocketService.unsubscribe(`trades:${tradingPair}`, tradeCallback);
     };
   }, [partyId, tradingPair]);
 
@@ -1028,6 +815,7 @@ export default function TradingInterface({ partyId }) {
               orderBook={orderBook}
             onMintTokens={handleMintTokens}
             mintingLoading={mintingLoading}
+              lastTradePrice={trades.length > 0 ? trades[0]?.price : null}
             />
 
           {/* Balance Card - Shows all token holdings including CBTC */}
@@ -1049,8 +837,12 @@ export default function TradingInterface({ partyId }) {
         <PriceChart 
           tradingPair={tradingPair}
           trades={trades}
-          currentPrice={orderBook.buys?.[0]?.price ? parseFloat(orderBook.buys[0].price) : 
-                       orderBook.sells?.[0]?.price ? parseFloat(orderBook.sells[0].price) : 0}
+          currentPrice={
+            // Priority: last trade price > best bid > best ask
+            (trades.length > 0 && parseFloat(trades[0]?.price) > 0) ? parseFloat(trades[0].price) :
+            orderBook.buys?.[0]?.price ? parseFloat(orderBook.buys[0].price) : 
+            orderBook.sells?.[0]?.price ? parseFloat(orderBook.sells[0].price) : 0
+          }
           priceChange24h={0}
           high24h={trades.length > 0 ? Math.max(...trades.map(t => parseFloat(t.price) || 0)) : 0}
           low24h={trades.length > 0 ? Math.min(...trades.filter(t => parseFloat(t.price) > 0).map(t => parseFloat(t.price))) : 0}
@@ -1082,6 +874,7 @@ export default function TradingInterface({ partyId }) {
             <MarketData 
               tradingPair={tradingPair}
               orderBook={orderBook}
+              trades={trades}
             />
             
             <RecentTrades 
@@ -1099,8 +892,11 @@ export default function TradingInterface({ partyId }) {
               bids: orderBook.buys || [],
               asks: orderBook.sells || []
             }}
-            currentPrice={orderBook.buys?.[0]?.price ? parseFloat(orderBook.buys[0].price) : 
-                         orderBook.sells?.[0]?.price ? parseFloat(orderBook.sells[0].price) : 0}
+            currentPrice={
+              (trades.length > 0 && parseFloat(trades[0]?.price) > 0) ? parseFloat(trades[0].price) :
+              orderBook.buys?.[0]?.price ? parseFloat(orderBook.buys[0].price) : 
+              orderBook.sells?.[0]?.price ? parseFloat(orderBook.sells[0].price) : 0
+            }
           />
           
           <TransactionHistory 

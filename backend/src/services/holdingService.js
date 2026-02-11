@@ -824,13 +824,30 @@ class HoldingService {
         total[symbol] = ((balances[symbol] || 0) + (lockedBalances[symbol] || 0)).toString();
       }
 
-      // Round available to avoid floating point display issues
+      // ── Reconcile locked balances ──
+      // Guard against negative available (can happen if Fill-Only deduction > actual available)
+      // and ensure locked never exceeds total Holdings for that asset.
       for (const sym of Object.keys(balances)) {
-        if (balances[sym] < 0.000000001) balances[sym] = 0; // clamp near-zero to 0
+        if (balances[sym] < 0) {
+          // Negative available means we over-deducted; shift excess back from locked
+          const excess = Math.abs(balances[sym]);
+          balances[sym] = 0;
+          lockedBalances[sym] = Math.max((lockedBalances[sym] || 0) - excess, 0);
+        }
+        // Clamp near-zero to 0 (floating point dust)
+        if (balances[sym] < 0.000000001) balances[sym] = 0;
+      }
+      for (const sym of Object.keys(lockedBalances)) {
+        // Clamp near-zero locked dust to 0
+        if (lockedBalances[sym] < 0.000000001) lockedBalances[sym] = 0;
       }
 
       console.log(`[HoldingService] Aggregated balances (after order deductions):`, 
         Object.entries(balances).map(([s, a]) => `${s}: ${a}`).join(', '));
+      if (Object.keys(lockedBalances).length > 0) {
+        console.log(`[HoldingService] Locked balances:`, 
+          Object.entries(lockedBalances).map(([s, a]) => `${s}: ${a}`).join(', '));
+      }
 
       return {
         available: balances,

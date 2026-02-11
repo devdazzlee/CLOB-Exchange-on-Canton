@@ -32,37 +32,45 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
   const [error, setError] = useState(null);
   const toast = useToast();
 
-  // Fetch pending transfer offers
-  const fetchOffers = useCallback(async () => {
+  // Fetch pending transfer offers (silent polling — only logs on changes)
+  const prevCountRef = React.useRef(-1);
+  
+  const fetchOffers = useCallback(async (isInitial = false) => {
     if (!partyId) return;
     
-    setLoading(true);
+    if (isInitial) setLoading(true);
     setError(null);
     
     try {
-      console.log('[TransferOffers] Fetching offers for:', partyId.substring(0, 30));
       const response = await apiClient.get(`/transfers/offers/${encodeURIComponent(partyId)}`);
       
       if (response.success) {
-        setOffers(response.data?.offers || []);
-        console.log('[TransferOffers] Found', response.data?.offerCount, 'offers');
+        const newOffers = response.data?.offers || [];
+        setOffers(newOffers);
+        // Only log when count changes (not every poll)
+        if (newOffers.length !== prevCountRef.current) {
+          console.log('[TransferOffers] Offers:', newOffers.length);
+          prevCountRef.current = newOffers.length;
+        }
       } else {
         throw new Error(response.error || 'Failed to fetch offers');
       }
     } catch (err) {
-      console.error('[TransferOffers] Error:', err);
+      // Only log errors on initial fetch, not on every poll
+      if (isInitial) console.error('[TransferOffers] Error:', err);
       setError(err.message);
     } finally {
-      setLoading(false);
+      if (isInitial) setLoading(false);
     }
   }, [partyId]);
 
-  // Initial fetch
+  // Initial fetch + poll every 30s
   useEffect(() => {
-    fetchOffers();
+    fetchOffers(true);
     
-    // Poll every 30 seconds for new offers
-    const interval = setInterval(fetchOffers, 30000);
+    const interval = setInterval(() => {
+      if (!document.hidden) fetchOffers(false);
+    }, 30000);
     return () => clearInterval(interval);
   }, [fetchOffers]);
 

@@ -50,7 +50,12 @@ class MatchingEngine {
     // 
     // Key: "buyContractId::sellContractId" → timestamp of last match attempt
     this.recentlyMatchedOrders = new Map();
-    this.RECENTLY_MATCHED_TTL = 180000; // 3 minutes cooldown before retry
+    this.RECENTLY_MATCHED_TTL = 30000; // 30 seconds cooldown (was 180s — too aggressive)
+
+    // ═══ Pending pairs queue ═══
+    // When a matching trigger arrives while a cycle is already running,
+    // queue the pair so it's processed immediately after the current cycle.
+    this.pendingPairs = new Set();
   }
 
   /**
@@ -94,8 +99,36 @@ class MatchingEngine {
         console.error('[MatchingEngine] Cycle error:', error.message);
         if (error.message?.includes('401') || error.message?.includes('security-sensitive')) {
           this.invalidateToken();
+        }
       }
-    }
+
+      // ═══ Process any pairs queued by order placement triggers ═══
+      // These were queued because matchingInProgress was true during the trigger.
+      // Process them IMMEDIATELY (no polling delay) so orders match fast.
+      if (this.pendingPairs.size > 0) {
+        const pending = [...this.pendingPairs];
+        this.pendingPairs.clear();
+        console.log(`[MatchingEngine] ⚡ Processing ${pending.length} queued pair(s): ${pending.join(', ')}`);
+        try {
+          this.matchingInProgress = true;
+          this.matchingStartTime = Date.now();
+          const token = await this.getAdminToken();
+          for (const pair of pending) {
+            try {
+              await this.processOrdersForPair(pair, token);
+            } catch (pairErr) {
+              if (!pairErr.message?.includes('No contracts found')) {
+                console.error(`[MatchingEngine] Queued pair ${pair} error:`, pairErr.message);
+              }
+            }
+          }
+        } catch (queueErr) {
+          console.error('[MatchingEngine] Queued pairs error:', queueErr.message);
+        } finally {
+          this.matchingInProgress = false;
+        }
+      }
+
       await new Promise(r => setTimeout(r, this.pollingInterval));
     }
     console.log('[MatchingEngine] Stopped');
@@ -396,6 +429,38 @@ class MatchingEngine {
           return; // For other errors, stop matching this cycle
         }
       }
+    }
+
+    // ═══ DIAGNOSTIC: Log why no match was found ═══
+    // This is critical for debugging — previously, silent exit made it impossible
+    // to tell whether orders were evaluated and didn't cross, or were filtered out.
+    const bestBuy = buyOrders.find(o => o.remaining > 0 && o.price !== null);
+    const bestSell = sellOrders.find(o => o.remaining > 0 && o.price !== null);
+    if (bestBuy && bestSell) {
+      const spread = bestSell.price - bestBuy.price;
+      if (spread <= 0) {
+        // Orders SHOULD cross but were blocked by cache/stale filters
+        const skippedByCache = [];
+        for (const b of buyOrders) {
+          for (const s of sellOrders) {
+            if (b.remaining > 0 && s.remaining > 0 && b.price !== null && s.price !== null && b.price >= s.price) {
+              const key = `${b.contractId}::${s.contractId}`;
+              if (this.recentlyMatchedOrders.has(key)) skippedByCache.push(`B@${b.price}↔S@${s.price}`);
+            }
+          }
+        }
+        if (skippedByCache.length > 0) {
+          console.warn(`[MatchingEngine] ⚠️ ${tradingPair}: Crossing orders exist but blocked by recentlyMatched cache: ${skippedByCache.join(', ')}`);
+        } else {
+          console.warn(`[MatchingEngine] ⚠️ ${tradingPair}: Crossing orders exist (bestBid=${bestBuy.price} >= bestAsk=${bestSell.price}) but no match — check filters`);
+        }
+      } else {
+        console.log(`[MatchingEngine] ${tradingPair}: No crossing orders (bestBid=${bestBuy.price} < bestAsk=${bestSell.price}, spread=${spread.toFixed(8)})`);
+      }
+    } else if (!bestBuy) {
+      console.log(`[MatchingEngine] ${tradingPair}: No active buy orders with price`);
+    } else if (!bestSell) {
+      console.log(`[MatchingEngine] ${tradingPair}: No active sell orders with price`);
     }
   }
   
@@ -1108,17 +1173,29 @@ class MatchingEngine {
         console.warn(`[MatchingEngine] ⚠️ matchingInProgress stuck for ${elapsed}ms — force-resetting`);
         this.matchingInProgress = false;
       } else {
+        // ═══ FIX: Queue the pair instead of dropping it ═══
+        // Previously this just returned, meaning orders placed during a cycle
+        // had to wait for the NEXT full cycle (potentially 10-20+ seconds).
+        // Now we queue the pair so matchLoop processes it immediately after.
+        if (targetPair) {
+          this.pendingPairs.add(targetPair);
+          console.log(`[MatchingEngine] ⏳ Queued ${targetPair} for matching after current cycle (${elapsed}ms in progress)`);
+          return { success: false, reason: 'queued_for_next_cycle' };
+        }
         console.log(`[MatchingEngine] ⚡ Skipping trigger — matching already in progress (${elapsed}ms)`);
         return { success: false, reason: 'matching_in_progress' };
       }
     }
 
-    // Rate limit: Don't trigger more than once per 10 seconds (within same warm instance)
+    // Rate limit: Don't trigger more than once per 2 seconds (was 10s — too slow for exchange)
     const now = Date.now();
-    if (this._lastTriggerTime && (now - this._lastTriggerTime) < 10000) {
-      const wait = Math.ceil((10000 - (now - this._lastTriggerTime)) / 1000);
-      console.log(`[MatchingEngine] ⚡ Rate limited — wait ${wait}s`);
-      return { success: false, reason: `rate_limited_${wait}s` };
+    if (this._lastTriggerTime && (now - this._lastTriggerTime) < 2000) {
+      // Still queue the pair even if rate-limited
+      if (targetPair) {
+        this.pendingPairs.add(targetPair);
+        return { success: false, reason: 'rate_limited_queued' };
+      }
+      return { success: false, reason: 'rate_limited' };
     }
     this._lastTriggerTime = now;
 

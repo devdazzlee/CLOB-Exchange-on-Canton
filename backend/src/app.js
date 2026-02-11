@@ -12,7 +12,8 @@ const http = require('http');
 const config = require('./config');
 const routes = require('./routes');
 const errorHandler = require('./middleware/errorHandler');
-const { initializeWebSocketService } = require('./services/websocketService');
+// WebSocket DISABLED — all real-time updates use HTTP polling from frontend
+// const { initializeWebSocketService } = require('./services/websocketService');
 
 // Validate configuration on startup - FAIL FAST
 console.log('');
@@ -150,13 +151,9 @@ function createApp() {
   // Global error handler (must be last)
   app.use(errorHandler);
 
-  // Initialize WebSocket service (skip in serverless/Vercel mode)
-  const isServerless = process.env.VERCEL === '1' || process.env.VERCEL_ENV;
-  if (!isServerless && server) {
-    initializeWebSocketService(server);
-  } else {
-    console.log('[App] Skipping WebSocket initialization (serverless mode)');
-  }
+  // WebSocket DISABLED — frontend uses HTTP polling (3s order book, 5s trades)
+  // global.broadcastWebSocket calls in services are no-ops (all guarded with `if (global.broadcastWebSocket)`)
+  console.log('[App] WebSocket disabled — using HTTP polling for real-time updates');
 
   // Milestone 4: Start stop-loss service (skip in serverless mode)
   if (!isServerless) {
@@ -233,7 +230,7 @@ async function startServer() {
     console.log('╚═══════════════════════════════════════════════════════════════╝');
     console.log('');
     console.log(`✅ Server running on port ${PORT}`);
-    console.log(`✅ WebSocket available at ws://localhost:${PORT}${config.websocket.path}`);
+    console.log(`✅ Real-time updates via HTTP polling (WebSocket disabled)`);
     console.log(`✅ Environment: ${config.server.env}`);
     console.log('');
 

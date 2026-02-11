@@ -416,21 +416,23 @@ class OrderService {
       });
     }
 
-    // IMMEDIATE MATCHING: Trigger matching engine right after order placement
-    // This ensures fastest execution instead of waiting for polling cycle
+    // ═══ IMMEDIATE MATCHING: Trigger matching engine for this specific pair ═══
+    // Previously: Gated by matchingEngine.isRunning (broken on serverless),
+    //   used setImmediate (fire-and-forget, unreliable), called runMatchingCycle()
+    //   which processes ALL pairs (slow) and competes with polling loop.
+    // Now: Always triggers, targets ONLY this pair, queues if busy.
     try {
       const { getMatchingEngine } = require('./matching-engine');
       const matchingEngine = getMatchingEngine();
-      if (matchingEngine && matchingEngine.isRunning) {
+      if (matchingEngine) {
         console.log(`[OrderService] Triggering immediate matching for ${tradingPair}`);
-        // Run matching asynchronously - don't block the order response
-        setImmediate(async () => {
-          try {
-            await matchingEngine.runMatchingCycle();
-          } catch (matchError) {
-            console.error('[OrderService] Immediate matching failed:', matchError.message);
-          }
-        });
+        // Use triggerMatchingCycle which targets a specific pair and queues if busy
+        const triggerResult = await matchingEngine.triggerMatchingCycle(tradingPair);
+        if (triggerResult.success) {
+          console.log(`[OrderService] ✅ Matching cycle completed for ${tradingPair} in ${triggerResult.elapsed}ms`);
+        } else {
+          console.log(`[OrderService] ⏳ Matching trigger result: ${triggerResult.reason}`);
+        }
       }
     } catch (matchErr) {
       // Don't fail order placement if matching trigger fails

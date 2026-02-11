@@ -26,7 +26,8 @@ export default function OrderForm({
   balance = { BTC: '0.0', USDT: '0.0' },
   orderBook = { buys: [], sells: [] },
   onMintTokens = null,
-  mintingLoading = false
+  mintingLoading = false,
+  lastTradePrice = null
 }) {
   const [timeInForce, setTimeInForce] = useState('GTC'); // GTC, IOC, FOK
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -42,9 +43,13 @@ export default function OrderForm({
   const bestBid = orderBook.buys?.[0]?.price || null;
   const bestAsk = orderBook.sells?.[0]?.price || null;
   
-  const marketPrice = bestBid && bestAsk 
+  // Market price priority: 1) Last trade price, 2) Mid-point bid/ask, 3) Best bid or ask
+  const midPrice = bestBid && bestAsk 
     ? (parseFloat(bestBid) + parseFloat(bestAsk)) / 2 
-    : parseFloat(bestBid) || parseFloat(bestAsk) || null;
+    : null;
+  const marketPrice = (lastTradePrice && parseFloat(lastTradePrice) > 0 ? parseFloat(lastTradePrice) : null) 
+    || midPrice 
+    || parseFloat(bestBid) || parseFloat(bestAsk) || null;
 
   // Calculate estimated cost/value
   const estimatedCost = useMemo(() => {
