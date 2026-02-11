@@ -323,20 +323,20 @@ export default function TradingInterface({ partyId }) {
     // Refresh orders list - ALWAYS use fresh data
     try {
       const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
-      const ordersList = ordersData?.data?.orders || [];
-      setOrders(ordersList.map(order => ({
-        id: order.orderId || order.contractId,
-        contractId: order.contractId,
-        type: order.orderType,
-        mode: order.orderMode,
-        price: order.price,
-        quantity: order.quantity,
-        filled: order.filled || '0',
+          const ordersList = ordersData?.data?.orders || [];
+          setOrders(ordersList.map(order => ({
+            id: order.orderId || order.contractId,
+            contractId: order.contractId,
+            type: order.orderType,
+            mode: order.orderMode,
+            price: order.price,
+            quantity: order.quantity,
+            filled: order.filled || '0',
         remaining: order.remaining,
-        status: order.status,
-        tradingPair: order.tradingPair,
-        timestamp: order.timestamp
-      })));
+            status: order.status,
+            tradingPair: order.tradingPair,
+            timestamp: order.timestamp
+          })));
     } catch (e) {
       console.warn('[Cancel Order] Failed to refresh orders:', e);
     }
@@ -834,15 +834,11 @@ export default function TradingInterface({ partyId }) {
       if (!document.hidden) loadUserOrders(false);
     }, 3000);
     
-    // EXTRA: Fire matching trigger every 10s to ensure matches happen on Vercel
-    const matchTriggerInterval = setInterval(() => {
-      if (document.hidden) return;
-      apiClient.post('/match/trigger', {}).catch(() => {/* silent */});
-    }, 10000);
+    // NOTE: Removed 10s match trigger interval — it caused infinite re-matching on Vercel.
+    // Matching is now event-driven: triggered only after order placement (orderController).
     
     return () => {
       clearInterval(ordersInterval);
-      clearInterval(matchTriggerInterval);
     };
   }, [partyId]);
 

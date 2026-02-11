@@ -357,23 +357,29 @@ class MatchingEngine {
           console.log(`[MatchingEngine]    Mode: Fill-Only (buy locked: ${buyHasLock}, sell locked: ${sellHasLock})`);
         }
 
-        // ═══ CRITICAL: Mark pair as recently matched BEFORE attempting ═══
-        // This prevents re-matching if the match partially succeeds (tokens transferred
-        // but FillOrder fails). Without this, the engine retries every cycle,
-        // creating duplicate trades and transferring tokens repeatedly.
+        // Mark pair in local cache (useful if this warm instance runs again)
+        // NOTE: On Vercel serverless, this cache is reset per invocation, so the
+        // REAL guard against duplicate matches is FillOrder-first-with-abort in executeMatch.
         this.recentlyMatchedOrders.set(matchKey, Date.now());
 
         try {
           await this.executeMatch(tradingPair, buyOrder, sellOrder, roundedQty, matchPrice, token, useDvP);
+          console.log(`[MatchingEngine] ✅ Match executed successfully`);
           return; // One match per cycle - exit
         } catch (error) {
           console.error(`[MatchingEngine] ❌ Match execution failed:`, error.message);
           
-          // If DvP failed, try Fill-Only as a fallback
-          // This handles Splice holdings (CC/CBTC) that can't be locked on-chain
-          if (useDvP && (error.message?.includes('could not be found') || 
-              error.message?.includes('CONTRACT_NOT_FOUND') ||
-              error.message?.includes('WRONGLY_TYPED_CONTRACT') ||
+          // If it was a "contract not found" error, the order was already processed
+          // by another serverless invocation. This is expected on Vercel — not a bug.
+          if (error.message?.includes('already filled') || 
+              error.message?.includes('could not be found') ||
+              error.message?.includes('CONTRACT_NOT_FOUND')) {
+            console.log(`[MatchingEngine] ℹ️ Order already processed by another invocation — skipping`);
+            continue; // Try next pair
+          }
+          
+          // If DvP failed for other reasons, try Fill-Only as a fallback
+          if (useDvP && (error.message?.includes('WRONGLY_TYPED_CONTRACT') ||
               error.message?.includes('DvP settlement failed'))) {
             console.log(`[MatchingEngine] 🔄 DvP failed — retrying as Fill-Only...`);
             try {
@@ -382,10 +388,8 @@ class MatchingEngine {
               return; // Match succeeded
             } catch (fallbackError) {
               console.error(`[MatchingEngine] ❌ Fill-Only fallback also failed: ${fallbackError.message}`);
-              // Mark holdings as stale so we don't retry DvP on them
               if (buyHasLock) this.staleHoldings.add(buyOrder.lockedHoldingCid);
               if (sellHasLock) this.staleHoldings.add(sellOrder.lockedHoldingCid);
-              console.log(`[MatchingEngine] Stale cache size: ${this.staleHoldings.size}`);
               continue;
             }
           }
@@ -455,18 +459,19 @@ class MatchingEngine {
       console.log(`[MatchingEngine] 📋 Fill-only mode: ${matchQty} ${baseSymbol} @ ${matchPrice} ${quoteSymbol}`);
       
       // ── STEP A: FillOrder on BOTH orders FIRST ──
-      // This closes orders on Canton, preventing re-matching
+      // This closes orders on Canton, preventing re-matching.
+      // CRITICAL: If EITHER FillOrder fails, we ABORT the entire match.
+      // On serverless (Vercel), a failed FillOrder usually means the contract
+      // was already archived by a concurrent invocation → this is a duplicate match.
+      // We must NOT create a trade or transfer tokens in that case.
       console.log(`[MatchingEngine] 📝 Filling orders FIRST (before token transfer)...`);
-      
-      let buyFillOk = false;
-      let sellFillOk = false;
 
-      // Fill buy order
+      // Fill buy order — MUST succeed
+      const buyFillArg = { fillQuantity: matchQty.toString() };
+      if (buyOrder.isNewPackage) {
+        buyFillArg.newAllocationCid = 'FILL_ONLY';
+      }
       try {
-        const buyFillArg = { fillQuantity: matchQty.toString() };
-        if (buyOrder.isNewPackage) {
-          buyFillArg.newAllocationCid = 'FILL_ONLY';
-        }
         await cantonService.exerciseChoice({
           token,
           actAsParty: [operatorPartyId],
@@ -476,18 +481,18 @@ class MatchingEngine {
           choiceArgument: buyFillArg,
           readAs: [operatorPartyId, buyOrder.owner],
         });
-        buyFillOk = true;
         console.log(`[MatchingEngine] ✅ Buy order filled: ${buyOrder.orderId}`);
       } catch (fillError) {
-        console.error(`[MatchingEngine] ❌ Buy FillOrder failed: ${fillError.message}`);
+        console.error(`[MatchingEngine] ❌ Buy FillOrder failed — ABORTING match: ${fillError.message}`);
+        throw new Error(`Buy FillOrder failed (likely already filled): ${fillError.message}`);
       }
 
-      // Fill sell order
+      // Fill sell order — MUST succeed
+      const sellFillArg = { fillQuantity: matchQty.toString() };
+      if (sellOrder.isNewPackage) {
+        sellFillArg.newAllocationCid = 'FILL_ONLY';
+      }
       try {
-        const sellFillArg = { fillQuantity: matchQty.toString() };
-        if (sellOrder.isNewPackage) {
-          sellFillArg.newAllocationCid = 'FILL_ONLY';
-        }
         await cantonService.exerciseChoice({
           token,
           actAsParty: [operatorPartyId],
@@ -497,20 +502,16 @@ class MatchingEngine {
           choiceArgument: sellFillArg,
           readAs: [operatorPartyId, sellOrder.owner],
         });
-        sellFillOk = true;
         console.log(`[MatchingEngine] ✅ Sell order filled: ${sellOrder.orderId}`);
       } catch (fillError) {
-        console.error(`[MatchingEngine] ❌ Sell FillOrder failed: ${fillError.message}`);
+        // Buy was already filled above — we can't undo it. Log a warning.
+        // The sell order may have been filled by another invocation concurrently.
+        console.error(`[MatchingEngine] ❌ Sell FillOrder failed — ABORTING match: ${fillError.message}`);
+        console.warn(`[MatchingEngine] ⚠️ Buy order was already filled — sell may need manual reconciliation`);
+        throw new Error(`Sell FillOrder failed (likely already filled): ${fillError.message}`);
       }
 
-      // If NEITHER FillOrder succeeded, abort — no tokens should be transferred
-      if (!buyFillOk && !sellFillOk) {
-        console.error(`[MatchingEngine] ❌ ABORTING: Both FillOrders failed — no tokens will be transferred`);
-        throw new Error('Both FillOrders failed — match aborted');
-      }
-      if (!buyFillOk || !sellFillOk) {
-        console.warn(`[MatchingEngine] ⚠️ Partial FillOrder success (buy: ${buyFillOk}, sell: ${sellFillOk}) — proceeding with token transfer`);
-      }
+      console.log(`[MatchingEngine] ✅ Both orders filled — proceeding with token transfer`);
 
       // ── STEP B: Transfer tokens via Splice TransferInstruction ──
       const isSpliceBase = ['CC', 'CBTC'].includes(baseSymbol);
@@ -1111,6 +1112,15 @@ class MatchingEngine {
         return { success: false, reason: 'matching_in_progress' };
       }
     }
+
+    // Rate limit: Don't trigger more than once per 10 seconds (within same warm instance)
+    const now = Date.now();
+    if (this._lastTriggerTime && (now - this._lastTriggerTime) < 10000) {
+      const wait = Math.ceil((10000 - (now - this._lastTriggerTime)) / 1000);
+      console.log(`[MatchingEngine] ⚡ Rate limited — wait ${wait}s`);
+      return { success: false, reason: `rate_limited_${wait}s` };
+    }
+    this._lastTriggerTime = now;
 
     const pairsToProcess = targetPair ? [targetPair] : this.tradingPairs;
     console.log(`[MatchingEngine] ⚡ On-demand cycle triggered for: ${pairsToProcess.join(', ')}`);

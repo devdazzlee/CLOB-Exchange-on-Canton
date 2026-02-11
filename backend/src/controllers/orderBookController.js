@@ -12,31 +12,19 @@ const { formatOrderBook } = require('../utils/orderBookAggregator');
 // Get singleton instance
 const orderBookService = getOrderBookService();
 
-// ═══ SERVERLESS MATCHING ENGINE TRIGGER ═══
-// On Vercel serverless, the matching engine can't run as a background loop.
-// We trigger it opportunistically on order book polls (every 3s from frontend).
-// Rate-limited to once per 3 seconds to avoid overload.
-let _lastMatchTriggerTime = 0;
-const MATCH_TRIGGER_COOLDOWN_MS = 3000;
-
-function triggerMatchingIfNeeded(tradingPair) {
-  const now = Date.now();
-  if (now - _lastMatchTriggerTime < MATCH_TRIGGER_COOLDOWN_MS) return;
-  _lastMatchTriggerTime = now;
-
-  // Fire-and-forget — don't block the API response
-  try {
-    const { getMatchingEngine } = require('../services/matching-engine');
-    const engine = getMatchingEngine();
-    engine.triggerMatchingCycle(tradingPair || null).catch(err => {
-      if (!err.message?.includes('401') && !err.message?.includes('No contracts')) {
-        console.warn('[OrderBookController] Background match trigger error:', err.message);
-      }
-    });
-  } catch (e) {
-    // Non-critical — matching engine may not be initialized
-  }
-}
+// ═══ MATCHING ENGINE TRIGGER REMOVED FROM ORDER BOOK POLLS ═══
+// CRITICAL FIX: Previously, every order book poll (every 3s per user) triggered
+// the matching engine. On Vercel serverless, each invocation creates a FRESH
+// MatchingEngine instance with EMPTY in-memory caches (recentlyMatchedOrders,
+// matchingInProgress). This caused a catastrophic infinite re-matching loop:
+//   1. Poll triggers matching → match found → FillOrder + Trade created
+//   2. Next poll (3s later) triggers matching in NEW instance → same orders found
+//   3. Repeat forever → 100+ duplicate trades
+//
+// Matching is now ONLY triggered by:
+//   1. orderController.place() — after a new order is placed (event-driven)
+//   2. POST /api/match/trigger — manual or cron (rate-limited to 30s)
+// This is the correct architecture for serverless: event-driven, not poll-driven.
 
 class OrderBookController {
   /**
@@ -55,9 +43,7 @@ class OrderBookController {
     const decodedTradingPair = decodeURIComponent(tradingPair);
     const { aggregate = 'true', precision = '2', depth = '50' } = req.query;
 
-    // Opportunistically trigger matching engine (serverless: doesn't run in background)
-    triggerMatchingIfNeeded(decodedTradingPair);
-
+    // NOTE: Matching trigger REMOVED from here — see comment at top of file
     try {
       // getOrderBook is now async - queries Canton directly
       const orderBook = await orderBookService.getOrderBook(decodedTradingPair);

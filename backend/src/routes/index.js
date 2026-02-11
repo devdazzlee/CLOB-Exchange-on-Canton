@@ -71,11 +71,28 @@ router.use('/trades/v2', tradeRoutesV2); // GET /api/trades/v2 (DvP trades)
 
 // Matching Engine: On-demand trigger (CRITICAL for serverless/Vercel where background matching can't run)
 // Supports both POST (from frontend) and GET (from Vercel Cron)
+// Rate-limited to prevent rapid-fire triggers causing duplicate matches on serverless.
+let _lastMatchTriggerTime = 0;
+const MATCH_COOLDOWN_MS = 30000; // 30 seconds between match cycles
+
 const matchTriggerHandler = async (req, res) => {
+  const now = Date.now();
+  const elapsed = now - _lastMatchTriggerTime;
+  
+  // Rate limit: skip if less than 30s since last trigger (within same warm instance)
+  if (elapsed < MATCH_COOLDOWN_MS) {
+    const remaining = Math.ceil((MATCH_COOLDOWN_MS - elapsed) / 1000);
+    console.log(`[MatchTrigger] Rate limited — ${remaining}s remaining`);
+    return res.json({ ok: true, data: { success: false, reason: `rate_limited_${remaining}s` } });
+  }
+  
+  _lastMatchTriggerTime = now;
+  
   try {
     const { getMatchingEngine } = require('../services/matching-engine');
     const engine = getMatchingEngine();
-    const result = await engine.triggerMatchingCycle();
+    const targetPair = req.query?.pair || req.body?.pair || null;
+    const result = await engine.triggerMatchingCycle(targetPair);
     res.json({ ok: true, data: result });
   } catch (error) {
     console.error('[MatchTrigger] Error:', error.message);
