@@ -25,7 +25,7 @@ const cantonService = require('./cantonService');
 const config = require('../config');
 const { getSettlementService } = require('./settlementService');
 const tokenProvider = require('./tokenProvider');
-const { REGISTRY_BACKEND_API, TEMPLATE_IDS } = require('../config/constants');
+const { REGISTRY_BACKEND_API, SCAN_PROXY_API, VALIDATOR_SCAN_PROXY_API, TEMPLATE_IDS } = require('../config/constants');
 
 class MatchingEngine {
   constructor() {
@@ -450,30 +450,28 @@ class MatchingEngine {
     }
 
     // ═══════════════════════════════════════════════════
-    // STEP 1b: Transfer tokens between buyer and seller (Fill-Only only)
-    //
-    // Strategy (in order of preference):
-    // 1. Splice TransferInstruction — visible on WolfEdge/Canton explorer
-    //    Uses Registry Backend API for CBTC context, Scan Proxy for CC.
-    // 2. Custom Holding mintDirect — fallback if Splice fails.
-    //    Creates new custom Holdings; balance calc deducts spent amounts.
-    // ═══════════════════════════════════════════════════
     // STEP 1b: Transfer tokens (Fill-Only mode)
     //
+    // For Splice tokens (CC, CBTC): Uses TransferInstruction (visible on explorer)
+    //   - CBTC: Registry Backend API for choice context
+    //   - CC: Validator Scan Proxy + AmuletRules for choice context
+    //   - NO mintDirect fallback — TransferInstruction is mandatory
+    // For custom tokens: mintDirect as fallback
+    //
     // CRITICAL: Do NOT fill orders unless BOTH transfers succeed.
-    // If any transfer fails, abort the match entirely.
     // ═══════════════════════════════════════════════════
     let baseTransferOk = useDvP; // DvP already handled transfers atomically
     let quoteTransferOk = useDvP;
 
     if (!useDvP) {
-      const { getHoldingService } = require('./holdingService');
-      const holdingService = getHoldingService();
-      await holdingService.initialize();
+      // Determine if this is a Splice token pair (CC, CBTC)
+      // Splice tokens use TransferInstruction — no mintDirect fallback allowed
+      const isSpliceBase = ['CC', 'CBTC'].includes(baseSymbol);
+      const isSpliceQuote = ['CC', 'CBTC'].includes(quoteSymbol);
 
       // --- Transfer base asset: seller → buyer ---
       try {
-        console.log(`[MatchingEngine] 💰 Transferring ${matchQty} ${baseSymbol}: seller → buyer (trying Splice)...`);
+        console.log(`[MatchingEngine] 💰 Transferring ${matchQty} ${baseSymbol}: seller → buyer (Splice TransferInstruction)...`);
         baseTransferOk = await this.attemptSpliceTransfer(
           sellOrder.owner, buyOrder.owner, baseSymbol, matchQty, token
         );
@@ -481,23 +479,32 @@ class MatchingEngine {
         console.warn(`[MatchingEngine] Splice transfer (base) threw: ${e.message}`);
         baseTransferOk = false;
       }
-      if (!baseTransferOk) {
+      if (!baseTransferOk && isSpliceBase) {
+        // Splice tokens MUST use TransferInstruction — no fallback
+        console.error(`[MatchingEngine] ❌ Splice TransferInstruction FAILED for ${baseSymbol} — no fallback`);
+        throw new Error(`Splice TransferInstruction failed for base asset ${baseSymbol}. Orders remain OPEN.`);
+      }
+      if (!baseTransferOk && !isSpliceBase) {
+        // Non-Splice (custom) tokens: mint as fallback
         try {
-          console.log(`[MatchingEngine] 💰 Splice failed for base — minting ${matchQty} ${baseSymbol} for buyer`);
+          const { getHoldingService } = require('./holdingService');
+          const holdingService = getHoldingService();
+          await holdingService.initialize();
+          console.log(`[MatchingEngine] 💰 Minting ${matchQty} ${baseSymbol} for buyer (custom token)`);
           await holdingService.mintDirect(buyOrder.owner, baseSymbol, matchQty, token);
           console.log(`[MatchingEngine] ✅ Buyer credited (mint): +${matchQty} ${baseSymbol}`);
           baseTransferOk = true;
         } catch (mintErr) {
           console.error(`[MatchingEngine] ❌ Buyer credit FAILED: ${mintErr.message}`);
-          baseTransferOk = false;
+          throw new Error(`Token transfer failed for base asset ${baseSymbol}: ${mintErr.message}`);
         }
-      } else {
-        console.log(`[MatchingEngine] ✅ Buyer credited (Splice transfer): +${matchQty} ${baseSymbol}`);
+      } else if (baseTransferOk) {
+        console.log(`[MatchingEngine] ✅ Buyer credited (Splice TransferInstruction): +${matchQty} ${baseSymbol}`);
       }
 
       // --- Transfer quote asset: buyer → seller ---
       try {
-        console.log(`[MatchingEngine] 💰 Transferring ${quoteAmount} ${quoteSymbol}: buyer → seller (trying Splice)...`);
+        console.log(`[MatchingEngine] 💰 Transferring ${quoteAmount} ${quoteSymbol}: buyer → seller (Splice TransferInstruction)...`);
         quoteTransferOk = await this.attemptSpliceTransfer(
           buyOrder.owner, sellOrder.owner, quoteSymbol, quoteAmount, token
         );
@@ -505,24 +512,32 @@ class MatchingEngine {
         console.warn(`[MatchingEngine] Splice transfer (quote) threw: ${e.message}`);
         quoteTransferOk = false;
       }
-      if (!quoteTransferOk) {
+      if (!quoteTransferOk && isSpliceQuote) {
+        // Splice tokens MUST use TransferInstruction — no fallback
+        console.error(`[MatchingEngine] ❌ Splice TransferInstruction FAILED for ${quoteSymbol} — no fallback`);
+        throw new Error(`Splice TransferInstruction failed for quote asset ${quoteSymbol}. Orders remain OPEN.`);
+      }
+      if (!quoteTransferOk && !isSpliceQuote) {
+        // Non-Splice (custom) tokens: mint as fallback
         try {
-          console.log(`[MatchingEngine] 💰 Splice failed for quote — minting ${quoteAmount} ${quoteSymbol} for seller`);
+          const { getHoldingService } = require('./holdingService');
+          const holdingService = getHoldingService();
+          await holdingService.initialize();
+          console.log(`[MatchingEngine] 💰 Minting ${quoteAmount} ${quoteSymbol} for seller (custom token)`);
           await holdingService.mintDirect(sellOrder.owner, quoteSymbol, quoteAmount, token);
           console.log(`[MatchingEngine] ✅ Seller credited (mint): +${quoteAmount} ${quoteSymbol}`);
           quoteTransferOk = true;
         } catch (mintErr) {
           console.error(`[MatchingEngine] ❌ Seller credit FAILED: ${mintErr.message}`);
-          quoteTransferOk = false;
+          throw new Error(`Token transfer failed for quote asset ${quoteSymbol}: ${mintErr.message}`);
         }
-      } else {
-        console.log(`[MatchingEngine] ✅ Seller credited (Splice transfer): +${quoteAmount} ${quoteSymbol}`);
+      } else if (quoteTransferOk) {
+        console.log(`[MatchingEngine] ✅ Seller credited (Splice TransferInstruction): +${quoteAmount} ${quoteSymbol}`);
       }
 
       // CRITICAL: If EITHER transfer failed, abort the match
       if (!baseTransferOk || !quoteTransferOk) {
         console.error(`[MatchingEngine] ❌ ABORTING MATCH — token transfer failed (base: ${baseTransferOk}, quote: ${quoteTransferOk})`);
-        console.error(`[MatchingEngine] Orders will remain OPEN and can be retried next cycle`);
         throw new Error(`Token transfer failed: base=${baseTransferOk}, quote=${quoteTransferOk}`);
       }
     }
@@ -736,7 +751,7 @@ class MatchingEngine {
   }
 
   // ═══════════════════════════════════════════════════════════════════
-  //  Splice Token Standard Transfer
+  //  Splice Token Standard Transfer (CC + CBTC)
   //
   //  Flow:
   //  1. Find sender's Splice/Amulet holding for the given symbol
@@ -744,21 +759,22 @@ class MatchingEngine {
   //  3. Transfer the (split) holding → creates TransferInstruction (visible on explorer)
   //  4. Accept the TransferInstruction → creates new Holding for receiver
   //
-  //  Uses Registry Backend API (CBTC) or Scan Proxy (CC) for choiceContext.
+  //  Choice context sources:
+  //  - CBTC: Registry Backend API (registrar = cbtc-network)
+  //  - CC (Amulet): Validator Scan Proxy API + AmuletRules enrichment
+  //
   //  Returns true on success, false if Splice transfer is not possible.
+  //  NO mintDirect fallback — TransferInstruction is the ONLY mechanism.
   // ═══════════════════════════════════════════════════════════════════
   async attemptSpliceTransfer(senderPartyId, receiverPartyId, symbol, amount, token) {
     const registryApi = REGISTRY_BACKEND_API || 'https://api.utilities.digitalasset-dev.com/api/token-standard';
+    const validatorScanProxyApi = VALIDATOR_SCAN_PROXY_API || 'https://wallet.validator.dev.canton.wolfedgelabs.com/api/validator';
+    const scanProxyApi = SCAN_PROXY_API || 'http://65.108.40.104:8088';
     const holdingInterfaceId = '#splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:Holding';
     const tiInterfaceId = TEMPLATE_IDS.spliceTransferInstructionInterfaceId ||
       '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.TransferInstructionV1:TransferInstruction';
     const operatorPartyId = config.canton.operatorPartyId;
-
-    // CC (Amulet) uses a completely different transfer mechanism — skip Splice for now
-    if (symbol === 'CC') {
-      console.log(`[MatchingEngine] Splice transfer not yet supported for CC (Amulet) — will use mintDirect`);
-      return false;
-    }
+    const isCC = symbol === 'CC';
 
     try {
       // ── Step 1: Find sender's Splice holding for this symbol ──
@@ -767,8 +783,7 @@ class MatchingEngine {
       await holdingService.initialize();
 
       const holdings = await holdingService.getAvailableHoldings(senderPartyId, symbol, token);
-      // CRITICAL FIX: getAvailableHoldings returns `isSplice`, NOT `isSpliceHolding`
-      const spliceHoldings = (holdings || []).filter(h => (h.isSplice || h.isSpliceHolding) && h.amount >= 0.000001);
+      const spliceHoldings = (holdings || []).filter(h => (h.isSplice || h.isSpliceHolding || h.isAmulet) && h.amount >= 0.000001);
       if (spliceHoldings.length === 0) {
         console.log(`[MatchingEngine] No Splice ${symbol} holdings for sender — cannot do Splice transfer`);
         return false;
@@ -783,82 +798,126 @@ class MatchingEngine {
       }
 
       const holdingCid = srcHolding.contractId;
-      console.log(`[MatchingEngine] Found Splice ${symbol} holding: ${holdingCid.substring(0, 25)}... (${srcHolding.amount})`);
+      console.log(`[MatchingEngine] Found ${isCC ? 'Amulet' : 'Splice'} ${symbol} holding: ${holdingCid.substring(0, 25)}... (${srcHolding.amount})`);
 
-      // ── Step 2: Determine registrar admin for this instrument ──
-      // CBTC uses the CBTC-network registrar; other tokens may vary
-      const adminPartyId = 'cbtc-network::12202a83c6f4082217c175e29bc53da5f2703ba2675778ab99217a5a881a949203ff';
-      const adminEncoded = encodeURIComponent(adminPartyId);
+      // ── Step 2: For CC, fetch AmuletRules (needed for choice context enrichment) ──
+      let amuletRulesData = null;
+      if (isCC) {
+        console.log(`[MatchingEngine] Fetching AmuletRules for CC transfer...`);
+        // Try BFT Scan Proxy first (no auth)
+        try {
+          const arUrl = `${scanProxyApi}/api/scan/v0/amulet-rules`;
+          const arResp = await fetch(arUrl, { method: 'GET' });
+          if (arResp.ok) {
+            amuletRulesData = await arResp.json();
+            console.log(`[MatchingEngine] ✅ AmuletRules from BFT Scan Proxy`);
+          }
+        } catch (e) { /* try next */ }
+        // Fallback: Validator Scan Proxy (with auth)
+        if (!amuletRulesData) {
+          try {
+            const arUrl = `${validatorScanProxyApi}/v0/scan-proxy/amulet-rules`;
+            const arResp = await fetch(arUrl, {
+              method: 'GET',
+              headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' },
+            });
+            if (arResp.ok) {
+              amuletRulesData = await arResp.json();
+              console.log(`[MatchingEngine] ✅ AmuletRules from Validator Scan Proxy`);
+            }
+          } catch (e2) {
+            console.warn(`[MatchingEngine] Failed to fetch AmuletRules: ${e2.message}`);
+          }
+        }
+        if (!amuletRulesData) {
+          console.error(`[MatchingEngine] ❌ Cannot fetch AmuletRules — CC transfer impossible`);
+          return false;
+        }
+      }
+
+      // ── Helper: Get choice context from appropriate API ──
+      // entityType: 'holding' or 'transfer-instruction'
+      const getChoiceCtx = async (entityType, cid, choiceName) => {
+        if (isCC) {
+          // CC: Validator Scan Proxy registry proxy (with auth)
+          const url = `${validatorScanProxyApi}/v0/scan-proxy/registry/${entityType}/v1/${encodeURIComponent(cid)}/choice-contexts/${choiceName}`;
+          const resp = await fetch(url, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${token}`,
+              'Accept': 'application/json',
+            },
+            body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
+          });
+          if (!resp.ok) {
+            const errText = await resp.text().catch(() => '');
+            throw new Error(`CC ${entityType}/${choiceName} context failed: ${resp.status} - ${errText.substring(0, 200)}`);
+          }
+          const data = await resp.json();
+          return this._enrichContextForCC(data, amuletRulesData);
+        } else {
+          // CBTC: Registry Backend API (no auth needed)
+          const adminPartyId = 'cbtc-network::12202a83c6f4082217c175e29bc53da5f2703ba2675778ab99217a5a881a949203ff';
+          const adminEncoded = encodeURIComponent(adminPartyId);
+          const url = `${registryApi}/v0/registrars/${adminEncoded}/registry/${entityType}/v1/${encodeURIComponent(cid)}/choice-contexts/${choiceName}`;
+          const resp = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
+          });
+          if (!resp.ok) {
+            const errText = await resp.text().catch(() => '');
+            throw new Error(`CBTC ${entityType}/${choiceName} context failed: ${resp.status} - ${errText.substring(0, 200)}`);
+          }
+          return resp.json();
+        }
+      };
 
       // ── Step 3: Split if holding > amount ──
       let transferCid = holdingCid;
       const needsSplit = srcHolding.amount > amount + 0.0000001;
 
       if (needsSplit) {
-        console.log(`[MatchingEngine] Splitting holding: ${srcHolding.amount} → ${amount} + remainder`);
-        try {
-          const splitCtxUrl = `${registryApi}/v0/registrars/${adminEncoded}/registry/holding/v1/${encodeURIComponent(holdingCid)}/choice-contexts/split`;
-          const splitCtxResp = await fetch(splitCtxUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
-          });
-          if (!splitCtxResp.ok) {
-            console.log(`[MatchingEngine] Split context failed: ${splitCtxResp.status}`);
-            return false;
-          }
-          const splitCtx = await splitCtxResp.json();
-          const splitDisclosed = (splitCtx.disclosedContracts || []).map(dc => ({
-            templateId: dc.templateId, contractId: dc.contractId,
-            createdEventBlob: dc.createdEventBlob, synchronizerId: dc.synchronizerId || '',
-          }));
-          const splitChoiceCtx = splitCtx.choiceContextData || splitCtx.choiceContext?.choiceContextData || { values: {} };
+        console.log(`[MatchingEngine] Splitting ${symbol} holding: ${srcHolding.amount} → ${amount} + remainder`);
+        const splitCtx = await getChoiceCtx('holding', holdingCid, 'split');
+        const splitDisclosed = (splitCtx.disclosedContracts || []).map(dc => ({
+          templateId: dc.templateId, contractId: dc.contractId,
+          createdEventBlob: dc.createdEventBlob, synchronizerId: dc.synchronizerId || '',
+        }));
+        const splitChoiceCtx = splitCtx.choiceContextData || splitCtx.choiceContext?.choiceContextData || { values: {} };
 
-          const splitResult = await cantonService.exerciseChoice({
-            token,
-            templateId: holdingInterfaceId,
-            contractId: holdingCid,
-            choice: 'Split',
-            choiceArgument: {
-              splitAmounts: [amount.toString()],
-              extraArgs: { context: splitChoiceCtx, meta: { values: {} } },
-            },
-            actAsParty: [senderPartyId, operatorPartyId],
-            disclosedContracts: splitDisclosed,
-          });
+        const splitResult = await cantonService.exerciseChoice({
+          token,
+          templateId: holdingInterfaceId,
+          contractId: holdingCid,
+          choice: 'Split',
+          choiceArgument: {
+            splitAmounts: [amount.toString()],
+            extraArgs: { context: splitChoiceCtx, meta: { values: {} } },
+          },
+          actAsParty: [senderPartyId, operatorPartyId],
+          disclosedContracts: splitDisclosed,
+        });
 
-          // Find the split piece with the exact transfer amount
-          const splitEvents = splitResult?.transaction?.events || [];
-          for (const ev of splitEvents) {
-            const created = ev.created || ev.CreatedEvent;
-            if (!created?.contractId) continue;
-            const ca = created.createArgument || {};
-            const evAmt = parseFloat(ca.amount || '0');
-            if (Math.abs(evAmt - amount) < 0.0000001) {
-              transferCid = created.contractId;
-              break;
-            }
+        // Find the split piece with the exact transfer amount
+        const splitEvents = splitResult?.transaction?.events || [];
+        for (const ev of splitEvents) {
+          const created = ev.created || ev.CreatedEvent;
+          if (!created?.contractId) continue;
+          const ca = created.createArgument || {};
+          const evAmt = parseFloat(ca.amount?.initialAmount || ca.amount || '0');
+          if (Math.abs(evAmt - amount) < 0.0000001) {
+            transferCid = created.contractId;
+            break;
           }
-          console.log(`[MatchingEngine] ✅ Split done → transfer piece: ${transferCid.substring(0, 25)}...`);
-        } catch (splitErr) {
-          console.warn(`[MatchingEngine] Split failed: ${splitErr.message} — aborting Splice transfer`);
-          return false;
         }
+        console.log(`[MatchingEngine] ✅ Split done → transfer piece: ${transferCid.substring(0, 25)}...`);
       }
 
       // ── Step 4: Transfer holding → creates TransferInstruction ──
-      console.log(`[MatchingEngine] Creating Splice TransferInstruction...`);
-      const txCtxUrl = `${registryApi}/v0/registrars/${adminEncoded}/registry/holding/v1/${encodeURIComponent(transferCid)}/choice-contexts/transfer`;
-      const txCtxResp = await fetch(txCtxUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
-      });
-      if (!txCtxResp.ok) {
-        console.log(`[MatchingEngine] Transfer context failed: ${txCtxResp.status}`);
-        return false;
-      }
-      const txCtx = await txCtxResp.json();
+      console.log(`[MatchingEngine] Creating ${symbol} TransferInstruction...`);
+      const txCtx = await getChoiceCtx('holding', transferCid, 'transfer');
       const txDisclosed = (txCtx.disclosedContracts || []).map(dc => ({
         templateId: dc.templateId, contractId: dc.contractId,
         createdEventBlob: dc.createdEventBlob, synchronizerId: dc.synchronizerId || '',
@@ -895,24 +954,13 @@ class MatchingEngine {
       if (!tiCid) {
         console.warn(`[MatchingEngine] Transfer exercised but could not find TransferInstruction CID`);
         // Transfer was initiated (visible on explorer as a pending TransferInstruction)
-        // Even if we can't auto-accept, the transfer IS visible. Return true.
         return true;
       }
       console.log(`[MatchingEngine] ✅ TransferInstruction created: ${tiCid.substring(0, 25)}...`);
 
       // ── Step 5: Accept the TransferInstruction ──
-      console.log(`[MatchingEngine] Accepting TransferInstruction for receiver...`);
-      const accCtxUrl = `${registryApi}/v0/registrars/${adminEncoded}/registry/transfer-instruction/v1/${encodeURIComponent(tiCid)}/choice-contexts/accept`;
-      const accCtxResp = await fetch(accCtxUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
-      });
-      if (!accCtxResp.ok) {
-        console.log(`[MatchingEngine] Accept context failed: ${accCtxResp.status} — TransferInstruction still visible on explorer`);
-        return true; // Transfer is pending but visible
-      }
-      const accCtx = await accCtxResp.json();
+      console.log(`[MatchingEngine] Accepting ${symbol} TransferInstruction for receiver...`);
+      const accCtx = await getChoiceCtx('transfer-instruction', tiCid, 'accept');
       const accDisclosed = (accCtx.disclosedContracts || []).map(dc => ({
         templateId: dc.templateId, contractId: dc.contractId,
         createdEventBlob: dc.createdEventBlob, synchronizerId: dc.synchronizerId || '',
@@ -934,9 +982,41 @@ class MatchingEngine {
       console.log(`[MatchingEngine] ✅ Splice transfer complete: ${amount} ${symbol} ${senderPartyId.substring(0, 20)}… → ${receiverPartyId.substring(0, 20)}…`);
       return true;
     } catch (error) {
-      console.error(`[MatchingEngine] Splice transfer failed: ${error.message}`);
+      console.error(`[MatchingEngine] Splice ${symbol} transfer failed: ${error.message}`);
       return false;
     }
+  }
+
+  /**
+   * Enrich choice context and disclosed contracts with AmuletRules for CC transfers.
+   * AmuletRules is required by the DSO for all Amulet operations.
+   */
+  _enrichContextForCC(ctxData, amuletRulesData) {
+    if (!amuletRulesData) return ctxData;
+
+    const disclosed = [...(ctxData.disclosedContracts || [])];
+    const choiceCtx = ctxData.choiceContextData || ctxData.choiceContext?.choiceContextData || { values: {} };
+
+    // Add AmuletRules to disclosed contracts if not already present
+    if (amuletRulesData.createdEventBlob && !disclosed.find(dc => dc.contractId === amuletRulesData.contractId)) {
+      disclosed.push({
+        templateId: amuletRulesData.templateId,
+        contractId: amuletRulesData.contractId,
+        createdEventBlob: amuletRulesData.createdEventBlob,
+        synchronizerId: amuletRulesData.synchronizerId || '',
+      });
+    }
+
+    // Add amulet-rules to choice context values
+    if (!choiceCtx.values) choiceCtx.values = {};
+    if (amuletRulesData.contractId && !choiceCtx.values['amulet-rules']) {
+      choiceCtx.values['amulet-rules'] = {
+        tag: 'AV_ContractId',
+        value: amuletRulesData.contractId,
+      };
+    }
+
+    return { ...ctxData, disclosedContracts: disclosed, choiceContextData: choiceCtx };
   }
 
   setPollingInterval(ms) {

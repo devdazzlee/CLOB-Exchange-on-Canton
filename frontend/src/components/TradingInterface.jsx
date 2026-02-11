@@ -702,21 +702,16 @@ export default function TradingInterface({ partyId }) {
 
     loadInitialOrderBook();
     
-    // Load initial trades (legacy API)
+    // Load initial trades — ALWAYS use fresh data from API
     const loadInitialTrades = async () => {
       try {
         const tradesData = await apiClient.get(API_ROUTES.TRADES.GET(tradingPair, 50));
         const tradesList = tradesData?.data?.trades || [];
         
-          setTrades(prev => {
-            if (tradesList.length === 0) {
-            return prev;
-            }
-            const apiTradeIds = new Set(tradesList.map(t => t.tradeId));
-            const newFromWs = prev.filter(t => !apiTradeIds.has(t.tradeId));
-            return [...newFromWs, ...tradesList].slice(0, 50);
-          });
-          console.log('[TradingInterface] Initial trades loaded:', tradesList.length);
+        if (tradesList.length > 0) {
+          setTrades(tradesList.slice(0, 50));
+        }
+        console.log('[TradingInterface] Initial trades loaded:', tradesList.length);
       } catch (error) {
         console.error('[TradingInterface] Failed to load initial trades:', error);
       } finally {
@@ -755,18 +750,15 @@ export default function TradingInterface({ partyId }) {
       }
     }, 3000); // 3 seconds — fast enough for near-real-time without WebSocket
 
-    // Poll trades every 5 seconds
+    // Poll trades every 5 seconds — ALWAYS use fresh data from API
     const tradesInterval = setInterval(async () => {
       if (document.hidden) return;
       try {
         const tradesData = await apiClient.get(API_ROUTES.TRADES.GET(tradingPair, 50));
         const tradesList = tradesData?.data?.trades || [];
-        setTrades(prev => {
-          if (tradesList.length === 0) return prev;
-          const apiTradeIds = new Set(tradesList.map(t => t.tradeId));
-          const newFromWs = prev.filter(t => !apiTradeIds.has(t.tradeId));
-          return [...newFromWs, ...tradesList].slice(0, 50);
-        });
+        if (tradesList.length > 0) {
+          setTrades(tradesList.slice(0, 50));
+        }
       } catch (error) {
         // Silent
       }
