@@ -38,6 +38,7 @@ console.log('');
  * Create Express application
  */
 function createApp() {
+  const isServerless = process.env.VERCEL === '1' || !!process.env.VERCEL_ENV;
   const app = express();
   const server = http.createServer(app);
 
