@@ -15,7 +15,7 @@
   "crons": [
     {
       "path": "/api/match/trigger",
-      "schedule": "* * * * *"
+      "schedule": "0 0 * * *"
     }
   ],
   "env": {
