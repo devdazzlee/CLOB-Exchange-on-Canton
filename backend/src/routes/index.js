@@ -69,6 +69,22 @@ router.use('/v1', exchangeRoutes); // Exchange API (orders, trades, etc.)
 router.use('/orders/v2', orderRoutesV2); // POST /api/orders/v2 (Token Standard orders)
 router.use('/trades/v2', tradeRoutesV2); // GET /api/trades/v2 (DvP trades)
 
+// Matching Engine: On-demand trigger (CRITICAL for serverless/Vercel where background matching can't run)
+// Supports both POST (from frontend) and GET (from Vercel Cron)
+const matchTriggerHandler = async (req, res) => {
+  try {
+    const { getMatchingEngine } = require('../services/matching-engine');
+    const engine = getMatchingEngine();
+    const result = await engine.triggerMatchingCycle();
+    res.json({ ok: true, data: result });
+  } catch (error) {
+    console.error('[MatchTrigger] Error:', error.message);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+};
+router.post('/match/trigger', matchTriggerHandler);
+router.get('/match/trigger', matchTriggerHandler); // For Vercel Cron
+
 // Debug: Log all registered routes
 console.log('[Routes] Registered routes:');
 console.log('  POST /api/create-party (legacy)');

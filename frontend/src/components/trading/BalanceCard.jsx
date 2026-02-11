@@ -1,5 +1,5 @@
 import { motion } from 'framer-motion';
-import { Wallet, RefreshCw, Loader2 } from 'lucide-react';
+import { Wallet, RefreshCw, Lock } from 'lucide-react';
 import { Button } from '../ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
 
@@ -25,11 +25,18 @@ function getTokenConfig(symbol) {
   };
 }
 
-export default function BalanceCard({ balance = {}, loading, onRefresh }) {
+export default function BalanceCard({ balance = {}, lockedBalance = {}, loading, onRefresh }) {
   // Get all tokens from balance (dynamic - includes CBTC, CC, etc.)
-  const tokens = Object.keys(balance).filter(token => {
-    const amount = parseFloat(balance[token] || 0);
-    return amount > 0 || TOKEN_CONFIG[token]; // Show tokens with balance OR known tokens
+  // Combine available + locked to get full token list
+  const allTokens = new Set([
+    ...Object.keys(balance),
+    ...Object.keys(lockedBalance || {})
+  ]);
+  
+  const tokens = [...allTokens].filter(token => {
+    const available = parseFloat(balance[token] || 0);
+    const locked = parseFloat((lockedBalance || {})[token] || 0);
+    return (available + locked) > 0 || TOKEN_CONFIG[token]; // Show tokens with balance OR known tokens
   });
 
   // Ensure we show at least some common tokens if balance is empty
@@ -61,7 +68,9 @@ export default function BalanceCard({ balance = {}, loading, onRefresh }) {
         {/* Dynamically render ALL tokens */}
         {tokens.map((token, index) => {
           const config = getTokenConfig(token);
-          const amount = parseFloat(balance[token] || 0);
+          const available = parseFloat(balance[token] || 0);
+          const locked = parseFloat((lockedBalance || {})[token] || 0);
+          const total = available + locked;
           
           return (
             <motion.div
@@ -86,12 +95,27 @@ export default function BalanceCard({ balance = {}, loading, onRefresh }) {
                   {loading ? (
                     <div className="animate-pulse bg-muted h-6 w-24 rounded"></div>
                   ) : (
-                    <div className={`text-2xl font-bold text-foreground group-hover:${config.color} transition-colors`}>
-                      {amount.toLocaleString(undefined, { 
-                        minimumFractionDigits: 2, 
-                        maximumFractionDigits: config.decimals 
-                      })}
-                    </div>
+                    <>
+                      {/* Available balance (main display) */}
+                      <div className={`text-2xl font-bold text-foreground group-hover:${config.color} transition-colors`}>
+                        {available.toLocaleString(undefined, { 
+                          minimumFractionDigits: 2, 
+                          maximumFractionDigits: config.decimals 
+                        })}
+                      </div>
+                      {/* Show locked amount if any */}
+                      {locked > 0 && (
+                        <div className="flex items-center justify-end gap-1 mt-0.5">
+                          <Lock className="w-3 h-3 text-yellow-500" />
+                          <span className="text-xs text-yellow-500/80">
+                            {locked.toLocaleString(undefined, { 
+                              minimumFractionDigits: 2, 
+                              maximumFractionDigits: config.decimals 
+                            })} locked
+                          </span>
+                        </div>
+                      )}
+                    </>
                   )}
                 </div>
               </div>
@@ -107,7 +131,7 @@ export default function BalanceCard({ balance = {}, loading, onRefresh }) {
           </div>
         )}
         
-        {/* Total Value - only if we have USDT equivalent */}
+        {/* Total Value - only if we have tokens */}
         {tokens.length > 0 && (
           <div className="mt-4 pt-4 border-t border-border">
             <div className="flex items-center justify-between">

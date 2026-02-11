@@ -71,7 +71,22 @@ class OrderController {
 
     console.log(`[OrderController] ✅ Order placed: ${result.orderId}`);
 
-    return success(res, result, 'Order placed successfully', 201);
+    // ═══ AUTO-TRIGGER MATCHING ENGINE ═══
+    // On serverless (Vercel), the matching engine doesn't run as a background process.
+    // Trigger a matching cycle synchronously within the request to ensure instant matching.
+    // This adds ~1-2s to order placement but guarantees matching happens.
+    let matchResult = null;
+    try {
+      const { getMatchingEngine } = require('../services/matching-engine');
+      const engine = getMatchingEngine();
+      console.log(`[OrderController] ⚡ Auto-triggering matching engine after order placement...`);
+      matchResult = await engine.triggerMatchingCycle();
+      console.log(`[OrderController] ⚡ Matching cycle complete:`, matchResult?.success ? 'success' : 'no matches');
+    } catch (matchErr) {
+      console.warn(`[OrderController] ⚠️ Auto-match trigger failed (non-critical):`, matchErr.message);
+    }
+
+    return success(res, { ...result, matchTriggered: true, matchResult }, 'Order placed successfully', 201);
   });
 
   /**

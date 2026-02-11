@@ -9,10 +9,11 @@ class WebSocketService {
     this.ws = null;
     this.subscribers = new Map(); // channel -> [callbacks]
     this.reconnectAttempts = 0;
-    this.maxReconnectAttempts = 5;
-    this.reconnectDelay = 1000;
+    this.maxReconnectAttempts = 3; // Fail fast — switch to polling sooner
+    this.reconnectDelay = 1000;    // Start at 1s, not 2s
     this.heartbeatInterval = null;
     this.isManualClose = false;
+    this.connectionFailed = false; // Track persistent failure
   }
 
   connect() {
@@ -85,14 +86,21 @@ class WebSocketService {
 
   reconnect() {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.warn('[WebSocket] Max reconnection attempts reached. Real-time updates unavailable — using HTTP polling.');
+      console.warn('[WebSocket] Max reconnection attempts reached — using HTTP polling only');
       this._degraded = true;
+      this.connectionFailed = true;
+      // Notify subscribers that connection has permanently failed
+      this.subscribers.forEach((callbacks, channel) => {
+        callbacks.forEach(cb => {
+          try { cb({ type: 'WS_CONNECTION_FAILED' }); } catch (e) { /* ignore */ }
+        });
+      });
       return;
     }
 
     this.reconnectAttempts++;
-    // Exponential backoff with cap at 30s
-    const delay = Math.min(this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1), 30000);
+    // Exponential backoff: 1s, 2s, 4s — capped at 5s (fast fail)
+    const delay = Math.min(this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1), 5000);
     
     console.log(`[WebSocket] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
     
@@ -221,14 +229,22 @@ class WebSocketService {
 }
 
 // Create singleton instance
-// WebSocket URL from environment or derived from current page location
+// WebSocket URL derivation priority:
+// 1. VITE_WS_URL (explicit override)
+// 2. VITE_BACKEND_URL (derive from backend URL)
+// 3. VITE_API_BASE_URL (derive from API URL, strip /api suffix)
+// 4. Same origin (production: use current page host)
+// 5. localhost:3001 (development only)
+//
+// NOTE: On Vercel/serverless, WebSockets cannot work. The frontend will
+// detect failure fast (3 attempts) and fall back to aggressive HTTP polling.
 const getWebSocketUrl = () => {
-  // 1. Explicit WS URL from environment (highest priority)
+  // 1. Explicit WS URL
   if (import.meta.env.VITE_WS_URL) {
     return import.meta.env.VITE_WS_URL;
   }
 
-  // 2. Derive from explicit backend URL if provided
+  // 2. Derive from backend URL
   if (import.meta.env.VITE_BACKEND_URL) {
     const backendUrl = import.meta.env.VITE_BACKEND_URL;
     const wsProtocol = backendUrl.startsWith('https') ? 'wss' : 'ws';
@@ -236,28 +252,39 @@ const getWebSocketUrl = () => {
     return `${wsProtocol}://${wsHost}/ws`;
   }
 
-  // 3. Development mode → localhost
+  // 3. Derive from API base URL (strip /api suffix)
+  if (import.meta.env.VITE_API_BASE_URL) {
+    const apiUrl = import.meta.env.VITE_API_BASE_URL.replace(/\/api\/?$/, '');
+    if (apiUrl && !apiUrl.startsWith('/')) {
+      const wsProtocol = apiUrl.startsWith('https') ? 'wss' : 'ws';
+      const wsHost = apiUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+      return `${wsProtocol}://${wsHost}/ws`;
+    }
+  }
+
+  // 4. In production (not dev mode), use same origin
+  if (!import.meta.env.DEV && typeof window !== 'undefined') {
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    return `${wsProtocol}://${window.location.host}/ws`;
+  }
+
+  // 5. Development fallback — only used in local dev mode
   if (import.meta.env.DEV) {
     return 'ws://localhost:3001/ws';
   }
 
-  // 4. Production fallback → derive from current page location (same-origin)
-  //    This is consistent with how API_BASE_URL falls back to '/api' in production.
+  // 6. Last resort — same origin (should never reach here)
   if (typeof window !== 'undefined') {
-    const loc = window.location;
-    const wsProtocol = loc.protocol === 'https:' ? 'wss' : 'ws';
-    return `${wsProtocol}://${loc.host}/ws`;
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    return `${wsProtocol}://${window.location.host}/ws`;
   }
 
-  // 5. Absolute last resort (should never reach here in a browser)
-  return 'wss://localhost:3001/ws';
+  return 'ws://localhost:3001/ws';
 };
 
 const WS_URL = getWebSocketUrl();
+console.log(`[WebSocket] URL resolved to: ${WS_URL}`);
 const websocketService = new WebSocketService(WS_URL);
-
-// Auto-connect on import (can be disabled if needed)
-// websocketService.connect();
 
 export default websocketService;
 export { WebSocketService };

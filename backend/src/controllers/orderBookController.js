@@ -12,6 +12,32 @@ const { formatOrderBook } = require('../utils/orderBookAggregator');
 // Get singleton instance
 const orderBookService = getOrderBookService();
 
+// ═══ SERVERLESS MATCHING ENGINE TRIGGER ═══
+// On Vercel serverless, the matching engine can't run as a background loop.
+// We trigger it opportunistically on order book polls (every 3s from frontend).
+// Rate-limited to once per 3 seconds to avoid overload.
+let _lastMatchTriggerTime = 0;
+const MATCH_TRIGGER_COOLDOWN_MS = 3000;
+
+function triggerMatchingIfNeeded() {
+  const now = Date.now();
+  if (now - _lastMatchTriggerTime < MATCH_TRIGGER_COOLDOWN_MS) return;
+  _lastMatchTriggerTime = now;
+
+  // Fire-and-forget — don't block the API response
+  try {
+    const { getMatchingEngine } = require('../services/matching-engine');
+    const engine = getMatchingEngine();
+    engine.triggerMatchingCycle().catch(err => {
+      if (!err.message?.includes('401') && !err.message?.includes('No contracts')) {
+        console.warn('[OrderBookController] Background match trigger error:', err.message);
+      }
+    });
+  } catch (e) {
+    // Non-critical — matching engine may not be initialized
+  }
+}
+
 class OrderBookController {
   /**
    * Get all OrderBooks
@@ -28,6 +54,9 @@ class OrderBookController {
     const { tradingPair } = req.params;
     const decodedTradingPair = decodeURIComponent(tradingPair);
     const { aggregate = 'true', precision = '2', depth = '50' } = req.query;
+
+    // Opportunistically trigger matching engine (serverless: doesn't run in background)
+    triggerMatchingIfNeeded();
 
     try {
       // getOrderBook is now async - queries Canton directly

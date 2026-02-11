@@ -644,15 +644,27 @@ class MatchingEngine {
     }
 
     // Broadcast via WebSocket for real-time UI updates
-      if (global.broadcastWebSocket) {
+    if (global.broadcastWebSocket) {
       global.broadcastWebSocket(`trades:${tradingPair}`, { type: 'NEW_TRADE', ...tradeRecord });
       global.broadcastWebSocket('trades:all', { type: 'NEW_TRADE', ...tradeRecord });
-        global.broadcastWebSocket(`orderbook:${tradingPair}`, {
+      global.broadcastWebSocket(`orderbook:${tradingPair}`, {
         type: 'TRADE_EXECUTED',
         buyOrderId: buyOrder.orderId,
         sellOrderId: sellOrder.orderId,
         fillQuantity: matchQty,
         fillPrice: matchPrice,
+      });
+
+      // Also broadcast balance updates for both parties so UI refreshes immediately
+      global.broadcastWebSocket(`balance:${buyOrder.owner}`, {
+        type: 'BALANCE_UPDATE',
+        partyId: buyOrder.owner,
+        timestamp: Date.now()
+      });
+      global.broadcastWebSocket(`balance:${sellOrder.owner}`, {
+        type: 'BALANCE_UPDATE',
+        partyId: sellOrder.owner,
+        timestamp: Date.now()
       });
     }
 
@@ -662,6 +674,43 @@ class MatchingEngine {
   setPollingInterval(ms) {
     this.pollingInterval = ms;
     console.log(`[MatchingEngine] Polling interval: ${ms}ms`);
+  }
+
+  /**
+   * Run a single matching cycle on-demand (for serverless / API trigger)
+   * Returns match results for the response
+   */
+  async triggerMatchingCycle() {
+    console.log('[MatchingEngine] ⚡ On-demand matching cycle triggered');
+    const startTime = Date.now();
+    let matchesFound = 0;
+    const results = [];
+
+    try {
+      const token = await this.getAdminToken();
+
+      for (const tradingPair of this.tradingPairs) {
+        try {
+          await this.processOrdersForPair(tradingPair, token);
+          // If processOrdersForPair completes without error, a match may have occurred
+        } catch (error) {
+          if (!error.message?.includes('No contracts found')) {
+            console.error(`[MatchingEngine] Trigger error for ${tradingPair}:`, error.message);
+          }
+        }
+      }
+
+      const elapsed = Date.now() - startTime;
+      console.log(`[MatchingEngine] ⚡ On-demand cycle complete in ${elapsed}ms`);
+
+      return { success: true, elapsed, tradingPairs: this.tradingPairs };
+    } catch (error) {
+      console.error(`[MatchingEngine] ⚡ On-demand cycle failed:`, error.message);
+      if (error.message?.includes('401') || error.message?.includes('security-sensitive')) {
+        this.invalidateToken();
+      }
+      return { success: false, error: error.message };
+    }
   }
 }
 

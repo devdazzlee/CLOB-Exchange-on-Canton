@@ -46,8 +46,9 @@ export default function TradingInterface({ partyId }) {
   const [orderMode, setOrderMode] = useState('LIMIT');
   const [price, setPrice] = useState('');
   const [quantity, setQuantity] = useState('');
-  // Dynamic balance object - will be populated from API (includes CBTC)
-  const [balance, setBalance] = useState({});
+  // Dynamic balance objects - available and locked, populated from API (includes CBTC)
+  const [balance, setBalance] = useState({});         // Available balance
+  const [lockedBalance, setLockedBalance] = useState({}); // Locked in open orders
   const [balanceLoading, setBalanceLoading] = useState(false);
   const isMintingRef = useRef(false);
   const lastMintAtRef = useRef(0);
@@ -135,6 +136,74 @@ export default function TradingInterface({ partyId }) {
     }
   }, [partyId, toast, mintingLoading]);
 
+  // ═══ SHARED REFRESH FUNCTION ═══
+  // Refreshes order book, user orders, balance, and trades in one call
+  const refreshAllData = useCallback(async (pair) => {
+    const activePair = pair || tradingPair;
+    console.log('[Refresh] Refreshing all data for', activePair);
+    
+    // Refresh order book
+    try {
+      const bookData = await getGlobalOrderBook(activePair);
+      if (bookData) {
+        setOrderBook({
+          buys: bookData.buyOrders || [],
+          sells: bookData.sellOrders || []
+        });
+      }
+    } catch (e) { console.warn('[Refresh] Order book error:', e.message); }
+
+    // Refresh user orders
+    try {
+      const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
+      const ordersList = ordersData?.data?.orders || [];
+      setOrders(ordersList.map(order => ({
+        id: order.orderId || order.contractId,
+        contractId: order.contractId,
+        type: order.orderType,
+        mode: order.orderMode,
+        price: order.price,
+        quantity: order.quantity,
+        filled: order.filled || '0',
+        status: order.status,
+        tradingPair: order.tradingPair,
+        timestamp: order.timestamp
+      })));
+    } catch (e) { console.warn('[Refresh] User orders error:', e.message); }
+
+    // Refresh balance from V2 Holdings (available + locked)
+    try {
+      const balanceData = await balanceService.getBalances(partyId);
+      if (balanceData.available) {
+        const dynamicBalance = {};
+        Object.keys(balanceData.available).forEach(token => {
+          dynamicBalance[token] = balanceData.available[token]?.toString() || '0.0';
+        });
+        setBalance(dynamicBalance);
+      }
+      if (balanceData.locked) {
+        const dynamicLocked = {};
+        Object.keys(balanceData.locked).forEach(token => {
+          dynamicLocked[token] = balanceData.locked[token]?.toString() || '0.0';
+        });
+        setLockedBalance(dynamicLocked);
+      }
+    } catch (e) { console.warn('[Refresh] Balance error:', e.message); }
+
+    // Refresh trades
+    try {
+      const tradesData = await apiClient.get(API_ROUTES.TRADES.GET(activePair, 50));
+      const tradesList = tradesData?.data?.trades || [];
+      if (tradesList.length > 0) {
+        setTrades(prev => {
+          const apiTradeIds = new Set(tradesList.map(t => t.tradeId));
+          const newFromWs = prev.filter(t => !apiTradeIds.has(t.tradeId));
+          return [...newFromWs, ...tradesList].slice(0, 50);
+        });
+      }
+    } catch (e) { console.warn('[Refresh] Trades error:', e.message); }
+  }, [partyId, tradingPair]);
+
   // Place order - uses legacy API but balances are V2 Holdings
   const handlePlaceOrder = useCallback(async (orderData) => {
     try {
@@ -185,70 +254,34 @@ export default function TradingInterface({ partyId }) {
       });
       setShowOrderSuccess(true);
       
-      // Wait briefly for Canton to fully commit the new order before refreshing
+      // Wait briefly for Canton to commit the order
       await new Promise(r => setTimeout(r, 800));
-      
-      // Refresh order book using the same aggregated format as initial load
-      try {
-        const bookData = await getGlobalOrderBook(orderData.tradingPair || tradingPair);
-        if (bookData) {
-          setOrderBook({
-            buys: bookData.buyOrders || [],
-            sells: bookData.sellOrders || []
-          });
-          console.log('[Refresh] Order book updated:', bookData.buyOrdersCount, 'buys,', bookData.sellOrdersCount, 'sells');
-        }
-      } catch (e) { console.error('[Refresh] Order book error:', e); }
-      
-      // Refresh user orders
-      try {
-        const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
-          const ordersList = ordersData?.data?.orders || [];
-          setOrders(ordersList.map(order => ({
-            id: order.orderId || order.contractId,
-            contractId: order.contractId,
-            type: order.orderType,
-            mode: order.orderMode,
-            price: order.price,
-            quantity: order.quantity,
-            filled: order.filled || '0',
-            status: order.status,
-            tradingPair: order.tradingPair,
-            timestamp: order.timestamp
-          })));
-      } catch (e) { console.error('[Refresh] User orders error:', e); }
-      
-      // Refresh balance from V2 Holdings (includes CBTC)
-      try {
-        const balanceData = await balanceService.getBalances(partyId);
-        if (balanceData.available) {
-          // Dynamic balance - show ALL tokens from API
-          const dynamicBalance = {};
-          Object.keys(balanceData.available).forEach(token => {
-            dynamicBalance[token] = balanceData.available[token]?.toString() || '0.0';
-          });
-          setBalance(dynamicBalance);
-        }
-      } catch (e) { console.error('[Refresh] Balance error:', e); }
-      
-      // Refresh trades
-      try {
-        const tradesData = await apiClient.get(API_ROUTES.TRADES.GET(tradingPair, 50));
-        setTrades(tradesData?.data?.trades || []);
-      } catch (e) { console.error('[Refresh] Trades error:', e); }
 
-      // Second refresh after 2 more seconds (catches any Canton propagation delay)
+      // ═══ TRIGGER MATCHING ENGINE ═══
+      // On serverless (Vercel), the matching engine doesn't run as a background process.
+      // We trigger it on-demand after every order placement to ensure instant matching.
+      console.log('[Place Order] Triggering matching engine...');
+      try {
+        await apiClient.post('/match/trigger', {});
+        console.log('[Place Order] ✅ Matching engine triggered');
+      } catch (matchErr) {
+        console.warn('[Place Order] Matching trigger failed (non-critical):', matchErr.message);
+      }
+
+      // Wait for matching to complete + Canton propagation
+      await new Promise(r => setTimeout(r, 1200));
+
+      // ═══ REFRESH ALL DATA ═══
+      await refreshAllData(orderData.tradingPair || tradingPair);
+
+      // Second matching trigger + refresh after 3s (catches propagation delays)
       setTimeout(async () => {
         try {
-          const bookData2 = await getGlobalOrderBook(orderData.tradingPair || tradingPair);
-          if (bookData2) {
-            setOrderBook({
-              buys: bookData2.buyOrders || [],
-              sells: bookData2.sellOrders || []
-            });
-          }
-        } catch (_) { /* silent retry */ }
-      }, 2000);
+          await apiClient.post('/match/trigger', {});
+        } catch (_) { /* silent */ }
+        // Refresh again
+        setTimeout(() => refreshAllData(orderData.tradingPair || tradingPair), 1500);
+      }, 3000);
       
     } catch (error) {
       console.error('[Place Order] Failed:', error);
@@ -300,19 +333,19 @@ export default function TradingInterface({ partyId }) {
     // Refresh orders list
     try {
       const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
-      const ordersList = ordersData?.data?.orders || [];
-      setOrders(ordersList.map(order => ({
-        id: order.orderId || order.contractId,
-        contractId: order.contractId,
-        type: order.orderType,
-        mode: order.orderMode,
-        price: order.price,
-        quantity: order.quantity,
-        filled: order.filled || '0',
-        status: order.status,
-        tradingPair: order.tradingPair,
-        timestamp: order.timestamp
-      })));
+          const ordersList = ordersData?.data?.orders || [];
+          setOrders(ordersList.map(order => ({
+            id: order.orderId || order.contractId,
+            contractId: order.contractId,
+            type: order.orderType,
+            mode: order.orderMode,
+            price: order.price,
+            quantity: order.quantity,
+            filled: order.filled || '0',
+            status: order.status,
+            tradingPair: order.tradingPair,
+            timestamp: order.timestamp
+          })));
     } catch (e) {
       console.warn('[Cancel Order] Failed to refresh orders:', e);
     }
@@ -394,21 +427,21 @@ export default function TradingInterface({ partyId }) {
   }, []);
 
   useEffect(() => {
-    // More robust heartbeat checker - increased threshold to 20 seconds
-    // to account for temporary main thread blocking
+    // Heartbeat checker — log-only, NEVER crash the UI
+    // The main thread can be blocked during heavy Canton API calls,
+    // WebSocket reconnections, or browser tab throttling. 
+    // Crashing the UI is worse than a brief stall.
     const heartbeatInterval = setInterval(() => {
       const now = Date.now();
       const timeSinceLastHeartbeat = now - heartbeatRef.current;
       
-      // Only trigger error if no heartbeat for 20 seconds (was 10 seconds)
-      // This accounts for temporary blocking from heavy operations
-      if (timeSinceLastHeartbeat > 20000) {
-        console.error('[TradingInterface] UI appears to be unresponsive - no heartbeat for', timeSinceLastHeartbeat, 'ms');
-        setErrorMessage(`UI unresponsive - no heartbeat for ${timeSinceLastHeartbeat}ms`);
-        setHasError(true);
-        setIsAlive(false);
+      // Only log a warning; never crash the UI
+      if (timeSinceLastHeartbeat > 60000) {
+        console.warn('[TradingInterface] Heartbeat stale for', timeSinceLastHeartbeat, 'ms — background tab or heavy load');
+        // Do NOT setHasError — that crashes the entire interface
+        // The polling intervals will catch up when the tab becomes active
       }
-    }, 3000); // Check every 3 seconds instead of 2
+    }, 10000); // Check every 10 seconds
 
     return () => clearInterval(heartbeatInterval);
   }, []);
@@ -659,24 +692,25 @@ export default function TradingInterface({ partyId }) {
       }
     };
 
-    // Initial load - merge with existing (don't overwrite WebSocket data)
+    // Initial load — ALWAYS use fresh data from API
     const loadInitialOrderBook = async () => {
       try {
         console.log('[TradingInterface] Loading initial order book for:', tradingPair);
         const bookData = await getGlobalOrderBook(tradingPair);
         if (bookData) {
-          // Only update if we got actual data
-          setOrderBook(prev => ({
-            buys: bookData.buyOrders?.length > 0 ? bookData.buyOrders : prev.buys,
-            sells: bookData.sellOrders?.length > 0 ? bookData.sellOrders : prev.sells
-          }));
-          console.log('[TradingInterface] Order book loaded:', bookData);
+          // ALWAYS set fresh data — never keep stale ghost orders
+          setOrderBook({
+            buys: bookData.buyOrders || [],
+            sells: bookData.sellOrders || []
+          });
+          console.log('[TradingInterface] Order book loaded:', {
+            buys: (bookData.buyOrders || []).length,
+            sells: (bookData.sellOrders || []).length
+          });
         }
       } catch (error) {
         console.error('[TradingInterface] Failed to load initial order book:', error);
-        // On error, keep existing data
       } finally {
-        // Always stop loading regardless of success/failure
         setOrderBookLoading(false);
         setTradesLoading(false);
         hasLoadedOrderBook = true;
@@ -716,27 +750,48 @@ export default function TradingInterface({ partyId }) {
     websocketService.subscribe(`orderbook:${tradingPair}`, orderBookCallback);
     websocketService.subscribe(`trades:${tradingPair}`, tradeCallback);
 
-    // Poll order book — faster when WebSocket is unavailable (degraded mode)
-    const pollInterval = websocketService.isDegraded ? 5000 : 30000;
+    // ═══ AGGRESSIVE POLLING ═══
+    // Poll frequently since WebSocket may not work on serverless (Vercel).
+    // CRITICAL: Always use fresh data — don't preserve old data when API returns empty,
+    // otherwise matched/cancelled orders will appear as "ghost orders" in the book.
     interval = setInterval(async () => {
-      if (!isLoadingRef.current) {
+      if (document.hidden || isLoadingRef.current) return;
+      
         try {
           const bookData = await getGlobalOrderBook(tradingPair);
-          // Only update if we got actual data
-          if (bookData && (bookData.buyOrders?.length > 0 || bookData.sellOrders?.length > 0)) {
-            setOrderBook(prev => ({
-              buys: bookData.buyOrders?.length > 0 ? bookData.buyOrders : prev.buys,
-              sells: bookData.sellOrders?.length > 0 ? bookData.sellOrders : prev.sells
-            }));
-          }
-        } catch (error) {
-          console.error('[TradingInterface] Failed to poll order book:', error);
+        if (bookData) {
+          // ALWAYS use fresh data from API — even if empty
+          // This ensures matched orders are removed from the book
+          setOrderBook({
+            buys: bookData.buyOrders || [],
+            sells: bookData.sellOrders || []
+          });
         }
+        } catch (error) {
+        // Silent - don't spam console on every failed poll
       }
-    }, pollInterval);
+    }, 3000); // 3 seconds — fast enough for near-real-time without WebSocket
+
+    // Poll trades every 5 seconds
+    const tradesInterval = setInterval(async () => {
+      if (document.hidden) return;
+      try {
+        const tradesData = await apiClient.get(API_ROUTES.TRADES.GET(tradingPair, 50));
+        const tradesList = tradesData?.data?.trades || [];
+        setTrades(prev => {
+          if (tradesList.length === 0) return prev;
+          const apiTradeIds = new Set(tradesList.map(t => t.tradeId));
+          const newFromWs = prev.filter(t => !apiTradeIds.has(t.tradeId));
+          return [...newFromWs, ...tradesList].slice(0, 50);
+        });
+      } catch (error) {
+        // Silent
+      }
+    }, 5000);
 
     return () => {
       if (interval) clearInterval(interval);
+      clearInterval(tradesInterval);
       websocketService.unsubscribe(`orderbook:${tradingPair}`, orderBookCallback);
       websocketService.unsubscribe(`trades:${tradingPair}`, tradeCallback);
     };
@@ -782,9 +837,10 @@ export default function TradingInterface({ partyId }) {
     };
 
     loadUserOrders(true);
-    // Poll faster when WebSocket is unavailable
-    const ordersPollInterval = websocketService.isDegraded ? 5000 : 10000;
-    const ordersInterval = setInterval(() => loadUserOrders(false), ordersPollInterval);
+    // Poll user orders every 3 seconds (fast enough to catch fills/cancels without WebSocket)
+    const ordersInterval = setInterval(() => {
+      if (!document.hidden) loadUserOrders(false);
+    }, 3000);
     
     return () => clearInterval(ordersInterval);
   }, [partyId]);
@@ -793,41 +849,41 @@ export default function TradingInterface({ partyId }) {
   const loadBalance = useCallback(async (showLoader = false) => {
     if (!partyId) return;
 
-      try {
-      // Always show loading when explicitly requested (e.g., refresh button)
-      if (showLoader) {
-          setBalanceLoading(true);
-        }
-      console.log('[Balance V2] Loading Holdings-based balance for party:', partyId);
+    try {
+      if (showLoader) setBalanceLoading(true);
       
-      // TOKEN STANDARD V2: Load balance from Holding contracts (includes CBTC)
-      try {
-        const balanceData = await balanceService.getBalances(partyId);
+      const balanceData = await balanceService.getBalances(partyId);
+      
+      if (balanceData.available && Object.keys(balanceData.available).length > 0) {
+        const dynamicBalance = {};
+        Object.keys(balanceData.available).forEach(token => {
+          dynamicBalance[token] = balanceData.available[token]?.toString() || '0.0';
+        });
+        setBalance(dynamicBalance);
         
-        if (balanceData.available && Object.keys(balanceData.available).length > 0) {
-          // Dynamic balance - show ALL tokens from API (including CBTC, CC, etc.)
-          const dynamicBalance = {};
-          Object.keys(balanceData.available).forEach(token => {
-            dynamicBalance[token] = balanceData.available[token]?.toString() || '0.0';
+        // Also capture locked balance
+        if (balanceData.locked && Object.keys(balanceData.locked).length > 0) {
+          const dynamicLocked = {};
+          Object.keys(balanceData.locked).forEach(token => {
+            dynamicLocked[token] = balanceData.locked[token]?.toString() || '0.0';
           });
-          setBalance(dynamicBalance);
-          console.log('[Balance V2] Holdings balance loaded:', dynamicBalance);
+          setLockedBalance(dynamicLocked);
+        } else {
+          setLockedBalance({});
+        }
+        
               hasLoadedBalanceRef.current = true;
               return;
             }
-        
-        // No Holdings found - show empty balance (no hardcoded defaults)
-        console.log('[Balance V2] No Holdings found - user needs to mint tokens or accept transfers');
-        setBalance({});
+      
+      // No Holdings found
+      setBalance({});
+      setLockedBalance({});
           hasLoadedBalanceRef.current = true;
-        } catch (balanceError) {
-        console.error('[Balance V2] Holdings fetch failed:', balanceError);
-        setBalance({});
-          hasLoadedBalanceRef.current = true;
-        }
       } catch (error) {
       console.error('[Balance V2] Failed to load balance:', error);
       setBalance({});
+      setLockedBalance({});
         hasLoadedBalanceRef.current = true;
       } finally {
         setBalanceLoading(false);
@@ -848,7 +904,10 @@ export default function TradingInterface({ partyId }) {
     };
 
     loadBalance(true);
-    const balanceInterval = setInterval(() => loadBalance(false), 60000); // Reduced from 30s to 60s to avoid spam
+    // Poll balance every 5 seconds (critical for showing updated balances after trades)
+    const balanceInterval = setInterval(() => {
+      if (!document.hidden) loadBalance(false);
+    }, 5000);
     window.addEventListener('keydown', handleKeyPress);
 
     return () => {
@@ -977,6 +1036,7 @@ export default function TradingInterface({ partyId }) {
           {/* Balance Card - Shows all token holdings including CBTC */}
           <BalanceCard
             balance={balance}
+            lockedBalance={lockedBalance}
             loading={balanceLoading}
             onRefresh={() => loadBalance(true)}
           />

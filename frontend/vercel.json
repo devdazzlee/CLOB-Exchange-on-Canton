@@ -12,6 +12,10 @@
       "destination": "/api/proxy"
     },
     {
+      "source": "/api/(.*)",
+      "destination": "/api/backend"
+    },
+    {
       "source": "/(.*)",
       "destination": "/index.html"
     }
@@ -19,7 +23,10 @@
   "functions": {
     "api/proxy.js": {
       "runtime": "@vercel/node@3.2.0"
+    },
+    "api/backend.js": {
+      "runtime": "@vercel/node@3.2.0",
+      "maxDuration": 30
     }
   }
 }
-
