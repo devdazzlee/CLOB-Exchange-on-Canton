@@ -190,16 +190,12 @@ export default function TradingInterface({ partyId }) {
       }
     } catch (e) { console.warn('[Refresh] Balance error:', e.message); }
 
-    // Refresh trades
+    // Refresh trades — ALWAYS use fresh data from API
     try {
       const tradesData = await apiClient.get(API_ROUTES.TRADES.GET(activePair, 50));
       const tradesList = tradesData?.data?.trades || [];
       if (tradesList.length > 0) {
-        setTrades(prev => {
-          const apiTradeIds = new Set(tradesList.map(t => t.tradeId));
-          const newFromWs = prev.filter(t => !apiTradeIds.has(t.tradeId));
-          return [...newFromWs, ...tradesList].slice(0, 50);
-        });
+        setTrades(tradesList.slice(0, 50));
       }
     } catch (e) { console.warn('[Refresh] Trades error:', e.message); }
   }, [partyId, tradingPair]);
@@ -254,34 +250,21 @@ export default function TradingInterface({ partyId }) {
       });
       setShowOrderSuccess(true);
       
-      // Wait briefly for Canton to commit the order
-      await new Promise(r => setTimeout(r, 800));
-
-      // ═══ TRIGGER MATCHING ENGINE ═══
-      // On serverless (Vercel), the matching engine doesn't run as a background process.
-      // We trigger it on-demand after every order placement to ensure instant matching.
-      console.log('[Place Order] Triggering matching engine...');
-      try {
-        await apiClient.post('/match/trigger', {});
-        console.log('[Place Order] ✅ Matching engine triggered');
-      } catch (matchErr) {
-        console.warn('[Place Order] Matching trigger failed (non-critical):', matchErr.message);
-      }
-
-      // Wait for matching to complete + Canton propagation
-      await new Promise(r => setTimeout(r, 1200));
-
-      // ═══ REFRESH ALL DATA ═══
-      await refreshAllData(orderData.tradingPair || tradingPair);
-
-      // Second matching trigger + refresh after 3s (catches propagation delays)
-      setTimeout(async () => {
-        try {
-          await apiClient.post('/match/trigger', {});
-        } catch (_) { /* silent */ }
-        // Refresh again
-        setTimeout(() => refreshAllData(orderData.tradingPair || tradingPair), 1500);
-      }, 3000);
+      // ═══ REFRESH DATA AGGRESSIVELY ═══
+      // The backend fires matching engine async after order placement.
+      // We poll multiple times to catch the match result quickly.
+      
+      // First refresh after 1s (order should be visible)
+      setTimeout(() => refreshAllData(orderData.tradingPair || tradingPair), 1000);
+      
+      // Second refresh after 3s (matching engine should have run)
+      setTimeout(() => refreshAllData(orderData.tradingPair || tradingPair), 3000);
+      
+      // Third refresh after 6s (catch any propagation delays)
+      setTimeout(() => refreshAllData(orderData.tradingPair || tradingPair), 6000);
+      
+      // Fourth refresh after 10s (safety net)
+      setTimeout(() => refreshAllData(orderData.tradingPair || tradingPair), 10000);
       
     } catch (error) {
       console.error('[Place Order] Failed:', error);
@@ -838,11 +821,21 @@ export default function TradingInterface({ partyId }) {
 
     loadUserOrders(true);
     // Poll user orders every 3 seconds (fast enough to catch fills/cancels without WebSocket)
+    // ALSO triggers matching engine via order book poll (see orderBookController)
     const ordersInterval = setInterval(() => {
       if (!document.hidden) loadUserOrders(false);
     }, 3000);
     
-    return () => clearInterval(ordersInterval);
+    // EXTRA: Fire matching trigger every 10s to ensure matches happen on Vercel
+    const matchTriggerInterval = setInterval(() => {
+      if (document.hidden) return;
+      apiClient.post('/match/trigger', {}).catch(() => {/* silent */});
+    }, 10000);
+    
+    return () => {
+      clearInterval(ordersInterval);
+      clearInterval(matchTriggerInterval);
+    };
   }, [partyId]);
 
   // Load balance from Holdings (Token Standard V2) - useCallback so it can be called from child components

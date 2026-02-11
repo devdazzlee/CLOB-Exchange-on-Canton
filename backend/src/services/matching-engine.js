@@ -458,53 +458,72 @@ class MatchingEngine {
     // 2. Custom Holding mintDirect — fallback if Splice fails.
     //    Creates new custom Holdings; balance calc deducts spent amounts.
     // ═══════════════════════════════════════════════════
+    // STEP 1b: Transfer tokens (Fill-Only mode)
+    //
+    // CRITICAL: Do NOT fill orders unless BOTH transfers succeed.
+    // If any transfer fails, abort the match entirely.
+    // ═══════════════════════════════════════════════════
+    let baseTransferOk = useDvP; // DvP already handled transfers atomically
+    let quoteTransferOk = useDvP;
+
     if (!useDvP) {
       const { getHoldingService } = require('./holdingService');
       const holdingService = getHoldingService();
       await holdingService.initialize();
 
       // --- Transfer base asset: seller → buyer ---
-      let baseSpliceOk = false;
       try {
         console.log(`[MatchingEngine] 💰 Transferring ${matchQty} ${baseSymbol}: seller → buyer (trying Splice)...`);
-        baseSpliceOk = await this.attemptSpliceTransfer(
+        baseTransferOk = await this.attemptSpliceTransfer(
           sellOrder.owner, buyOrder.owner, baseSymbol, matchQty, token
         );
       } catch (e) {
         console.warn(`[MatchingEngine] Splice transfer (base) threw: ${e.message}`);
+        baseTransferOk = false;
       }
-      if (!baseSpliceOk) {
+      if (!baseTransferOk) {
         try {
           console.log(`[MatchingEngine] 💰 Splice failed for base — minting ${matchQty} ${baseSymbol} for buyer`);
           await holdingService.mintDirect(buyOrder.owner, baseSymbol, matchQty, token);
           console.log(`[MatchingEngine] ✅ Buyer credited (mint): +${matchQty} ${baseSymbol}`);
+          baseTransferOk = true;
         } catch (mintErr) {
           console.error(`[MatchingEngine] ❌ Buyer credit FAILED: ${mintErr.message}`);
+          baseTransferOk = false;
         }
       } else {
         console.log(`[MatchingEngine] ✅ Buyer credited (Splice transfer): +${matchQty} ${baseSymbol}`);
       }
 
       // --- Transfer quote asset: buyer → seller ---
-      let quoteSpliceOk = false;
       try {
         console.log(`[MatchingEngine] 💰 Transferring ${quoteAmount} ${quoteSymbol}: buyer → seller (trying Splice)...`);
-        quoteSpliceOk = await this.attemptSpliceTransfer(
+        quoteTransferOk = await this.attemptSpliceTransfer(
           buyOrder.owner, sellOrder.owner, quoteSymbol, quoteAmount, token
         );
       } catch (e) {
         console.warn(`[MatchingEngine] Splice transfer (quote) threw: ${e.message}`);
+        quoteTransferOk = false;
       }
-      if (!quoteSpliceOk) {
+      if (!quoteTransferOk) {
         try {
           console.log(`[MatchingEngine] 💰 Splice failed for quote — minting ${quoteAmount} ${quoteSymbol} for seller`);
           await holdingService.mintDirect(sellOrder.owner, quoteSymbol, quoteAmount, token);
           console.log(`[MatchingEngine] ✅ Seller credited (mint): +${quoteAmount} ${quoteSymbol}`);
+          quoteTransferOk = true;
         } catch (mintErr) {
           console.error(`[MatchingEngine] ❌ Seller credit FAILED: ${mintErr.message}`);
+          quoteTransferOk = false;
         }
       } else {
         console.log(`[MatchingEngine] ✅ Seller credited (Splice transfer): +${quoteAmount} ${quoteSymbol}`);
+      }
+
+      // CRITICAL: If EITHER transfer failed, abort the match
+      if (!baseTransferOk || !quoteTransferOk) {
+        console.error(`[MatchingEngine] ❌ ABORTING MATCH — token transfer failed (base: ${baseTransferOk}, quote: ${quoteTransferOk})`);
+        console.error(`[MatchingEngine] Orders will remain OPEN and can be retried next cycle`);
+        throw new Error(`Token transfer failed: base=${baseTransferOk}, quote=${quoteTransferOk}`);
       }
     }
 
@@ -748,7 +767,8 @@ class MatchingEngine {
       await holdingService.initialize();
 
       const holdings = await holdingService.getAvailableHoldings(senderPartyId, symbol, token);
-      const spliceHoldings = (holdings || []).filter(h => h.isSpliceHolding && h.amount >= 0.000001);
+      // CRITICAL FIX: getAvailableHoldings returns `isSplice`, NOT `isSpliceHolding`
+      const spliceHoldings = (holdings || []).filter(h => (h.isSplice || h.isSpliceHolding) && h.amount >= 0.000001);
       if (spliceHoldings.length === 0) {
         console.log(`[MatchingEngine] No Splice ${symbol} holdings for sender — cannot do Splice transfer`);
         return false;
@@ -925,20 +945,36 @@ class MatchingEngine {
   }
 
   /**
-   * Run a single matching cycle on-demand (for serverless / API trigger)
-   * Returns match results for the response
-   */
-  /**
    * Run a single matching cycle on-demand (for serverless / API trigger).
    * @param {string|null} targetPair - If provided, only match this pair (faster).
    *                                   If null, process all pairs.
+   * 
+   * CONCURRENCY GUARD: Uses matchingInProgress to prevent overlapping cycles.
+   * On Vercel, multiple API calls can arrive simultaneously (e.g., order placement
+   * + cron + order book poll all triggering matching at once). Without this guard,
+   * they race on the same orders, causing duplicate fills or stale contract errors.
    */
   async triggerMatchingCycle(targetPair = null) {
+    // Concurrency guard — shared with runMatchingCycle
+    if (this.matchingInProgress) {
+      const elapsed = Date.now() - this.matchingStartTime;
+      if (elapsed > 25000) {
+        console.warn(`[MatchingEngine] ⚠️ matchingInProgress stuck for ${elapsed}ms — force-resetting`);
+        this.matchingInProgress = false;
+      } else {
+        console.log(`[MatchingEngine] ⚡ Skipping trigger — matching already in progress (${elapsed}ms)`);
+        return { success: false, reason: 'matching_in_progress' };
+      }
+    }
+
     const pairsToProcess = targetPair ? [targetPair] : this.tradingPairs;
     console.log(`[MatchingEngine] ⚡ On-demand cycle triggered for: ${pairsToProcess.join(', ')}`);
     const startTime = Date.now();
 
     try {
+      this.matchingInProgress = true;
+      this.matchingStartTime = startTime;
+
       const token = await this.getAdminToken();
 
       for (const tradingPair of pairsToProcess) {
@@ -961,6 +997,8 @@ class MatchingEngine {
         this.invalidateToken();
       }
       return { success: false, error: error.message };
+    } finally {
+      this.matchingInProgress = false;
     }
   }
 }

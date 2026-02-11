@@ -71,25 +71,32 @@ class OrderController {
 
     console.log(`[OrderController] ✅ Order placed: ${result.orderId}`);
 
-    // ═══ AUTO-TRIGGER MATCHING ENGINE ═══
-    // On serverless (Vercel), the matching engine doesn't run as a background process.
-    // Wait briefly for Canton propagation, then trigger matching for THIS pair only.
-    let matchResult = null;
-    try {
-      // Wait for Canton to propagate the new Order contract before matching.
-      // Without this, the freshly-placed order may not be visible to the query yet.
-      await new Promise(r => setTimeout(r, 1500));
+    // ═══ AUTO-TRIGGER MATCHING ENGINE (FIRE-AND-FORGET) ═══
+    // On serverless (Vercel), matching can't run in the background.
+    // We trigger it ASYNCHRONOUSLY after responding to the client.
+    // This prevents the order placement response from being blocked by matching
+    // (which can take 5-15s with Splice transfers).
+    //
+    // The client gets an instant response, and matching happens in the background.
+    // The frontend polls every 3s for order book updates, which also triggers matching.
 
-      const { getMatchingEngine } = require('../services/matching-engine');
-      const engine = getMatchingEngine();
-      console.log(`[OrderController] ⚡ Auto-triggering matching for ${decodedTradingPair}...`);
-      matchResult = await engine.triggerMatchingCycle(decodedTradingPair);
-      console.log(`[OrderController] ⚡ Matching cycle complete:`, matchResult?.success ? 'success' : 'no matches');
-    } catch (matchErr) {
-      console.warn(`[OrderController] ⚠️ Auto-match trigger failed (non-critical):`, matchErr.message);
-    }
+    // Return response immediately — don't wait for matching
+    const response = success(res, { ...result, matchTriggered: true }, 'Order placed successfully', 201);
 
-    return success(res, { ...result, matchTriggered: true, matchResult }, 'Order placed successfully', 201);
+    // Fire-and-forget: trigger matching after a short delay for Canton propagation
+    setTimeout(async () => {
+      try {
+        const { getMatchingEngine } = require('../services/matching-engine');
+        const engine = getMatchingEngine();
+        console.log(`[OrderController] ⚡ Auto-triggering matching for ${decodedTradingPair}...`);
+        const matchResult = await engine.triggerMatchingCycle(decodedTradingPair);
+        console.log(`[OrderController] ⚡ Matching cycle complete:`, matchResult?.success ? 'success' : matchResult?.reason || 'no matches');
+      } catch (matchErr) {
+        console.warn(`[OrderController] ⚠️ Auto-match trigger failed (non-critical):`, matchErr.message);
+      }
+    }, 1500);
+
+    return response;
   });
 
   /**
