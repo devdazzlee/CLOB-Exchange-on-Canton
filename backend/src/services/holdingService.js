@@ -603,6 +603,13 @@ class HoldingService {
       const balances = {};
       const lockedBalances = {};
       const holdingDetails = [];
+      // Track Splice/Amulet vs Custom balances separately.
+      // Fill-Only deductions should ONLY reduce Splice/Amulet amounts (the originals
+      // that "should have been consumed" but weren't). Custom holdings (created by
+      // mintDirect during Fill-Only matching) must never be deducted — they represent
+      // real minted tokens that prove a trade happened.
+      const spliceBalances = {};  // Only Splice/Amulet holdings
+      const customBalances = {};  // Only custom (mintDirect) holdings
 
       for (const holding of allHoldings) {
         const payload = holding.payload || holding.createArgument || {};
@@ -654,6 +661,12 @@ class HoldingService {
         // Track available (unlocked) balance
         if (!isLocked) {
           balances[symbol] = (balances[symbol] || 0) + amount;
+          // Separate tracking for Fill-Only deduction accuracy
+          if (isSplice || isAmulet) {
+            spliceBalances[symbol] = (spliceBalances[symbol] || 0) + amount;
+          } else {
+            customBalances[symbol] = (customBalances[symbol] || 0) + amount;
+          }
         }
 
         // Track locked balance
@@ -734,26 +747,35 @@ class HoldingService {
             }
           }
         }
-        // ── Deduct FILLED amounts from Fill-Only orders (Splice holdings) ──
-        // Fill-Only mode mints new custom Holdings for recipients, but the original
-        // Splice holdings are never consumed. Orders tagged with allocationCid="FILL_ONLY"
-        // or empty allocationCid (older Splice orders) need their filled amounts deducted
-        // to prevent double-counting (original Splice holding + minted credit).
+        // ── Deduct FILLED amounts from Fill-Only orders (Splice/Amulet holdings only) ──
+        //
+        // Fill-Only matching:
+        // - mintDirect creates new CUSTOM holdings for recipients
+        // - But the sender's original Splice/Amulet holdings are NOT consumed
+        //
+        // CRITICAL: Deductions must ONLY reduce Splice/Amulet amounts.
+        // Custom holdings (from mintDirect) must NEVER be deducted — they are
+        // the proof that a trade happened and the user received/lost tokens.
+        //
+        // We cap the total deduction per asset at the user's actual Splice/Amulet
+        // balance for that asset. This prevents:
+        // - Over-deduction when many historical Fill-Only trades accumulate
+        // - Minted custom holdings being eaten by deductions (which made balances
+        //   appear unchanged even after successful trades)
         const filledNonDvpOrders = (Array.isArray(orderContracts) ? orderContracts : []).filter(c => {
           const p = c.payload || {};
           const filled = parseFloat(p.filled || 0);
-          // Orders that used Fill-Only matching:
-          // - allocationCid === "FILL_ONLY" (tagged by matching engine)
-          // - allocationCid is empty/NONE (Splice holdings that skipped lock)
           const allocCid = p.allocationCid || '';
           const isFillOnly = allocCid === 'FILL_ONLY' || allocCid === '' || allocCid === 'NONE';
           return p.owner === partyId && filled > 0 && isFillOnly;
         });
 
         if (filledNonDvpOrders.length > 0) {
-          console.log(`[HoldingService] Found ${filledNonDvpOrders.length} Fill-Only orders with fills – deducting spent amounts`);
+          console.log(`[HoldingService] Found ${filledNonDvpOrders.length} Fill-Only orders with fills – deducting spent amounts (capped at Splice balance)`);
         }
 
+        // Accumulate deductions per asset, then apply capped at Splice balance
+        const fillOnlyDeductions = {};
         for (const c of filledNonDvpOrders) {
           const p = c.payload || {};
           const pair = p.tradingPair || '';
@@ -765,20 +787,29 @@ class HoldingService {
             typeof p.price === 'object' && p.price?.Some !== undefined ? p.price.Some : p.price
           ) || 0;
 
-          // Determine which asset was SPENT in this trade
           let debitAsset, debitAmount;
           if (p.orderType === 'BUY') {
-            // Buyer spent quote asset (e.g., CBTC to buy CC)
             debitAsset = quoteAsset;
             debitAmount = priceVal > 0 ? filled * priceVal : filled;
           } else {
-            // Seller spent base asset (e.g., CC to sell for CBTC)
             debitAsset = baseAsset;
             debitAmount = filled;
           }
 
-          if (debitAmount > 0 && balances[debitAsset] !== undefined) {
-            balances[debitAsset] = (balances[debitAsset] || 0) - debitAmount;
+          if (debitAmount > 0) {
+            fillOnlyDeductions[debitAsset] = (fillOnlyDeductions[debitAsset] || 0) + debitAmount;
+          }
+        }
+
+        // Apply deductions, but CAPPED at the Splice/Amulet balance for each asset.
+        // This ensures custom holdings (from mintDirect) are NEVER deducted.
+        for (const [asset, rawDeduction] of Object.entries(fillOnlyDeductions)) {
+          const spliceAmt = spliceBalances[asset] || 0;
+          // Cap: never deduct more than what's in Splice/Amulet holdings
+          const cappedDeduction = Math.min(rawDeduction, spliceAmt);
+          if (cappedDeduction > 0 && balances[asset] !== undefined) {
+            balances[asset] = (balances[asset] || 0) - cappedDeduction;
+            console.log(`[HoldingService] Fill-Only deduction for ${asset}: raw=${rawDeduction.toFixed(6)}, capped=${cappedDeduction.toFixed(6)} (Splice balance: ${spliceAmt.toFixed(6)})`);
           }
         }
       } catch (orderQueryErr) {
