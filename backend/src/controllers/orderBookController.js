@@ -19,7 +19,7 @@ const orderBookService = getOrderBookService();
 let _lastMatchTriggerTime = 0;
 const MATCH_TRIGGER_COOLDOWN_MS = 3000;
 
-function triggerMatchingIfNeeded() {
+function triggerMatchingIfNeeded(tradingPair) {
   const now = Date.now();
   if (now - _lastMatchTriggerTime < MATCH_TRIGGER_COOLDOWN_MS) return;
   _lastMatchTriggerTime = now;
@@ -28,7 +28,7 @@ function triggerMatchingIfNeeded() {
   try {
     const { getMatchingEngine } = require('../services/matching-engine');
     const engine = getMatchingEngine();
-    engine.triggerMatchingCycle().catch(err => {
+    engine.triggerMatchingCycle(tradingPair || null).catch(err => {
       if (!err.message?.includes('401') && !err.message?.includes('No contracts')) {
         console.warn('[OrderBookController] Background match trigger error:', err.message);
       }
@@ -56,7 +56,7 @@ class OrderBookController {
     const { aggregate = 'true', precision = '2', depth = '50' } = req.query;
 
     // Opportunistically trigger matching engine (serverless: doesn't run in background)
-    triggerMatchingIfNeeded();
+    triggerMatchingIfNeeded(decodedTradingPair);
 
     try {
       // getOrderBook is now async - queries Canton directly

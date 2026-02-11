@@ -73,14 +73,17 @@ class OrderController {
 
     // ═══ AUTO-TRIGGER MATCHING ENGINE ═══
     // On serverless (Vercel), the matching engine doesn't run as a background process.
-    // Trigger a matching cycle synchronously within the request to ensure instant matching.
-    // This adds ~1-2s to order placement but guarantees matching happens.
+    // Wait briefly for Canton propagation, then trigger matching for THIS pair only.
     let matchResult = null;
     try {
+      // Wait for Canton to propagate the new Order contract before matching.
+      // Without this, the freshly-placed order may not be visible to the query yet.
+      await new Promise(r => setTimeout(r, 1500));
+
       const { getMatchingEngine } = require('../services/matching-engine');
       const engine = getMatchingEngine();
-      console.log(`[OrderController] ⚡ Auto-triggering matching engine after order placement...`);
-      matchResult = await engine.triggerMatchingCycle();
+      console.log(`[OrderController] ⚡ Auto-triggering matching for ${decodedTradingPair}...`);
+      matchResult = await engine.triggerMatchingCycle(decodedTradingPair);
       console.log(`[OrderController] ⚡ Matching cycle complete:`, matchResult?.success ? 'success' : 'no matches');
     } catch (matchErr) {
       console.warn(`[OrderController] ⚠️ Auto-match trigger failed (non-critical):`, matchErr.message);
