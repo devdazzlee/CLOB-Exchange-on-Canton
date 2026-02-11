@@ -41,6 +41,16 @@ class MatchingEngine {
     this.staleHoldings = new Set();
     this.staleHoldingsLastClear = Date.now();
     this.STALE_CACHE_TTL = 120000; // Clear stale cache every 2 minutes
+
+    // ═══ CRITICAL: Recently matched orders guard ═══
+    // Prevents catastrophic re-matching loop where:
+    // 1. Orders match → tokens transfer → FillOrder fails silently
+    // 2. Orders remain OPEN → next cycle matches them AGAIN → tokens transfer AGAIN
+    // 3. Infinite loop: duplicate trades + repeated token transfers
+    // 
+    // Key: "buyContractId::sellContractId" → timestamp of last match attempt
+    this.recentlyMatchedOrders = new Map();
+    this.RECENTLY_MATCHED_TTL = 180000; // 3 minutes cooldown before retry
   }
 
   /**
@@ -270,13 +280,21 @@ class MatchingEngine {
    *    The operator ensures token settlement separately.
    */
   async findAndExecuteOneMatch(tradingPair, buyOrders, sellOrders, token) {
-    // Periodically clear stale holding cache so re-placed orders get retried
-    if (Date.now() - this.staleHoldingsLastClear > this.STALE_CACHE_TTL) {
+    // Periodically clear stale caches so retries happen after cooldown
+    const now = Date.now();
+    if (now - this.staleHoldingsLastClear > this.STALE_CACHE_TTL) {
       if (this.staleHoldings.size > 0) {
         console.log(`[MatchingEngine] 🗑️ Clearing ${this.staleHoldings.size} stale holding entries`);
       }
       this.staleHoldings.clear();
-      this.staleHoldingsLastClear = Date.now();
+      this.staleHoldingsLastClear = now;
+    }
+
+    // Clear expired entries from recentlyMatchedOrders
+    for (const [key, ts] of this.recentlyMatchedOrders) {
+      if (now - ts > this.RECENTLY_MATCHED_TTL) {
+        this.recentlyMatchedOrders.delete(key);
+      }
     }
     
     for (const buyOrder of buyOrders) {
@@ -286,6 +304,13 @@ class MatchingEngine {
         // Self-trade prevention disabled per client request (comment at top of file)
         // Uncomment the following to prevent self-trades:
         // if (buyOrder.owner === sellOrder.owner) continue;
+
+        // ═══ CRITICAL: Skip recently matched order pairs ═══
+        // Prevents catastrophic re-matching when FillOrder fails
+        const matchKey = `${buyOrder.contractId}::${sellOrder.contractId}`;
+        if (this.recentlyMatchedOrders.has(matchKey)) {
+          continue; // Already attempted — wait for cooldown
+        }
 
         const buyHasLock = buyOrder.lockedHoldingCid && buyOrder.lockedHoldingCid !== '';
         const sellHasLock = sellOrder.lockedHoldingCid && sellOrder.lockedHoldingCid !== '';
@@ -331,6 +356,12 @@ class MatchingEngine {
     } else {
           console.log(`[MatchingEngine]    Mode: Fill-Only (buy locked: ${buyHasLock}, sell locked: ${sellHasLock})`);
         }
+
+        // ═══ CRITICAL: Mark pair as recently matched BEFORE attempting ═══
+        // This prevents re-matching if the match partially succeeds (tokens transferred
+        // but FillOrder fails). Without this, the engine retries every cycle,
+        // creating duplicate trades and transferring tokens repeatedly.
+        this.recentlyMatchedOrders.set(matchKey, Date.now());
 
         try {
           await this.executeMatch(tradingPair, buyOrder, sellOrder, roundedQty, matchPrice, token, useDvP);
@@ -383,12 +414,12 @@ class MatchingEngine {
     // e.g., 0.1 * 0.05 = 0.005000000000000001 in JS, but we need exactly 0.005
     const quoteAmount = parseFloat((matchQty * matchPrice).toFixed(10));
     
-    // ═══════════════════════════════════════════════════
-    // STEP 1: DvP Settlement (atomic token swap) — only if both sides locked
-    // ═══════════════════════════════════════════════════
     let tradeContractId = null;
     let createdHoldings = [];
 
+    // ═══════════════════════════════════════════════════════════════
+    // DvP MODE: Settlement first (atomic token swap), then FillOrder
+    // ═══════════════════════════════════════════════════════════════
     if (useDvP) {
       console.log(`[MatchingEngine] 🔄 DvP Settlement: ${matchQty} ${baseSymbol} ↔ ${quoteAmount} ${quoteSymbol}`);
       try {
@@ -407,10 +438,144 @@ class MatchingEngine {
         console.error(`[MatchingEngine] ❌ DvP Settlement failed: ${settleError.message}`);
         throw new Error(`DvP settlement failed: ${settleError.message}`);
       }
-    } else {
-      console.log(`[MatchingEngine] 📋 Fill-only mode: ${matchQty} ${baseSymbol} @ ${matchPrice} ${quoteSymbol} (no DvP)`);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // FILL-ONLY MODE: FillOrder FIRST, THEN transfer tokens
+    //
+    // CRITICAL ORDERING: We MUST FillOrder before transferring tokens.
+    // Previous bug: Transfer tokens first → FillOrder fails → orders stay OPEN
+    //   → next cycle matches same orders → transfers tokens AGAIN → infinite loop!
+    // 
+    // New order: FillOrder first → orders marked FILLED on Canton
+    //   → even if token transfer fails, orders won't be re-matched.
+    //   → token transfer can be retried or reconciled manually.
+    // ═══════════════════════════════════════════════════════════════
+    if (!useDvP) {
+      console.log(`[MatchingEngine] 📋 Fill-only mode: ${matchQty} ${baseSymbol} @ ${matchPrice} ${quoteSymbol}`);
       
-      // Create Trade contract on Canton for record keeping (even without DvP settlement)
+      // ── STEP A: FillOrder on BOTH orders FIRST ──
+      // This closes orders on Canton, preventing re-matching
+      console.log(`[MatchingEngine] 📝 Filling orders FIRST (before token transfer)...`);
+      
+      let buyFillOk = false;
+      let sellFillOk = false;
+
+      // Fill buy order
+      try {
+        const buyFillArg = { fillQuantity: matchQty.toString() };
+        if (buyOrder.isNewPackage) {
+          buyFillArg.newAllocationCid = 'FILL_ONLY';
+        }
+        await cantonService.exerciseChoice({
+          token,
+          actAsParty: [operatorPartyId],
+          templateId: buyOrder.templateId || `${packageId}:Order:Order`,
+          contractId: buyOrder.contractId,
+          choice: 'FillOrder',
+          choiceArgument: buyFillArg,
+          readAs: [operatorPartyId, buyOrder.owner],
+        });
+        buyFillOk = true;
+        console.log(`[MatchingEngine] ✅ Buy order filled: ${buyOrder.orderId}`);
+      } catch (fillError) {
+        console.error(`[MatchingEngine] ❌ Buy FillOrder failed: ${fillError.message}`);
+      }
+
+      // Fill sell order
+      try {
+        const sellFillArg = { fillQuantity: matchQty.toString() };
+        if (sellOrder.isNewPackage) {
+          sellFillArg.newAllocationCid = 'FILL_ONLY';
+        }
+        await cantonService.exerciseChoice({
+          token,
+          actAsParty: [operatorPartyId],
+          templateId: sellOrder.templateId || `${packageId}:Order:Order`,
+          contractId: sellOrder.contractId,
+          choice: 'FillOrder',
+          choiceArgument: sellFillArg,
+          readAs: [operatorPartyId, sellOrder.owner],
+        });
+        sellFillOk = true;
+        console.log(`[MatchingEngine] ✅ Sell order filled: ${sellOrder.orderId}`);
+      } catch (fillError) {
+        console.error(`[MatchingEngine] ❌ Sell FillOrder failed: ${fillError.message}`);
+      }
+
+      // If NEITHER FillOrder succeeded, abort — no tokens should be transferred
+      if (!buyFillOk && !sellFillOk) {
+        console.error(`[MatchingEngine] ❌ ABORTING: Both FillOrders failed — no tokens will be transferred`);
+        throw new Error('Both FillOrders failed — match aborted');
+      }
+      if (!buyFillOk || !sellFillOk) {
+        console.warn(`[MatchingEngine] ⚠️ Partial FillOrder success (buy: ${buyFillOk}, sell: ${sellFillOk}) — proceeding with token transfer`);
+      }
+
+      // ── STEP B: Transfer tokens via Splice TransferInstruction ──
+      const isSpliceBase = ['CC', 'CBTC'].includes(baseSymbol);
+      const isSpliceQuote = ['CC', 'CBTC'].includes(quoteSymbol);
+      let baseTransferOk = false;
+      let quoteTransferOk = false;
+
+      // Transfer base asset: seller → buyer
+      try {
+        console.log(`[MatchingEngine] 💰 Transferring ${matchQty} ${baseSymbol}: seller → buyer...`);
+        baseTransferOk = await this.attemptSpliceTransfer(
+          sellOrder.owner, buyOrder.owner, baseSymbol, matchQty, token
+        );
+      } catch (e) {
+        console.warn(`[MatchingEngine] Splice transfer (base) threw: ${e.message}`);
+        baseTransferOk = false;
+      }
+      if (!baseTransferOk && !isSpliceBase) {
+        // Non-Splice (custom) tokens: mint as fallback
+        try {
+          const { getHoldingService } = require('./holdingService');
+          const holdingService = getHoldingService();
+          await holdingService.initialize();
+          console.log(`[MatchingEngine] 💰 Minting ${matchQty} ${baseSymbol} for buyer (custom token)`);
+          await holdingService.mintDirect(buyOrder.owner, baseSymbol, matchQty, token);
+          baseTransferOk = true;
+        } catch (mintErr) {
+          console.error(`[MatchingEngine] ❌ Buyer credit FAILED: ${mintErr.message}`);
+        }
+      }
+      if (baseTransferOk) {
+        console.log(`[MatchingEngine] ✅ Buyer credited: +${matchQty} ${baseSymbol}`);
+      } else {
+        console.error(`[MatchingEngine] ❌ Base token transfer FAILED — orders are filled but tokens not moved. Manual reconciliation needed.`);
+      }
+
+      // Transfer quote asset: buyer → seller
+      try {
+        console.log(`[MatchingEngine] 💰 Transferring ${quoteAmount} ${quoteSymbol}: buyer → seller...`);
+        quoteTransferOk = await this.attemptSpliceTransfer(
+          buyOrder.owner, sellOrder.owner, quoteSymbol, quoteAmount, token
+        );
+      } catch (e) {
+        console.warn(`[MatchingEngine] Splice transfer (quote) threw: ${e.message}`);
+        quoteTransferOk = false;
+      }
+      if (!quoteTransferOk && !isSpliceQuote) {
+        try {
+          const { getHoldingService } = require('./holdingService');
+          const holdingService = getHoldingService();
+          await holdingService.initialize();
+          console.log(`[MatchingEngine] 💰 Minting ${quoteAmount} ${quoteSymbol} for seller (custom token)`);
+          await holdingService.mintDirect(sellOrder.owner, quoteSymbol, quoteAmount, token);
+          quoteTransferOk = true;
+        } catch (mintErr) {
+          console.error(`[MatchingEngine] ❌ Seller credit FAILED: ${mintErr.message}`);
+        }
+      }
+      if (quoteTransferOk) {
+        console.log(`[MatchingEngine] ✅ Seller credited: +${quoteAmount} ${quoteSymbol}`);
+      } else {
+        console.error(`[MatchingEngine] ❌ Quote token transfer FAILED — orders are filled but tokens not moved. Manual reconciliation needed.`);
+      }
+
+      // ── STEP C: Create Trade record on Canton ──
       try {
         const tradeId = `trade-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
         const tradeResult = await cantonService.createContract({
@@ -419,8 +584,8 @@ class MatchingEngine {
           createArguments: {
             tradeId: tradeId,
             operator: operatorPartyId,
-        buyer: buyOrder.owner,
-        seller: sellOrder.owner,
+            buyer: buyOrder.owner,
+            seller: sellOrder.owner,
             baseInstrumentId: {
               issuer: operatorPartyId,
               symbol: baseSymbol,
@@ -433,7 +598,7 @@ class MatchingEngine {
             },
             baseAmount: matchQty.toString(),
             quoteAmount: quoteAmount.toString(),
-        price: matchPrice.toString(),
+            price: matchPrice.toString(),
             buyOrderId: buyOrder.orderId,
             sellOrderId: sellOrder.orderId,
             timestamp: new Date().toISOString(),
@@ -446,99 +611,6 @@ class MatchingEngine {
       } catch (tradeErr) {
         console.warn(`[MatchingEngine] ⚠️ Trade record creation failed (non-critical): ${tradeErr.message}`);
         tradeContractId = `trade-${Date.now()}`;
-      }
-    }
-
-    // ═══════════════════════════════════════════════════
-    // STEP 1b: Transfer tokens (Fill-Only mode)
-    //
-    // For Splice tokens (CC, CBTC): Uses TransferInstruction (visible on explorer)
-    //   - CBTC: Registry Backend API for choice context
-    //   - CC: Validator Scan Proxy + AmuletRules for choice context
-    //   - NO mintDirect fallback — TransferInstruction is mandatory
-    // For custom tokens: mintDirect as fallback
-    //
-    // CRITICAL: Do NOT fill orders unless BOTH transfers succeed.
-    // ═══════════════════════════════════════════════════
-    let baseTransferOk = useDvP; // DvP already handled transfers atomically
-    let quoteTransferOk = useDvP;
-
-    if (!useDvP) {
-      // Determine if this is a Splice token pair (CC, CBTC)
-      // Splice tokens use TransferInstruction — no mintDirect fallback allowed
-      const isSpliceBase = ['CC', 'CBTC'].includes(baseSymbol);
-      const isSpliceQuote = ['CC', 'CBTC'].includes(quoteSymbol);
-
-      // --- Transfer base asset: seller → buyer ---
-      try {
-        console.log(`[MatchingEngine] 💰 Transferring ${matchQty} ${baseSymbol}: seller → buyer (Splice TransferInstruction)...`);
-        baseTransferOk = await this.attemptSpliceTransfer(
-          sellOrder.owner, buyOrder.owner, baseSymbol, matchQty, token
-        );
-      } catch (e) {
-        console.warn(`[MatchingEngine] Splice transfer (base) threw: ${e.message}`);
-        baseTransferOk = false;
-      }
-      if (!baseTransferOk && isSpliceBase) {
-        // Splice tokens MUST use TransferInstruction — no fallback
-        console.error(`[MatchingEngine] ❌ Splice TransferInstruction FAILED for ${baseSymbol} — no fallback`);
-        throw new Error(`Splice TransferInstruction failed for base asset ${baseSymbol}. Orders remain OPEN.`);
-      }
-      if (!baseTransferOk && !isSpliceBase) {
-        // Non-Splice (custom) tokens: mint as fallback
-        try {
-          const { getHoldingService } = require('./holdingService');
-          const holdingService = getHoldingService();
-          await holdingService.initialize();
-          console.log(`[MatchingEngine] 💰 Minting ${matchQty} ${baseSymbol} for buyer (custom token)`);
-          await holdingService.mintDirect(buyOrder.owner, baseSymbol, matchQty, token);
-          console.log(`[MatchingEngine] ✅ Buyer credited (mint): +${matchQty} ${baseSymbol}`);
-          baseTransferOk = true;
-        } catch (mintErr) {
-          console.error(`[MatchingEngine] ❌ Buyer credit FAILED: ${mintErr.message}`);
-          throw new Error(`Token transfer failed for base asset ${baseSymbol}: ${mintErr.message}`);
-        }
-      } else if (baseTransferOk) {
-        console.log(`[MatchingEngine] ✅ Buyer credited (Splice TransferInstruction): +${matchQty} ${baseSymbol}`);
-      }
-
-      // --- Transfer quote asset: buyer → seller ---
-      try {
-        console.log(`[MatchingEngine] 💰 Transferring ${quoteAmount} ${quoteSymbol}: buyer → seller (Splice TransferInstruction)...`);
-        quoteTransferOk = await this.attemptSpliceTransfer(
-          buyOrder.owner, sellOrder.owner, quoteSymbol, quoteAmount, token
-        );
-      } catch (e) {
-        console.warn(`[MatchingEngine] Splice transfer (quote) threw: ${e.message}`);
-        quoteTransferOk = false;
-      }
-      if (!quoteTransferOk && isSpliceQuote) {
-        // Splice tokens MUST use TransferInstruction — no fallback
-        console.error(`[MatchingEngine] ❌ Splice TransferInstruction FAILED for ${quoteSymbol} — no fallback`);
-        throw new Error(`Splice TransferInstruction failed for quote asset ${quoteSymbol}. Orders remain OPEN.`);
-      }
-      if (!quoteTransferOk && !isSpliceQuote) {
-        // Non-Splice (custom) tokens: mint as fallback
-        try {
-          const { getHoldingService } = require('./holdingService');
-          const holdingService = getHoldingService();
-          await holdingService.initialize();
-          console.log(`[MatchingEngine] 💰 Minting ${quoteAmount} ${quoteSymbol} for seller (custom token)`);
-          await holdingService.mintDirect(sellOrder.owner, quoteSymbol, quoteAmount, token);
-          console.log(`[MatchingEngine] ✅ Seller credited (mint): +${quoteAmount} ${quoteSymbol}`);
-          quoteTransferOk = true;
-        } catch (mintErr) {
-          console.error(`[MatchingEngine] ❌ Seller credit FAILED: ${mintErr.message}`);
-          throw new Error(`Token transfer failed for quote asset ${quoteSymbol}: ${mintErr.message}`);
-        }
-      } else if (quoteTransferOk) {
-        console.log(`[MatchingEngine] ✅ Seller credited (Splice TransferInstruction): +${quoteAmount} ${quoteSymbol}`);
-      }
-
-      // CRITICAL: If EITHER transfer failed, abort the match
-      if (!baseTransferOk || !quoteTransferOk) {
-        console.error(`[MatchingEngine] ❌ ABORTING MATCH — token transfer failed (base: ${baseTransferOk}, quote: ${quoteTransferOk})`);
-        throw new Error(`Token transfer failed: base=${baseTransferOk}, quote=${quoteTransferOk}`);
       }
     }
 
@@ -640,59 +712,52 @@ class MatchingEngine {
     }
 
     // ═══════════════════════════════════════════════════
-    // STEP 3: FillOrder on both Order contracts
-    // For partial fills, pass newAllocationCid to update the order's reference
+    // STEP 3: FillOrder on both Order contracts (DvP mode only)
+    // Fill-Only mode already handled FillOrder in STEP A above.
+    // For partial fills, pass newAllocationCid to update the order's reference.
     // ═══════════════════════════════════════════════════
-    console.log(`[MatchingEngine] 📝 Filling orders...`);
+    if (useDvP) {
+      console.log(`[MatchingEngine] 📝 Filling orders (DvP mode)...`);
 
-    // Fill buy order
-    try {
-      const buyFillArg = { fillQuantity: matchQty.toString() };
-      if (buyOrder.isNewPackage) {
-        if (useDvP) {
-          // DvP: Pass the new locked holding CID if partial fill, or null (None) for full fill
+      // Fill buy order
+      try {
+        const buyFillArg = { fillQuantity: matchQty.toString() };
+        if (buyOrder.isNewPackage) {
           buyFillArg.newAllocationCid = buyNewAllocationCid ? buyNewAllocationCid : null;
-        } else {
-          // Fill-Only: Tag the order so balance service knows tokens were exchanged
-          buyFillArg.newAllocationCid = 'FILL_ONLY';
         }
+        await cantonService.exerciseChoice({
+          token,
+          actAsParty: [operatorPartyId],
+          templateId: buyOrder.templateId || `${packageId}:Order:Order`,
+          contractId: buyOrder.contractId,
+          choice: 'FillOrder',
+          choiceArgument: buyFillArg,
+          readAs: [operatorPartyId, buyOrder.owner],
+        });
+        console.log(`[MatchingEngine] ✅ Buy order filled: ${buyOrder.orderId}${buyIsPartial ? ' (partial)' : ' (complete)'}`);
+      } catch (fillError) {
+        console.error(`[MatchingEngine] ❌ Buy FillOrder failed: ${fillError.message}`);
       }
-      await cantonService.exerciseChoice({
-        token,
-        actAsParty: operatorPartyId,
-        templateId: buyOrder.templateId || `${packageId}:Order:Order`,
-        contractId: buyOrder.contractId,
-        choice: 'FillOrder',
-        choiceArgument: buyFillArg,
-        readAs: [operatorPartyId, buyOrder.owner],
-      });
-      console.log(`[MatchingEngine] ✅ Buy order filled: ${buyOrder.orderId}${buyIsPartial ? ' (partial)' : ' (complete)'}`);
-    } catch (fillError) {
-      console.error(`[MatchingEngine] ❌ Buy FillOrder failed: ${fillError.message}`);
-    }
 
-    // Fill sell order
-    try {
-      const sellFillArg = { fillQuantity: matchQty.toString() };
-      if (sellOrder.isNewPackage) {
-        if (useDvP) {
+      // Fill sell order
+      try {
+        const sellFillArg = { fillQuantity: matchQty.toString() };
+        if (sellOrder.isNewPackage) {
           sellFillArg.newAllocationCid = sellNewAllocationCid ? sellNewAllocationCid : null;
-        } else {
-          sellFillArg.newAllocationCid = 'FILL_ONLY';
         }
+        await cantonService.exerciseChoice({
+          token,
+          actAsParty: [operatorPartyId],
+          templateId: sellOrder.templateId || `${packageId}:Order:Order`,
+          contractId: sellOrder.contractId,
+          choice: 'FillOrder',
+          choiceArgument: sellFillArg,
+          readAs: [operatorPartyId, sellOrder.owner],
+        });
+        console.log(`[MatchingEngine] ✅ Sell order filled: ${sellOrder.orderId}${sellIsPartial ? ' (partial)' : ' (complete)'}`);
+      } catch (fillError) {
+        console.error(`[MatchingEngine] ❌ Sell FillOrder failed: ${fillError.message}`);
       }
-      await cantonService.exerciseChoice({
-        token,
-        actAsParty: operatorPartyId,
-        templateId: sellOrder.templateId || `${packageId}:Order:Order`,
-        contractId: sellOrder.contractId,
-        choice: 'FillOrder',
-        choiceArgument: sellFillArg,
-        readAs: [operatorPartyId, sellOrder.owner],
-      });
-      console.log(`[MatchingEngine] ✅ Sell order filled: ${sellOrder.orderId}${sellIsPartial ? ' (partial)' : ' (complete)'}`);
-    } catch (fillError) {
-      console.error(`[MatchingEngine] ❌ Sell FillOrder failed: ${fillError.message}`);
     }
 
     // ═══════════════════════════════════════════════════

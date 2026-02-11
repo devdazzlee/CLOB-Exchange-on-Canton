@@ -193,8 +193,8 @@ export default function ActiveOrdersTable({ orders, onCancelOrder }) {
               </thead>
               <tbody>
                 <AnimatePresence>
-                  {orders.length > 0 ? (
-                    orders.map((order) => (
+                  {orders.filter(o => o.status === 'OPEN' || o.status === 'PARTIALLY_FILLED').length > 0 ? (
+                    orders.filter(o => o.status === 'OPEN' || o.status === 'PARTIALLY_FILLED').map((order) => (
                       <motion.tr
                         key={order.id}
                         initial={{ opacity: 0, y: 10 }}

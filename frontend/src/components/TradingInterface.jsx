@@ -153,7 +153,7 @@ export default function TradingInterface({ partyId }) {
       }
     } catch (e) { console.warn('[Refresh] Order book error:', e.message); }
 
-    // Refresh user orders
+    // Refresh user orders - ALWAYS use fresh data
     try {
       const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
       const ordersList = ordersData?.data?.orders || [];
@@ -165,6 +165,7 @@ export default function TradingInterface({ partyId }) {
         price: order.price,
         quantity: order.quantity,
         filled: order.filled || '0',
+        remaining: order.remaining,
         status: order.status,
         tradingPair: order.tradingPair,
         timestamp: order.timestamp
@@ -190,13 +191,19 @@ export default function TradingInterface({ partyId }) {
       }
     } catch (e) { console.warn('[Refresh] Balance error:', e.message); }
 
-    // Refresh trades — ALWAYS use fresh data from API
+    // Refresh trades — ALWAYS use fresh data from API (even if empty, to clear stale trades)
     try {
       const tradesData = await apiClient.get(API_ROUTES.TRADES.GET(activePair, 50));
       const tradesList = tradesData?.data?.trades || [];
-      if (tradesList.length > 0) {
-        setTrades(tradesList.slice(0, 50));
-      }
+      // Deduplicate by tradeId
+      const seen = new Set();
+      const uniqueTrades = tradesList.filter(t => {
+        const key = t.tradeId || `${t.price}-${t.quantity}-${t.timestamp}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      setTrades(uniqueTrades.slice(0, 50));
     } catch (e) { console.warn('[Refresh] Trades error:', e.message); }
   }, [partyId, tradingPair]);
 
@@ -313,22 +320,23 @@ export default function TradingInterface({ partyId }) {
     // Wait for Canton to propagate the cancellation
     await new Promise(r => setTimeout(r, 800));
     
-    // Refresh orders list
+    // Refresh orders list - ALWAYS use fresh data
     try {
       const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
-          const ordersList = ordersData?.data?.orders || [];
-          setOrders(ordersList.map(order => ({
-            id: order.orderId || order.contractId,
-            contractId: order.contractId,
-            type: order.orderType,
-            mode: order.orderMode,
-            price: order.price,
-            quantity: order.quantity,
-            filled: order.filled || '0',
-            status: order.status,
-            tradingPair: order.tradingPair,
-            timestamp: order.timestamp
-          })));
+      const ordersList = ordersData?.data?.orders || [];
+      setOrders(ordersList.map(order => ({
+        id: order.orderId || order.contractId,
+        contractId: order.contractId,
+        type: order.orderType,
+        mode: order.orderMode,
+        price: order.price,
+        quantity: order.quantity,
+        filled: order.filled || '0',
+        remaining: order.remaining,
+        status: order.status,
+        tradingPair: order.tradingPair,
+        timestamp: order.timestamp
+      })));
     } catch (e) {
       console.warn('[Cancel Order] Failed to refresh orders:', e);
     }
@@ -708,10 +716,16 @@ export default function TradingInterface({ partyId }) {
         const tradesData = await apiClient.get(API_ROUTES.TRADES.GET(tradingPair, 50));
         const tradesList = tradesData?.data?.trades || [];
         
-        if (tradesList.length > 0) {
-          setTrades(tradesList.slice(0, 50));
-        }
-        console.log('[TradingInterface] Initial trades loaded:', tradesList.length);
+        // Deduplicate by tradeId
+        const seen = new Set();
+        const uniqueTrades = tradesList.filter(t => {
+          const key = t.tradeId || `${t.price}-${t.quantity}-${t.timestamp}`;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+        setTrades(uniqueTrades.slice(0, 50));
+        console.log('[TradingInterface] Initial trades loaded:', uniqueTrades.length);
       } catch (error) {
         console.error('[TradingInterface] Failed to load initial trades:', error);
       } finally {
@@ -756,9 +770,16 @@ export default function TradingInterface({ partyId }) {
       try {
         const tradesData = await apiClient.get(API_ROUTES.TRADES.GET(tradingPair, 50));
         const tradesList = tradesData?.data?.trades || [];
-        if (tradesList.length > 0) {
-          setTrades(tradesList.slice(0, 50));
-        }
+        // CRITICAL FIX: Always set fresh data (even if empty) to remove stale trades
+        // Deduplicate by tradeId to prevent duplicates from re-matching bug
+        const seen = new Set();
+        const uniqueTrades = tradesList.filter(t => {
+          const key = t.tradeId || `${t.price}-${t.quantity}-${t.timestamp}`;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+        setTrades(uniqueTrades.slice(0, 50));
       } catch (error) {
         // Silent
       }
@@ -778,9 +799,8 @@ export default function TradingInterface({ partyId }) {
 
     const loadUserOrders = async (isInitial = false) => {
       try {
-        // Fetch all orders (not just OPEN) so we can see FILLED/CANCELLED transitions
-        // This is critical when WebSocket is unavailable (Vercel serverless)
-        const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId));
+        // Fetch OPEN orders only - filled/cancelled orders should not appear
+        const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
         const ordersList = ordersData?.data?.orders || [];
         
           const formattedOrders = ordersList.map(order => ({
@@ -797,14 +817,10 @@ export default function TradingInterface({ partyId }) {
             timestamp: order.timestamp
           }));
           
-          if (formattedOrders.length > 0 || isInitial) {
-            setOrders(prev => {
-              if (formattedOrders.length > 0) {
-                return formattedOrders;
-              }
-              return prev;
-            });
-          }
+          // CRITICAL FIX: ALWAYS set fresh data from API
+          // Previous bug: if API returned empty (all orders filled), kept old stale orders
+          // → "ghost orders" stayed in UI forever
+          setOrders(formattedOrders);
           console.log('[TradingInterface] User orders loaded:', formattedOrders.length);
       } catch (error) {
         console.error('[TradingInterface] Failed to load user orders:', error);
