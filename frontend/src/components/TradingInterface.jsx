@@ -91,14 +91,16 @@ export default function TradingInterface({ partyId }) {
         { symbol: 'BTC', amount: 10 },
         { symbol: 'USDT', amount: 100000 },
         { symbol: 'ETH', amount: 100 },
-        { symbol: 'SOL', amount: 1000 }
+        { symbol: 'SOL', amount: 1000 },
+        { symbol: 'CC', amount: 50 },
+        { symbol: 'CBTC', amount: 5 }
       ]);
       
       if (mintResult.success) {
         console.log('[Mint V2] Holdings created:', mintResult);
         toast.success('Test tokens minted as Holdings!', {
           title: '🪙 Holdings Created',
-          details: 'BTC: 10 | USDT: 100,000 | ETH: 100 | SOL: 1,000'
+          details: 'BTC: 10 | USDT: 100,000 | ETH: 100 | SOL: 1,000 | CC: 50 | CBTC: 5'
         });
         
         // Refresh balance from V2 Holdings (includes CBTC)

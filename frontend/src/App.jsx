@@ -97,27 +97,28 @@ function App() {
       <div className="min-h-screen bg-[#0B0E11]">
         {/* Header */}
         <header className="bg-[#181A20] border-b border-[#2B3139] sticky top-0 z-50 shadow-sm">
-          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div className="flex items-center justify-between h-16">
-              <div className="flex items-center space-x-3">
-                <div className="w-10 h-10 bg-[#F0B90B] rounded-md flex items-center justify-center font-bold text-[#0B0E11] text-lg shadow-lg">
+          <div className="max-w-7xl mx-auto px-3 sm:px-6 lg:px-8">
+            {/* Top row: Logo + Actions */}
+            <div className="flex items-center justify-between h-14 sm:h-16">
+              <div className="flex items-center space-x-2 sm:space-x-3 min-w-0">
+                <div className="w-8 h-8 sm:w-10 sm:h-10 bg-[#F0B90B] rounded-md flex items-center justify-center font-bold text-[#0B0E11] text-sm sm:text-lg shadow-lg flex-shrink-0">
                   C
                 </div>
-                <h1 className="text-xl font-bold text-[#EAECEF]">
+                <h1 className="text-base sm:text-xl font-bold text-[#EAECEF] whitespace-nowrap">
                   CLOB Exchange
                 </h1>
               </div>
-              <div className="flex items-center space-x-3">
+              <div className="flex items-center space-x-2 sm:space-x-3 min-w-0">
+                {/* Party ID - hidden on very small screens, shown inline on md+ */}
                 {partyId && (
-                  <div className="flex items-center space-x-2 text-sm">
-                    <span className="hidden sm:inline text-[#848E9C]">Party ID:</span>
-                    <code className="px-2 sm:px-3 py-1.5 bg-[#1E2329] border border-[#2B3139] rounded-md text-[#F0B90B] font-mono text-xs max-w-[100px] sm:max-w-[200px] md:max-w-none truncate">
-                      <span className="hidden sm:inline">{partyId.substring(0, 30)}...</span>
-                      <span className="sm:hidden">{partyId.substring(0, 12)}...</span>
+                  <div className="hidden md:flex items-center space-x-2 text-sm">
+                    <span className="text-[#848E9C]">Party ID:</span>
+                    <code className="px-3 py-1.5 bg-[#1E2329] border border-[#2B3139] rounded-md text-[#F0B90B] font-mono text-xs truncate max-w-[200px] lg:max-w-none">
+                      {partyId.substring(0, 30)}...
                     </code>
                     <button
                       onClick={handleCopyPartyId}
-                      className="p-1.5 sm:p-2 hover:bg-[#2B3139] rounded-md transition-colors group border border-[#2B3139] hover:border-[#F0B90B]"
+                      className="p-2 hover:bg-[#2B3139] rounded-md transition-colors group border border-[#2B3139] hover:border-[#F0B90B] flex-shrink-0"
                       title={copiedPartyId ? "Copied!" : "Copy Party ID"}
                     >
                       {copiedPartyId ? (
@@ -126,25 +127,52 @@ function App() {
                         </svg>
                       ) : (
                         <svg className="w-4 h-4 text-[#848E9C] group-hover:text-[#F0B90B] transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012-2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
                         </svg>
                       )}
                     </button>
                   </div>
                 )}
+                {/* Mobile: compact copy button only */}
+                {partyId && (
+                  <button
+                    onClick={handleCopyPartyId}
+                    className="md:hidden p-2 hover:bg-[#2B3139] rounded-md transition-colors group border border-[#2B3139] hover:border-[#F0B90B] flex-shrink-0"
+                    title={copiedPartyId ? "Copied!" : "Copy Party ID"}
+                  >
+                    {copiedPartyId ? (
+                      <svg className="w-4 h-4 text-green-500 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                      </svg>
+                    ) : (
+                      <svg className="w-4 h-4 text-[#848E9C] group-hover:text-[#F0B90B] transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                      </svg>
+                    )}
+                  </button>
+                )}
                 {walletReady && (
                   <button
                     onClick={handleLogout}
-                    className="text-[#848E9C] hover:text-[#EAECEF] transition-colors flex items-center space-x-2"
+                    className="text-[#848E9C] hover:text-[#EAECEF] transition-colors flex items-center space-x-1.5 sm:space-x-2 flex-shrink-0 text-sm sm:text-base"
                   >
-                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <svg className="w-4 h-4 sm:w-5 sm:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
                     </svg>
-                    <span>Logout</span>
+                    <span className="hidden sm:inline">Logout</span>
                   </button>
                 )}
               </div>
             </div>
+            {/* Mobile Party ID row - shown below header on small screens */}
+            {partyId && (
+              <div className="md:hidden flex items-center space-x-2 pb-2.5 -mt-1">
+                <span className="text-[#848E9C] text-xs flex-shrink-0">Party ID:</span>
+                <code className="px-2 py-1 bg-[#1E2329] border border-[#2B3139] rounded text-[#F0B90B] font-mono text-[10px] sm:text-xs truncate min-w-0">
+                  {partyId.substring(0, 20)}...
+                </code>
+              </div>
+            )}
           </div>
         </header>
 
