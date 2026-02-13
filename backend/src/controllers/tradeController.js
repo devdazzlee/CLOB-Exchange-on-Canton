@@ -15,10 +15,16 @@ const asyncHandler = require('../middleware/asyncHandler');
 const config = require('../config');
 const cantonService = require('../services/cantonService');
 const tokenProvider = require('../services/tokenProvider');
+const { getUpdateStream } = require('../services/cantonUpdateStream');
 
 class TradeController {
   /**
-   * Query trades directly from Canton API
+   * Query trades from Canton API + in-memory cache (merged, deduplicated).
+   * 
+   * Canton's node has a 200-element limit per query. When Settlement:Trade
+   * contracts exceed 200, the Canton query returns 0. The in-memory cache
+   * (populated by the matching engine after each match) acts as fallback
+   * so recent trades are always visible in the UI.
    * 
    * Trade contracts are signed by operator, so we query as operator.
    * Template: Settlement:Trade (in the clobExchange package)
@@ -33,14 +39,11 @@ class TradeController {
       throw new Error('CLOB_EXCHANGE_PACKAGE_ID not configured');
     }
 
-    // Query Trade contracts as operator (signatory on Trade template)
-    // Settlement:Trade exists ONLY in the current package (TOKEN_STANDARD_PACKAGE_ID)
-    // Trade:Trade exists ONLY in the legacy package (LEGACY_PACKAGE_ID)
-    // Canton API rejects the entire query if ANY template ID is invalid,
-    // so we must query each package's templates separately and merge results.
+    // ═══ STEP 1: Query Canton API for on-ledger trade contracts ═══
     let contracts = [];
+    let cantonQueryFailed = false;
 
-    // 1. Query current package for Settlement:Trade
+    // 1a. Query current package for Settlement:Trade
     try {
       const currentPkgContracts = await cantonService.queryActiveContracts({
         party: operatorPartyId,
@@ -52,9 +55,10 @@ class TradeController {
       }
     } catch (e) {
       console.warn(`[TradeController] Settlement:Trade query failed: ${e.message}`);
+      cantonQueryFailed = true;
     }
 
-    // 2. Query legacy package for Trade:Trade (if different package)
+    // 1b. Query legacy package for Trade:Trade (if different package)
     if (legacyPackageId && legacyPackageId !== packageId) {
       try {
         const legacyContracts = await cantonService.queryActiveContracts({
@@ -70,20 +74,21 @@ class TradeController {
       }
     }
 
-    const allTrades = [];
+    // Parse Canton contracts into trade objects
+    const tradeMap = new Map(); // keyed by tradeId for dedup
     for (const c of (Array.isArray(contracts) ? contracts : [])) {
       const payload = c.payload || c.createArgument || {};
       
-      // Derive tradingPair from instrument IDs
       const baseSymbol = payload.baseInstrumentId?.symbol || '';
       const quoteSymbol = payload.quoteInstrumentId?.symbol || '';
       const tradingPair = (baseSymbol && quoteSymbol) 
         ? `${baseSymbol}/${quoteSymbol}` 
         : (payload.tradingPair || 'UNKNOWN');
 
-      allTrades.push({
+      const tradeId = payload.tradeId || c.contractId;
+      tradeMap.set(tradeId, {
         contractId: c.contractId,
-        tradeId: payload.tradeId,
+        tradeId,
         tradingPair,
         buyer: payload.buyer,
         seller: payload.seller,
@@ -93,8 +98,33 @@ class TradeController {
         buyOrderId: payload.buyOrderId,
         sellOrderId: payload.sellOrderId,
         timestamp: payload.timestamp,
+        source: 'canton',
       });
     }
+
+    // ═══ STEP 2: Merge with in-memory trade cache (fallback for 200+ limit) ═══
+    try {
+      const updateStream = getUpdateStream();
+      const cachedTrades = updateStream.getAllTrades(limit * 2);
+      let mergedCount = 0;
+      for (const ct of cachedTrades) {
+        const tid = ct.tradeId;
+        if (tid && !tradeMap.has(tid)) {
+          tradeMap.set(tid, {
+            ...ct,
+            source: 'cache',
+          });
+          mergedCount++;
+        }
+      }
+      if (mergedCount > 0) {
+        console.log(`[TradeController] Merged ${mergedCount} cached trades (Canton returned ${contracts.length}${cantonQueryFailed ? ', Settlement:Trade query hit 200+ limit' : ''})`);
+      }
+    } catch (e) {
+      // Non-critical — cache is best-effort
+    }
+
+    const allTrades = [...tradeMap.values()];
 
     // Apply filter, sort by timestamp (newest first), and limit
     return allTrades

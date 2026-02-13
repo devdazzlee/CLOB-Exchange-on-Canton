@@ -969,7 +969,17 @@ class HoldingService {
             isAmulet: isAmulet,
           };
         })
-        .sort((a, b) => b.amount - a.amount); // Largest first
+        .sort((a, b) => {
+          // CRITICAL: Custom Holdings first, then Splice/Amulet.
+          // Custom Holdings can be locked for orders (operator is signatory).
+          // Splice/Amulet can NOT be locked — they require multi-step Registry API
+          // calls that are prone to 404 race conditions.
+          const aIsCustom = !a.isSplice && !a.isAmulet;
+          const bIsCustom = !b.isSplice && !b.isAmulet;
+          if (aIsCustom && !bIsCustom) return -1; // Custom first
+          if (!aIsCustom && bIsCustom) return 1;
+          return b.amount - a.amount; // Within same type: largest first
+        });
     } catch (error) {
       console.error('[HoldingService] Failed to get available holdings:', error.message);
       throw error;

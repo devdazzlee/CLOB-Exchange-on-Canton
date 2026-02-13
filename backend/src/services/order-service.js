@@ -91,35 +91,51 @@ class OrderService {
     
     console.log(`[OrderService] Found ${holdingsResult.holdings.length} Holdings with total ${holdingsResult.totalAmount} ${asset}`);
     
-    // 2. For simplicity, lock the first (largest) holding that covers the amount
-    // In production, could merge multiple holdings or split
-    const primaryHolding = holdingsResult.holdings[0];
+    // 2. Prefer custom Holdings (lockable) over Splice Holdings (cannot lock)
+    // findHoldingsForAmount already sorts custom first, but explicitly pick the
+    // first custom holding that covers the amount for reliable DvP settlement.
+    const allHoldings = holdingsResult.holdings;
     
-    if (primaryHolding.amount < amount) {
-      // Need to handle partial holdings - for now require single holding
-      throw new ValidationError(`Largest ${asset} Holding (${primaryHolding.amount}) is less than required (${amount}). Please consolidate your holdings.`);
+    // Try to find a CUSTOM holding first (can be locked → enables atomic DvP)
+    let primaryHolding = allHoldings.find(h => {
+      const isSplice = h.isSplice || 
+        h.templateId?.includes('Splice') || 
+        h.templateId?.includes('Registry') ||
+        h.templateId?.includes('Utility');
+      return !isSplice && h.amount >= amount;
+    });
+    
+    // Fall back to any holding that covers the amount
+    if (!primaryHolding) {
+      primaryHolding = allHoldings.find(h => h.amount >= amount);
+    }
+    
+    if (!primaryHolding) {
+      throw new ValidationError(`Largest ${asset} Holding is less than required (${amount}). Please consolidate your holdings or mint more via "Get Test Funds".`);
     }
     
     // 3. Check if this is a Splice holding (CBTC, Amulet, etc.)
-    // Splice holdings use different templates and cannot be locked with our custom Lock choice
+    // Splice holdings CANNOT be locked — they use a different template controlled by DSO.
+    // REQUIRE custom holdings for atomic DvP settlement. No Fill-Only mode.
     const isSpliceHolding = primaryHolding.isSplice || 
       primaryHolding.templateId?.includes('Splice') || 
       primaryHolding.templateId?.includes('Registry') ||
       primaryHolding.templateId?.includes('Utility');
     
     if (isSpliceHolding) {
-      // For Splice holdings (CBTC, CC), skip locking - use trust-based orders for now
-      // In production, this would use the DvP Settlement flow from Splice Token Standard
-      console.log(`[OrderService] ⚠️ Splice holding detected (${asset}) - skipping lock (trust-based order)`);
-      console.log(`[OrderService] Reference holding: ${primaryHolding.contractId.substring(0, 30)}...`);
-      
-      return {
-        lockedHoldingCid: primaryHolding.contractId, // Reference the unlocked holding
-        lockedAmount: amount,
-        asset: asset,
-        isSpliceHolding: true,
-        skippedLock: true
-      };
+      // No custom holding available — REJECT the order.
+      // User must click "Get Test Funds" to mint custom Holdings that can be locked.
+      console.error(`[OrderService] ❌ No custom ${asset} holding available — cannot lock Splice holdings for DvP`);
+      throw new ValidationError(
+        `No lockable ${asset} holdings found. Click "Get Test Funds" to mint custom ${asset} holdings for trading. ` +
+        `Splice/Amulet holdings cannot be used for exchange orders.`
+      );
+    }
+    
+    console.log(`[OrderService] ✅ Found custom ${asset} holding (${primaryHolding.amount}) — locking for atomic DvP`);
+    
+    if (primaryHolding.amount < amount) {
+      throw new ValidationError(`Largest ${asset} Holding (${primaryHolding.amount}) is less than required (${amount}). Please consolidate your holdings.`);
     }
     
     // 4. Lock the Holding for this order (custom holdings only)
@@ -329,11 +345,9 @@ class OrderService {
         // Canton JSON API v2: Time is ISO 8601 datetime string
         timestamp: timestamp,
         operator: operatorPartyId,
-        // TOKEN STANDARD: Store locked Holding reference
-        // IMPORTANT: Only store allocationCid if holding was actually locked on-chain.
-        // Splice holdings (CC/CBTC) can't be locked, so store empty string to signal
-        // the matching engine to use fill-only mode (no DvP settlement).
-        allocationCid: (lockedHoldingInfo?.skippedLock ? '' : lockedHoldingInfo?.lockedHoldingCid) || ''
+        // TOKEN STANDARD: Store locked Holding reference for atomic DvP settlement.
+        // ALL orders MUST have a locked custom holding — no Fill-Only mode.
+        allocationCid: lockedHoldingInfo?.lockedHoldingCid || ''
       },
       readAs: [operatorPartyId, partyId]
     });
