@@ -814,6 +814,7 @@ export default function TradingInterface({ partyId }) {
               loading={orderPlacing}
               onSubmit={handlePlaceOrder}
               balance={balance}
+              lockedBalance={lockedBalance}
               orderBook={orderBook}
             onMintTokens={handleMintTokens}
             mintingLoading={mintingLoading}

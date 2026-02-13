@@ -24,6 +24,7 @@
 const cantonService = require('./cantonService');
 const config = require('../config');
 const { getSettlementService } = require('./settlementService');
+const { getHoldingService } = require('./holdingService');
 const tokenProvider = require('./tokenProvider');
 const { TEMPLATE_IDS } = require('../config/constants');
 
@@ -291,7 +292,7 @@ class MatchingEngine {
       // Find and execute ONE match per cycle (contract IDs become stale after match)
       await this.findAndExecuteOneMatch(tradingPair, buyOrders, sellOrders, token);
       
-          } catch (error) {
+    } catch (error) {
       if (error.message?.includes('401') || error.message?.includes('security-sensitive')) {
         this.invalidateToken();
           }
@@ -306,9 +307,12 @@ class MatchingEngine {
    * Find ONE crossing match and execute it
    * Only one per cycle because contract IDs change after exercise
    * 
-   * ATOMIC DvP ONLY — Both sides MUST have locked custom Holdings.
-   * Orders without locked holdings are skipped (user must "Get Test Funds" first).
-   * No Fill-Only mode. No mintDirect fallback. No Splice workarounds.
+   * TWO MODES:
+   * 1. ATOMIC DvP — Both sides have locked custom Holdings → Settlement_Execute
+   * 2. FILL-ONLY — One or both sides lack locked holdings → FillOrder + mintDirect
+   *
+   * Fill-Only is required for Splice tokens (CC/CBTC) whose holdings can't be locked.
+   * mintDirect creates new custom holdings for the counterparties to reflect the trade.
    */
   async findAndExecuteOneMatch(tradingPair, buyOrders, sellOrders, token) {
     // Periodically clear stale caches so retries happen after cooldown
@@ -327,8 +331,6 @@ class MatchingEngine {
         this.recentlyMatchedOrders.delete(key);
       }
     }
-
-    let skippedNoLock = 0;
     
     for (const buyOrder of buyOrders) {
       for (const sellOrder of sellOrders) {
@@ -339,23 +341,17 @@ class MatchingEngine {
         if (this.recentlyMatchedOrders.has(matchKey)) {
           continue;
         }
-
+        
         const buyHasLock = buyOrder.lockedHoldingCid && buyOrder.lockedHoldingCid !== '';
         const sellHasLock = sellOrder.lockedHoldingCid && sellOrder.lockedHoldingCid !== '';
 
-        // ═══ REQUIRE both locked holdings for atomic DvP ═══
-        // No Fill-Only mode. Locked custom holdings are IMMUTABLE — they can't get
-        // stale because Holding_Split/Transfer/Merge all assert (lock == None).
-        // This guarantees Settlement_Execute always succeeds.
-        if (!buyHasLock || !sellHasLock) {
-          skippedNoLock++;
-          continue;
-        }
-
         // Skip orders with known-stale holding CIDs (from previous failed settlements)
-        if (this.staleHoldings.has(buyOrder.lockedHoldingCid)) continue;
-        if (this.staleHoldings.has(sellOrder.lockedHoldingCid)) continue;
+        if (buyHasLock && this.staleHoldings.has(buyOrder.lockedHoldingCid)) continue;
+        if (sellHasLock && this.staleHoldings.has(sellOrder.lockedHoldingCid)) continue;
         
+        // Determine settlement mode
+        const useDvP = buyHasLock && sellHasLock;
+
         // Check if orders cross
         const buyPrice = buyOrder.price;
         const sellPrice = sellOrder.price;
@@ -380,17 +376,17 @@ class MatchingEngine {
         const matchQty = Math.min(buyOrder.remaining, sellOrder.remaining);
         const roundedQty = parseFloat(matchQty.toFixed(10));
 
+        const mode = useDvP ? 'ATOMIC DvP' : 'FILL-ONLY (mintDirect)';
         console.log(`[MatchingEngine] ✅ MATCH FOUND: BUY ${buyPrice !== null ? buyPrice : 'MARKET'} x ${buyOrder.remaining} ↔ SELL ${sellPrice !== null ? sellPrice : 'MARKET'} x ${sellOrder.remaining}`);
-        console.log(`[MatchingEngine]    Fill: ${roundedQty} @ ${matchPrice}`);
-        console.log(`[MatchingEngine]    Buyer Holding: ${buyOrder.lockedHoldingCid.substring(0, 30)}...`);
-        console.log(`[MatchingEngine]    Seller Holding: ${sellOrder.lockedHoldingCid.substring(0, 30)}...`);
-        console.log(`[MatchingEngine]    Mode: ATOMIC DvP Settlement (both sides locked)`);
+        console.log(`[MatchingEngine]    Fill: ${roundedQty} @ ${matchPrice} | Mode: ${mode}`);
+        if (buyHasLock) console.log(`[MatchingEngine]    Buyer Holding: ${buyOrder.lockedHoldingCid.substring(0, 30)}...`);
+        if (sellHasLock) console.log(`[MatchingEngine]    Seller Holding: ${sellOrder.lockedHoldingCid.substring(0, 30)}...`);
 
         this.recentlyMatchedOrders.set(matchKey, Date.now());
 
         try {
-          await this.executeMatch(tradingPair, buyOrder, sellOrder, roundedQty, matchPrice, token);
-          console.log(`[MatchingEngine] ✅ Match executed successfully via atomic DvP`);
+          await this.executeMatch(tradingPair, buyOrder, sellOrder, roundedQty, matchPrice, token, useDvP);
+          console.log(`[MatchingEngine] ✅ Match executed successfully via ${mode}`);
           return; // One match per cycle
         } catch (error) {
           console.error(`[MatchingEngine] ❌ Match execution failed:`, error.message);
@@ -399,25 +395,20 @@ class MatchingEngine {
               error.message?.includes('could not be found') ||
               error.message?.includes('CONTRACT_NOT_FOUND')) {
             console.log(`[MatchingEngine] ℹ️ Order already processed — skipping`);
-            // Mark holdings as stale so we don't retry them
-            this.staleHoldings.add(buyOrder.lockedHoldingCid);
-            this.staleHoldings.add(sellOrder.lockedHoldingCid);
+            if (buyHasLock) this.staleHoldings.add(buyOrder.lockedHoldingCid);
+            if (sellHasLock) this.staleHoldings.add(sellOrder.lockedHoldingCid);
             continue;
           }
           
-          // Mark holdings as stale on DvP failure
-          this.staleHoldings.add(buyOrder.lockedHoldingCid);
-          this.staleHoldings.add(sellOrder.lockedHoldingCid);
+          // Mark holdings as stale on failure
+          if (buyHasLock) this.staleHoldings.add(buyOrder.lockedHoldingCid);
+          if (sellHasLock) this.staleHoldings.add(sellOrder.lockedHoldingCid);
           return; // Stop matching this cycle
         }
       }
     }
 
     // ═══ DIAGNOSTIC: Log why no match was found ═══
-    if (skippedNoLock > 0) {
-      console.log(`[MatchingEngine] ${tradingPair}: Skipped ${skippedNoLock} crossing pair(s) — orders lack locked holdings. Users must click "Get Test Funds" to mint custom Holdings.`);
-    }
-
     const bestBuy = buyOrders.find(o => o.remaining > 0 && o.price !== null);
     const bestSell = sellOrders.find(o => o.remaining > 0 && o.price !== null);
     if (bestBuy && bestSell) {
@@ -446,200 +437,292 @@ class MatchingEngine {
   }
   
   /**
-   * Execute a match: Atomic DvP Settlement + FillOrder on both orders
+   * Execute a match with the appropriate settlement mode.
    * 
-   * ARCHITECTURE (proper exchange settlement):
-   * 1. SettlementInstruction created on Canton (references locked Holdings)
-   * 2. Settlement_Execute exercised (SINGLE DAML transaction):
-   *    - Archives both locked Holdings
-   *    - Creates new Holdings for counterparties (buyer gets base, seller gets quote)
-   *    - Creates Trade record
-   *    - Handles change (partial fills)
-   *    ALL ATOMIC — succeeds entirely or rolls back entirely.
-   * 3. FillOrder on both Order contracts (update filled/status)
-   * 4. Re-lock change holdings for partial fills
-   * 
-   * WHY this works: Locked custom Holdings are IMMUTABLE. The DAML Holding template
-   * asserts (lock == None) on Split/Transfer/Merge. So locked holdings can NEVER become
-   * stale — only Settlement_Execute or Holding_Unlock can consume them.
+   * TWO MODES:
+   * ─────────
+   * 1. ATOMIC DvP (useDvP=true): Both sides have locked custom Holdings
+   *    → SettlementInstruction + Settlement_Execute (single atomic DAML transaction)
+   *    → Then FillOrder on both orders
+   *    → Re-lock change holdings for partial fills
+   *
+   * 2. FILL-ONLY (useDvP=false): One or both sides lack locked holdings (Splice tokens)
+   *    → FillOrder on BOTH orders FIRST (prevents re-matching loop)
+   *    → Then mintDirect to create custom Holdings for the counterparties
+   *    → This reflects the trade in on-chain balances
+   *
+   * WHY Fill-Only is needed:
+   * Splice tokens (CC/CBTC) use the Splice Token Standard. Their holdings can't be locked
+   * with our custom Holding_Lock choice. So DvP settlement is impossible for Splice-only users.
+   * mintDirect creates custom exchange holdings that DO show up in balances, reflecting the trade.
    */
-  async executeMatch(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, token) {
+  async executeMatch(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, token, useDvP = false) {
     const packageId = config.canton.packageIds?.clobExchange;
     const operatorPartyId = config.canton.operatorPartyId;
+    const synchronizerId = config.canton.synchronizerId;
     const [baseSymbol, quoteSymbol] = tradingPair.split('/');
     const quoteAmount = parseFloat((matchQty * matchPrice).toFixed(10));
     
     let tradeContractId = null;
     let createdHoldings = [];
-
-    // ═══════════════════════════════════════════════════════════════
-    // STEP 1: ATOMIC DvP Settlement via Settlement_Execute
-    // 
-    // This is a SINGLE DAML transaction that atomically:
-    // - Fetches and validates both locked Holdings
-    // - Archives both locked Holdings
-    // - Creates new Holding for buyer (receives base token, e.g. CC)
-    // - Creates new Holding for seller (receives quote token, e.g. CBTC)
-    // - Returns change Holdings if amounts differ (partial fills)
-    // - Creates Trade record on-chain
-    //
-    // If ANYTHING fails, the ENTIRE transaction rolls back.
-    // No partial state. No race conditions. No stale CIDs.
-    // ═══════════════════════════════════════════════════════════════
-    console.log(`[MatchingEngine] 🔄 ATOMIC DvP Settlement: ${matchQty} ${baseSymbol} ↔ ${quoteAmount} ${quoteSymbol}`);
-    try {
-      const settlementService = getSettlementService();
-      const result = await settlementService.settleMatch({
-        buyOrder: { ...buyOrder, tradingPair },
-        sellOrder: { ...sellOrder, tradingPair },
-        fillQuantity: matchQty,
-        fillPrice: matchPrice,
-      }, token);
-
-      tradeContractId = result.tradeContractId;
-      createdHoldings = result.createdHoldings || [];
-      console.log(`[MatchingEngine] ✅ DvP complete — Trade: ${tradeContractId?.substring(0, 25)}...`);
-      console.log(`[MatchingEngine]    ${createdHoldings.length} new Holdings created atomically`);
-    } catch (settleError) {
-      console.error(`[MatchingEngine] ❌ DvP Settlement FAILED: ${settleError.message}`);
-      throw new Error(`DvP settlement failed: ${settleError.message}`);
-    }
-
-    // ═══════════════════════════════════════════════════
-    // STEP 2: Handle partial fills — Re-lock change holdings
-    // 
-    // Settlement_Execute returns UNLOCKED change holdings when the
-    // locked amount exceeds the trade amount. For partial fills,
-    // we re-lock these for the remaining order quantity.
-    // ═══════════════════════════════════════════════════
     const buyIsPartial = buyOrder.remaining > matchQty;
     const sellIsPartial = sellOrder.remaining > matchQty;
 
-    let buyNewAllocationCid = null;
-    let sellNewAllocationCid = null;
+    if (useDvP) {
+      // ═══════════════════════════════════════════════════════════════
+      // MODE 1: ATOMIC DvP Settlement via Settlement_Execute
+      // ═══════════════════════════════════════════════════════════════
+      console.log(`[MatchingEngine] 🔄 ATOMIC DvP Settlement: ${matchQty} ${baseSymbol} ↔ ${quoteAmount} ${quoteSymbol}`);
+      try {
+        const settlementService = getSettlementService();
+        const result = await settlementService.settleMatch({
+          buyOrder: { ...buyOrder, tradingPair },
+          sellOrder: { ...sellOrder, tradingPair },
+          fillQuantity: matchQty,
+          fillPrice: matchPrice,
+        }, token);
 
-    if (buyIsPartial || sellIsPartial) {
-      console.log(`[MatchingEngine] 🔄 Partial fill — re-locking change holdings...`);
-      const holdingTemplateId = `${packageId}:Holding:Holding`;
-      
-      if (buyIsPartial) {
-        const buyRemainder = createdHoldings.find(h => 
-          h.owner === buyOrder.owner && h.symbol === quoteSymbol && !h.locked);
-        if (buyRemainder) {
-          try {
-            console.log(`[MatchingEngine]    Re-locking buyer change: ${buyRemainder.amount} ${quoteSymbol}`);
-            const lockResult = await cantonService.exerciseChoice({
-              token,
-              templateId: holdingTemplateId,
-              contractId: buyRemainder.contractId,
-              choice: 'Holding_Lock',
-              choiceArgument: {
-                lockHolder: operatorPartyId,
-                lockReason: `ORDER:${buyOrder.orderId}`,
-                lockAmount: buyRemainder.amount.toString(),
-              },
-              actAsParty: [buyOrder.owner, operatorPartyId],
-              readAs: [operatorPartyId],
-            });
-            const events = lockResult?.transaction?.events || [];
-            for (const event of events) {
-              const created = event.created || event.CreatedEvent;
-              if (created?.contractId && created.createArgument?.lock) {
-                buyNewAllocationCid = created.contractId;
-                console.log(`[MatchingEngine]    ✅ Buyer change re-locked: ${buyNewAllocationCid.substring(0, 25)}...`);
-                break;
+        tradeContractId = result.tradeContractId;
+        createdHoldings = result.createdHoldings || [];
+        console.log(`[MatchingEngine] ✅ DvP complete — Trade: ${tradeContractId?.substring(0, 25)}...`);
+      } catch (settleError) {
+        console.error(`[MatchingEngine] ❌ DvP Settlement FAILED: ${settleError.message}`);
+        throw new Error(`DvP settlement failed: ${settleError.message}`);
+      }
+
+      // Re-lock change holdings for partial fills (DvP only)
+      let buyNewAllocationCid = null;
+      let sellNewAllocationCid = null;
+
+      if (buyIsPartial || sellIsPartial) {
+        console.log(`[MatchingEngine] 🔄 Partial fill — re-locking change holdings...`);
+        const holdingTemplateId = `${packageId}:Holding:Holding`;
+        
+        if (buyIsPartial) {
+          const buyRemainder = createdHoldings.find(h => 
+            h.owner === buyOrder.owner && h.symbol === quoteSymbol && !h.locked);
+          if (buyRemainder) {
+            try {
+              const lockResult = await cantonService.exerciseChoice({
+                token,
+                templateId: holdingTemplateId,
+                contractId: buyRemainder.contractId,
+                choice: 'Holding_Lock',
+          choiceArgument: {
+                  lockHolder: operatorPartyId,
+                  lockReason: `ORDER:${buyOrder.orderId}`,
+                  lockAmount: buyRemainder.amount.toString(),
+                },
+                actAsParty: [buyOrder.owner, operatorPartyId],
+                readAs: [operatorPartyId],
+              });
+              const events = lockResult?.transaction?.events || [];
+              for (const event of events) {
+                const created = event.created || event.CreatedEvent;
+                if (created?.contractId && created.createArgument?.lock) {
+                  buyNewAllocationCid = created.contractId;
+                  break;
+                }
               }
+            } catch (lockErr) {
+              console.error(`[MatchingEngine]    ⚠️ Re-lock failed: ${lockErr.message}`);
             }
-          } catch (lockErr) {
-            console.error(`[MatchingEngine]    ⚠️ Re-lock failed (non-critical, tokens already transferred): ${lockErr.message}`);
+          }
+        }
+
+        if (sellIsPartial) {
+          const sellRemainder = createdHoldings.find(h => 
+            h.owner === sellOrder.owner && h.symbol === baseSymbol && !h.locked);
+          if (sellRemainder) {
+            try {
+              const lockResult = await cantonService.exerciseChoice({
+                token,
+                templateId: holdingTemplateId,
+                contractId: sellRemainder.contractId,
+                choice: 'Holding_Lock',
+          choiceArgument: {
+                  lockHolder: operatorPartyId,
+                  lockReason: `ORDER:${sellOrder.orderId}`,
+                  lockAmount: sellRemainder.amount.toString(),
+                },
+                actAsParty: [sellOrder.owner, operatorPartyId],
+                readAs: [operatorPartyId],
+              });
+              const events = lockResult?.transaction?.events || [];
+              for (const event of events) {
+                const created = event.created || event.CreatedEvent;
+                if (created?.contractId && created.createArgument?.lock) {
+                  sellNewAllocationCid = created.contractId;
+                  break;
+                }
+              }
+            } catch (lockErr) {
+              console.error(`[MatchingEngine]    ⚠️ Re-lock failed: ${lockErr.message}`);
+            }
           }
         }
       }
 
-      if (sellIsPartial) {
-        const sellRemainder = createdHoldings.find(h => 
-          h.owner === sellOrder.owner && h.symbol === baseSymbol && !h.locked);
-        if (sellRemainder) {
-          try {
-            console.log(`[MatchingEngine]    Re-locking seller change: ${sellRemainder.amount} ${baseSymbol}`);
-            const lockResult = await cantonService.exerciseChoice({
-              token,
-              templateId: holdingTemplateId,
-              contractId: sellRemainder.contractId,
-              choice: 'Holding_Lock',
-              choiceArgument: {
-                lockHolder: operatorPartyId,
-                lockReason: `ORDER:${sellOrder.orderId}`,
-                lockAmount: sellRemainder.amount.toString(),
-              },
-              actAsParty: [sellOrder.owner, operatorPartyId],
-              readAs: [operatorPartyId],
-            });
-            const events = lockResult?.transaction?.events || [];
-            for (const event of events) {
-              const created = event.created || event.CreatedEvent;
-              if (created?.contractId && created.createArgument?.lock) {
-                sellNewAllocationCid = created.contractId;
-                console.log(`[MatchingEngine]    ✅ Seller change re-locked: ${sellNewAllocationCid.substring(0, 25)}...`);
-                break;
-              }
-            }
-          } catch (lockErr) {
-            console.error(`[MatchingEngine]    ⚠️ Re-lock failed (non-critical, tokens already transferred): ${lockErr.message}`);
-          }
+      // FillOrder on both sides (DvP already succeeded so these are non-critical)
+      console.log(`[MatchingEngine] 📝 Filling orders on-chain...`);
+      try {
+        const buyFillArg = { fillQuantity: matchQty.toString() };
+        if (buyOrder.isNewPackage) buyFillArg.newAllocationCid = buyNewAllocationCid || null;
+        await cantonService.exerciseChoice({
+          token, actAsParty: [operatorPartyId],
+          templateId: buyOrder.templateId || `${packageId}:Order:Order`,
+          contractId: buyOrder.contractId, choice: 'FillOrder',
+          choiceArgument: buyFillArg,
+          readAs: [operatorPartyId, buyOrder.owner],
+        });
+        console.log(`[MatchingEngine] ✅ Buy order filled: ${buyOrder.orderId}${buyIsPartial ? ' (partial)' : ' (complete)'}`);
+      } catch (fillError) {
+        console.error(`[MatchingEngine] ⚠️ Buy FillOrder failed (DvP already settled): ${fillError.message}`);
+      }
+
+      try {
+        const sellFillArg = { fillQuantity: matchQty.toString() };
+        if (sellOrder.isNewPackage) sellFillArg.newAllocationCid = sellNewAllocationCid || null;
+        await cantonService.exerciseChoice({
+          token, actAsParty: [operatorPartyId],
+          templateId: sellOrder.templateId || `${packageId}:Order:Order`,
+          contractId: sellOrder.contractId, choice: 'FillOrder',
+          choiceArgument: sellFillArg,
+          readAs: [operatorPartyId, sellOrder.owner],
+        });
+        console.log(`[MatchingEngine] ✅ Sell order filled: ${sellOrder.orderId}${sellIsPartial ? ' (partial)' : ' (complete)'}`);
+      } catch (fillError) {
+        console.error(`[MatchingEngine] ⚠️ Sell FillOrder failed (DvP already settled): ${fillError.message}`);
+      }
+
+    } else {
+      // ═══════════════════════════════════════════════════════════════
+      // MODE 2: FILL-ONLY Settlement (FillOrder + mintDirect)
+      //
+      // CRITICAL: FillOrder FIRST to prevent re-matching loop.
+      // If FillOrder succeeds, the order status changes to FILLED/PARTIAL
+      // and the matching engine won't pick it up again.
+      // ═══════════════════════════════════════════════════════════════
+      console.log(`[MatchingEngine] 🔄 FILL-ONLY Settlement: ${matchQty} ${baseSymbol} ↔ ${quoteAmount} ${quoteSymbol}`);
+
+      // STEP A: FillOrder on BOTH orders FIRST
+      console.log(`[MatchingEngine] 📝 Step A: Filling orders on-chain (FIRST to prevent re-matching)...`);
+      let buyFillOk = false;
+      let sellFillOk = false;
+
+      try {
+        const buyFillArg = { fillQuantity: matchQty.toString() };
+        if (buyOrder.isNewPackage) buyFillArg.newAllocationCid = null;
+        await cantonService.exerciseChoice({
+          token, actAsParty: [operatorPartyId],
+          templateId: buyOrder.templateId || `${packageId}:Order:Order`,
+          contractId: buyOrder.contractId, choice: 'FillOrder',
+          choiceArgument: buyFillArg,
+          readAs: [operatorPartyId, buyOrder.owner],
+        });
+        buyFillOk = true;
+        console.log(`[MatchingEngine] ✅ Buy order filled: ${buyOrder.orderId}${buyIsPartial ? ' (partial)' : ' (complete)'}`);
+      } catch (fillError) {
+        console.error(`[MatchingEngine] ❌ Buy FillOrder FAILED: ${fillError.message}`);
+        // If the buy fill fails, the order might already be filled → skip
+        if (fillError.message?.includes('already filled') || fillError.message?.includes('CONTRACT_NOT_FOUND')) {
+          throw fillError; // Rethrow to skip this pair
+        }
+        throw new Error(`Fill-Only: Buy FillOrder failed: ${fillError.message}`);
+      }
+
+      try {
+        const sellFillArg = { fillQuantity: matchQty.toString() };
+        if (sellOrder.isNewPackage) sellFillArg.newAllocationCid = null;
+        await cantonService.exerciseChoice({
+          token, actAsParty: [operatorPartyId],
+          templateId: sellOrder.templateId || `${packageId}:Order:Order`,
+          contractId: sellOrder.contractId, choice: 'FillOrder',
+          choiceArgument: sellFillArg,
+          readAs: [operatorPartyId, sellOrder.owner],
+        });
+        sellFillOk = true;
+        console.log(`[MatchingEngine] ✅ Sell order filled: ${sellOrder.orderId}${sellIsPartial ? ' (partial)' : ' (complete)'}`);
+      } catch (fillError) {
+        console.error(`[MatchingEngine] ❌ Sell FillOrder FAILED: ${fillError.message}`);
+        // Buy was already filled — still continue with token transfer attempt
+        if (!fillError.message?.includes('already filled') && !fillError.message?.includes('CONTRACT_NOT_FOUND')) {
+          console.warn(`[MatchingEngine] ⚠️ Sell FillOrder failed but buy succeeded — tokens may still be minted`);
         }
       }
-    }
 
-    // ═══════════════════════════════════════════════════
-    // STEP 3: FillOrder on both Order contracts
-    // Updates filled quantity and status on-chain.
-    // For partial fills, passes new locked holding CID.
-    // ═══════════════════════════════════════════════════
-    console.log(`[MatchingEngine] 📝 Filling orders on-chain...`);
+      // STEP B: Mint custom Holdings to reflect the trade
+      // Buyer receives baseSymbol (e.g., CC), Seller receives quoteSymbol (e.g., CBTC)
+      console.log(`[MatchingEngine] 💰 Step B: Minting holdings to reflect trade...`);
+      try {
+        const holdingService = getHoldingService();
+        await holdingService.initialize();
 
-    try {
-      const buyFillArg = { fillQuantity: matchQty.toString() };
-      if (buyOrder.isNewPackage) {
-        buyFillArg.newAllocationCid = buyNewAllocationCid || null;
+        // Mint base token for buyer (e.g., buyer gets CC)
+        console.log(`[MatchingEngine]    Minting ${matchQty} ${baseSymbol} → buyer: ${buyOrder.owner.substring(0, 30)}...`);
+        await holdingService.mintDirect(buyOrder.owner, baseSymbol, matchQty, token);
+        console.log(`[MatchingEngine]    ✅ Buyer received ${matchQty} ${baseSymbol}`);
+
+        // Mint quote token for seller (e.g., seller gets CBTC)
+        console.log(`[MatchingEngine]    Minting ${quoteAmount} ${quoteSymbol} → seller: ${sellOrder.owner.substring(0, 30)}...`);
+        await holdingService.mintDirect(sellOrder.owner, quoteSymbol, quoteAmount, token);
+        console.log(`[MatchingEngine]    ✅ Seller received ${quoteAmount} ${quoteSymbol}`);
+      } catch (mintError) {
+        // Non-fatal: FillOrder already succeeded so orders are marked as filled.
+        // Balance update will be delayed but no re-matching loop.
+        console.error(`[MatchingEngine] ⚠️ mintDirect failed (orders already filled): ${mintError.message}`);
       }
-      await cantonService.exerciseChoice({
-        token,
-        actAsParty: [operatorPartyId],
-        templateId: buyOrder.templateId || `${packageId}:Order:Order`,
-        contractId: buyOrder.contractId,
-        choice: 'FillOrder',
-        choiceArgument: buyFillArg,
-        readAs: [operatorPartyId, buyOrder.owner],
-      });
-      console.log(`[MatchingEngine] ✅ Buy order filled: ${buyOrder.orderId}${buyIsPartial ? ' (partial)' : ' (complete)'}`);
-    } catch (fillError) {
-      // Non-fatal: DvP settlement already succeeded — tokens are transferred.
-      // Order status will be stale but no financial impact.
-      console.error(`[MatchingEngine] ⚠️ Buy FillOrder failed (DvP already settled): ${fillError.message}`);
-    }
 
-    try {
-      const sellFillArg = { fillQuantity: matchQty.toString() };
-      if (sellOrder.isNewPackage) {
-        sellFillArg.newAllocationCid = sellNewAllocationCid || null;
+      // Create a Trade record on-chain for history
+      try {
+        const tradeTemplateId = `${packageId}:Settlement:Trade`;
+        const tradeId = `trade-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
+        const tradeResult = await cantonService.createContractWithTransaction({
+          token,
+          actAsParty: operatorPartyId,
+          templateId: tradeTemplateId,
+          createArguments: {
+            tradeId: tradeId,
+            operator: operatorPartyId,
+            buyer: buyOrder.owner,
+            seller: sellOrder.owner,
+            baseInstrumentId: {
+              issuer: operatorPartyId,
+              symbol: baseSymbol,
+              version: '1.0',
+            },
+            quoteInstrumentId: {
+              issuer: operatorPartyId,
+              symbol: quoteSymbol,
+              version: '1.0',
+            },
+            baseAmount: matchQty.toString(),
+            quoteAmount: quoteAmount.toString(),
+            price: matchPrice.toString(),
+            buyOrderId: buyOrder.orderId,
+            sellOrderId: sellOrder.orderId,
+            timestamp: new Date().toISOString(),
+          },
+          readAs: [operatorPartyId, buyOrder.owner, sellOrder.owner],
+          synchronizerId,
+        });
+        const events = tradeResult?.transaction?.events || [];
+        for (const event of events) {
+          const created = event.created || event.CreatedEvent;
+          if (created?.contractId) {
+            tradeContractId = created.contractId;
+            break;
+          }
+        }
+        console.log(`[MatchingEngine] ✅ Trade record created: ${tradeContractId?.substring(0, 25)}...`);
+      } catch (tradeErr) {
+        console.warn(`[MatchingEngine] ⚠️ Trade record creation failed (non-critical): ${tradeErr.message}`);
+        tradeContractId = `trade-${Date.now()}`;
       }
-      await cantonService.exerciseChoice({
-        token,
-        actAsParty: [operatorPartyId],
-        templateId: sellOrder.templateId || `${packageId}:Order:Order`,
-        contractId: sellOrder.contractId,
-        choice: 'FillOrder',
-        choiceArgument: sellFillArg,
-        readAs: [operatorPartyId, sellOrder.owner],
-      });
-      console.log(`[MatchingEngine] ✅ Sell order filled: ${sellOrder.orderId}${sellIsPartial ? ' (partial)' : ' (complete)'}`);
-    } catch (fillError) {
-      console.error(`[MatchingEngine] ⚠️ Sell FillOrder failed (DvP already settled): ${fillError.message}`);
     }
 
     // ═══════════════════════════════════════════════════
-    // STEP 4: Record trade and broadcast via WebSocket
+    // FINAL: Record trade and broadcast via WebSocket
     // ═══════════════════════════════════════════════════
     const tradeRecord = {
       tradeId: tradeContractId || `trade-${Date.now()}`,
@@ -651,7 +734,7 @@ class MatchingEngine {
       buyOrderId: buyOrder.orderId,
       sellOrderId: sellOrder.orderId,
       timestamp: new Date().toISOString(),
-      settlementType: 'DvP',
+      settlementType: useDvP ? 'DvP' : 'FillOnly',
     };
 
     // Add to UpdateStream for persistence (so trades API can serve it)
@@ -677,7 +760,7 @@ class MatchingEngine {
         fillPrice: matchPrice,
       });
 
-      // Also broadcast balance updates for both parties so UI refreshes immediately
+      // Broadcast balance updates for both parties so UI refreshes immediately
       global.broadcastWebSocket(`balance:${buyOrder.owner}`, {
         type: 'BALANCE_UPDATE',
         partyId: buyOrder.owner,
@@ -690,13 +773,8 @@ class MatchingEngine {
       });
     }
 
-    console.log(`[MatchingEngine] ═══ Match complete: ${matchQty} ${baseSymbol} @ ${matchPrice} ${quoteSymbol} ═══`);
+    console.log(`[MatchingEngine] ═══ Match complete: ${matchQty} ${baseSymbol} @ ${matchPrice} ${quoteSymbol} (${useDvP ? 'DvP' : 'FillOnly'}) ═══`);
   }
-
-  // NOTE: Splice transfer methods (attemptSpliceTransfer, _doSpliceTransfer, _enrichContextForCC)
-  // have been REMOVED. All token settlement now happens via atomic DvP using Settlement_Execute.
-  // Locked custom Holdings are immutable (DAML asserts lock == None on Split/Transfer/Merge),
-  // so they can never become stale. No retry logic, no workarounds needed.
 
   setPollingInterval(ms) {
     this.pollingInterval = ms;
@@ -760,7 +838,7 @@ class MatchingEngine {
       for (const tradingPair of pairsToProcess) {
         try {
           await this.processOrdersForPair(tradingPair, token);
-        } catch (error) {
+    } catch (error) {
           if (!error.message?.includes('No contracts found')) {
             console.error(`[MatchingEngine] Trigger error for ${tradingPair}:`, error.message);
           }

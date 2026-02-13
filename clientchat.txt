@@ -1,0 +1,191 @@
+
+2/5/2026
+2/6/2026
+Saturday
+Mohak
++971 58 590 3850
+Brother, match making is the primary functionality for the clob
+Yes, it is working, but an error occurs. I’m fixing that. This was also working previously; I tested it. I know matchmaking is the primary functionality.
+4:05 PM
+Mohak
++971 58 590 3850
+You mentioned other than match making all other functionality is complete. I have explained this before, the primary thing which has to be rock solid is match making which included order fulfilment(partial or full), order cancellation etc, with real transfer of tokens. 
+We still haven’t been able to test all of it yet. UI fixes, additionally features etc we can cover in next milestone but the core functionality needs to be tested. Once you have tested it, let us know and then we will test
+7:46 PM
+
+👍
+Monday
+@~huz  now check match making and  transfer of tokens
+8:14 PM
+huz
++91 79903 24401
+@AHMED I just created an order (ID starting with order-1770…), but the order isnt visible in Buy Orders
+Edited9:06 PM
+huz
++91 79903 24401
+This message couldn't load. Open the message on your phone to view it. Click here to update.
+9:06 PM
+The order you created (ID starting with order-1770…) is visible in the Buy Orders section it's aggregated at the 0.10 price level along with other orders at the same price, which is standard exchange behavior (similar to Binance).
+To make this clearer, we've added a "My" column to the order book. It shows a numbered badge next to any price level where you have orders, so you can instantly see which rows include your orders and how many.
+We also improved the order book refresh timing after placing or canceling an order it now waits for Canton to fully commit the transaction before refreshing, so your new orders appear immediately without needing a manual refresh.
+10:27 PM
+@~huz, did you check?
+1:26 AM
+huz
++91 79903 24401
+@AHMED I did create few orders and are visible too in sell/buy orders “MY” section, stuck on how can I match any order. Can you give me a sample input which I can use to request a new order which will result in matchmaking
+10:54 AM
+@AHMED if you are available, can we connect on a call to check the clob?
+8:40 PM
+Orders are matching but it seems that the tokens are not being transferred
+9:06 PM
+huz
++91 79903 24401
+@AHMED if you are available, can we connect on a call to check the clob?
+Yes sure
+9:12 PM
+huz
++91 79903 24401
+@AHMED I did create few orders and are visible too in sell/buy orders “MY” section, stuck on how can I match any order. Can you give me a sample input which I can use to request a new order which will result in matchmaking
+I’m Im working on it
+9:12 PM
+huz
++91 79903 24401
+You
+Yes sure
+Connect now?
+9:25 PM
+huz
++91 79903 24401
+Connect now?
+Yes
+9:34 PM
+Are you sharing the meeting link ?
+9:36 PM
+huz
++91 79903 24401
+Give me few mins
+9:40 PM
+
+👍
+Theres a power outage in my area, will ping you if it comes back else lets connect in the morning
+10:12 PM
+huz
++91 79903 24401
+Theres a power outage in my area, will ping you if it comes back else lets connect in the morning
+Om
+10:13 PM
+No problem
+10:13 PM
+huz
++91 79903 24401
+Can connect now or if its too late for you then lets connect tomorrow
+Edited10:32 PM
+huz
++91 79903 24401
+Can connect now or if its too late for you then lets connect tomorrow
+Connect now
+10:38 PM
+
+👍
+huz
++91 79903 24401
+Meet
+Real-time meetings by Google. Using your browser, share your video, desktop, and presentations with teammates and customers.
+meet.google.com
+https://meet.google.com/tin-zgtz-mhy
+10:40 PM
+You deleted this message
+10:43 PM
+Wednesday
+Mohak
++971 58 590 3850
+We have tried testing again today:
+
+-The orders are taking around 30 mins to match.
+-Once they match, the balances remain unchanged.
+11:57 AM
+Not sure if we are on right track here. As it’s not a small bug anymore, it’s been more than a week and we still don’t have basic order match making working.
+11:58 AM
+If there are any limitations, please let us know asap.
+11:58 AM
+Also, are we using allocations as discussed before? We can’t see any transfer of tokens on explorer when the order is matched
+3:39 PM
+30 min match delay: The matching engine executes in 1-2 seconds on the backend. The delay is because the production WebSocket is pointing to localhost instead of the live server so the UI misses real-time updates. This is a config fix.
+
+Balances unchanged: The UI is showing total balance instead of available balance. Backend locks funds correctly but the frontend isn't reflecting it. Display bug — fixing now.
+No transfers on explorer: We're updating the settlement flow to use the proper allocation-based transfer mechanism so token movements are visible on the explorer.
+
+No fundamental limitations  core matching works. These are config and display issues. Working on all three fixes now.
+Edited3:50 PM
+Mohak
++971 58 590 3850
+Thanks for the update. Please test it once you have fixed these and let us know
+4:02 PM
+Today
+Mohak
++971 58 590 3850
+Hi, when will we be able to test the app?
+1:01 PM
+Hi, you’ll be able to test the app by tomorrow. I’ll share the link once it’s ready.
+Edited2:17 PM
+Hi,
+
+I've been debugging the matching issues and found the root problems:
+Issue 1: Balances not updating after trades
+
+When an order matches, we're minting new tokens for the buyer but the seller's original CC/CBTC tokens aren't being burned. This causes the total supply to inflate.
+We need to know:
+
+Can we programmatically archive/burn Splice Holdings (CC/CBTC)?
+Should we integrate with the Transfer Registry you mentioned (http://65.108.40.104:8088)?
+Any other preferred method?
+
+Issue 2: No transfer events showing on explorer
+The current approach creates new token contracts instead of transferring existing ones. The problem is Canton's Splice Holdings (CC/CBTC) have restrictions in their Daml templates:
+
+assert (lock == None) on Split
+assert (lock == None) …Read more
+9:09 PM
+@~Mohak @~huz
+9:18 PM
+Mohak
++971 58 590 3850
+How are you minting new tokens?
+9:22 PM
+Like how can you mint new CBTC and supply to inflate, we don’t own CBTC contract
+9:23 PM
+huz
++91 79903 24401
+You
+Hi,
+
+I've been debugging the matching issues and found the root problems:
+Issue 1: Balances not updating after trades
+
+When an order matches, we're minting new tokens for the buyer but the seller's original CC/CBTC tokens aren't being burned. This causes the total supply to inflate.
+We need to know:
+
+Can we programmatically archive/burn Splice Holdings (CC/CBTC)?
+Should we integrate with the Transfer Registry you mentioned (http://65.108.40.104:8088)?
+Any other preferred method?
+
+Issue 2: No transfer events showing on explorer
+The current approach creates new token contracts instead of transferring existing ones. The problem is Canton's Splice Holdings (CC/CBTC) have restrictions in their Daml templates:
+
+assert (lock == None) on Split
+assert (lock == None) 
+Yes, we need to use transfer registry (specific to instrument) to transfer tokens from one party to another.
+9:29 PM
+
+👍
+Mohak
++971 58 590 3850
+Like how can you mint new CBTC and supply to inflate, we don’t own CBTC contract
+We're creating custom Holding contracts on our own Daml template with the symbol "CBTC" they're IOUs inside our exchange, not real CBTC. We can't mint actual CBTC since we don't own that contract. We need the correct API to transfer real CC/CBTC between parties during settlement.
+9:33 PM
+huz
++91 79903 24401
+You
+We're creating custom Holding contracts on our own Daml template with the symbol "CBTC" they're IOUs inside our exchange, not real CBTC. We can't mint actual CBTC since we don't own that contract. We need the correct API to transfer real CC/CBTC between parties during settlement.
+We need to use the splice token Holding interface and not custom templates, unless you are inheriting this interface in your template then its fine...

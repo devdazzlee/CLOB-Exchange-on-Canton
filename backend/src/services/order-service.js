@@ -123,13 +123,16 @@ class OrderService {
       primaryHolding.templateId?.includes('Utility');
     
     if (isSpliceHolding) {
-      // No custom holding available — REJECT the order.
-      // User must click "Get Test Funds" to mint custom Holdings that can be locked.
-      console.error(`[OrderService] ❌ No custom ${asset} holding available — cannot lock Splice holdings for DvP`);
-      throw new ValidationError(
-        `No lockable ${asset} holdings found. Click "Get Test Funds" to mint custom ${asset} holdings for trading. ` +
-        `Splice/Amulet holdings cannot be used for exchange orders.`
-      );
+      // No custom holding available — use FILL_ONLY mode.
+      // Splice holdings (CBTC, Amulet/CC) can't be locked, so we place the order
+      // without a locked holding. The matching engine will use Fill-Only settlement
+      // (FillOrder + mintDirect) instead of atomic DvP.
+      console.log(`[OrderService] ⚠️ No custom ${asset} holding — using FILL_ONLY mode (Splice holdings can't be locked)`);
+      return {
+        lockedHoldingCid: 'FILL_ONLY',
+        lockedAmount: amount,
+        asset: asset
+      };
     }
     
     console.log(`[OrderService] ✅ Found custom ${asset} holding (${primaryHolding.amount}) — locking for atomic DvP`);
@@ -613,14 +616,14 @@ class OrderService {
     let result;
     try {
       result = await cantonService.exerciseChoice({
-        token,
-        actAsParty: partyId, // Owner cancels their own order
-        templateId: `${packageId}:Order:Order`,
-        contractId: orderContractId,
-        choice: 'CancelOrder',
-        choiceArgument: {},
-        readAs: [operatorPartyId, partyId]
-      });
+      token,
+      actAsParty: partyId, // Owner cancels their own order
+      templateId: `${packageId}:Order:Order`,
+      contractId: orderContractId,
+      choice: 'CancelOrder',
+      choiceArgument: {},
+      readAs: [operatorPartyId, partyId]
+    });
     } catch (cancelErr) {
       // If new package fails, try legacy package
       const legacyPackageId = config.canton.packageIds?.legacy;

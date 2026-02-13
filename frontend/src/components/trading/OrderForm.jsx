@@ -24,6 +24,7 @@ export default function OrderForm({
   loading, 
   onSubmit,
   balance = { BTC: '0.0', USDT: '0.0' },
+  lockedBalance = {},
   orderBook = { buys: [], sells: [] },
   onMintTokens = null,
   mintingLoading = false,
@@ -36,8 +37,9 @@ export default function OrderForm({
 
   // Get base and quote tokens
   const [baseToken, quoteToken] = tradingPair.split('/');
-  const baseBalance = parseFloat(balance[baseToken] || 0);
-  const quoteBalance = parseFloat(balance[quoteToken] || 0);
+  // Available = Total - Locked (so user sees actual free funds)
+  const baseBalance = Math.max(0, parseFloat(balance[baseToken] || 0) - parseFloat(lockedBalance[baseToken] || 0));
+  const quoteBalance = Math.max(0, parseFloat(balance[quoteToken] || 0) - parseFloat(lockedBalance[quoteToken] || 0));
 
   // Get best bid/ask prices - REAL DATA ONLY
   const bestBid = orderBook.buys?.[0]?.price || null;
