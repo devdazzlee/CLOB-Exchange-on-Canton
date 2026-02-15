@@ -19,7 +19,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@canton-network/wallet-sdk": "^0.20.0",
+    "@canton-network/wallet-sdk": "^0.21.0",
     "@grpc/grpc-js": "^1.14.3",
     "@grpc/proto-loader": "^0.8.0",
     "@noble/ed25519": "^2.0.0",

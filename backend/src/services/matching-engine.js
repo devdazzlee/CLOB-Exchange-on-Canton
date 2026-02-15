@@ -2,7 +2,7 @@
  * Matching Engine Bot
  * 
  * Core exchange functionality — matches buy/sell orders and settles trades
- * exclusively via the Transfer Registry API.
+ * using the Canton Wallet SDK (2-step transfer flow).
  * 
  * Flow:
  * 1. Poll Canton for OPEN Order contracts every N seconds
@@ -11,25 +11,29 @@
  * 4. Find crossing orders (buy price >= sell price)
  * 5. For each match:
  *    a. FillOrder on both Canton contracts (prevents re-matching loop)
- *    b. Transfer instrument (seller→buyer) via Transfer Registry
- *    c. Transfer payment (buyer→seller) via Transfer Registry
- *    d. Unlock remaining locked funds for fully-filled orders
- *    e. Create Trade record on Canton for history
- *    f. Broadcast via WebSocket
+ *    b. Transfer instrument (seller→buyer) via SDK 2-step transfer
+ *    c. Transfer payment (buyer→seller) via SDK 2-step transfer
+ *    d. Create Trade record on Canton for history
+ *    e. Broadcast via WebSocket
  * 
- * ALL token movements go through Transfer Registry — NO custom minting,
- * NO DvP settlement, NO Fill-Only mode. Transfers are visible on Canton Explorer.
+ * Settlement uses Canton Wallet SDK:
+ * - sdk.tokenStandard.createTransfer() → creates TransferInstruction (locks UTXOs)
+ * - sdk.tokenStandard.exerciseTransferInstructionChoice(cid, 'Accept') → completes transfer
+ * 
+ * All transfers are REAL Canton token movements visible on Canton Explorer.
  * 
  * Uses Canton JSON Ledger API v2:
  * - POST /v2/state/active-contracts — Query orders
- * - POST /v2/commands/submit-and-wait-for-transaction — Execute matches
+ * - POST /v2/commands/submit-and-wait-for-transaction — Execute matches & transfers
+ * 
+ * @see https://docs.digitalasset.com/integrate/devnet/token-standard/index.html
  */
 
 const Decimal = require('decimal.js');
 const cantonService = require('./cantonService');
 const config = require('../config');
 const tokenProvider = require('./tokenProvider');
-const { getTransferRegistry } = require('./transferRegistryClient');
+const { getCantonSDKClient } = require('./canton-sdk-client');
 
 // Configure decimal.js for financial precision
 Decimal.set({ precision: 20, rounding: Decimal.ROUND_DOWN });
@@ -43,6 +47,11 @@ class MatchingEngine {
     this.adminToken = null;
     this.tokenExpiry = null;
     this.tradingPairs = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'CC/CBTC'];
+
+    // ═══ Log throttling — suppress noisy repeat messages ═══
+    this._lastLogState = {};          // Per-pair last log message hash
+    this._cyclesSinceLastLog = 0;     // Cycles since we printed a status
+    this._LOG_THROTTLE_CYCLES = 30;   // Print status every N cycles even if unchanged
 
     // ═══ CRITICAL: Recently matched orders guard ═══
     // Prevents catastrophic re-matching loop where:
@@ -256,6 +265,16 @@ class MatchingEngine {
       
       if (buyOrders.length === 0 || sellOrders.length === 0) return;
 
+      // ═══ Throttled logging: only log order counts when they change ═══
+      const stateKey = `${tradingPair}:${buyOrders.length}b:${sellOrders.length}s`;
+      this._cyclesSinceLastLog++;
+      const shouldLogStatus = (this._lastLogState[tradingPair] !== stateKey) || (this._cyclesSinceLastLog >= this._LOG_THROTTLE_CYCLES);
+      if (shouldLogStatus) {
+        console.log(`[MatchingEngine] ${tradingPair}: ${buyOrders.length} buys, ${sellOrders.length} sells`);
+        this._lastLogState[tradingPair] = stateKey;
+        this._cyclesSinceLastLog = 0;
+      }
+
       // Sort: buys by highest price first (MARKET first), sells by lowest price first (MARKET first)
       buyOrders.sort((a, b) => {
         if (a.price === null && b.price !== null) return -1;
@@ -272,8 +291,6 @@ class MatchingEngine {
         if (a.price !== b.price) return a.price - b.price;
         return new Date(a.timestamp) - new Date(b.timestamp);
       });
-
-      console.log(`[MatchingEngine] ${tradingPair}: ${buyOrders.length} buys, ${sellOrders.length} sells`);
 
       // Find and execute ONE match per cycle (contract IDs become stale after match)
       await this.findAndExecuteOneMatch(tradingPair, buyOrders, sellOrders, token);
@@ -315,7 +332,12 @@ class MatchingEngine {
         // A party must NEVER trade with itself — regulatory requirement.
         // ═══════════════════════════════════════════════════════════
         if (buyOrder.owner === sellOrder.owner) {
-          console.log(`[MatchingEngine] ⚠️ BLOCKED: Self-trade attempt by ${buyOrder.owner.substring(0, 30)}...`);
+          // Throttled: only log once per party per 60 seconds
+          const selfTradeKey = `self:${buyOrder.owner}`;
+          if (!this._lastLogState[selfTradeKey] || (now - this._lastLogState[selfTradeKey]) > 60000) {
+            console.log(`[MatchingEngine] ⚠️ Self-trade blocked: ${buyOrder.owner.substring(0, 30)}... (suppressing repeats for 60s)`);
+            this._lastLogState[selfTradeKey] = now;
+          }
           continue;
         }
 
@@ -352,13 +374,13 @@ class MatchingEngine {
         const matchQtyNum = matchQty.toNumber();    // Number for comparisons
 
         console.log(`[MatchingEngine] ✅ MATCH FOUND: BUY ${buyPrice !== null ? buyPrice : 'MARKET'} x ${buyOrder.remaining} ↔ SELL ${sellPrice !== null ? sellPrice : 'MARKET'} x ${sellOrder.remaining}`);
-        console.log(`[MatchingEngine]    Fill: ${matchQtyStr} @ ${matchPrice} | Settlement: Transfer Registry`);
+        console.log(`[MatchingEngine]    Fill: ${matchQtyStr} @ ${matchPrice} | Settlement: Canton SDK (2-step transfer)`);
 
         this.recentlyMatchedOrders.set(matchKey, Date.now());
 
         try {
           await this.executeMatch(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, token);
-          console.log(`[MatchingEngine] ✅ Match executed successfully via Transfer Registry`);
+          console.log(`[MatchingEngine] ✅ Match executed successfully via Canton SDK`);
           return; // One match per cycle
         } catch (error) {
           console.error(`[MatchingEngine] ❌ Match execution failed:`, error.message);
@@ -375,7 +397,7 @@ class MatchingEngine {
       }
     }
 
-    // ═══ DIAGNOSTIC: Log why no match was found ═══
+    // ═══ DIAGNOSTIC: Log why no match was found (throttled) ═══
     const bestBuy = buyOrders.find(o => o.remaining > 0 && o.price !== null);
     const bestSell = sellOrders.find(o => o.remaining > 0 && o.price !== null);
     if (bestBuy && bestSell) {
@@ -394,28 +416,32 @@ class MatchingEngine {
           console.warn(`[MatchingEngine] ⚠️ ${tradingPair}: Crossing orders blocked by recentlyMatched cache: ${skippedByCache.join(', ')}`);
         }
       } else {
-        console.log(`[MatchingEngine] ${tradingPair}: No crossing orders (bestBid=${bestBuy.price} < bestAsk=${bestSell.price}, spread=${spread.toFixed(8)})`);
+        // Throttle "no crossing" message — only log when spread changes
+        const spreadKey = `spread:${tradingPair}:${bestBuy.price}:${bestSell.price}`;
+        if (this._lastLogState[`spread:${tradingPair}`] !== spreadKey) {
+          console.log(`[MatchingEngine] ${tradingPair}: No crossing (bid=${bestBuy.price} < ask=${bestSell.price}, spread=${spread.toFixed(4)})`);
+          this._lastLogState[`spread:${tradingPair}`] = spreadKey;
+        }
       }
-    } else if (!bestBuy) {
-      console.log(`[MatchingEngine] ${tradingPair}: No active buy orders with price`);
-    } else if (!bestSell) {
-      console.log(`[MatchingEngine] ${tradingPair}: No active sell orders with price`);
     }
   }
   
   /**
-   * Execute a match using Transfer Registry API for REAL token transfers.
+   * Execute a match using Canton Wallet SDK for REAL token transfers.
    * 
-   * Settlement flow:
+   * Settlement flow (2-step transfer via SDK):
    * 1. FillOrder on BOTH Canton order contracts FIRST (prevents re-matching loop)
-   * 2. Transfer instrument (e.g., CBTC) from seller → buyer via Transfer Registry
-   * 3. Transfer payment (e.g., CC) from buyer → seller via Transfer Registry
-   * 4. Unlock remaining locked funds for fully-filled orders
-   * 5. Create Trade record on Canton for history
-   * 6. Broadcast via WebSocket
+   * 2. Transfer instrument (e.g., CC) from seller → buyer:
+   *    a. SDK createTransfer → creates TransferInstruction (locks seller's UTXOs)
+   *    b. SDK exerciseTransferInstructionChoice('Accept') → completes transfer
+   * 3. Transfer payment (e.g., CBTC) from buyer → seller:
+   *    a. SDK createTransfer → creates TransferInstruction (locks buyer's UTXOs)
+   *    b. SDK exerciseTransferInstructionChoice('Accept') → completes transfer
+   * 4. Create Trade record on Canton for history
+   * 5. Broadcast via WebSocket
    * 
-   * ALL token movements are via Transfer Registry API — NO custom minting.
-   * Transfers are visible on Canton Explorer.
+   * All transfers are REAL Canton token movements visible on Canton Explorer.
+   * No custom minting, no fake APIs — pure Splice Token Standard.
    * 
    * @param {string} tradingPair
    * @param {object} buyOrder
@@ -440,7 +466,7 @@ class MatchingEngine {
     const buyIsPartial = new Decimal(buyOrder.remaining).gt(matchQty);
     const sellIsPartial = new Decimal(sellOrder.remaining).gt(matchQty);
     
-    const transferRegistry = getTransferRegistry();
+    const sdkClient = getCantonSDKClient();
 
     // ═══════════════════════════════════════════════════════════════════
     // STEP 1: FillOrder on BOTH Canton orders FIRST
@@ -488,102 +514,73 @@ class MatchingEngine {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // STEP 2: Transfer REAL tokens via Transfer Registry API
-    // Two transfers per settlement:
-    //   a) Instrument (e.g., CBTC) from seller → buyer
-    //   b) Payment (e.g., CC) from buyer → seller
-    // These are REAL transfers visible on Canton Explorer.
+    // STEP 2: Transfer REAL tokens via Canton Wallet SDK (2-step flow)
+    // Two full transfers per settlement:
+    //   a) Instrument (e.g., CC) from seller → buyer
+    //   b) Payment (e.g., CBTC) from buyer → seller
     //
-    // ATOMIC SAFETY: If transfer A succeeds but B fails, we log both
-    // transaction hashes for manual resolution. Orders are already filled
-    // on-chain so no re-matching loop occurs.
+    // Each executeFullTransfer does:
+    //   1. createTransfer → locks sender's UTXOs, creates TransferInstruction
+    //   2. acceptTransfer → completes transfer, receiver gets holdings
+    //
+    // These are REAL Splice Token Standard transfers visible on Canton Explorer.
     // ═══════════════════════════════════════════════════════════════════
-    console.log(`[MatchingEngine] 💰 Step 2: Transferring REAL tokens via Transfer Registry...`);
+    console.log(`[MatchingEngine] 💰 Step 2: Transferring REAL tokens via Canton SDK (2-step flow)...`);
     
     let instrumentTransferResult = null;
     let paymentTransferResult = null;
 
-    // Transfer A: Instrument (base) from seller → buyer
-    try {
-      console.log(`[MatchingEngine]    📤 Transfer ${matchQtyStr} ${baseSymbol}: seller → buyer`);
-      instrumentTransferResult = await transferRegistry.transfer({
-        instrument: baseSymbol,
-        fromParty: sellOrder.owner,
-        toParty: buyOrder.owner,
-        amount: matchQtyStr,
-        metadata: {
-          buyOrderId: buyOrder.orderId,
-          sellOrderId: sellOrder.orderId,
-          type: 'instrument_settlement',
-          tradingPair,
-          price: matchPrice.toString(),
-          timestamp: new Date().toISOString(),
-        },
-      });
-      console.log(`[MatchingEngine]    ✅ Instrument transfer completed — txHash: ${instrumentTransferResult.transactionHash || 'N/A'}`);
-    } catch (transferError) {
-      console.error(`[MatchingEngine]    ❌ Instrument transfer FAILED: ${transferError.message}`);
-      console.error(`[MatchingEngine]    ⚠️ Orders are filled but tokens not yet transferred — manual resolution needed`);
-    }
-
-    // Transfer B: Payment (quote) from buyer → seller
-    try {
-      console.log(`[MatchingEngine]    📤 Transfer ${quoteAmountStr} ${quoteSymbol}: buyer → seller`);
-      paymentTransferResult = await transferRegistry.transfer({
-        instrument: quoteSymbol,
-        fromParty: buyOrder.owner,
-        toParty: sellOrder.owner,
-        amount: quoteAmountStr,
-        metadata: {
-          buyOrderId: buyOrder.orderId,
-          sellOrderId: sellOrder.orderId,
-          type: 'payment_settlement',
-          tradingPair,
-          price: matchPrice.toString(),
-          timestamp: new Date().toISOString(),
-        },
-      });
-      console.log(`[MatchingEngine]    ✅ Payment transfer completed — txHash: ${paymentTransferResult.transactionHash || 'N/A'}`);
-    } catch (transferError) {
-      console.error(`[MatchingEngine]    ❌ Payment transfer FAILED: ${transferError.message}`);
-      // Log both hashes for manual resolution if instrument succeeded but payment failed
-      if (instrumentTransferResult) {
-        console.error(`[MatchingEngine]    🚨 CRITICAL: Instrument transferred (txHash: ${instrumentTransferResult.transactionHash}) but payment FAILED`);
-        console.error(`[MatchingEngine]    🚨 Manual intervention required: reverse instrument transfer or retry payment`);
-        console.error(`[MatchingEngine]    🚨 Buyer: ${buyOrder.owner.substring(0, 40)}, Seller: ${sellOrder.owner.substring(0, 40)}`);
-        console.error(`[MatchingEngine]    🚨 Instrument: ${matchQtyStr} ${baseSymbol}, Payment: ${quoteAmountStr} ${quoteSymbol}`);
-      }
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // STEP 3: Unlock remaining locked funds for fully-filled orders
-    // If the order is fully filled, release the Transfer Registry lock.
-    // For partial fills, the remaining amount stays locked for the next match.
-    // ═══════════════════════════════════════════════════════════════════
-    console.log(`[MatchingEngine] 🔓 Step 3: Unlocking completed order locks...`);
-
-    // Unlock buyer's lock if fully filled
-    if (!buyIsPartial && buyOrder.lockId) {
+    if (sdkClient.isReady()) {
+      // Transfer A: Instrument (base) from seller → buyer
       try {
-        await transferRegistry.unlockFunds(buyOrder.lockId);
-        console.log(`[MatchingEngine]    ✅ Buyer lock released: ${buyOrder.lockId.substring(0, 25)}...`);
-      } catch (unlockErr) {
-        console.warn(`[MatchingEngine]    ⚠️ Buyer unlock failed (non-critical): ${unlockErr.message}`);
+        console.log(`[MatchingEngine]    📤 Transfer ${matchQtyStr} ${baseSymbol}: seller → buyer (2-step)`);
+        instrumentTransferResult = await sdkClient.executeFullTransfer(
+          sellOrder.owner,
+          buyOrder.owner,
+          matchQtyStr,
+          baseSymbol,
+          `settlement:${buyOrder.orderId}:${sellOrder.orderId}:instrument`
+        );
+        console.log(`[MatchingEngine]    ✅ Instrument transfer completed — updateId: ${instrumentTransferResult.updateId || 'N/A'}${instrumentTransferResult.autoCompleted ? ' (auto-completed via pre-approval)' : ''}`);
+      } catch (transferError) {
+        console.error(`[MatchingEngine]    ❌ Instrument transfer FAILED: ${transferError.message}`);
+        console.error(`[MatchingEngine]    ⚠️ Orders are filled but tokens not yet transferred — manual resolution needed`);
       }
+
+      // Transfer B: Payment (quote) from buyer → seller
+      try {
+        console.log(`[MatchingEngine]    📤 Transfer ${quoteAmountStr} ${quoteSymbol}: buyer → seller (2-step)`);
+        paymentTransferResult = await sdkClient.executeFullTransfer(
+          buyOrder.owner,
+          sellOrder.owner,
+          quoteAmountStr,
+          quoteSymbol,
+          `settlement:${buyOrder.orderId}:${sellOrder.orderId}:payment`
+        );
+        console.log(`[MatchingEngine]    ✅ Payment transfer completed — updateId: ${paymentTransferResult.updateId || 'N/A'}${paymentTransferResult.autoCompleted ? ' (auto-completed via pre-approval)' : ''}`);
+      } catch (transferError) {
+        console.error(`[MatchingEngine]    ❌ Payment transfer FAILED: ${transferError.message}`);
+        if (instrumentTransferResult) {
+          console.error(`[MatchingEngine]    🚨 CRITICAL: Partial settlement — instrument transferred but payment FAILED`);
+          console.error(`[MatchingEngine]    🚨 Buyer: ${buyOrder.owner.substring(0, 40)}, Seller: ${sellOrder.owner.substring(0, 40)}`);
+          console.error(`[MatchingEngine]    🚨 Instrument: ${matchQtyStr} ${baseSymbol}, Payment: ${quoteAmountStr} ${quoteSymbol}`);
+          console.error(`[MatchingEngine]    🚨 Manual intervention required`);
+        }
+      }
+    } else {
+      console.warn(`[MatchingEngine]    ⚠️ Canton SDK not ready — skipping token transfers`);
+      console.warn(`[MatchingEngine]    ⚠️ Orders are filled but tokens NOT transferred — manual resolution needed`);
     }
 
-    // Unlock seller's lock if fully filled
-    if (!sellIsPartial && sellOrder.lockId) {
-      try {
-        await transferRegistry.unlockFunds(sellOrder.lockId);
-        console.log(`[MatchingEngine]    ✅ Seller lock released: ${sellOrder.lockId.substring(0, 25)}...`);
-      } catch (unlockErr) {
-        console.warn(`[MatchingEngine]    ⚠️ Seller unlock failed (non-critical): ${unlockErr.message}`);
-      }
-    }
+    // Release balance reservations for filled quantities
+    try {
+      const { releasePartialReservation } = require('./order-service');
+      releasePartialReservation(sellOrder.orderId, matchQtyStr);
+      releasePartialReservation(buyOrder.orderId, quoteAmountStr);
+    } catch (_) { /* non-critical */ }
 
     // ═══════════════════════════════════════════════════════════════════
-    // STEP 4: Create Trade record on Canton for history
+    // STEP 3: Create Trade record on Canton for history
     // ═══════════════════════════════════════════════════════════════════
     try {
       const tradeTemplateId = `${packageId}:Settlement:Trade`;
@@ -644,10 +641,9 @@ class MatchingEngine {
       buyOrderId: buyOrder.orderId,
       sellOrderId: sellOrder.orderId,
       timestamp: new Date().toISOString(),
-      settlementType: 'TransferRegistry',
-      instrumentTxHash: instrumentTransferResult?.transactionHash || null,
-      paymentTxHash: paymentTransferResult?.transactionHash || null,
-      explorerUrl: instrumentTransferResult?.explorerUrl || null,
+      settlementType: 'CantonSDK',
+      instrumentUpdateId: instrumentTransferResult?.updateId || null,
+      paymentUpdateId: paymentTransferResult?.updateId || null,
     };
 
     // Add to UpdateStream for persistence (so trades API can serve it)
@@ -686,7 +682,7 @@ class MatchingEngine {
       });
     }
 
-    console.log(`[MatchingEngine] ═══ Match complete: ${matchQtyStr} ${baseSymbol} @ ${matchPrice} ${quoteSymbol} (TransferRegistry) ═══`);
+    console.log(`[MatchingEngine] ═══ Match complete: ${matchQtyStr} ${baseSymbol} @ ${matchPrice} ${quoteSymbol} (CantonSDK) ═══`);
   }
 
   setPollingInterval(ms) {

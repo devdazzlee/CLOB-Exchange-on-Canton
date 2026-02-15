@@ -1,14 +1,15 @@
 /**
- * Order Service — Canton JSON Ledger API v2 + Transfer Registry
+ * Order Service — Canton JSON Ledger API v2 + Canton Wallet SDK
  * 
  * Uses the correct Canton APIs:
  * - POST /v2/commands/submit-and-wait-for-transaction — Place/Cancel orders
  * - POST /v2/state/active-contracts — Query orders
  * 
- * Fund locking/unlocking uses Transfer Registry API exclusively for CC/CBTC.
- * No Holdings, no DvP, no Fill-Only — Transfer Registry only.
+ * Balance checks use the Canton Wallet SDK (listHoldingUtxos).
+ * No explicit lock/unlock — holdings are locked naturally during
+ * the 2-step transfer flow at settlement time.
  * 
- * https://docs.digitalasset.com/build/3.5/reference/json-api/openapi.html
+ * @see https://docs.digitalasset.com/integrate/devnet/token-standard/index.html
  */
 
 const Decimal = require('decimal.js');
@@ -19,10 +20,72 @@ const { ValidationError, NotFoundError } = require('../utils/errors');
 const { v4: uuidv4 } = require('uuid');
 const { getReadModelService } = require('./readModelService');
 const { getUpdateStream } = require('./cantonUpdateStream');
-const { getTransferRegistry } = require('./transferRegistryClient');
+const { getCantonSDKClient } = require('./canton-sdk-client');
 
 // Configure Decimal for financial precision
 Decimal.set({ precision: 20, rounding: Decimal.ROUND_DOWN });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BALANCE RESERVATION TRACKER
+// Prevents overselling by tracking how much balance is "spoken for" by
+// open orders that haven't settled yet. The Canton SDK's soft balance check
+// only sees the on-chain available balance — it doesn't know about pending
+// orders in the order book that will require those funds at settlement time.
+//
+// Key: "partyId::asset" → total reserved amount (Decimal)
+// Updated on: order placement (+), cancellation (-), settlement fill (-)
+// ═══════════════════════════════════════════════════════════════════════════
+const _reservations = new Map();    // "partyId::asset" → Decimal amount
+const _orderReservations = new Map(); // "orderId" → { partyId, asset, amount }
+
+function _reservationKey(partyId, asset) {
+  return `${partyId}::${asset}`;
+}
+
+function getReservedBalance(partyId, asset) {
+  const key = _reservationKey(partyId, asset);
+  return _reservations.get(key) || new Decimal(0);
+}
+
+function addReservation(orderId, partyId, asset, amount) {
+  const key = _reservationKey(partyId, asset);
+  const current = _reservations.get(key) || new Decimal(0);
+  _reservations.set(key, current.plus(new Decimal(amount)));
+  _orderReservations.set(orderId, { partyId, asset, amount: new Decimal(amount).toString() });
+  console.log(`[BalanceReservation] ➕ Reserved ${amount} ${asset} for ${orderId} (total reserved: ${_reservations.get(key).toString()})`);
+}
+
+function releaseReservation(orderId) {
+  const reservation = _orderReservations.get(orderId);
+  if (!reservation) return;
+
+  const key = _reservationKey(reservation.partyId, reservation.asset);
+  const current = _reservations.get(key) || new Decimal(0);
+  const newAmount = Decimal.max(current.minus(new Decimal(reservation.amount)), new Decimal(0));
+  _reservations.set(key, newAmount);
+  _orderReservations.delete(orderId);
+  console.log(`[BalanceReservation] ➖ Released ${reservation.amount} ${reservation.asset} for ${orderId} (total reserved: ${newAmount.toString()})`);
+}
+
+function releasePartialReservation(orderId, filledAmount) {
+  const reservation = _orderReservations.get(orderId);
+  if (!reservation) return;
+
+  const key = _reservationKey(reservation.partyId, reservation.asset);
+  const current = _reservations.get(key) || new Decimal(0);
+  const releaseAmt = Decimal.min(new Decimal(filledAmount), new Decimal(reservation.amount));
+  const newReserved = Decimal.max(current.minus(releaseAmt), new Decimal(0));
+  _reservations.set(key, newReserved);
+
+  // Update the order's remaining reservation
+  const remaining = Decimal.max(new Decimal(reservation.amount).minus(releaseAmt), new Decimal(0));
+  if (remaining.lte(0)) {
+    _orderReservations.delete(orderId);
+  } else {
+    reservation.amount = remaining.toString();
+  }
+  console.log(`[BalanceReservation] ➖ Partially released ${filledAmount} ${reservation.asset} for ${orderId} (remaining reservation: ${remaining.toString()})`);
+}
 
 class OrderService {
   constructor() {
@@ -62,91 +125,105 @@ class OrderService {
   }
 
   /**
-   * Lock funds for order placement via Transfer Registry API.
-   * Returns the lockId (stored in order's allocationCid field on Canton).
+   * Check available balance via Canton Wallet SDK before order placement.
+   * 
+   * With the SDK approach, there is NO explicit lock/unlock.
+   * Holdings are locked naturally when the 2-step transfer is created
+   * at settlement time by the matching engine.
+   * 
+   * This method performs a soft balance check to prevent obviously
+   * invalid orders from being placed.
+   * 
+   * @returns {Object} { verified: true, availableBalance, asset }
    */
-  async lockHoldingsForOrder(token, partyId, operatorPartyId, asset, amount, orderId) {
-    console.log(`[OrderService] TRANSFER REGISTRY: Locking ${amount} ${asset} for order ${orderId}`);
+  async checkBalanceForOrder(token, partyId, operatorPartyId, asset, amount, orderId) {
+    console.log(`[OrderService] SDK: Checking ${amount} ${asset} balance for order ${orderId}`);
     
-    const transferRegistry = getTransferRegistry();
+    const sdkClient = getCantonSDKClient();
     
-    // 1. Check available balance via Transfer Registry
+    if (!sdkClient.isReady()) {
+      console.warn(`[OrderService] ⚠️ Canton SDK not ready — skipping balance check (order will proceed)`);
+      return { verified: false, availableBalance: 0, asset };
+    }
+
     try {
-      const balanceResponse = await transferRegistry.getBalance(partyId, asset);
-      const availableBalance = parseFloat(balanceResponse.balance?.available || '0');
+      const balance = await sdkClient.getBalance(partyId, asset);
+      const availableBalance = parseFloat(balance.available || '0');
+
+      // Deduct balance already reserved by other open orders (prevents overselling)
+      const reserved = getReservedBalance(partyId, asset);
+      const effectiveAvailable = new Decimal(availableBalance).minus(reserved);
       
-      if (availableBalance < amount) {
+      if (effectiveAvailable.lt(new Decimal(amount))) {
         throw new ValidationError(
-          `Insufficient ${asset} balance. Available: ${availableBalance}, Required: ${amount}`
+          `Insufficient ${asset} balance. On-chain available: ${availableBalance}, ` +
+          `Reserved by open orders: ${reserved.toString()}, ` +
+          `Effective available: ${effectiveAvailable.toString()}, ` +
+          `Required: ${amount}`
         );
       }
-      console.log(`[OrderService] ✅ Balance check passed: ${availableBalance} ${asset} available (need ${amount})`);
-    } catch (err) {
-      if (err instanceof ValidationError) throw err;
-      console.warn(`[OrderService] Balance check failed (proceeding with lock attempt): ${err.message}`);
-      // Continue — the lock API itself will reject if insufficient
-    }
-    
-    // 2. Lock funds via Transfer Registry API
-    try {
-      const lockResponse = await transferRegistry.lockFunds({
-        party: partyId,
-        instrument: asset,          // "CBTC" or "CC" — case-sensitive
-        amount: amount.toString(),  // MUST be string
-        reason: orderId,            // Reference the order
-        expirySeconds: 86400,       // 24-hour expiry safety net
-      });
-      
-      const lockId = lockResponse.lockId;
-      console.log(`[OrderService] ✅ Funds locked via Transfer Registry`);
-      console.log(`[OrderService]    lockId: ${lockId}`);
-      console.log(`[OrderService]    amount: ${amount} ${asset}`);
-      console.log(`[OrderService]    remaining available: ${lockResponse.remainingBalance?.available || 'N/A'}`);
+      console.log(`[OrderService] ✅ Balance check passed: ${availableBalance} ${asset} on-chain, ${reserved.toString()} reserved, ${effectiveAvailable.toString()} effective (need ${amount})`);
       
       return {
-        lockId: lockId,     // Transfer Registry lockId → stored in allocationCid field
-        lockedAmount: amount,
-        asset: asset
+        verified: true,
+        availableBalance: effectiveAvailable.toNumber(),
+        asset,
       };
-    } catch (lockError) {
-      console.error(`[OrderService] ❌ Transfer Registry lock failed:`, lockError.message);
-      throw new ValidationError(
-        `Failed to lock ${amount} ${asset}: ${lockError.message}`
-      );
+    } catch (err) {
+      if (err instanceof ValidationError) throw err;
+      console.warn(`[OrderService] ⚠️ Balance check failed (proceeding anyway): ${err.message}`);
+      return { verified: false, availableBalance: 0, asset };
     }
   }
 
   /**
-   * Unlock funds when order is cancelled via Transfer Registry API.
+   * Withdraw any pending transfer instructions for an order being cancelled.
+   * 
+   * With the SDK approach, there is no explicit lock/unlock.
+   * If the matching engine created a TransferInstruction for this order
+   * that hasn't been accepted yet, we need to withdraw it to unlock
+   * the sender's holdings.
+   * 
+   * In practice, this is rarely needed because:
+   * 1. The matching engine accepts transfers immediately after creating them
+   * 2. Open orders that haven't been matched have no pending transfers
    */
-  async unlockHoldingsForOrder(token, partyId, lockId) {
-    console.log(`[OrderService] TRANSFER REGISTRY: Unlocking ${lockId?.substring(0, 30)}...`);
+  async withdrawPendingTransfersForOrder(token, partyId, orderId) {
+    console.log(`[OrderService] SDK: Checking for pending transfers to withdraw for order ${orderId}`);
     
-    if (!lockId) {
-      console.warn('[OrderService] No lockId to unlock');
+    const sdkClient = getCantonSDKClient();
+    
+    if (!sdkClient.isReady()) {
+      console.warn('[OrderService] ⚠️ Canton SDK not ready — skipping transfer withdrawal');
       return;
     }
-
-    // Skip unlock for old-style markers that aren't real lock IDs
-    if (lockId === 'FILL_ONLY' || lockId === 'NONE' || lockId === '') {
-      console.log(`[OrderService] Skipping unlock — marker value: "${lockId}"`);
-      return;
-    }
-    
-    const transferRegistry = getTransferRegistry();
     
     try {
-      await transferRegistry.unlockFunds(lockId);
-      console.log(`[OrderService] ✅ Funds unlocked via Transfer Registry`);
+      const pendingTransfers = await sdkClient.getPendingTransfers(partyId);
+      
+      for (const transfer of pendingTransfers) {
+        // Match transfers to this order via the memo/reason field
+        // The matching engine sets memo = "settlement:<buyOrderId>:<sellOrderId>:<type>"
+        const memo = transfer.meta?.values?.['splice.lfdecentralizedtrust.org/reason'] || '';
+        if (memo.includes(orderId)) {
+          try {
+            await sdkClient.withdrawTransfer(transfer.contractId, partyId);
+            console.log(`[OrderService] ✅ Withdrew pending transfer: ${transfer.contractId.substring(0, 30)}...`);
+          } catch (withdrawErr) {
+            console.warn(`[OrderService] ⚠️ Could not withdraw transfer: ${withdrawErr.message}`);
+          }
+        }
+      }
     } catch (err) {
-      console.error(`[OrderService] ⚠️ Transfer Registry unlock failed:`, err.message);
+      console.warn(`[OrderService] ⚠️ Failed to check pending transfers: ${err.message}`);
       // Don't throw — order cancellation should still proceed
     }
   }
 
   /**
    * Place order using Canton JSON Ledger API v2.
-   * Locks funds via Transfer Registry, then creates an Order contract on Canton.
+   * Checks balance via Canton SDK, then creates an Order contract on Canton.
+   * No explicit lock — holdings are locked at settlement time by the 2-step transfer.
    */
   async placeOrder(orderData) {
     const {
@@ -248,10 +325,14 @@ class OrderService {
     const lockInfo = this.calculateLockAmount(tradingPair, orderType, price, quantity, orderMode, estimatedPrice);
     console.log(`[OrderService] Order will lock ${lockInfo.amount} ${lockInfo.asset}`);
 
-    // ========= LOCK FUNDS VIA TRANSFER REGISTRY =========
-    let lockResult = null;
+    // ========= CHECK BALANCE VIA CANTON SDK =========
+    // With the SDK approach, there is NO explicit lock at order placement.
+    // Holdings are locked naturally when the 2-step transfer is created
+    // at settlement time by the matching engine (createTransfer → accept).
+    // We only do a soft balance check here to reject obviously invalid orders.
+    let balanceCheck = null;
     try {
-      lockResult = await this.lockHoldingsForOrder(
+      balanceCheck = await this.checkBalanceForOrder(
         token, 
         partyId, 
         operatorPartyId,
@@ -259,11 +340,20 @@ class OrderService {
         lockInfo.amount,
         orderId
       );
-      console.log(`[OrderService] Funds locked — lockId: ${lockResult.lockId?.substring(0, 20)}...`);
-    } catch (lockError) {
-      console.error(`[OrderService] Lock failed:`, lockError.message);
+      if (balanceCheck.verified) {
+        console.log(`[OrderService] ✅ Balance verified: ${balanceCheck.availableBalance} ${lockInfo.asset} available`);
+      } else {
+        console.warn(`[OrderService] ⚠️ Balance check skipped (SDK not ready) — order will proceed`);
+      }
+    } catch (balanceError) {
+      console.error(`[OrderService] Balance check failed:`, balanceError.message);
       throw new ValidationError(`Insufficient ${lockInfo.asset} balance. Required: ${lockInfo.amount}`);
     }
+
+    // ═══ RESERVE BALANCE to prevent overselling ═══
+    // Track this order's required funds so subsequent orders see reduced available balance.
+    // Released on cancel, or partially released as the order fills during settlement.
+    addReservation(orderId, partyId, lockInfo.asset, lockInfo.amount);
 
     // Create Order contract on Canton using submit-and-wait-for-transaction
     // Canton JSON API v2 serialization:
@@ -292,8 +382,8 @@ class OrderService {
         // Canton JSON API v2: Time is ISO 8601 datetime string
         timestamp: timestamp,
         operator: operatorPartyId,
-        // Transfer Registry lockId — used for unlock on cancel / settlement
-        allocationCid: lockResult?.lockId || ''
+        // No explicit lock — SDK handles locking at 2-step transfer time
+        allocationCid: ''
       },
       readAs: [operatorPartyId, partyId]
     });
@@ -328,10 +418,10 @@ class OrderService {
       filled: '0',
       status: 'OPEN',
       timestamp: timestamp,
-      // Transfer Registry lockId
-      lockId: lockResult?.lockId || null,
-      lockedAmount: lockResult?.lockedAmount || null,
-      lockedAsset: lockResult?.asset || null
+      // No explicit lock — SDK locks UTXOs at transfer time
+      lockId: null,
+      lockedAmount: lockInfo.amount,
+      lockedAsset: lockInfo.asset
     };
     
     const updateStream = getUpdateStream();
@@ -413,7 +503,7 @@ class OrderService {
       remaining: quantity,
       lockedAsset: lockInfo.asset,
       lockedAmount: lockInfo.amount,
-      lockId: lockResult?.lockId || null,
+      lockId: null, // No explicit lock — SDK handles locking at transfer time
       tokenStandard: true,
       timestamp: new Date().toISOString()
     };
@@ -468,8 +558,8 @@ class OrderService {
   }
 
   /**
-   * Cancel order: unlocks funds via Transfer Registry, then exercises
-   * CancelOrder on Canton to archive the Order contract.
+   * Cancel order: withdraws any pending transfer instructions via Canton SDK,
+   * then exercises CancelOrder on Canton to archive the Order contract.
    */
   async cancelOrder(orderContractId, partyId, tradingPair = null) {
     if (!orderContractId || !partyId) {
@@ -528,18 +618,21 @@ class OrderService {
       console.warn('[OrderService] Could not fetch order details before cancel:', e.message);
     }
 
-    // Unlock funds via Transfer Registry before cancelling the on-chain order
-    const lockId = orderDetails?.allocationCid || '';
-    if (lockId && lockId !== 'FILL_ONLY' && lockId !== 'NONE' && lockId !== '') {
+    // Withdraw any pending transfer instructions for this order (SDK approach)
+    // With the SDK, there's no explicit lock/unlock. Instead, if the matching engine
+    // created a TransferInstruction for this order that hasn't been accepted yet,
+    // we withdraw it to release the sender's locked holdings.
+    const orderId_cancel = orderDetails?.orderId;
+    if (orderId_cancel) {
       try {
-        await this.unlockHoldingsForOrder(token, partyId, lockId);
-        console.log(`[OrderService] ✅ Funds unlocked for cancelled order`);
-      } catch (unlockErr) {
-        console.warn('[OrderService] Could not unlock funds:', unlockErr.message);
-        // Continue with cancellation even if unlock fails
+        await this.withdrawPendingTransfersForOrder(token, partyId, orderId_cancel);
+        console.log(`[OrderService] ✅ Pending transfers checked/withdrawn for cancelled order`);
+      } catch (withdrawErr) {
+        console.warn('[OrderService] Could not withdraw pending transfers:', withdrawErr.message);
+        // Continue with cancellation even if withdrawal fails
       }
     } else {
-      console.log(`[OrderService] No lockId on order (${lockId || 'empty'}) — skipping unlock`);
+      console.log(`[OrderService] No orderId for pending transfer check — skipping`);
     }
 
     // Exercise CancelOrder choice on the Order contract
@@ -580,24 +673,9 @@ class OrderService {
 
     console.log(`[OrderService] ✅ Order cancelled: ${orderContractId}`);
 
-    // If we didn't unlock before cancel (because we couldn't find order details),
-    // try to extract lockId from the created (cancelled) order event and unlock now
-    if (!orderDetails?.allocationCid && result?.transaction?.events) {
-      const createdEvent = result.transaction.events.find(e => 
-        e.created?.templateId?.includes('Order') && 
-        e.created?.createArguments?.status === 'CANCELLED'
-      );
-      const fallbackLockId = createdEvent?.created?.createArguments?.allocationCid;
-      if (fallbackLockId && fallbackLockId !== 'FILL_ONLY' && 
-          fallbackLockId !== 'NONE' && fallbackLockId !== '') {
-        console.log(`[OrderService] Found lockId from cancel result: ${fallbackLockId.substring(0, 30)}...`);
-        try {
-          await this.unlockHoldingsForOrder(token, partyId, fallbackLockId);
-          console.log(`[OrderService] ✅ Funds unlocked (from cancel result)`);
-        } catch (unlockErr) {
-          console.warn('[OrderService] Post-cancel unlock failed:', unlockErr.message);
-        }
-      }
+    // Release balance reservation so other orders can use the freed funds
+    if (orderId_cancel) {
+      releaseReservation(orderId_cancel);
     }
 
     // Remove from UpdateStream (persistent storage)
@@ -940,3 +1018,8 @@ class OrderService {
 }
 
 module.exports = OrderService;
+
+// Export reservation helpers for use by the matching engine
+module.exports.releaseReservation = releaseReservation;
+module.exports.releasePartialReservation = releasePartialReservation;
+module.exports.getReservedBalance = getReservedBalance;

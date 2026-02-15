@@ -8,15 +8,12 @@
  * - Balance: Query user's token balance (total, available, locked)
  * - Transaction Status: Check if a transfer completed
  * 
- * Base URL: http://65.108.40.104:8088
+ * Base URL: Configured via TRANSFER_REGISTRY_URL env var
  * 
  * CRITICAL: This replaces ALL custom Holding contract creation/minting.
  * All token amounts must be sent as STRINGS (e.g., "10.5", not 10.5).
  * Instrument names are case-sensitive: "CBTC" and "CC" (not "cbtc" or "cc").
  */
-
-// Node.js v18+ has built-in fetch — no external package needed
-const fetch = globalThis.fetch;
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -33,8 +30,10 @@ const TRANSFER_REGISTRY_CONFIG = {
     CBTC: 'CBTC',
     CC: 'CC',
   },
-  TIMEOUT: 30000,       // 30 seconds
-  RETRY_ATTEMPTS: 3,
+  TIMEOUT: 30000,             // 30 seconds for write operations (transfer/lock/unlock)
+  BALANCE_TIMEOUT: 5000,      // 5 seconds for balance queries (read-only, fail fast)
+  RETRY_ATTEMPTS: 3,          // retries for write operations
+  BALANCE_RETRY_ATTEMPTS: 1,  // NO retries for balance queries (fail fast)
 };
 
 // ─── Transfer Registry Client ────────────────────────────────────────────────
@@ -43,8 +42,51 @@ class TransferRegistryClient {
   constructor() {
     this.baseUrl = TRANSFER_REGISTRY_CONFIG.BASE_URL;
     this.timeout = TRANSFER_REGISTRY_CONFIG.TIMEOUT;
+    this.balanceTimeout = TRANSFER_REGISTRY_CONFIG.BALANCE_TIMEOUT;
     this.retryAttempts = TRANSFER_REGISTRY_CONFIG.RETRY_ATTEMPTS;
+    this.balanceRetryAttempts = TRANSFER_REGISTRY_CONFIG.BALANCE_RETRY_ATTEMPTS;
+    this._healthChecked = false;
+    this._apiAvailable = false;
     console.log(`[TransferRegistry] Initialized — Base URL: ${this.baseUrl}`);
+  }
+
+  // ─── HEALTH CHECK ──────────────────────────────────────────────────────────
+  // One-time check on first call to verify the Transfer Registry API is reachable
+  // and returns JSON (not an HTML SPA page).
+
+  async _checkApiHealth() {
+    if (this._healthChecked) return this._apiAvailable;
+    this._healthChecked = true;
+
+    const testUrl = `${this.baseUrl}${TRANSFER_REGISTRY_CONFIG.ENDPOINTS.BALANCE}/health-check/CBTC`;
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 3000); // 3s max
+
+      const response = await fetch(testUrl, {
+        method: 'GET',
+        headers: { 'Accept': 'application/json' },
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+
+      const contentType = response.headers.get('content-type') || '';
+
+      if (contentType.includes('text/html')) {
+        console.error(`[TransferRegistry] ⛔ API UNAVAILABLE — ${this.baseUrl} returns HTML (likely a web frontend, not a REST API)`);
+        console.error(`[TransferRegistry] ⛔ Set TRANSFER_REGISTRY_URL env var to the correct API endpoint`);
+        this._apiAvailable = false;
+        return false;
+      }
+
+      this._apiAvailable = true;
+      console.log(`[TransferRegistry] ✅ API reachable at ${this.baseUrl}`);
+      return true;
+    } catch (err) {
+      console.error(`[TransferRegistry] ⛔ API UNREACHABLE at ${this.baseUrl}: ${err.message}`);
+      this._apiAvailable = false;
+      return false;
+    }
   }
 
   // ─── TRANSFER TOKENS ────────────────────────────────────────────────────────
@@ -73,6 +115,8 @@ class TransferRegistryClient {
           metadata: metadata || {},
         }),
       });
+
+      await this._ensureJsonResponse(response, 'Transfer');
 
       if (!response.ok) {
         const errorBody = await response.json().catch(() => ({ error: response.statusText }));
@@ -133,6 +177,8 @@ class TransferRegistryClient {
         body: JSON.stringify(body),
       });
 
+      await this._ensureJsonResponse(response, 'Lock');
+
       if (!response.ok) {
         const errorBody = await response.json().catch(() => ({ error: response.statusText }));
         const errMsg = errorBody.error || errorBody.message || `Lock failed (HTTP ${response.status})`;
@@ -182,6 +228,8 @@ class TransferRegistryClient {
         },
       });
 
+      await this._ensureJsonResponse(response, 'Unlock');
+
       if (!response.ok) {
         const errorBody = await response.json().catch(() => ({ error: response.statusText }));
         const errMsg = errorBody.error || errorBody.message || `Unlock failed (HTTP ${response.status})`;
@@ -210,15 +258,24 @@ class TransferRegistryClient {
 
   // ─── GET BALANCE ─────────────────────────────────────────────────────────────
   // Query a user's token balance — total, available (free), and locked.
+  // Uses short timeout and no retries to fail fast.
 
   async getBalance(partyId, instrument) {
+    // Quick bail-out if we already know the API is unreachable
+    const apiOk = await this._checkApiHealth();
+    if (!apiOk) {
+      throw new Error(`Transfer Registry API unavailable at ${this.baseUrl} (returns HTML, not JSON). Set TRANSFER_REGISTRY_URL to the correct API endpoint.`);
+    }
+
     const url = `${this.baseUrl}${TRANSFER_REGISTRY_CONFIG.ENDPOINTS.BALANCE}/${encodeURIComponent(partyId)}/${encodeURIComponent(instrument)}`;
 
     try {
       const response = await this._doFetch(url, {
         method: 'GET',
         headers: { 'Accept': 'application/json' },
-      });
+      }, this.balanceTimeout);
+
+      await this._ensureJsonResponse(response, `Balance(${instrument})`);
 
       if (!response.ok) {
         const errorBody = await response.json().catch(() => ({ error: response.statusText }));
@@ -236,9 +293,21 @@ class TransferRegistryClient {
 
   // ─── GET ALL BALANCES ────────────────────────────────────────────────────────
   // Convenience: get CBTC + CC balances in parallel.
+  // Fails fast and returns zeros for any failed instruments.
 
   async getAllBalances(partyId) {
     const instruments = Object.values(TRANSFER_REGISTRY_CONFIG.INSTRUMENTS);
+
+    // Quick bail-out if API is unavailable (avoids 2 network calls)
+    const apiOk = await this._checkApiHealth();
+    if (!apiOk) {
+      console.warn(`[TransferRegistry] ⚠️ API unavailable — returning zero balances for ${partyId.substring(0, 30)}...`);
+      const zeros = {};
+      for (const instr of instruments) {
+        zeros[instr] = '0';
+      }
+      return { available: { ...zeros }, locked: { ...zeros }, total: { ...zeros } };
+    }
 
     const results = await Promise.allSettled(
       instruments.map(instrument => this.getBalance(partyId, instrument))
@@ -278,6 +347,8 @@ class TransferRegistryClient {
         headers: { 'Accept': 'application/json' },
       });
 
+      await this._ensureJsonResponse(response, 'TransactionStatus');
+
       if (!response.ok) {
         throw new Error(`Transaction status query failed (HTTP ${response.status})`);
       }
@@ -289,16 +360,31 @@ class TransferRegistryClient {
     }
   }
 
+  // ─── INTERNAL: Response validation ─────────────────────────────────────────
+
+  async _ensureJsonResponse(response, operation) {
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType.includes('text/html')) {
+      // The server returned an HTML page (e.g., an SPA index.html) instead of JSON.
+      // This means the API endpoint doesn't exist at this URL.
+      this._apiAvailable = false; // Mark as unavailable for future calls
+      throw new Error(
+        `${operation}: Transfer Registry returned HTML instead of JSON. ` +
+        `The API at ${this.baseUrl} appears to be a web frontend, not a REST API. ` +
+        `Set TRANSFER_REGISTRY_URL env var to the correct API endpoint.`
+      );
+    }
+  }
+
   // ─── INTERNAL: Fetch helpers ─────────────────────────────────────────────────
 
-  async _doFetch(url, options) {
-    const AbortController = globalThis.AbortController || require('abort-controller');
+  async _doFetch(url, options, timeoutMs) {
+    const effectiveTimeout = timeoutMs || this.timeout;
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+    const timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
 
     try {
-      const fetchFn = globalThis.fetch || require('node-fetch');
-      const response = await fetchFn(url, {
+      const response = await fetch(url, {
         ...options,
         signal: controller.signal,
       });
@@ -306,6 +392,9 @@ class TransferRegistryClient {
       return response;
     } catch (err) {
       clearTimeout(timeoutId);
+      if (err.name === 'AbortError') {
+        throw new Error(`Request to ${url} timed out after ${effectiveTimeout}ms`);
+      }
       throw err;
     }
   }
@@ -322,6 +411,14 @@ class TransferRegistryClient {
       }
       throw error;
     }
+  }
+
+  // ─── Reset health check (useful if API comes back online) ──────────────────
+
+  resetHealthCheck() {
+    this._healthChecked = false;
+    this._apiAvailable = false;
+    console.log(`[TransferRegistry] Health check reset — will re-check on next call`);
   }
 }
 
@@ -341,4 +438,3 @@ module.exports = {
   getTransferRegistry,
   TRANSFER_REGISTRY_CONFIG,
 };
-

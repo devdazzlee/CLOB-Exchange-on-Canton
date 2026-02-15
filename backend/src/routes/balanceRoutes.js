@@ -1,10 +1,12 @@
 /**
- * Balance Routes — Transfer Registry ONLY
+ * Balance Routes — Canton Wallet SDK
  * 
- * ALL balance operations go through the Transfer Registry API
- * at http://65.108.40.104:8088. No Holdings fallback.
+ * ALL balance operations go through the Canton Wallet SDK
+ * which queries real holdings from the Canton ledger (UTXO-based).
  * 
- * Supported instruments: CC, CBTC (case-sensitive).
+ * Supported instruments: CC (Amulet), CBTC (case-sensitive).
+ * 
+ * @see https://docs.digitalasset.com/integrate/devnet/token-standard/index.html
  */
 
 const express = require('express');
@@ -12,11 +14,11 @@ const router = express.Router();
 const { success, error } = require('../utils/response');
 const asyncHandler = require('../middleware/asyncHandler');
 const { ValidationError } = require('../utils/errors');
-const { getTransferRegistry } = require('../services/transferRegistryClient');
+const { getCantonSDKClient } = require('../services/canton-sdk-client');
 
 // ─────────────────────────────────────────────────────────
 // GET /api/balance/:partyId
-// Primary balance endpoint — Transfer Registry only
+// Primary balance endpoint — Canton SDK (UTXO-based)
 // ─────────────────────────────────────────────────────────
 router.get('/:partyId', asyncHandler(async (req, res) => {
   const { partyId } = req.params;
@@ -27,22 +29,22 @@ router.get('/:partyId', asyncHandler(async (req, res) => {
 
   console.log(`[Balance] Getting balance for party: ${partyId.substring(0, 30)}...`);
   
-  const transferRegistry = getTransferRegistry();
+  const sdkClient = getCantonSDKClient();
   
   try {
-    const trBalances = await transferRegistry.getAllBalances(partyId);
+    const balances = await sdkClient.getAllBalances(partyId);
     
     const available = {};
     const locked = {};
     const total = {};
     
-    for (const [sym, amt] of Object.entries(trBalances.available)) {
+    for (const [sym, amt] of Object.entries(balances.available)) {
       available[sym] = parseFloat(amt) || 0;
     }
-    for (const [sym, amt] of Object.entries(trBalances.locked)) {
+    for (const [sym, amt] of Object.entries(balances.locked)) {
       locked[sym] = parseFloat(amt) || 0;
     }
-    for (const [sym, amt] of Object.entries(trBalances.total)) {
+    for (const [sym, amt] of Object.entries(balances.total)) {
       total[sym] = parseFloat(amt) || 0;
     }
 
@@ -56,10 +58,10 @@ router.get('/:partyId', asyncHandler(async (req, res) => {
       total,
       holdings: [],
       tokenStandard: true,
-      source: 'transfer-registry',
-    }, 'Balances retrieved from Transfer Registry');
+      source: 'canton-sdk',
+    }, 'Balances retrieved from Canton SDK');
   } catch (err) {
-    console.error(`[Balance] Transfer Registry query failed:`, err.message);
+    console.error(`[Balance] Canton SDK query failed:`, err.message);
     return success(res, {
       partyId,
       balance: {},
@@ -68,14 +70,14 @@ router.get('/:partyId', asyncHandler(async (req, res) => {
       total: {},
       holdings: [],
       tokenStandard: true,
-      source: 'transfer-registry',
+      source: 'canton-sdk',
     }, 'No balances found');
   }
 }));
 
 // ─────────────────────────────────────────────────────────
 // POST /api/balance/mint
-// Mint tokens by transferring from faucet via Transfer Registry
+// Mint tokens by transferring from faucet via Canton SDK
 // ─────────────────────────────────────────────────────────
 router.post('/mint', asyncHandler(async (req, res) => {
   const { partyId, tokens } = req.body;
@@ -90,28 +92,28 @@ router.post('/mint', asyncHandler(async (req, res) => {
 
   console.log(`[Balance] Minting for party: ${partyId.substring(0, 30)}...`, tokens);
 
-  const transferRegistry = getTransferRegistry();
+  const sdkClient = getCantonSDKClient();
   const FAUCET_PARTY = process.env.FAUCET_PARTY_ID || 'faucet::1220faucet';
   
   const results = [];
   
   for (const tokenInfo of tokens) {
     try {
-      const result = await transferRegistry.transfer({
-        instrument: tokenInfo.symbol,
-        fromParty: FAUCET_PARTY,
-        toParty: partyId,
-        amount: String(tokenInfo.amount),
-        metadata: {
-          type: 'faucet_mint',
-          timestamp: new Date().toISOString(),
-        },
-      });
+      if (!sdkClient.isReady()) {
+        throw new Error('Canton SDK not initialized — cannot mint');
+      }
+      const result = await sdkClient.executeFullTransfer(
+        FAUCET_PARTY,
+        partyId,
+        String(tokenInfo.amount),
+        tokenInfo.symbol,
+        `faucet_mint_${Date.now()}`
+      );
       results.push({
         symbol: tokenInfo.symbol,
         amount: tokenInfo.amount,
         status: 'minted',
-        transactionHash: result.transactionHash,
+        updateId: result.updateId || null,
       });
       console.log(`[Balance] Transferred ${tokenInfo.amount} ${tokenInfo.symbol} from faucet to ${partyId.substring(0, 30)}...`);
     } catch (err) {
@@ -133,17 +135,17 @@ router.post('/mint', asyncHandler(async (req, res) => {
     minted: successful,
     failed,
     tokenStandard: true,
-    source: 'transfer-registry',
+    source: 'canton-sdk',
   }, `Minted ${successful.length}/${tokens.length} tokens`, 201);
 }));
 
 // ─────────────────────────────────────────────────────────
-// V2 ENDPOINTS (same behavior — Transfer Registry only)
+// V2 ENDPOINTS (same behavior — Canton SDK only)
 // ─────────────────────────────────────────────────────────
 
 /**
  * GET /api/balance/v2/:partyId
- * Get balance — Transfer Registry only.
+ * Get balance — Canton SDK (UTXO-based).
  */
 router.get('/v2/:partyId', asyncHandler(async (req, res) => {
   const { partyId } = req.params;
@@ -154,22 +156,22 @@ router.get('/v2/:partyId', asyncHandler(async (req, res) => {
 
   console.log(`[Balance V2] Getting balance for party: ${partyId.substring(0, 30)}...`);
   
-  const transferRegistry = getTransferRegistry();
+  const sdkClient = getCantonSDKClient();
   
   try {
-    const trBalances = await transferRegistry.getAllBalances(partyId);
+    const balances = await sdkClient.getAllBalances(partyId);
     
     const available = {};
     const locked = {};
     const total = {};
     
-    for (const [sym, amt] of Object.entries(trBalances.available)) {
+    for (const [sym, amt] of Object.entries(balances.available)) {
       available[sym] = parseFloat(amt) || 0;
     }
-    for (const [sym, amt] of Object.entries(trBalances.locked)) {
+    for (const [sym, amt] of Object.entries(balances.locked)) {
       locked[sym] = parseFloat(amt) || 0;
     }
-    for (const [sym, amt] of Object.entries(trBalances.total)) {
+    for (const [sym, amt] of Object.entries(balances.total)) {
       total[sym] = parseFloat(amt) || 0;
     }
 
@@ -182,11 +184,11 @@ router.get('/v2/:partyId', asyncHandler(async (req, res) => {
       locked,
       total,
       holdings: [],
-      source: 'transfer-registry',
+      source: 'canton-sdk',
       tokenStandard: true,
-    }, 'Balances retrieved from Transfer Registry');
+    }, 'Balances retrieved from Canton SDK');
   } catch (err) {
-    console.error('[Balance V2] Transfer Registry failed:', err.message);
+    console.error('[Balance V2] Canton SDK query failed:', err.message);
     return success(res, {
       partyId,
       balance: {},
@@ -194,7 +196,7 @@ router.get('/v2/:partyId', asyncHandler(async (req, res) => {
       locked: {},
       total: {},
       holdings: [],
-      source: 'transfer-registry',
+      source: 'canton-sdk',
       tokenStandard: true,
     }, 'No balances found');
   }
@@ -202,7 +204,7 @@ router.get('/v2/:partyId', asyncHandler(async (req, res) => {
 
 /**
  * POST /api/balance/v2/mint
- * Mint tokens via Transfer Registry faucet transfer.
+ * Mint tokens via Canton SDK faucet transfer.
  */
 router.post('/v2/mint', asyncHandler(async (req, res) => {
   const { partyId, tokens } = req.body;
@@ -217,28 +219,28 @@ router.post('/v2/mint', asyncHandler(async (req, res) => {
 
   console.log(`[Balance V2] Minting for party: ${partyId.substring(0, 30)}...`, tokens);
 
-  const transferRegistry = getTransferRegistry();
+  const sdkClient = getCantonSDKClient();
   const FAUCET_PARTY = process.env.FAUCET_PARTY_ID || 'faucet::1220faucet';
 
   const results = [];
   
   for (const tokenInfo of tokens) {
     try {
-      const result = await transferRegistry.transfer({
-        instrument: tokenInfo.symbol,
-        fromParty: FAUCET_PARTY,
-        toParty: partyId,
-        amount: String(tokenInfo.amount),
-        metadata: {
-          type: 'faucet_mint',
-          timestamp: new Date().toISOString(),
-        },
-      });
+      if (!sdkClient.isReady()) {
+        throw new Error('Canton SDK not initialized — cannot mint');
+      }
+      const result = await sdkClient.executeFullTransfer(
+        FAUCET_PARTY,
+        partyId,
+        String(tokenInfo.amount),
+        tokenInfo.symbol,
+        `faucet_mint_v2_${Date.now()}`
+      );
       results.push({
         symbol: tokenInfo.symbol,
         amount: tokenInfo.amount,
         status: 'minted',
-        transactionHash: result.transactionHash,
+        updateId: result.updateId || null,
       });
       console.log(`[Balance V2] Transferred ${tokenInfo.amount} ${tokenInfo.symbol} from faucet to ${partyId.substring(0, 30)}...`);
     } catch (err) {
@@ -260,13 +262,13 @@ router.post('/v2/mint', asyncHandler(async (req, res) => {
     minted: successful,
     failed,
     tokenStandard: true,
-    source: 'transfer-registry',
+    source: 'canton-sdk',
   }, `Minted ${successful.length}/${tokens.length} tokens`, 201);
 }));
 
 /**
  * GET /api/balance/v2/holdings/:partyId
- * Get balance summary from Transfer Registry (no individual holdings).
+ * Get holding UTXOs from Canton SDK.
  */
 router.get('/v2/holdings/:partyId', asyncHandler(async (req, res) => {
   const { partyId } = req.params;
@@ -278,41 +280,40 @@ router.get('/v2/holdings/:partyId', asyncHandler(async (req, res) => {
 
   console.log(`[Balance V2] Getting holdings for party: ${partyId.substring(0, 30)}...${symbol ? ` (${symbol})` : ''}`);
 
-  const transferRegistry = getTransferRegistry();
+  const sdkClient = getCantonSDKClient();
   
   try {
     if (symbol) {
       // Single instrument query
-      const balData = await transferRegistry.getBalance(partyId, symbol);
-      const bal = balData.balance || {};
+      const balance = await sdkClient.getBalance(partyId, symbol);
       return success(res, {
         partyId,
         symbol,
         holdings: [{
-          type: 'transfer-registry',
+          type: 'canton-sdk-utxo',
           instrument: symbol,
-          available: bal.available || '0',
-          locked: bal.locked || '0',
-          total: bal.total || '0',
+          available: balance.available || '0',
+          locked: balance.locked || '0',
+          total: balance.total || '0',
         }],
         count: 1,
-        totalAmount: parseFloat(bal.total || '0'),
-        source: 'transfer-registry',
-      }, `${symbol} balance from Transfer Registry`);
+        totalAmount: parseFloat(balance.total || '0'),
+        source: 'canton-sdk',
+      }, `${symbol} balance from Canton SDK`);
     }
     
     // All instruments
-    const trBalances = await transferRegistry.getAllBalances(partyId);
+    const balances = await sdkClient.getAllBalances(partyId);
     const holdings = [];
     const summary = {};
     
-    for (const sym of Object.keys(trBalances.available)) {
-      const avail = trBalances.available[sym] || '0';
-      const lock = trBalances.locked[sym] || '0';
-      const tot = trBalances.total[sym] || '0';
+    for (const sym of Object.keys(balances.available)) {
+      const avail = balances.available[sym] || '0';
+      const lock = balances.locked[sym] || '0';
+      const tot = balances.total[sym] || '0';
       
       holdings.push({
-        type: 'transfer-registry',
+        type: 'canton-sdk-utxo',
         instrument: sym,
         available: avail,
         locked: lock,
@@ -326,7 +327,7 @@ router.get('/v2/holdings/:partyId', asyncHandler(async (req, res) => {
       holdings,
       count: holdings.length,
       summary,
-      source: 'transfer-registry',
+      source: 'canton-sdk',
     }, `Found ${holdings.length} instruments`);
   } catch (err) {
     console.error('[Balance V2] Failed to get holdings:', err.message);
@@ -335,14 +336,16 @@ router.get('/v2/holdings/:partyId', asyncHandler(async (req, res) => {
       holdings: [],
       count: 0,
       summary: {},
-      source: 'transfer-registry',
+      source: 'canton-sdk',
     }, 'No holdings found');
   }
 }));
 
 /**
  * POST /api/balance/v2/lock
- * Lock funds via Transfer Registry API.
+ * Lock funds — NOT supported in SDK mode.
+ * With the SDK approach, holdings are locked naturally when
+ * a 2-step transfer instruction is created at settlement time.
  */
 router.post('/v2/lock', asyncHandler(async (req, res) => {
   const { lockReason, lockAmount, ownerPartyId, instrument } = req.body;
@@ -351,36 +354,28 @@ router.post('/v2/lock', asyncHandler(async (req, res) => {
     throw new ValidationError('Required fields: instrument, lockReason, lockAmount, ownerPartyId');
   }
 
-  console.log(`[Balance V2] Locking ${lockAmount} ${instrument} for ${ownerPartyId.substring(0, 30)}... (reason: ${lockReason})`);
+  console.log(`[Balance V2] Lock request: ${lockAmount} ${instrument} for ${ownerPartyId.substring(0, 30)}...`);
+  console.log(`[Balance V2] ⚠️ Explicit locking not supported in SDK mode — holdings are locked at transfer time`);
   
-  const transferRegistry = getTransferRegistry();
-  
-  try {
-    const result = await transferRegistry.lockFunds({
-      party: ownerPartyId,
-      instrument,
-      amount: String(lockAmount),
-      reason: lockReason,
-      expirySeconds: 86400,
-    });
-    
-    return success(res, {
-      lockId: result.lockId,
-      instrument,
-      lockReason,
-      lockAmount: result.amount,
-      remainingBalance: result.remainingBalance,
-      source: 'transfer-registry',
-    }, 'Funds locked via Transfer Registry');
-  } catch (err) {
-    console.error('[Balance V2] Lock failed:', err.message);
-    return error(res, err.message, 500);
-  }
+  // In SDK mode, there's no explicit lock API. Holdings are locked when
+  // the matching engine creates a TransferInstruction (createTransfer).
+  // Return a simulated lock response for backward compatibility.
+  return success(res, {
+    lockId: `sdk-no-lock-${Date.now()}`,
+    instrument,
+    lockReason,
+    lockAmount,
+    remainingBalance: null,
+    source: 'canton-sdk',
+    note: 'SDK mode: Holdings are locked at transfer time, not at order placement.',
+  }, 'Lock acknowledged (SDK mode: actual lock occurs at settlement)');
 }));
 
 /**
  * POST /api/balance/v2/unlock
- * Unlock funds via Transfer Registry API.
+ * Unlock funds — NOT supported in SDK mode.
+ * With the SDK approach, locked holdings are released when the
+ * TransferInstruction is withdrawn (Withdraw choice).
  */
 router.post('/v2/unlock', asyncHandler(async (req, res) => {
   const { lockId } = req.body;
@@ -389,23 +384,18 @@ router.post('/v2/unlock', asyncHandler(async (req, res) => {
     throw new ValidationError('lockId is required');
   }
 
-  console.log(`[Balance V2] Unlocking lockId: ${lockId.substring(0, 30)}...`);
+  console.log(`[Balance V2] Unlock request: ${lockId.substring(0, 30)}...`);
+  console.log(`[Balance V2] ⚠️ Explicit unlocking not supported in SDK mode — use transfer withdrawal`);
   
-  const transferRegistry = getTransferRegistry();
-  
-  try {
-    const result = await transferRegistry.unlockFunds(lockId);
-    
-    return success(res, {
-      lockId: result.lockId,
-      amount: result.amount,
-      remainingBalance: result.remainingBalance,
-      source: 'transfer-registry',
-    }, 'Funds unlocked via Transfer Registry');
-  } catch (err) {
-    console.error('[Balance V2] Unlock failed:', err.message);
-    return error(res, err.message, 500);
-  }
+  // In SDK mode, there's no explicit unlock API. Locked holdings are released
+  // when a TransferInstruction is withdrawn by the sender.
+  return success(res, {
+    lockId,
+    amount: null,
+    remainingBalance: null,
+    source: 'canton-sdk',
+    note: 'SDK mode: Locked holdings are released via TransferInstruction withdrawal.',
+  }, 'Unlock acknowledged (SDK mode: use transfer withdrawal to release)');
 }));
 
 module.exports = router;

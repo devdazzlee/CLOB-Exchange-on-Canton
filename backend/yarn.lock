@@ -2,116 +2,141 @@
 # yarn lockfile v1
 
 
-"@canton-network/core-ledger-client@^0.25.1":
-  version "0.25.2"
-  resolved "https://registry.npmjs.org/@canton-network/core-ledger-client/-/core-ledger-client-0.25.2.tgz"
-  integrity sha512-KuK5uXTOeCsRvYrVkP+cyTGKqQqBBqlmV5EnhuZ2xYiLlrXuWGjHCiFhH1XNdR3bYf1ZYBvLCYULSI7lJnBtzg==
+"@canton-network/core-asyncapi-client@^0.1.0":
+  version "0.1.0"
+  resolved "https://registry.yarnpkg.com/@canton-network/core-asyncapi-client/-/core-asyncapi-client-0.1.0.tgz#aba29a84e7533d1fa9abb0b7fc6ccb102a8bf5bb"
+  integrity sha512-q+rVq64DirvtV0g3EvTLf3t6E3sbWSyg8WzNFicLe9E0+Gb66wV+MGiFi3HWbUK6oJ915jzUb2mN7yJt2ASWug==
   dependencies:
-    "@canton-network/core-ledger-proto" "^0.17.3"
-    "@canton-network/core-splice-client" "^0.19.3"
-    "@canton-network/core-token-standard" "^0.17.3"
-    "@canton-network/core-types" "^0.16.3"
-    "@canton-network/core-wallet-auth" "^0.17.3"
+    "@canton-network/core-ledger-client-types" "^0.20.0"
+    "@canton-network/core-types" "^0.18.1"
+    "@canton-network/core-wallet-auth" "^0.19.1"
+    bignumber.js "^9.3.1"
+    pino "^10.2.1"
+
+"@canton-network/core-ledger-client-types@^0.20.0":
+  version "0.20.0"
+  resolved "https://registry.yarnpkg.com/@canton-network/core-ledger-client-types/-/core-ledger-client-types-0.20.0.tgz#a8aaa547a29678229144b6379c35b4e30beaa0bd"
+  integrity sha512-Pf/8ih/Y3tA6xUbIZph0eLHjokfpLjw+EROtOVR+ZYrzknr2PfuZ1kmqqZLYCRRNMVcydIK2ipjHuE3ehB80sg==
+  dependencies:
+    "@canton-network/core-types" "^0.18.1"
+    bignumber.js "^9.3.1"
+    dayjs "^1.11.19"
+    openapi-fetch "^0.15.0"
+    pino "^10.2.1"
+
+"@canton-network/core-ledger-client@^0.27.2":
+  version "0.27.2"
+  resolved "https://registry.yarnpkg.com/@canton-network/core-ledger-client/-/core-ledger-client-0.27.2.tgz#6681a0de632c8e8c509db4b5a351d1fcf69859c6"
+  integrity sha512-RhxmKahn2qtrCu1uHkQ27pnNerFXnaQ1NIpVKMSGqf6soXOpgqPh3qN5duKtYN/wN6CfsEVJzelxN7Z9A1a+AA==
+  dependencies:
+    "@canton-network/core-ledger-client-types" "^0.20.0"
+    "@canton-network/core-ledger-proto" "^0.19.1"
+    "@canton-network/core-splice-client" "^0.21.1"
+    "@canton-network/core-token-standard" "^0.19.1"
+    "@canton-network/core-types" "^0.18.1"
+    "@canton-network/core-wallet-auth" "^0.19.1"
     bignumber.js "^9.3.1"
     dayjs "^1.11.19"
     openapi-fetch "^0.15.0"
     pino "^10.2.1"
     typescript-lru-cache "^2.0.0"
 
-"@canton-network/core-ledger-proto@^0.17.2", "@canton-network/core-ledger-proto@^0.17.3":
-  version "0.17.3"
-  resolved "https://registry.npmjs.org/@canton-network/core-ledger-proto/-/core-ledger-proto-0.17.3.tgz"
-  integrity sha512-fkC+l7elPpijtFjr3qJPmwUczMh16IXZ464I1wKU+b6pOz6HwoFcnM/aMLu5LgGKed41Z+8s5K30IX4oebzDtA==
+"@canton-network/core-ledger-proto@^0.19.1":
+  version "0.19.1"
+  resolved "https://registry.yarnpkg.com/@canton-network/core-ledger-proto/-/core-ledger-proto-0.19.1.tgz#fe9f6501bb6726e427308202799927ed3f4c74a8"
+  integrity sha512-Ev6GVH9YDK92XX45ZHCOPUFI0w6Q/7IkIjLEv/W+iCs6cu9BCE7fWbTRQy9x8xcgsRmjolA7H5RwLBhkYEqBOw==
   dependencies:
     "@protobuf-ts/runtime" "^2.11.1"
     "@protobuf-ts/runtime-rpc" "^2.11.1"
 
-"@canton-network/core-rpc-errors@^0.13.3":
-  version "0.13.3"
-  resolved "https://registry.npmjs.org/@canton-network/core-rpc-errors/-/core-rpc-errors-0.13.3.tgz"
-  integrity sha512-ot5m80RSMcNlTkpVvD2s196/ZZXL+y0kQDLc1VYFHML5hBOndx+Ws5hs6kVJGbomIWS9Zt6DD/AGJpJiQCOdlg==
+"@canton-network/core-rpc-errors@^0.15.1":
+  version "0.15.1"
+  resolved "https://registry.yarnpkg.com/@canton-network/core-rpc-errors/-/core-rpc-errors-0.15.1.tgz#c1af5bcec36765f61f9d112bd131c8a8b7408d8b"
+  integrity sha512-3T8IPsPwPMm8WXIJgK4p7Ad57Ygg9JUMEm5AuttrhVdR39LyCC5B+kqGd6vjBQa+O4u34+8Sh1ymHuX+MLh3Eg==
   dependencies:
     "@metamask/rpc-errors" "^7.0.3"
 
-"@canton-network/core-signing-lib@^0.20.2":
-  version "0.20.3"
-  resolved "https://registry.npmjs.org/@canton-network/core-signing-lib/-/core-signing-lib-0.20.3.tgz"
-  integrity sha512-+fksLbcomqns68JE1XMImH39ij8rTZzFfz8PIy6jsZEwVKiJkolt7TllUUOZ0aTGhvCf5CtsIQq3FsB6ZrqBsw==
+"@canton-network/core-signing-lib@^0.22.1":
+  version "0.22.1"
+  resolved "https://registry.yarnpkg.com/@canton-network/core-signing-lib/-/core-signing-lib-0.22.1.tgz#2283dd4bf90b568d32d339d973da9054c7708550"
+  integrity sha512-e73xaz7OayBQzOuQgZadrzE/OaBjWqpqsHp8WIrA5T7m2RKgaZsJQBLlJCvdMQBO27xJROy72Lx03jaNvPPL2g==
   dependencies:
-    "@canton-network/core-wallet-auth" "^0.17.3"
+    "@canton-network/core-wallet-auth" "^0.19.1"
     fs-extra "^11.3.3"
     lodash "^4.17.23"
     tweetnacl "^1.0.3"
     tweetnacl-util "^0.15.1"
     zod "^4.3.5"
 
-"@canton-network/core-splice-client@^0.19.2", "@canton-network/core-splice-client@^0.19.3":
-  version "0.19.3"
-  resolved "https://registry.npmjs.org/@canton-network/core-splice-client/-/core-splice-client-0.19.3.tgz"
-  integrity sha512-kGo+zzwA1qh+ZHl1gs+M2mctAClPpydHbUV03YI7Msbow4gD6tHCyJd/tuCJte7irbqMOtFtzXQY/D1LkfD9+A==
+"@canton-network/core-splice-client@^0.21.1":
+  version "0.21.1"
+  resolved "https://registry.yarnpkg.com/@canton-network/core-splice-client/-/core-splice-client-0.21.1.tgz#aabbcfa9f860552d6c6e17f7c40840b92c3b4d6b"
+  integrity sha512-Mxaq8IoEsrq5+z4gWY6+SFsv2eqg4Hjb1hwC5SrWK5fAQVfLqMNg0SY2q4otks/CiADGqfHHixYwNT2NvZIVGA==
   dependencies:
-    "@canton-network/core-types" "^0.16.3"
-    "@canton-network/core-wallet-auth" "^0.17.3"
+    "@canton-network/core-types" "^0.18.1"
+    "@canton-network/core-wallet-auth" "^0.19.1"
     openapi-fetch "^0.15.0"
     uuid "^11.1.0"
     zod "^4.3.5"
 
-"@canton-network/core-token-standard@^0.17.2", "@canton-network/core-token-standard@^0.17.3":
-  version "0.17.3"
-  resolved "https://registry.npmjs.org/@canton-network/core-token-standard/-/core-token-standard-0.17.3.tgz"
-  integrity sha512-n3dY4oNsnDJpnfeBEVEwuqWFTQj4cEigOToIcJezAXj53dQmubIMqgJPHl6YcBCAz03bd1KLdkFzTA6Os1vibg==
+"@canton-network/core-token-standard@^0.19.1":
+  version "0.19.1"
+  resolved "https://registry.yarnpkg.com/@canton-network/core-token-standard/-/core-token-standard-0.19.1.tgz#624283f456e99d79598c4b70fe3d224ee1de441d"
+  integrity sha512-G+OX1frnSr6TmyoPoRWB04nAmzNWmu138Ni2oGqXBSdwTXgLDVOMo4pmh398SIy2u/8xav6zsia3+NZNiGpGcQ==
   dependencies:
-    "@canton-network/core-types" "^0.16.3"
+    "@canton-network/core-types" "^0.18.1"
     lodash "^4.17.23"
     openapi-fetch "^0.15.0"
     uuid "^11.1.0"
     zod "^4.3.5"
 
-"@canton-network/core-tx-visualizer@^0.17.2":
-  version "0.17.3"
-  resolved "https://registry.npmjs.org/@canton-network/core-tx-visualizer/-/core-tx-visualizer-0.17.3.tgz"
-  integrity sha512-I6RGel7epimboMtr6LxW68juvBU9McjV2o/7G3OF8DFuipgQQHxLpjF2EJWWO55x1MpJ9adVvHHusFdBomNuxA==
+"@canton-network/core-tx-visualizer@^0.19.1":
+  version "0.19.1"
+  resolved "https://registry.yarnpkg.com/@canton-network/core-tx-visualizer/-/core-tx-visualizer-0.19.1.tgz#bcd975e81535f1f83be184a8a1a101bb37e04a3f"
+  integrity sha512-C6wRZquQzhVRc8SymGan+3npTkqU5eZvzD4qymqYk5yZyixL0v1AsLmfemmosp2vRpcEpxOS7l0fpn541gI1bQ==
   dependencies:
-    "@canton-network/core-ledger-proto" "^0.17.3"
+    "@canton-network/core-ledger-proto" "^0.19.1"
     "@types/node" "^25.0.10"
     camelcase-keys "^10.0.1"
 
-"@canton-network/core-types@^0.16.2", "@canton-network/core-types@^0.16.3":
-  version "0.16.3"
-  resolved "https://registry.npmjs.org/@canton-network/core-types/-/core-types-0.16.3.tgz"
-  integrity sha512-ejMaFW/07ERFLWYWdg0GBc76DXXE807i1BTzrBDbuap1Gmku+FW5BK1j7w9vMtwyN2wVDJPHsz8zr1rexxMTZA==
+"@canton-network/core-types@^0.18.1":
+  version "0.18.1"
+  resolved "https://registry.yarnpkg.com/@canton-network/core-types/-/core-types-0.18.1.tgz#cb941f41fdc64b5767c50bad26ae4d5562ab5e57"
+  integrity sha512-bvlLz/mbn7rg3b0M4YQYk/0xXBdFSNiy9pOk3USjexzKEMLVA17KbhkPWrdUEzgmbZ0TSu8s092rBmk+HP4HPQ==
   dependencies:
     uuid "^11.1.0"
     zod "^4.3.5"
 
-"@canton-network/core-wallet-auth@^0.17.2", "@canton-network/core-wallet-auth@^0.17.3":
-  version "0.17.3"
-  resolved "https://registry.npmjs.org/@canton-network/core-wallet-auth/-/core-wallet-auth-0.17.3.tgz"
-  integrity sha512-iBWdlKlX4hexo0uDMWepSMTMx9Gxj72ku/CW3sp3XDitEfwZPxda/awa0KQpHhJu6v8gcOzAsluR50jTEg/Bvw==
+"@canton-network/core-wallet-auth@^0.19.1":
+  version "0.19.1"
+  resolved "https://registry.yarnpkg.com/@canton-network/core-wallet-auth/-/core-wallet-auth-0.19.1.tgz#a05f6860ae3414511bacafd3a4beda1a754fb488"
+  integrity sha512-RLhWWovsgXsy64Mwaofzdwift1BeVcXrtS3umQKCU08KA76TM/1Exfq3tQmp7HOsGB2Jpaf91sGuSU9Xf+FCfg==
   dependencies:
-    "@canton-network/core-rpc-errors" "^0.13.3"
-    "@canton-network/core-types" "^0.16.3"
+    "@canton-network/core-rpc-errors" "^0.15.1"
+    "@canton-network/core-types" "^0.18.1"
     jose "^6.1.3"
     zod "^4.3.5"
 
-"@canton-network/wallet-sdk@^0.20.0":
-  version "0.20.0"
-  resolved "https://registry.npmjs.org/@canton-network/wallet-sdk/-/wallet-sdk-0.20.0.tgz"
-  integrity sha512-vqK4s5YgG0WqAwApVKdf9y1Wq9fr12EGUNt4M00krrkzZJem2v+MG/KxVeHyJlctibVjYrYGlUIlxsX9fN4UXw==
+"@canton-network/wallet-sdk@^0.21.0":
+  version "0.21.0"
+  resolved "https://registry.yarnpkg.com/@canton-network/wallet-sdk/-/wallet-sdk-0.21.0.tgz#a445c989b287a83d604b1860f4236f5a5006e259"
+  integrity sha512-RhvjNksEJN8iPejZWeZYa9cZN03zyiZE5mk4UEEFHbHDfbxyRrvBmkchKJRGHSjhPEim04SPh51Xv2vCWhMcOg==
   dependencies:
-    "@canton-network/core-ledger-client" "^0.25.1"
-    "@canton-network/core-ledger-proto" "^0.17.2"
-    "@canton-network/core-signing-lib" "^0.20.2"
-    "@canton-network/core-splice-client" "^0.19.2"
-    "@canton-network/core-token-standard" "^0.17.2"
-    "@canton-network/core-tx-visualizer" "^0.17.2"
-    "@canton-network/core-types" "^0.16.2"
-    "@canton-network/core-wallet-auth" "^0.17.2"
+    "@canton-network/core-asyncapi-client" "^0.1.0"
+    "@canton-network/core-ledger-client" "^0.27.2"
+    "@canton-network/core-ledger-client-types" "^0.20.0"
+    "@canton-network/core-ledger-proto" "^0.19.1"
+    "@canton-network/core-signing-lib" "^0.22.1"
+    "@canton-network/core-splice-client" "^0.21.1"
+    "@canton-network/core-token-standard" "^0.19.1"
+    "@canton-network/core-tx-visualizer" "^0.19.1"
+    "@canton-network/core-types" "^0.18.1"
+    "@canton-network/core-wallet-auth" "^0.19.1"
     "@grpc/grpc-js" "^1.14.3"
     "@protobuf-ts/grpc-transport" "^2.11.1"
     decimal.js "^10.6.0"
     jose "^6.1.3"
-    pino "^10.1.1"
+    pino "^10.2.1"
     uuid "^11.1.0"
 
 "@ethereumjs/common@^3.2.0":
@@ -1049,7 +1074,7 @@ pino-std-serializers@^7.0.0:
   resolved "https://registry.npmjs.org/pino-std-serializers/-/pino-std-serializers-7.1.0.tgz"
   integrity sha512-BndPH67/JxGExRgiX1dX0w1FvZck5Wa4aal9198SrRhZjH3GxKQUKIBnYJTdj2HDN3UQAS06HlfcSbQj2OHmaw==
 
-pino@^10.1.1, pino@^10.2.1:
+pino@^10.2.1:
   version "10.3.1"
   resolved "https://registry.npmjs.org/pino/-/pino-10.3.1.tgz"
   integrity sha512-r34yH/GlQpKZbU1BvFFqOjhISRo1MNx1tWYsYvmj6KIRHSPMT2+yHOEb1SG6NMvRoHRF0a07kCOox/9yakl1vg==

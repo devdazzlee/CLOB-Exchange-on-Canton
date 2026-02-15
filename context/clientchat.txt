@@ -189,3 +189,24 @@ huz
 You
 We're creating custom Holding contracts on our own Daml template with the symbol "CBTC" they're IOUs inside our exchange, not real CBTC. We can't mint actual CBTC since we don't own that contract. We need the correct API to transfer real CC/CBTC between parties during settlement.
 We need to use the splice token Holding interface and not custom templates, unless you are inheriting this interface in your template then its fine...
+
+
+@~huz 
+We have confirmed that http://65.108.40.104:8088 is the Scan frontend UI and not a Transfer Registry REST API. The Scan API at /api/scan/v0/ is functioning correctly for discovery purposes.
+
+Could you please clarify the following:
+
+What is the exact API or choice we should call to transfer CC/CBTC between parties during order settlement?
+Should we exercise a DAML choice on Splice Holding contracts directly via the Ledger API on port 31539?
+Is there a specific transfer factory or pre-approval flow that we should use?
+You will need Scan Api for fetching transfer registry, validator-app also exposes this same scan api via /api/validator/v0/scan-proxy but with some restricited routes. You can use either of them, the route for transfer-registry is https://docs.sync.global/app_dev/token_standard/openapi/transfer_instruction.html. 
+
+For example,
+To fetch factoryID and context 
+/api/validator/v0/scan-proxy/registry/transfer-instruction/v1/transfer-factory
+
+
+
+You can check this script for better undertstanding https://github.com/hyperledger-labs/splice/blob/main/token-standard/cli/src/commands/transfer.ts
+
+Or, you can use wallet-sdk for convenience https://docs.digitalasset.com/integrate/devnet/token-standard/index.html#how-do-i-quickly-perform-a-transfer-between-two-parties

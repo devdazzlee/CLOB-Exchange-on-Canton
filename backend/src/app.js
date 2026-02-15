@@ -235,6 +235,22 @@ async function startServer() {
     console.log(`✅ Environment: ${config.server.env}`);
     console.log('');
 
+    // Initialize Canton Wallet SDK (non-blocking)
+    console.log('🔄 Initializing Canton Wallet SDK...');
+    try {
+      const { getCantonSDKClient } = require('./services/canton-sdk-client');
+      const sdkClient = getCantonSDKClient();
+      await sdkClient.initialize();
+      if (sdkClient.isReady()) {
+        console.log('✅ Canton Wallet SDK initialized and ready');
+      } else {
+        console.warn('⚠️  Canton Wallet SDK initialized but not ready (check SDK package installation)');
+      }
+    } catch (sdkErr) {
+      console.error('⚠️  Canton Wallet SDK initialization failed:', sdkErr.message);
+      console.error('   Balance queries and token transfers will be unavailable.');
+    }
+
     // Initialize Read Model (non-blocking)
     console.log('🔄 Initializing Read Model from Canton ledger...');
     await initializeReadModel();
