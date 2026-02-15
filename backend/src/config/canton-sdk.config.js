@@ -81,6 +81,15 @@ const CANTON_SDK_CONFIG = {
       quoteInstrument: 'USDT',
     },
   },
+
+  // ─── Transfer Factory support ──────────────────────────────────────────────
+  // The Transfer Factory Registry (ExternalPartyAmuletRules) only supports
+  // Amulet (CC) transfers. Other instruments (CBTC, etc.) are not supported
+  // by the current factory contract and will fail with an instrumentId mismatch.
+  // 
+  // Instruments in this set will be transferred via the SDK 2-step flow.
+  // Others are handled as exchange-managed custodial balances.
+  FACTORY_SUPPORTED_INSTRUMENTS: new Set(['Amulet']),
 };
 
 /**
@@ -119,10 +128,24 @@ function toExchangeSymbol(instrumentId) {
   return CANTON_SDK_CONFIG.REVERSE_INSTRUMENT_MAP[id] || String(id);
 }
 
+/**
+ * Check if an exchange symbol's Canton instrument is supported by the Transfer Factory.
+ * Only instruments in FACTORY_SUPPORTED_INSTRUMENTS can be transferred via the SDK 2-step flow.
+ * Others (CBTC, etc.) are handled as exchange-managed custodial balances.
+ * 
+ * @param {string} symbol - Exchange symbol (e.g., 'CC', 'CBTC')
+ * @returns {boolean} true if the factory supports on-chain transfers for this instrument
+ */
+function isFactoryTransferable(symbol) {
+  const cantonId = toCantonInstrument(symbol);
+  return CANTON_SDK_CONFIG.FACTORY_SUPPORTED_INSTRUMENTS.has(cantonId);
+}
+
 module.exports = {
   CANTON_SDK_CONFIG,
   toCantonInstrument,
   toExchangeSymbol,
   extractInstrumentId,
+  isFactoryTransferable,
 };
 

@@ -34,6 +34,7 @@ const cantonService = require('./cantonService');
 const config = require('../config');
 const tokenProvider = require('./tokenProvider');
 const { getCantonSDKClient } = require('./canton-sdk-client');
+const { isFactoryTransferable } = require('../config/canton-sdk.config');
 
 // Configure decimal.js for financial precision
 Decimal.set({ precision: 20, rounding: Decimal.ROUND_DOWN });
@@ -515,56 +516,73 @@ class MatchingEngine {
 
     // ═══════════════════════════════════════════════════════════════════
     // STEP 2: Transfer REAL tokens via Canton Wallet SDK (2-step flow)
-    // Two full transfers per settlement:
-    //   a) Instrument (e.g., CC) from seller → buyer
-    //   b) Payment (e.g., CBTC) from buyer → seller
     //
-    // Each executeFullTransfer does:
+    // The Transfer Factory Registry (ExternalPartyAmuletRules) only supports
+    // Amulet (CC) on-chain transfers. Other instruments (CBTC, etc.) are
+    // handled as exchange-managed custodial balance changes.
+    //
+    // For factory-supported instruments:
     //   1. createTransfer → locks sender's UTXOs, creates TransferInstruction
     //   2. acceptTransfer → completes transfer, receiver gets holdings
     //
-    // These are REAL Splice Token Standard transfers visible on Canton Explorer.
+    // For unsupported instruments:
+    //   Trade is recorded, balance reservations handle the accounting.
+    //   No on-chain 2-step transfer is attempted.
     // ═══════════════════════════════════════════════════════════════════
-    console.log(`[MatchingEngine] 💰 Step 2: Transferring REAL tokens via Canton SDK (2-step flow)...`);
+    console.log(`[MatchingEngine] 💰 Step 2: Token settlement via Canton SDK...`);
     
+    const baseTransferable = isFactoryTransferable(baseSymbol);
+    const quoteTransferable = isFactoryTransferable(quoteSymbol);
+
+    if (!baseTransferable) {
+      console.log(`[MatchingEngine]    ℹ️ ${baseSymbol} is exchange-managed (factory does not support it) — no on-chain transfer`);
+    }
+    if (!quoteTransferable) {
+      console.log(`[MatchingEngine]    ℹ️ ${quoteSymbol} is exchange-managed (factory does not support it) — no on-chain transfer`);
+    }
+
     let instrumentTransferResult = null;
     let paymentTransferResult = null;
 
     if (sdkClient.isReady()) {
-      // Transfer A: Instrument (base) from seller → buyer
-      try {
-        console.log(`[MatchingEngine]    📤 Transfer ${matchQtyStr} ${baseSymbol}: seller → buyer (2-step)`);
-        instrumentTransferResult = await sdkClient.executeFullTransfer(
-          sellOrder.owner,
-          buyOrder.owner,
-          matchQtyStr,
-          baseSymbol,
-          `settlement:${buyOrder.orderId}:${sellOrder.orderId}:instrument`
-        );
-        console.log(`[MatchingEngine]    ✅ Instrument transfer completed — updateId: ${instrumentTransferResult.updateId || 'N/A'}${instrumentTransferResult.autoCompleted ? ' (auto-completed via pre-approval)' : ''}`);
-      } catch (transferError) {
-        console.error(`[MatchingEngine]    ❌ Instrument transfer FAILED: ${transferError.message}`);
-        console.error(`[MatchingEngine]    ⚠️ Orders are filled but tokens not yet transferred — manual resolution needed`);
+      // Transfer A: Instrument (base) from seller → buyer — only if factory supports it
+      if (baseTransferable) {
+        try {
+          console.log(`[MatchingEngine]    📤 Transfer ${matchQtyStr} ${baseSymbol}: seller → buyer (2-step on-chain)`);
+          instrumentTransferResult = await sdkClient.executeFullTransfer(
+            sellOrder.owner,
+            buyOrder.owner,
+            matchQtyStr,
+            baseSymbol,
+            `settlement:${buyOrder.orderId}:${sellOrder.orderId}:instrument`
+          );
+          console.log(`[MatchingEngine]    ✅ Instrument transfer completed — updateId: ${instrumentTransferResult.updateId || 'N/A'}${instrumentTransferResult.autoCompleted ? ' (auto-completed via pre-approval)' : ''}`);
+        } catch (transferError) {
+          console.error(`[MatchingEngine]    ❌ Instrument transfer FAILED: ${transferError.message}`);
+          console.error(`[MatchingEngine]    ⚠️ Orders are filled but tokens not yet transferred — manual resolution needed`);
+        }
       }
 
-      // Transfer B: Payment (quote) from buyer → seller
-      try {
-        console.log(`[MatchingEngine]    📤 Transfer ${quoteAmountStr} ${quoteSymbol}: buyer → seller (2-step)`);
-        paymentTransferResult = await sdkClient.executeFullTransfer(
-          buyOrder.owner,
-          sellOrder.owner,
-          quoteAmountStr,
-          quoteSymbol,
-          `settlement:${buyOrder.orderId}:${sellOrder.orderId}:payment`
-        );
-        console.log(`[MatchingEngine]    ✅ Payment transfer completed — updateId: ${paymentTransferResult.updateId || 'N/A'}${paymentTransferResult.autoCompleted ? ' (auto-completed via pre-approval)' : ''}`);
-      } catch (transferError) {
-        console.error(`[MatchingEngine]    ❌ Payment transfer FAILED: ${transferError.message}`);
-        if (instrumentTransferResult) {
-          console.error(`[MatchingEngine]    🚨 CRITICAL: Partial settlement — instrument transferred but payment FAILED`);
-          console.error(`[MatchingEngine]    🚨 Buyer: ${buyOrder.owner.substring(0, 40)}, Seller: ${sellOrder.owner.substring(0, 40)}`);
-          console.error(`[MatchingEngine]    🚨 Instrument: ${matchQtyStr} ${baseSymbol}, Payment: ${quoteAmountStr} ${quoteSymbol}`);
-          console.error(`[MatchingEngine]    🚨 Manual intervention required`);
+      // Transfer B: Payment (quote) from buyer → seller — only if factory supports it
+      if (quoteTransferable) {
+        try {
+          console.log(`[MatchingEngine]    📤 Transfer ${quoteAmountStr} ${quoteSymbol}: buyer → seller (2-step on-chain)`);
+          paymentTransferResult = await sdkClient.executeFullTransfer(
+            buyOrder.owner,
+            sellOrder.owner,
+            quoteAmountStr,
+            quoteSymbol,
+            `settlement:${buyOrder.orderId}:${sellOrder.orderId}:payment`
+          );
+          console.log(`[MatchingEngine]    ✅ Payment transfer completed — updateId: ${paymentTransferResult.updateId || 'N/A'}${paymentTransferResult.autoCompleted ? ' (auto-completed via pre-approval)' : ''}`);
+        } catch (transferError) {
+          console.error(`[MatchingEngine]    ❌ Payment transfer FAILED: ${transferError.message}`);
+          if (instrumentTransferResult) {
+            console.error(`[MatchingEngine]    🚨 CRITICAL: Partial settlement — instrument transferred but payment FAILED`);
+            console.error(`[MatchingEngine]    🚨 Buyer: ${buyOrder.owner.substring(0, 40)}, Seller: ${sellOrder.owner.substring(0, 40)}`);
+            console.error(`[MatchingEngine]    🚨 Instrument: ${matchQtyStr} ${baseSymbol}, Payment: ${quoteAmountStr} ${quoteSymbol}`);
+            console.error(`[MatchingEngine]    🚨 Manual intervention required`);
+          }
         }
       }
     } else {
