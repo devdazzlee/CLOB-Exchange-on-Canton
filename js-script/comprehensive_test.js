@@ -4,7 +4,7 @@
  */
 
 require('dotenv').config({ path: './backend/.env' });
-const { OPERATOR_PARTY_ID, CANTON_JSON_LEDGER_API_BASE } = require('./backend/src/config/constants');
+const { OPERATOR_PARTY_ID, CANTON_JSON_LEDGER_API_BASE } = require('../../backend/src/config/constants');
 
 const PARTY_ID = OPERATOR_PARTY_ID;
 const BASE_URL = 'http://localhost:3001/api';
@@ -172,8 +172,8 @@ async function main() {
   
   // Test 6: InterfaceFilter Query (Direct)
   tests.push(await test('InterfaceFilter - Direct Query', async () => {
-    const cantonService = require('./backend/src/services/cantonService');
-    const tokenProvider = require('./backend/src/services/tokenProvider');
+    const cantonService = require('../../backend/src/services/cantonService');
+    const tokenProvider = require('../../backend/src/services/tokenProvider');
     
     const token = await tokenProvider.getServiceToken();
     const interfaceId = "#splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:Holding";
