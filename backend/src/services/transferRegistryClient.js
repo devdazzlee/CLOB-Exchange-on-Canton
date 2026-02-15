@@ -15,7 +15,8 @@
  * Instrument names are case-sensitive: "CBTC" and "CC" (not "cbtc" or "cc").
  */
 
-const fetch = require('node-fetch') || globalThis.fetch;
+// Node.js v18+ has built-in fetch — no external package needed
+const fetch = globalThis.fetch;
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
