@@ -3,8 +3,8 @@
  */
 
 require('dotenv').config({ path: './backend/.env' });
-const tokenProvider = require('./backend/src/services/tokenProvider');
-const cantonService = require('./backend/src/services/cantonService');
+const tokenProvider = require('../backend/src/services/tokenProvider');
+const cantonService = require('../backend/src/services/cantonService');
 
 const CLIENT_PARTY_ID = "wolfedgelabs-dev-1::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292";
 const OUR_PARTY_ID = "8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292";

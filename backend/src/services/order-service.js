@@ -1,18 +1,17 @@
 /**
- * Order Service - REAL Canton JSON Ledger API v2 integration
+ * Order Service — Canton JSON Ledger API v2 + Transfer Registry
  * 
  * Uses the correct Canton APIs:
- * - POST /v2/commands/submit-and-wait-for-transaction - Place/Cancel orders
- * - POST /v2/state/active-contracts - Query orders
+ * - POST /v2/commands/submit-and-wait-for-transaction — Place/Cancel orders
+ * - POST /v2/state/active-contracts — Query orders
  * 
- * Features:
- * - Global Order Book (all users see same book)
- * - Limit + Market Orders with proper fund locking
- * - Cancellation with fund release
+ * Fund locking/unlocking uses Transfer Registry API exclusively for CC/CBTC.
+ * No Holdings, no DvP, no Fill-Only — Transfer Registry only.
  * 
  * https://docs.digitalasset.com/build/3.5/reference/json-api/openapi.html
  */
 
+const Decimal = require('decimal.js');
 const config = require('../config');
 const cantonService = require('./cantonService');
 const tokenProvider = require('./tokenProvider');
@@ -20,7 +19,10 @@ const { ValidationError, NotFoundError } = require('../utils/errors');
 const { v4: uuidv4 } = require('uuid');
 const { getReadModelService } = require('./readModelService');
 const { getUpdateStream } = require('./cantonUpdateStream');
-const { getHoldingService } = require('./holdingService');
+const { getTransferRegistry } = require('./transferRegistryClient');
+
+// Configure Decimal for financial precision
+Decimal.set({ precision: 20, rounding: Decimal.ROUND_DOWN });
 
 class OrderService {
   constructor() {
@@ -28,180 +30,123 @@ class OrderService {
   }
 
   /**
-   * Calculate amount to lock for an order
-   * BUY order: lock quote currency (e.g., USDT)
-   * SELL order: lock base currency (e.g., BTC)
+   * Calculate amount to lock for an order (uses Decimal for precision).
+   * BUY order: lock quote currency (e.g., CBTC for CC/CBTC pair)
+   * SELL order: lock base currency (e.g., CC for CC/CBTC pair)
    * 
    * For MARKET orders, use estimatedPrice (from order book) 
-   * with a slippage buffer to ensure sufficient funds
+   * with a 5% slippage buffer to ensure sufficient funds.
    */
   calculateLockAmount(tradingPair, orderType, price, quantity, orderMode = 'LIMIT', estimatedPrice = null) {
     const [baseAsset, quoteAsset] = tradingPair.split('/');
-    const qty = parseFloat(quantity);
+    const qty = new Decimal(quantity);
 
     if (orderType.toUpperCase() === 'BUY') {
-      // For MARKET BUY: use estimated price with 5% slippage buffer
       let prc;
       if (orderMode.toUpperCase() === 'MARKET') {
-        prc = parseFloat(estimatedPrice) || 0;
-        // Add 5% slippage buffer for market orders
-        prc = prc * 1.05;
+        prc = new Decimal(estimatedPrice || '0').times('1.05'); // 5% slippage buffer
       } else {
-        prc = parseFloat(price) || 0;
+        prc = new Decimal(price || '0');
       }
       
-      // Lock quote currency (e.g., USDT = price * quantity)
       return {
         asset: quoteAsset,
-        amount: prc * qty
+        amount: prc.times(qty).toNumber()
       };
     } else {
-      // Lock base currency (e.g., BTC = quantity)
-      // Same for both LIMIT and MARKET sell orders
       return {
         asset: baseAsset,
-        amount: qty
+        amount: qty.toNumber()
       };
     }
   }
 
   /**
-   * TOKEN STANDARD: Lock Holdings for order placement
-   * Uses real Holding contracts (UTXO-like) instead of text balances
-   * 
-   * Flow:
-   * 1. Find available Holdings for the required asset
-   * 2. Select sufficient Holdings to cover the amount
-   * 3. Lock the Holding(s) with order reference
-   * 4. Return the locked Holding contractId
+   * Lock funds for order placement via Transfer Registry API.
+   * Returns the lockId (stored in order's allocationCid field on Canton).
    */
   async lockHoldingsForOrder(token, partyId, operatorPartyId, asset, amount, orderId) {
-    console.log(`[OrderService] TOKEN STANDARD: Locking ${amount} ${asset} from Holdings`);
+    console.log(`[OrderService] TRANSFER REGISTRY: Locking ${amount} ${asset} for order ${orderId}`);
     
-    const holdingService = getHoldingService();
-    await holdingService.initialize();
+    const transferRegistry = getTransferRegistry();
     
-    // 1. Find available Holdings that can cover the required amount
-    let holdingsResult;
+    // 1. Check available balance via Transfer Registry
     try {
-      holdingsResult = await holdingService.findHoldingsForAmount(partyId, asset, amount, token);
+      const balanceResponse = await transferRegistry.getBalance(partyId, asset);
+      const availableBalance = parseFloat(balanceResponse.balance?.available || '0');
+      
+      if (availableBalance < amount) {
+        throw new ValidationError(
+          `Insufficient ${asset} balance. Available: ${availableBalance}, Required: ${amount}`
+        );
+      }
+      console.log(`[OrderService] ✅ Balance check passed: ${availableBalance} ${asset} available (need ${amount})`);
     } catch (err) {
-      throw new ValidationError(`Insufficient ${asset} balance. Required: ${amount}. ${err.message}`);
+      if (err instanceof ValidationError) throw err;
+      console.warn(`[OrderService] Balance check failed (proceeding with lock attempt): ${err.message}`);
+      // Continue — the lock API itself will reject if insufficient
     }
     
-    console.log(`[OrderService] Found ${holdingsResult.holdings.length} Holdings with total ${holdingsResult.totalAmount} ${asset}`);
-    
-    // 2. Prefer custom Holdings (lockable) over Splice Holdings (cannot lock)
-    // findHoldingsForAmount already sorts custom first, but explicitly pick the
-    // first custom holding that covers the amount for reliable DvP settlement.
-    const allHoldings = holdingsResult.holdings;
-    
-    // Try to find a CUSTOM holding first (can be locked → enables atomic DvP)
-    let primaryHolding = allHoldings.find(h => {
-      const isSplice = h.isSplice || 
-        h.templateId?.includes('Splice') || 
-        h.templateId?.includes('Registry') ||
-        h.templateId?.includes('Utility');
-      return !isSplice && h.amount >= amount;
-    });
-    
-    // Fall back to any holding that covers the amount
-    if (!primaryHolding) {
-      primaryHolding = allHoldings.find(h => h.amount >= amount);
-    }
-    
-    if (!primaryHolding) {
-      throw new ValidationError(`Largest ${asset} Holding is less than required (${amount}). Please consolidate your holdings or mint more via "Get Test Funds".`);
-    }
-    
-    // 3. Check if this is a Splice holding (CBTC, Amulet, etc.)
-    // Splice holdings CANNOT be locked — they use a different template controlled by DSO.
-    // REQUIRE custom holdings for atomic DvP settlement. No Fill-Only mode.
-    const isSpliceHolding = primaryHolding.isSplice || 
-      primaryHolding.templateId?.includes('Splice') || 
-      primaryHolding.templateId?.includes('Registry') ||
-      primaryHolding.templateId?.includes('Utility');
-    
-    if (isSpliceHolding) {
-      // No custom holding available — use FILL_ONLY mode.
-      // Splice holdings (CBTC, Amulet/CC) can't be locked, so we place the order
-      // without a locked holding. The matching engine will use Fill-Only settlement
-      // (FillOrder + mintDirect) instead of atomic DvP.
-      console.log(`[OrderService] ⚠️ No custom ${asset} holding — using FILL_ONLY mode (Splice holdings can't be locked)`);
-      return {
-        lockedHoldingCid: 'FILL_ONLY',
-        lockedAmount: amount,
-        asset: asset
-      };
-    }
-    
-    console.log(`[OrderService] ✅ Found custom ${asset} holding (${primaryHolding.amount}) — locking for atomic DvP`);
-    
-    if (primaryHolding.amount < amount) {
-      throw new ValidationError(`Largest ${asset} Holding (${primaryHolding.amount}) is less than required (${amount}). Please consolidate your holdings.`);
-    }
-    
-    // 4. Lock the Holding for this order (custom holdings only)
+    // 2. Lock funds via Transfer Registry API
     try {
-      const lockResult = await holdingService.lockHolding(
-        primaryHolding.contractId,
-        operatorPartyId,        // Lock holder (operator manages order matching)
-        `ORDER:${orderId}`,     // Lock reason references the order
-        amount,                 // Lock amount
-        partyId,               // Owner party
-        token
-      );
+      const lockResponse = await transferRegistry.lockFunds({
+        party: partyId,
+        instrument: asset,          // "CBTC" or "CC" — case-sensitive
+        amount: amount.toString(),  // MUST be string
+        reason: orderId,            // Reference the order
+        expirySeconds: 86400,       // 24-hour expiry safety net
+      });
       
-      // CRITICAL: Use the NEW locked Holding contract ID, not the original (now archived) one!
-      // After Holding_Lock, the original contract is consumed and a new locked one is created.
-      const lockedCid = lockResult.newLockedHoldingCid || primaryHolding.contractId;
-      
-      console.log(`[OrderService] ✅ Holding locked for ${amount} ${asset}`);
-      console.log(`[OrderService]    Original CID: ${primaryHolding.contractId.substring(0, 25)}... (ARCHIVED)`);
-      console.log(`[OrderService]    Locked CID:   ${lockedCid.substring(0, 25)}... (ACTIVE)`);
+      const lockId = lockResponse.lockId;
+      console.log(`[OrderService] ✅ Funds locked via Transfer Registry`);
+      console.log(`[OrderService]    lockId: ${lockId}`);
+      console.log(`[OrderService]    amount: ${amount} ${asset}`);
+      console.log(`[OrderService]    remaining available: ${lockResponse.remainingBalance?.available || 'N/A'}`);
       
       return {
-        lockedHoldingCid: lockedCid,
+        lockId: lockId,     // Transfer Registry lockId → stored in allocationCid field
         lockedAmount: amount,
         asset: asset
       };
     } catch (lockError) {
-      console.error(`[OrderService] Failed to lock Holding:`, lockError.message);
-      throw new ValidationError(`Failed to lock ${asset} Holding: ${lockError.message}`);
+      console.error(`[OrderService] ❌ Transfer Registry lock failed:`, lockError.message);
+      throw new ValidationError(
+        `Failed to lock ${amount} ${asset}: ${lockError.message}`
+      );
     }
   }
 
   /**
-   * TOKEN STANDARD: Unlock Holdings when order is cancelled
+   * Unlock funds when order is cancelled via Transfer Registry API.
    */
-  async unlockHoldingsForOrder(token, partyId, lockedHoldingCid) {
-    console.log(`[OrderService] TOKEN STANDARD: Unlocking Holding ${lockedHoldingCid?.substring(0, 20)}...`);
+  async unlockHoldingsForOrder(token, partyId, lockId) {
+    console.log(`[OrderService] TRANSFER REGISTRY: Unlocking ${lockId?.substring(0, 30)}...`);
     
-    if (!lockedHoldingCid) {
-      console.warn('[OrderService] No locked Holding CID to unlock');
+    if (!lockId) {
+      console.warn('[OrderService] No lockId to unlock');
+      return;
+    }
+
+    // Skip unlock for old-style markers that aren't real lock IDs
+    if (lockId === 'FILL_ONLY' || lockId === 'NONE' || lockId === '') {
+      console.log(`[OrderService] Skipping unlock — marker value: "${lockId}"`);
       return;
     }
     
-    const holdingService = getHoldingService();
-    await holdingService.initialize();
+    const transferRegistry = getTransferRegistry();
     
     try {
-      await holdingService.unlockHolding(lockedHoldingCid, partyId, token);
-      console.log(`[OrderService] ✅ Holding unlocked successfully`);
+      await transferRegistry.unlockFunds(lockId);
+      console.log(`[OrderService] ✅ Funds unlocked via Transfer Registry`);
     } catch (err) {
-      console.error(`[OrderService] Failed to unlock Holding:`, err.message);
-      // Don't throw - order cancellation should still succeed
+      console.error(`[OrderService] ⚠️ Transfer Registry unlock failed:`, err.message);
+      // Don't throw — order cancellation should still proceed
     }
   }
 
   /**
-   * Place order using Canton JSON Ledger API v2
-   * POST /v2/commands/submit-and-wait-for-transaction
-   * 
-   * This creates an Order contract that:
-   * - Is visible to the operator (for matching)
-   * - Is visible to the owner (for cancellation)
-   * - Will lock funds via Balance contract Reserve choice
+   * Place order using Canton JSON Ledger API v2.
+   * Locks funds via Transfer Registry, then creates an Order contract on Canton.
    */
   async placeOrder(orderData) {
     const {
@@ -303,11 +248,10 @@ class OrderService {
     const lockInfo = this.calculateLockAmount(tradingPair, orderType, price, quantity, orderMode, estimatedPrice);
     console.log(`[OrderService] Order will lock ${lockInfo.amount} ${lockInfo.asset}`);
 
-    // ========= TOKEN STANDARD: LOCK HOLDINGS =========
-    // Uses real Holding contracts instead of text balances
-    let lockedHoldingInfo = null;
+    // ========= LOCK FUNDS VIA TRANSFER REGISTRY =========
+    let lockResult = null;
     try {
-      lockedHoldingInfo = await this.lockHoldingsForOrder(
+      lockResult = await this.lockHoldingsForOrder(
         token, 
         partyId, 
         operatorPartyId,
@@ -315,9 +259,9 @@ class OrderService {
         lockInfo.amount,
         orderId
       );
-      console.log(`[OrderService] TOKEN STANDARD: Locked Holding ${lockedHoldingInfo.lockedHoldingCid?.substring(0, 20)}...`);
+      console.log(`[OrderService] Funds locked — lockId: ${lockResult.lockId?.substring(0, 20)}...`);
     } catch (lockError) {
-      console.error(`[OrderService] Holding lock failed:`, lockError.message);
+      console.error(`[OrderService] Lock failed:`, lockError.message);
       throw new ValidationError(`Insufficient ${lockInfo.asset} balance. Required: ${lockInfo.amount}`);
     }
 
@@ -348,9 +292,8 @@ class OrderService {
         // Canton JSON API v2: Time is ISO 8601 datetime string
         timestamp: timestamp,
         operator: operatorPartyId,
-        // TOKEN STANDARD: Store locked Holding reference for atomic DvP settlement.
-        // ALL orders MUST have a locked custom holding — no Fill-Only mode.
-        allocationCid: lockedHoldingInfo?.lockedHoldingCid || ''
+        // Transfer Registry lockId — used for unlock on cancel / settlement
+        allocationCid: lockResult?.lockId || ''
       },
       readAs: [operatorPartyId, partyId]
     });
@@ -385,10 +328,10 @@ class OrderService {
       filled: '0',
       status: 'OPEN',
       timestamp: timestamp,
-      // TOKEN STANDARD: Track locked Holding
-      lockedHoldingCid: lockedHoldingInfo?.lockedHoldingCid || null,
-      lockedAmount: lockedHoldingInfo?.lockedAmount || null,
-      lockedAsset: lockedHoldingInfo?.asset || null
+      // Transfer Registry lockId
+      lockId: lockResult?.lockId || null,
+      lockedAmount: lockResult?.lockedAmount || null,
+      lockedAsset: lockResult?.asset || null
     };
     
     const updateStream = getUpdateStream();
@@ -470,8 +413,7 @@ class OrderService {
       remaining: quantity,
       lockedAsset: lockInfo.asset,
       lockedAmount: lockInfo.amount,
-      // TOKEN STANDARD: Return locked Holding info
-      lockedHoldingCid: lockedHoldingInfo?.lockedHoldingCid || null,
+      lockId: lockResult?.lockId || null,
       tokenStandard: true,
       timestamp: new Date().toISOString()
     };
@@ -526,13 +468,8 @@ class OrderService {
   }
 
   /**
-   * Cancel order using Canton JSON Ledger API v2
-   * POST /v2/commands/submit-and-wait-for-transaction (ExerciseCommand)
-   * 
-   * Cancellation:
-   * - Exercises CancelOrder choice on Order contract
-   * - Returns locked funds to available balance
-   * - Removes order from Global Order Book
+   * Cancel order: unlocks funds via Transfer Registry, then exercises
+   * CancelOrder on Canton to archive the Order contract.
    */
   async cancelOrder(orderContractId, partyId, tradingPair = null) {
     if (!orderContractId || !partyId) {
@@ -591,20 +528,18 @@ class OrderService {
       console.warn('[OrderService] Could not fetch order details before cancel:', e.message);
     }
 
-    // TOKEN STANDARD: Unlock the Holding before cancelling
-    // Only unlock if allocationCid is a real contract ID (not a marker like "FILL_ONLY", "NONE", or "")
-    const allocCid = orderDetails?.allocationCid || '';
-    const isRealAllocation = allocCid && allocCid !== 'FILL_ONLY' && allocCid !== 'NONE' && allocCid.length >= 40;
-    if (isRealAllocation) {
+    // Unlock funds via Transfer Registry before cancelling the on-chain order
+    const lockId = orderDetails?.allocationCid || '';
+    if (lockId && lockId !== 'FILL_ONLY' && lockId !== 'NONE' && lockId !== '') {
       try {
-        await this.unlockHoldingsForOrder(token, partyId, allocCid);
-        console.log(`[OrderService] TOKEN STANDARD: Holding unlocked for cancelled order`);
+        await this.unlockHoldingsForOrder(token, partyId, lockId);
+        console.log(`[OrderService] ✅ Funds unlocked for cancelled order`);
       } catch (unlockErr) {
-        console.warn('[OrderService] Could not unlock Holding:', unlockErr.message);
+        console.warn('[OrderService] Could not unlock funds:', unlockErr.message);
         // Continue with cancellation even if unlock fails
       }
     } else {
-      console.log(`[OrderService] No real allocationCid on order (${allocCid || 'empty'}) - skipping unlock`);
+      console.log(`[OrderService] No lockId on order (${lockId || 'empty'}) — skipping unlock`);
     }
 
     // Exercise CancelOrder choice on the Order contract
@@ -646,28 +581,21 @@ class OrderService {
     console.log(`[OrderService] ✅ Order cancelled: ${orderContractId}`);
 
     // If we didn't unlock before cancel (because we couldn't find order details),
-    // try to extract allocationCid from the archived event and unlock now
+    // try to extract lockId from the created (cancelled) order event and unlock now
     if (!orderDetails?.allocationCid && result?.transaction?.events) {
-      const archivedEvent = result.transaction.events.find(e => 
-        e.archived?.contractId === orderContractId
+      const createdEvent = result.transaction.events.find(e => 
+        e.created?.templateId?.includes('Order') && 
+        e.created?.createArguments?.status === 'CANCELLED'
       );
-      if (!archivedEvent) {
-        // Try to find allocationCid from the created (cancelled) order event
-        const createdEvent = result.transaction.events.find(e => 
-          e.created?.templateId?.includes('Order') && 
-          e.created?.createArguments?.status === 'CANCELLED'
-        );
-        const fallbackAllocationCid = createdEvent?.created?.createArguments?.allocationCid;
-        const isFallbackReal = fallbackAllocationCid && fallbackAllocationCid !== 'FILL_ONLY' && 
-          fallbackAllocationCid !== 'NONE' && fallbackAllocationCid.length >= 40;
-        if (isFallbackReal) {
-          console.log(`[OrderService] Found allocationCid from cancel result: ${fallbackAllocationCid.substring(0, 30)}...`);
-          try {
-            await this.unlockHoldingsForOrder(token, partyId, fallbackAllocationCid);
-            console.log(`[OrderService] TOKEN STANDARD: Holding unlocked (from cancel result)`);
-          } catch (unlockErr) {
-            console.warn('[OrderService] Post-cancel unlock failed:', unlockErr.message);
-          }
+      const fallbackLockId = createdEvent?.created?.createArguments?.allocationCid;
+      if (fallbackLockId && fallbackLockId !== 'FILL_ONLY' && 
+          fallbackLockId !== 'NONE' && fallbackLockId !== '') {
+        console.log(`[OrderService] Found lockId from cancel result: ${fallbackLockId.substring(0, 30)}...`);
+        try {
+          await this.unlockHoldingsForOrder(token, partyId, fallbackLockId);
+          console.log(`[OrderService] ✅ Funds unlocked (from cancel result)`);
+        } catch (unlockErr) {
+          console.warn('[OrderService] Post-cancel unlock failed:', unlockErr.message);
         }
       }
     }
@@ -1002,7 +930,6 @@ class OrderService {
         filled: payload.filled || '0',
         status: payload.status,
         timestamp: payload.timestamp,
-        // TOKEN STANDARD: Include locked Holding reference
         allocationCid: payload.allocationCid || null
       };
     } catch (error) {

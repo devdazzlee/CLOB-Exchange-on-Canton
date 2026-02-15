@@ -3,7 +3,7 @@
  */
 
 require('dotenv').config({ path: './backend/.env' });
-const tokenProvider = require('./backend/src/services/tokenProvider');
+const tokenProvider = require('../backend/src/services/tokenProvider');
 
 const PARTY_ID = "8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292";
 const CANTON_API = "http://65.108.40.104:31539";

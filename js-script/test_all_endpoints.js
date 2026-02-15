@@ -4,9 +4,9 @@
  */
 
 require('dotenv').config({ path: './backend/.env' });
-const cantonService = require('./backend/src/services/cantonService');
-const tokenProvider = require('./backend/src/services/tokenProvider');
-const { OPERATOR_PARTY_ID, CANTON_JSON_LEDGER_API_BASE } = require('./backend/src/config/constants');
+const cantonService = require('../backend/src/services/cantonService');
+const tokenProvider = require('../backend/src/services/tokenProvider');
+const { OPERATOR_PARTY_ID, CANTON_JSON_LEDGER_API_BASE } = require('../backend/src/config/constants');
 
 const PARTY_ID = OPERATOR_PARTY_ID;
 

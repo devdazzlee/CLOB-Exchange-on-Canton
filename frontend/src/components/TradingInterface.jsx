@@ -631,7 +631,7 @@ export default function TradingInterface({ partyId }) {
     };
   }, [partyId]);
 
-  // Load balance from Holdings (Token Standard V2) - useCallback so it can be called from child components
+  // Load balance from Transfer Registry (CC/CBTC) + Holdings (others) - useCallback so it can be called from child components
   const loadBalance = useCallback(async (showLoader = false) => {
     if (!partyId) return;
 
