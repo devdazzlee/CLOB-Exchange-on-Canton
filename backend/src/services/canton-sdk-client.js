@@ -176,7 +176,8 @@ class CantonSDKClient {
       // Set Transfer Factory Registry URL
       // The SDK uses this to fetch the TransferFactory and choice contexts
       // from the Scan Proxy at /registry/transfer-instruction/v1/*
-      this.sdk.tokenStandard?.setTransferFactoryRegistryUrl(registryUrl);
+      // CRITICAL: SDK expects a URL object (it calls .href internally), NOT a string
+      this.sdk.tokenStandard?.setTransferFactoryRegistryUrl(new URL(registryUrl));
       console.log(`[CantonSDK] ✅ Transfer Factory Registry configured: ${registryUrl}`);
 
       // Discover instrument admin party (needed for createTransfer)
@@ -254,6 +255,14 @@ class CantonSDKClient {
             if (this.currentPartyId !== partyId) {
               await this.sdk.setPartyId(partyId);
               this.currentPartyId = partyId;
+              // CRITICAL: setPartyId recreates the TokenStandardController via
+              // the factory, so the new controller loses its registry URL.
+              // Re-set it after every context switch.
+              // NOTE: SDK expects a URL object (it calls .href internally), NOT a string.
+              const registryUrl = CANTON_SDK_CONFIG.REGISTRY_API_URL;
+              if (registryUrl && this.sdk.tokenStandard) {
+                this.sdk.tokenStandard.setTransferFactoryRegistryUrl(new URL(registryUrl));
+              }
             }
             const result = await operation();
             resolve(result);
@@ -474,7 +483,10 @@ class CantonSDKClient {
       const commands = Array.isArray(transferCommand) ? transferCommand : [transferCommand];
 
       let result = null;
-      for (const cmd of commands) {
+      for (const rawCmd of commands) {
+        // SDK wraps commands as { ExerciseCommand: { templateId, contractId, choice, choiceArgument } }
+        const cmd = rawCmd.ExerciseCommand || rawCmd;
+
         // Log command details for debugging
         console.log(`[CantonSDK]    Submitting exercise: ${cmd.choice || 'unknown'} on ${cmd.contractId?.substring(0, 30) || 'unknown'}...`);
 
@@ -564,7 +576,10 @@ class CantonSDKClient {
       const commands = Array.isArray(acceptCommand) ? acceptCommand : [acceptCommand];
 
       let result = null;
-      for (const cmd of commands) {
+      for (const rawCmd of commands) {
+        // SDK wraps commands as { ExerciseCommand: { templateId, contractId, choice, choiceArgument } }
+        const cmd = rawCmd.ExerciseCommand || rawCmd;
+
         result = await cantonService.exerciseChoice({
           token: adminToken,
           actAsParty: [receiverPartyId],
@@ -682,7 +697,10 @@ class CantonSDKClient {
       const commands = Array.isArray(withdrawCommand) ? withdrawCommand : [withdrawCommand];
 
       let result = null;
-      for (const cmd of commands) {
+      for (const rawCmd of commands) {
+        // SDK wraps commands as { ExerciseCommand: { templateId, contractId, choice, choiceArgument } }
+        const cmd = rawCmd.ExerciseCommand || rawCmd;
+
         result = await cantonService.exerciseChoice({
           token: adminToken,
           actAsParty: [senderPartyId],
@@ -729,7 +747,10 @@ class CantonSDKClient {
       const commands = Array.isArray(rejectCommand) ? rejectCommand : [rejectCommand];
 
       let result = null;
-      for (const cmd of commands) {
+      for (const rawCmd of commands) {
+        // SDK wraps commands as { ExerciseCommand: { templateId, contractId, choice, choiceArgument } }
+        const cmd = rawCmd.ExerciseCommand || rawCmd;
+
         result = await cantonService.exerciseChoice({
           token: adminToken,
           actAsParty: [receiverPartyId],

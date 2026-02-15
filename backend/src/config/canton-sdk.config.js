@@ -27,9 +27,10 @@ const CANTON_SDK_CONFIG = {
   // The SDK TokenStandardController takes this as its "base" URL
   VALIDATOR_API_URL: process.env.VALIDATOR_API_URL || `${SCAN_PROXY_BASE}/api/validator`,
 
-  // Registry API URL — the Scan Proxy path used by SDK's setTransferFactoryRegistryUrl()
-  // This is where the Transfer Factory Registry API lives
-  REGISTRY_API_URL: process.env.REGISTRY_API_URL || `${SCAN_PROXY_BASE}/api/validator/v0/scan-proxy`,
+  // Registry API URL — used by SDK's setTransferFactoryRegistryUrl()
+  // openapi-fetch concatenates this with "/registry/transfer-instruction/v1/..."
+  // so it must be the bare host — NOT the scan-proxy sub-path
+  REGISTRY_API_URL: process.env.REGISTRY_API_URL || SCAN_PROXY_BASE,
 
   // Scan API URL — used by SDK's TokenStandardController for scan-based lookups
   SCAN_API_URL: process.env.SCAN_API_URL || `${SCAN_PROXY_BASE}/api/scan`,
