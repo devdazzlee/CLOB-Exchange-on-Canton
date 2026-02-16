@@ -94,7 +94,7 @@ const CANTON_SDK_CONFIG = {
 // 
 // CBTC uses a DIFFERENT Transfer Factory Registry than CC:
 // - CC  → Splice SDK → Scan Proxy at http://65.108.40.104:8088
-// - CBTC → Utilities Backend API → https://api.utilities.digitalasset-dev.com/api/utilities
+// - CBTC → Utilities Backend API → https://api.utilities.digitalasset-dev.com/api/token-standard
 //
 // The Utilities Backend API has a different path structure:
 //   ${BACKEND}/v0/registrars/${ADMIN_PARTY}/registry/transfer-instruction/v1/transfer-factory
