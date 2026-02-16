@@ -171,10 +171,22 @@ function createApp() {
 
   // Health check (before API routes)
   app.get('/health', (req, res) => {
+    let sdkStatus = 'unknown';
+    try {
+      const { getCantonSDKClient } = require('./services/canton-sdk-client');
+      const sdkClient = getCantonSDKClient();
+      sdkStatus = sdkClient.isReady() ? 'ready' : (sdkClient.initialized ? 'initialized_not_ready' : `not_initialized: ${sdkClient.initError || 'pending'}`);
+    } catch (e) {
+      sdkStatus = `error: ${e.message}`;
+    }
+
     res.json({
       status: 'healthy',
       timestamp: new Date().toISOString(),
       uptime: process.uptime(),
+      sdkStatus,
+      sdkInitDone: _sdkInitDone,
+      isServerless: !!(process.env.VERCEL === '1' || process.env.VERCEL_ENV),
       config: {
         cantonConfigured: !!config.canton.jsonApiBase,
         operatorConfigured: !!config.canton.operatorPartyId,
