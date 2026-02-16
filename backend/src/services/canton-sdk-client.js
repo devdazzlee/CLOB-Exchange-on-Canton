@@ -46,9 +46,9 @@ try {
   ValidatorController = walletSdk.ValidatorController;
   console.log('[CantonSDK] ✅ @canton-network/wallet-sdk loaded');
 } catch (e) {
-  sdkLoadError = e.message;
-  console.error('[CantonSDK] ❌ SDK not available:', e.message);
-  console.error('[CantonSDK] Install: yarn add @canton-network/wallet-sdk');
+  sdkLoadError = `${e.code || 'UNKNOWN'}: ${e.message}`;
+  console.error('[CantonSDK] ❌ SDK require() failed:', e.code, e.message);
+  console.error('[CantonSDK] ❌ Stack:', (e.stack || '').split('\n').slice(0, 5).join('\n'));
 }
 
 // ─── SDK Client ────────────────────────────────────────────────────────────
@@ -87,7 +87,7 @@ class CantonSDKClient {
   async _doInitialize() {
 
     if (!WalletSDKImpl) {
-      this.initError = 'Canton Wallet SDK not installed. Run: yarn add @canton-network/wallet-sdk';
+      this.initError = `SDK package not loaded: ${sdkLoadError || 'require() failed'}`;
       console.error(`[CantonSDK] ❌ ${this.initError}`);
       return;
     }
