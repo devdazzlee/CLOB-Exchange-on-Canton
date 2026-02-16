@@ -12,6 +12,7 @@
 
 const config = require('../config');
 const { getTokenStandardTemplateIds, OPERATOR_PARTY_ID, DSO_PARTY_ID, REGISTRY_BACKEND_API, SCAN_PROXY_API, VALIDATOR_SCAN_PROXY_API, TEMPLATE_IDS } = require('../config/constants');
+const { UTILITIES_CONFIG } = require('../config/canton-sdk.config');
 const tokenProvider = require('./tokenProvider');
 
 // Get canton service instance
@@ -205,12 +206,27 @@ class TransferOfferService {
         console.log(`[TransferOfferService] Template hint: ${templateId.substring(0, 60)}...`);
       }
       
-      // ─── Approach 1: Canton SDK client (works for ALL transfer types) ──────────
+      // ─── Detect token type from template ID ────────────────────────────────────
+      // Utility.Registry.App → CBTC (Utilities token)
+      // Splice.Amulet → CC (Amulet/Splice token)
+      let detectedSymbol = null;
+      const templateLower = (templateId || '').toLowerCase();
+      if (templateLower.includes('utility') || templateLower.includes('cbtc')) {
+        detectedSymbol = 'CBTC';
+        console.log(`[TransferOfferService] Detected: CBTC (Utilities token)`);
+      } else if (templateLower.includes('amulet') || templateLower.includes('splice.amulet')) {
+        detectedSymbol = 'CC';
+        console.log(`[TransferOfferService] Detected: CC (Amulet/Splice token)`);
+      } else {
+        console.log(`[TransferOfferService] Token type unknown from template, will try all approaches`);
+      }
+      
+      // ─── Approach 1: Canton SDK client ─────────────────────────────────────────
       const sdkClient = getSDKClient();
       if (sdkClient && sdkClient.isReady()) {
         try {
-          console.log('[TransferOfferService] Using Canton SDK to accept transfer...');
-          const result = await sdkClient.acceptTransfer(offerContractId, partyId);
+          console.log(`[TransferOfferService] Using Canton SDK to accept transfer (symbol: ${detectedSymbol || 'auto'})...`);
+          const result = await sdkClient.acceptTransfer(offerContractId, partyId, detectedSymbol);
           console.log('[TransferOfferService] ✅ Transfer accepted via Canton SDK!');
           return { success: true, offerContractId, usedSdk: true, result };
         } catch (sdkError) {
@@ -220,72 +236,157 @@ class TransferOfferService {
         console.log('[TransferOfferService] SDK not ready, skipping SDK approach');
       }
       
-      // ─── Approach 2: Direct Scan Proxy API ──────────────────────────────────────
-      // The Transfer Registry API is at: /registry/transfer-instruction/v1/{id}/choice-contexts/accept
-      // Available via scan proxy at: http://65.108.40.104:8088
-      const scanProxyBase = SCAN_PROXY_API || 'http://65.108.40.104:8088';
-      
-      // Try two URL patterns: direct and via validator scan-proxy prefix
-      const urlPatterns = [
-        `${scanProxyBase}/api/validator/v0/scan-proxy/registry/transfer-instruction/v1/${offerContractId}/choice-contexts/accept`,
-        `${scanProxyBase}/registry/transfer-instruction/v1/${offerContractId}/choice-contexts/accept`,
-      ];
-      
       const adminToken = token || await tokenProvider.getServiceToken();
       
-      for (const acceptUrl of urlPatterns) {
-        try {
-          console.log(`[TransferOfferService] Trying: ${acceptUrl.substring(0, 80)}...`);
-          
-          const contextResponse = await fetch(acceptUrl, {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${adminToken}`,
-              'Content-Type': 'application/json',
-              'Accept': 'application/json',
-            },
-            body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
-          });
-          
-          if (!contextResponse.ok) {
-            const errorText = await contextResponse.text();
-            console.log(`[TransferOfferService] ${contextResponse.status}: ${errorText.substring(0, 100)}`);
-            continue; // Try next URL pattern
-          }
-          
-          const contextData = await contextResponse.json();
-          console.log(`[TransferOfferService] ✅ Got choice context (${contextData.disclosedContracts?.length || 0} disclosed contracts)`);
-          
-          // Prepare disclosed contracts
-          const disclosedContracts = (contextData.disclosedContracts || []).map(dc => ({
-            templateId: dc.templateId,
-            contractId: dc.contractId,
-            createdEventBlob: dc.createdEventBlob,
-            ...(dc.synchronizerId && { synchronizerId: dc.synchronizerId }),
-          }));
-          
-          const choiceContextData = contextData.choiceContextData || contextData.choiceContext?.choiceContextData || { values: {} };
-          
-          // Execute the Accept choice on the TransferInstruction
-          const result = await this.cantonService.exerciseChoice({
-            token: adminToken,
-            templateId: TRANSFER_INSTRUCTION_INTERFACE,
-            contractId: offerContractId,
-            choice: 'TransferInstruction_Accept',
-            choiceArgument: {
-              extraArgs: {
-                context: choiceContextData,
-                meta: { values: {} },
+      // ─── Approach 2: Utilities/Registry Backend API (for CBTC) ────────────────
+      // Tries multiple URL patterns for the accept choice context
+      if (detectedSymbol === 'CBTC' || !detectedSymbol) {
+        const backendUrl = UTILITIES_CONFIG.BACKEND_URL;
+        const adminParty = UTILITIES_CONFIG.CBTC_ADMIN_PARTY;
+        const encodedCid = encodeURIComponent(offerContractId);
+        const scanProxyBase = SCAN_PROXY_API || 'http://65.108.40.104:8088';
+        
+        const utilitiesUrls = [
+          // Pattern 1: Token Standard API (client-provided URL)
+          `${backendUrl}/v0/registrars/${encodeURIComponent(adminParty)}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`,
+          // Pattern 2: Without encoding admin party
+          `${backendUrl}/v0/registrars/${adminParty}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`,
+          // Pattern 3: Scan Proxy registry endpoint
+          `${scanProxyBase}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`,
+          // Pattern 4: Validator API direct accept
+          `${scanProxyBase}/api/validator/v0/wallet/transfer-offers/${encodedCid}/accept`,
+        ];
+        
+        for (const acceptContextUrl of utilitiesUrls) {
+          try {
+            console.log(`[TransferOfferService] Trying: ${acceptContextUrl.substring(0, 120)}...`);
+            
+            const contextResponse = await fetch(acceptContextUrl, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${adminToken}`,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
               },
-            },
-            actAsParty: [partyId],
-            disclosedContracts,
-          });
-          
-          console.log('[TransferOfferService] ✅ Transfer accepted via Scan Proxy!');
-          return { success: true, offerContractId, usedScanProxy: true, result };
-        } catch (urlError) {
-          console.log(`[TransferOfferService] URL pattern failed: ${(urlError?.message || String(urlError)).substring(0, 100)}`);
+              body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
+            });
+            
+            if (contextResponse.ok) {
+              const acceptContext = await contextResponse.json();
+              
+              // If validator API direct accept (Pattern 4), it accepted directly
+              if (acceptContextUrl.includes('/wallet/transfer-offers/')) {
+                console.log('[TransferOfferService] ✅ Transfer accepted directly via Validator API!');
+                return { success: true, offerContractId, usedValidatorApi: true, result: acceptContext };
+              }
+              
+              console.log(`[TransferOfferService] ✅ Got accept context (${acceptContext.disclosedContracts?.length || 0} disclosed contracts)`);
+              
+              // Default synchronizerId from config (REQUIRED by Canton JSON API v2)
+              const defaultSyncId = config.canton.synchronizerId;
+              
+              const disclosedContracts = (acceptContext.disclosedContracts || []).map(dc => ({
+                templateId: dc.templateId,
+                contractId: dc.contractId,
+                createdEventBlob: dc.createdEventBlob,
+                synchronizerId: dc.synchronizerId || defaultSyncId,
+              }));
+              
+              const choiceContextData = acceptContext.choiceContextData || acceptContext.choiceContext?.choiceContextData || { values: {} };
+              const utilitiesInterface = UTILITIES_CONFIG.TRANSFER_INSTRUCTION_INTERFACE || TRANSFER_INSTRUCTION_INTERFACE;
+              
+              const result = await this.cantonService.exerciseChoice({
+                token: adminToken,
+                templateId: utilitiesInterface,
+                contractId: offerContractId,
+                choice: 'TransferInstruction_Accept',
+                choiceArgument: {
+                  extraArgs: {
+                    context: choiceContextData,
+                    meta: { values: {} },
+                  },
+                },
+                actAsParty: [partyId],
+                disclosedContracts,
+                synchronizerId: defaultSyncId,
+              });
+              
+              console.log('[TransferOfferService] ✅ Transfer accepted via Utilities Backend API!');
+              return { success: true, offerContractId, usedUtilitiesApi: true, result };
+            } else {
+              const errorText = await contextResponse.text();
+              console.log(`[TransferOfferService] ${contextResponse.status}: ${errorText.substring(0, 150)}`);
+            }
+          } catch (utilError) {
+            console.log(`[TransferOfferService] Failed: ${(utilError?.message || String(utilError)).substring(0, 120)}`);
+          }
+        }
+        console.log(`[TransferOfferService] All Utilities/Registry URL patterns failed for CBTC`);
+      }
+      
+      // ─── Approach 3: Scan Proxy API (for CC/Amulet) ────────────────────────────
+      if (detectedSymbol === 'CC' || !detectedSymbol) {
+        const scanProxyBase = SCAN_PROXY_API || 'http://65.108.40.104:8088';
+        
+        const urlPatterns = [
+          `${scanProxyBase}/registry/transfer-instruction/v1/${offerContractId}/choice-contexts/accept`,
+          `${scanProxyBase}/api/validator/v0/scan-proxy/registry/transfer-instruction/v1/${offerContractId}/choice-contexts/accept`,
+        ];
+        
+        for (const acceptUrl of urlPatterns) {
+          try {
+            console.log(`[TransferOfferService] Trying Scan Proxy: ${acceptUrl.substring(0, 80)}...`);
+            
+            const contextResponse = await fetch(acceptUrl, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${adminToken}`,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+              },
+              body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
+            });
+            
+            if (!contextResponse.ok) {
+              const errorText = await contextResponse.text();
+              console.log(`[TransferOfferService] ${contextResponse.status}: ${errorText.substring(0, 100)}`);
+              continue;
+            }
+            
+            const contextData = await contextResponse.json();
+            console.log(`[TransferOfferService] ✅ Got choice context (${contextData.disclosedContracts?.length || 0} disclosed contracts)`);
+            
+            const defaultSyncId2 = config.canton.synchronizerId;
+            const disclosedContracts = (contextData.disclosedContracts || []).map(dc => ({
+              templateId: dc.templateId,
+              contractId: dc.contractId,
+              createdEventBlob: dc.createdEventBlob,
+              synchronizerId: dc.synchronizerId || defaultSyncId2,
+            }));
+            
+            const choiceContextData = contextData.choiceContextData || contextData.choiceContext?.choiceContextData || { values: {} };
+            
+            const result = await this.cantonService.exerciseChoice({
+              token: adminToken,
+              templateId: TRANSFER_INSTRUCTION_INTERFACE,
+              contractId: offerContractId,
+              choice: 'TransferInstruction_Accept',
+              choiceArgument: {
+                extraArgs: {
+                  context: choiceContextData,
+                  meta: { values: {} },
+                },
+              },
+              actAsParty: [partyId],
+              disclosedContracts,
+              synchronizerId: defaultSyncId2,
+            });
+            
+            console.log('[TransferOfferService] ✅ Transfer accepted via Scan Proxy!');
+            return { success: true, offerContractId, usedScanProxy: true, result };
+          } catch (urlError) {
+            console.log(`[TransferOfferService] URL pattern failed: ${(urlError?.message || String(urlError)).substring(0, 100)}`);
+          }
         }
       }
       

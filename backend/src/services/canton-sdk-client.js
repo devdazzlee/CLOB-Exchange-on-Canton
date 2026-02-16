@@ -780,31 +780,69 @@ class CantonSDKClient {
   async _acceptUtilitiesTransfer(transferInstructionId, receiverPartyId, symbol) {
     const adminParty = getInstrumentAdmin(symbol);
     const backendUrl = UTILITIES_CONFIG.BACKEND_URL;
+    const encodedCid = encodeURIComponent(transferInstructionId);
 
     console.log(`[CantonSDK]    Using Utilities Backend API for ${symbol} accept`);
 
-    // Step 1: Get accept choice context from Utilities Backend
-    const acceptContextUrl = `${backendUrl}/v0/registrars/${adminParty}/registry/transfer-instruction/v1/${transferInstructionId}/choice-contexts/accept`;
+    // Try multiple URL patterns for the accept context
+    const urlPatterns = [
+      // Pattern 1: Token Standard API (client-provided URL)
+      `${backendUrl}/v0/registrars/${encodeURIComponent(adminParty)}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`,
+      // Pattern 2: Without URL-encoding the admin party
+      `${backendUrl}/v0/registrars/${adminParty}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`,
+      // Pattern 3: Scan Proxy / Validator registry endpoint  
+      `${CANTON_SDK_CONFIG.SCAN_PROXY_URL}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`,
+      // Pattern 4: Validator API accept endpoint
+      `${CANTON_SDK_CONFIG.VALIDATOR_API_URL}/v0/wallet/transfer-offers/${encodedCid}/accept`,
+    ];
 
-    const contextResponse = await fetch(acceptContextUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        meta: {},
-        excludeDebugFields: true,
-      }),
-    });
+    let contextResponse = null;
+    let acceptContextUrl = null;
+    
+    for (const url of urlPatterns) {
+      try {
+        console.log(`[CantonSDK]    Trying: ${url.substring(0, 120)}...`);
+        const resp = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            meta: {},
+            excludeDebugFields: true,
+          }),
+        });
+        
+        if (resp.ok) {
+          contextResponse = resp;
+          acceptContextUrl = url;
+          console.log(`[CantonSDK]    ✅ Got response from: ${url.substring(0, 80)}...`);
+          break;
+        } else {
+          const errorText = await resp.text();
+          console.log(`[CantonSDK]    ❌ ${resp.status} from: ${url.substring(0, 80)}... — ${errorText.substring(0, 100)}`);
+        }
+      } catch (fetchErr) {
+        console.log(`[CantonSDK]    ❌ Fetch error: ${fetchErr.message?.substring(0, 100)}`);
+      }
+    }
 
-    if (!contextResponse.ok) {
-      const errorText = await contextResponse.text();
-      throw new Error(`Utilities accept context API failed (${contextResponse.status}): ${errorText}`);
+    if (!contextResponse) {
+      throw new Error(`Utilities accept context API failed: all URL patterns returned errors`);
     }
 
     const acceptContext = await contextResponse.json();
+    
+    // If the validator API directly accepted (Pattern 4), it returns a result directly
+    if (acceptContextUrl && acceptContextUrl.includes('/wallet/transfer-offers/')) {
+      console.log(`[CantonSDK]    ✅ Transfer accepted directly via Validator API`);
+      return acceptContext;
+    }
+
     console.log(`[CantonSDK]    ✅ Accept context received (${acceptContext.disclosedContracts?.length || 0} disclosed contracts)`);
 
     // Step 2: Submit TransferInstruction_Accept to Canton Ledger
     const adminToken = await tokenProvider.getServiceToken();
+    const defaultSyncId = CANTON_SDK_CONFIG.LEDGER_API_URL ? 
+      (process.env.DEFAULT_SYNCHRONIZER_ID || 'global-domain::1220be58c29e65de40bf273be1dc2b266d43a9a002ea5b18955aeef7aac881bb471a') : null;
 
     const result = await cantonService.exerciseChoice({
       token: adminToken,
@@ -819,11 +857,12 @@ class CantonSDKClient {
         },
       },
       readAs: [receiverPartyId],
+      synchronizerId: defaultSyncId,
       disclosedContracts: (acceptContext.disclosedContracts || []).map(dc => ({
         templateId: dc.templateId,
         contractId: dc.contractId,
         createdEventBlob: dc.createdEventBlob,
-        ...(dc.synchronizerId && { synchronizerId: dc.synchronizerId }),
+        synchronizerId: dc.synchronizerId || defaultSyncId,
       })),
     });
 

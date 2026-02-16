@@ -102,8 +102,9 @@ const CANTON_SDK_CONFIG = {
 // Reference: https://docs.digitalasset.com/utilities/devnet/how-tos/registry/transfer/transfer.html
 // ═══════════════════════════════════════════════════════════════════════════
 const UTILITIES_CONFIG = {
-  // DevNet Utilities Backend API
-  BACKEND_URL: process.env.UTILITIES_BACKEND_URL || 'https://api.utilities.digitalasset-dev.com/api/utilities',
+  // DevNet Utilities Backend API (Token Standard)
+  // Client confirmed: use https://api.utilities.digitalasset-dev.com/api/token-standard for dev
+  BACKEND_URL: process.env.UTILITIES_BACKEND_URL || 'https://api.utilities.digitalasset-dev.com/api/token-standard',
 
   // CBTC Admin Party (cBTC Network registrar)
   CBTC_ADMIN_PARTY: process.env.CBTC_ADMIN_PARTY || 'cbtc-network::12202a83c6f4082217c175e29bc53da5f2703ba2675778ab99217a5a881a949203ff',

@@ -301,13 +301,14 @@ class CantonService {
     const templateIdString = templateIdToString(templateId);
 
     // Build correct v2 API structure with top-level "commands" object
-    // NOTE: synchronizerId is NOT a valid field in submit-and-wait-for-transaction
     // CRITICAL: Use "ExerciseCommand" (capitalized) not "exercise" per JSON Ledger API v2 spec
     const body = {
       commands: {
         commandId: commandId || `cmd-exercise-${crypto.randomUUID()}`,
         actAs,
         ...(readAs.length > 0 && { readAs }),
+        // domainId / synchronizerId - required when using disclosed contracts (e.g., Splice transfers)
+        ...(synchronizerId && { domainId: synchronizerId }),
         commands: [{
           ExerciseCommand: {
             templateId: templateIdString,
