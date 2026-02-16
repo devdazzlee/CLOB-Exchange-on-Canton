@@ -34,6 +34,47 @@ console.log('📋 Configuration Summary:');
 console.log(JSON.stringify(config.getSummary(), null, 2));
 console.log('');
 
+// ─────────────────────────────────────────────────────────────────────
+// Lazy SDK initialization for Vercel serverless (cold starts)
+// On Vercel, there's no persistent server — each request may cold-start.
+// We initialize the SDK on first request and cache it for the lifetime
+// of the serverless function instance.
+// ─────────────────────────────────────────────────────────────────────
+let _sdkInitPromise = null;
+let _sdkInitDone = false;
+
+async function ensureSDKInitialized() {
+  if (_sdkInitDone) return;
+  if (_sdkInitPromise) return _sdkInitPromise;
+
+  _sdkInitPromise = (async () => {
+    try {
+      console.log('[Vercel] 🔄 Lazy-initializing Canton Wallet SDK...');
+      const { getCantonSDKClient } = require('./services/canton-sdk-client');
+      const sdkClient = getCantonSDKClient();
+      await sdkClient.initialize();
+      if (sdkClient.isReady()) {
+        console.log('[Vercel] ✅ Canton Wallet SDK initialized and ready');
+      } else {
+        console.warn('[Vercel] ⚠️  Canton Wallet SDK initialized but not ready');
+      }
+    } catch (err) {
+      console.error('[Vercel] ❌ Canton Wallet SDK init failed:', err.message);
+    }
+
+    // Also init Read Model (non-critical)
+    try {
+      await initializeReadModel();
+    } catch (err) {
+      console.warn('[Vercel] ⚠️  Read Model init failed:', err.message);
+    }
+
+    _sdkInitDone = true;
+  })();
+
+  return _sdkInitPromise;
+}
+
 /**
  * Create Express application
  */
@@ -41,6 +82,21 @@ function createApp() {
   const isServerless = process.env.VERCEL === '1' || !!process.env.VERCEL_ENV;
   const app = express();
   const server = http.createServer(app);
+
+  // ── Vercel: Lazy SDK init middleware ──
+  // Ensures the Canton SDK is initialized before any API request is processed.
+  // On local server, this is skipped (SDK init happens in startServer).
+  if (isServerless) {
+    app.use(async (req, res, next) => {
+      try {
+        await ensureSDKInitialized();
+      } catch (err) {
+        // Non-fatal: continue even if SDK init fails
+        console.warn('[Vercel] SDK init middleware error:', err.message);
+      }
+      next();
+    });
+  }
 
   // Middleware - CORS configuration
   app.use(cors({
