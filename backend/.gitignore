@@ -35,3 +35,6 @@ build/
 tmp/
 temp/
 *.tmp
+
+# Runtime data (trades cache, etc.)
+data/

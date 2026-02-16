@@ -158,7 +158,7 @@ class OrderBookService {
      *   baseAmount, quoteAmount, price, buyOrderId, sellOrderId, timestamp
      */
     async getTrades(tradingPair, limit = 50) {
-        console.log(`[OrderBookService] Querying Canton DIRECTLY for trades: ${tradingPair}`);
+        console.log(`[OrderBookService] Querying trades for ${tradingPair} (Canton + cache)`);
         
         const token = await tokenProvider.getServiceToken();
         const packageId = config.canton.packageIds?.clobExchange;
@@ -169,22 +169,62 @@ class OrderBookService {
             return [];
         }
 
+        // ═══ STEP 1: Check file-backed cache FIRST ═══
+        const tradeMap = new Map();
+        let cacheCount = 0;
         try {
+            const { getUpdateStream } = require('./cantonUpdateStream');
+            const updateStream = getUpdateStream();
+            const cachedTrades = updateStream.getTradesForPair(tradingPair, limit * 2);
+            for (const ct of cachedTrades) {
+                const tid = ct.tradeId;
+                if (tid) {
+                    tradeMap.set(tid, ct);
+                    cacheCount++;
+                }
+            }
+        } catch (e) {
+            // Non-critical
+        }
+
+        try {
+            // ═══ STEP 2: Query Canton ═══
             // Settlement:Trade exists ONLY in current package (TOKEN_STANDARD_PACKAGE_ID)
             // Trade:Trade exists ONLY in legacy package (LEGACY_PACKAGE_ID)
             // Canton API rejects entire query if ANY template ID is invalid,
             // so query each package separately and merge.
-            let contracts = [];
 
             // 1. Current package: Settlement:Trade
             try {
                 const currentContracts = await cantonService.queryActiveContracts({
                     party: operatorPartyId,
                     templateIds: [`${packageId}:Settlement:Trade`],
-                    pageSize: limit
+                    pageSize: Math.min(limit, 100)
                 }, token);
-                if (Array.isArray(currentContracts)) {
-                    contracts = contracts.concat(currentContracts);
+                if (Array.isArray(currentContracts) && currentContracts.length > 0) {
+                    for (const c of currentContracts) {
+                        const payload = c.payload || c.createArgument || {};
+                        const baseSymbol = payload.baseInstrumentId?.symbol || '';
+                        const quoteSymbol = payload.quoteInstrumentId?.symbol || '';
+                        const pair = (baseSymbol && quoteSymbol)
+                            ? `${baseSymbol}/${quoteSymbol}`
+                            : (payload.tradingPair || '');
+                        if (pair !== tradingPair) continue;
+                        const tradeId = payload.tradeId || c.contractId;
+                        tradeMap.set(tradeId, {
+                            contractId: c.contractId,
+                            tradeId,
+                            tradingPair: pair,
+                            buyer: payload.buyer,
+                            seller: payload.seller,
+                            price: payload.price,
+                            quantity: payload.baseAmount || payload.quantity,
+                            quoteAmount: payload.quoteAmount,
+                            buyOrderId: payload.buyOrderId,
+                            sellOrderId: payload.sellOrderId,
+                            timestamp: payload.timestamp,
+                        });
+                    }
                 }
             } catch (e) {
                 console.warn(`[OrderBookService] Settlement:Trade query failed: ${e.message}`);
@@ -196,48 +236,52 @@ class OrderBookService {
                     const legacyContracts = await cantonService.queryActiveContracts({
                         party: operatorPartyId,
                         templateIds: [`${legacyPackageId}:Trade:Trade`],
-                        pageSize: limit
+                        pageSize: Math.min(limit, 100)
                     }, token);
                     if (Array.isArray(legacyContracts)) {
-                        contracts = contracts.concat(legacyContracts);
+                        for (const c of legacyContracts) {
+                            const payload = c.payload || c.createArgument || {};
+                            const baseSymbol = payload.baseInstrumentId?.symbol || '';
+                            const quoteSymbol = payload.quoteInstrumentId?.symbol || '';
+                            const pair = (baseSymbol && quoteSymbol)
+                                ? `${baseSymbol}/${quoteSymbol}`
+                                : (payload.tradingPair || '');
+                            if (pair !== tradingPair) continue;
+                            const tradeId = payload.tradeId || c.contractId;
+                            if (!tradeMap.has(tradeId)) {
+                                tradeMap.set(tradeId, {
+                                    contractId: c.contractId,
+                                    tradeId,
+                                    tradingPair: pair,
+                                    buyer: payload.buyer,
+                                    seller: payload.seller,
+                                    price: payload.price,
+                                    quantity: payload.baseAmount || payload.quantity,
+                                    quoteAmount: payload.quoteAmount,
+                                    buyOrderId: payload.buyOrderId,
+                                    sellOrderId: payload.sellOrderId,
+                                    timestamp: payload.timestamp,
+                                });
+                            }
+                        }
                     }
                 } catch (e) {
                     console.warn(`[OrderBookService] Legacy Trade:Trade query failed: ${e.message}`);
                 }
             }
 
-            const trades = (Array.isArray(contracts) ? contracts : [])
-                .map(c => {
-                    const payload = c.payload || c.createArgument || {};
-                    // Derive tradingPair from instrument IDs
-                    const baseSymbol = payload.baseInstrumentId?.symbol || '';
-                    const quoteSymbol = payload.quoteInstrumentId?.symbol || '';
-                    const pair = (baseSymbol && quoteSymbol)
-                        ? `${baseSymbol}/${quoteSymbol}`
-                        : (payload.tradingPair || '');
-                    return {
-                        contractId: c.contractId,
-                        tradeId: payload.tradeId,
-                        tradingPair: pair,
-                        buyer: payload.buyer,
-                        seller: payload.seller,
-                        price: payload.price,
-                        quantity: payload.baseAmount || payload.quantity,
-                        quoteAmount: payload.quoteAmount,
-                        buyOrderId: payload.buyOrderId,
-                        sellOrderId: payload.sellOrderId,
-                        timestamp: payload.timestamp,
-                    };
-                })
-                .filter(t => t.tradingPair === tradingPair)
+            const trades = [...tradeMap.values()]
                 .sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0))
                 .slice(0, limit);
 
-            console.log(`[OrderBookService] Canton returned ${trades.length} trades for ${tradingPair}`);
+            console.log(`[OrderBookService] Returning ${trades.length} trades for ${tradingPair} (${cacheCount} from cache)`);
             return trades;
         } catch (error) {
             console.error(`[OrderBookService] Trade query failed: ${error.message}`);
-            return [];
+            // Fall back to cache-only
+            return [...tradeMap.values()]
+                .sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0))
+                .slice(0, limit);
         }
     }
 

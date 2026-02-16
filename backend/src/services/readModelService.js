@@ -105,67 +105,42 @@ class ReadModelService extends EventEmitter {
     }
 
     /**
-     * Query trades directly from Canton API
+     * Get recent trades — from file-backed cache (primary) + Canton API (fallback).
+     * The in-memory cache is populated by the matching engine after each match
+     * and persisted to disk, surviving server restarts.
      */
-    async queryTradesFromCanton(tradingPair = null) {
-        const token = await tokenProvider.getServiceToken();
-        const packageId = config.canton.packageIds?.clobExchange;
-        const operatorPartyId = config.canton.operatorPartyId;
-        
-        if (!packageId || !operatorPartyId) {
+    getRecentTrades(tradingPair = null, limit = 50) {
+        try {
+            const { getUpdateStream } = require('./cantonUpdateStream');
+            const updateStream = getUpdateStream();
+            const trades = tradingPair
+                ? updateStream.getTradesForPair(tradingPair, limit)
+                : updateStream.getAllTrades(limit);
+            return trades;
+        } catch (e) {
             return [];
         }
-
-        const tradeTemplateId = `${packageId}:Trade:Trade`;
-        const contracts = await this.cantonService.queryActiveContracts({
-            party: operatorPartyId,
-            templateIds: [tradeTemplateId],
-            pageSize: 200
-        }, token);
-
-        const trades = (Array.isArray(contracts) ? contracts : [])
-            .map(c => {
-                const payload = c.payload || c.createArgument || {};
-                return {
-                    contractId: c.contractId,
-                    tradeId: payload.tradeId,
-                    tradingPair: payload.tradingPair,
-                    buyer: payload.buyer,
-                    seller: payload.seller,
-                    price: payload.price,
-                    quantity: payload.quantity,
-                    buyOrderId: payload.buyOrderId,
-                    sellOrderId: payload.sellOrderId,
-                    timestamp: payload.timestamp
-                };
-            })
-            .sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0));
-
-        if (tradingPair) {
-            return trades.filter(t => t.tradingPair === tradingPair);
-        }
-        return trades;
     }
 
     /**
-     * Get trades for a trading pair - DIRECT FROM CANTON
+     * Get trades for a trading pair
      */
     async getTradesForPair(tradingPair) {
-        return this.queryTradesFromCanton(tradingPair);
+        return this.getRecentTrades(tradingPair, 100);
     }
 
     /**
-     * Get all trades - DIRECT FROM CANTON
+     * Get all trades
      */
     async getAllTrades() {
-        return this.queryTradesFromCanton();
+        return this.getRecentTrades(null, 200);
     }
 
     /**
-     * Get trades for a party - DIRECT FROM CANTON
+     * Get trades for a party
      */
     async getTradesForParty(partyId) {
-        const trades = await this.queryTradesFromCanton();
+        const trades = this.getRecentTrades(null, 500);
         return trades.filter(t => t.buyer === partyId || t.seller === partyId);
     }
 

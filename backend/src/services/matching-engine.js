@@ -42,7 +42,8 @@ Decimal.set({ precision: 20, rounding: Decimal.ROUND_DOWN });
 class MatchingEngine {
   constructor() {
     this.isRunning = false;
-    this.pollingInterval = parseInt(config.matchingEngine?.intervalMs) || 2000;
+    this.basePollingInterval = parseInt(config.matchingEngine?.intervalMs) || 2000;
+    this.pollingInterval = this.basePollingInterval;
     this.matchingInProgress = false;
     this.matchingStartTime = 0; // Track start time for deadlock detection
     this.adminToken = null;
@@ -68,6 +69,17 @@ class MatchingEngine {
     // When a matching trigger arrives while a cycle is already running,
     // queue the pair so it's processed immediately after the current cycle.
     this.pendingPairs = new Set();
+
+    // ═══ Adaptive polling — reduces load when no matches are happening ═══
+    // Starts at basePollingInterval (2s). After consecutive idle cycles,
+    // backs off to longer intervals. Resets to fast polling when a new
+    // order triggers matching.
+    this._consecutiveIdleCycles = 0;
+    this._IDLE_THRESHOLD_MEDIUM = 5;   // After 5 idle cycles → 10s
+    this._IDLE_THRESHOLD_SLOW = 20;    // After 20 idle cycles → 30s
+    this._MEDIUM_INTERVAL = 10000;     // 10 seconds
+    this._SLOW_INTERVAL = 30000;       // 30 seconds
+    this._lastMatchTime = 0;           // Timestamp of last successful match
   }
 
   /**
@@ -116,6 +128,9 @@ class MatchingEngine {
 
       // ═══ Process any pairs queued by order placement triggers ═══
       if (this.pendingPairs.size > 0) {
+        // New order arrived — reset to fast polling
+        this._resetToFastPolling();
+
         const pending = [...this.pendingPairs];
         this.pendingPairs.clear();
         console.log(`[MatchingEngine] ⚡ Processing ${pending.length} queued pair(s): ${pending.join(', ')}`);
@@ -139,13 +154,56 @@ class MatchingEngine {
         }
       }
 
+      // ═══ Adaptive polling — sleep longer when idle ═══
       await new Promise(r => setTimeout(r, this.pollingInterval));
     }
     console.log('[MatchingEngine] Stopped');
   }
 
   /**
-   * Run one matching cycle across all trading pairs
+   * Called after a successful match to reset polling to fast mode
+   */
+  _onMatchExecuted() {
+    this._consecutiveIdleCycles = 0;
+    this._lastMatchTime = Date.now();
+    if (this.pollingInterval !== this.basePollingInterval) {
+      console.log(`[MatchingEngine] ⚡ Match found — resetting polling to ${this.basePollingInterval}ms`);
+      this.pollingInterval = this.basePollingInterval;
+    }
+  }
+
+  /**
+   * Called after a cycle with no matches to potentially slow down polling
+   */
+  _onIdleCycle() {
+    this._consecutiveIdleCycles++;
+    const oldInterval = this.pollingInterval;
+
+    if (this._consecutiveIdleCycles >= this._IDLE_THRESHOLD_SLOW) {
+      this.pollingInterval = this._SLOW_INTERVAL;
+    } else if (this._consecutiveIdleCycles >= this._IDLE_THRESHOLD_MEDIUM) {
+      this.pollingInterval = this._MEDIUM_INTERVAL;
+    }
+
+    if (this.pollingInterval !== oldInterval) {
+      console.log(`[MatchingEngine] 😴 No matches for ${this._consecutiveIdleCycles} cycles — polling interval now ${this.pollingInterval}ms`);
+    }
+  }
+
+  /**
+   * Reset to fast polling when a new order triggers matching
+   */
+  _resetToFastPolling() {
+    this._consecutiveIdleCycles = 0;
+    if (this.pollingInterval !== this.basePollingInterval) {
+      console.log(`[MatchingEngine] ⚡ New order detected — resetting polling to ${this.basePollingInterval}ms`);
+      this.pollingInterval = this.basePollingInterval;
+    }
+  }
+
+  /**
+   * Run one matching cycle across all trading pairs.
+   * Tracks idle cycles and adjusts polling interval adaptively.
    */
   async runMatchingCycle() {
     if (this.matchingInProgress) {
@@ -154,8 +212,7 @@ class MatchingEngine {
         console.warn('[MatchingEngine] ⚠️ matchingInProgress stuck for >25s — force-resetting');
         this.matchingInProgress = false;
       } else {
-        console.log('[MatchingEngine] Skipping: matching already in progress');
-        return;
+        return; // Silently skip — no need to log every skip
       }
     }
 
@@ -164,8 +221,18 @@ class MatchingEngine {
       this.matchingStartTime = Date.now();
       const token = await this.getAdminToken();
 
+      let matchFoundThisCycle = false;
+
       for (const pair of this.tradingPairs) {
-        await this.processOrdersForPair(pair, token);
+        const hadMatch = await this.processOrdersForPair(pair, token);
+        if (hadMatch) matchFoundThisCycle = true;
+      }
+
+      // ═══ Adaptive polling update ═══
+      if (matchFoundThisCycle) {
+        this._onMatchExecuted();
+      } else {
+        this._onIdleCycle();
       }
     } catch (error) {
       if (error.message?.includes('401') || error.message?.includes('security-sensitive')) {
@@ -180,11 +247,14 @@ class MatchingEngine {
   /**
    * Process orders for a single trading pair
    */
+  /**
+   * @returns {boolean} true if a match was found and executed
+   */
   async processOrdersForPair(tradingPair, token) {
     const packageId = config.canton.packageIds?.clobExchange;
     const operatorPartyId = config.canton.operatorPartyId;
       
-    if (!packageId || !operatorPartyId) return;
+    if (!packageId || !operatorPartyId) return false;
 
     try {
       // Query Canton for active Order contracts from BOTH packages
@@ -200,7 +270,7 @@ class MatchingEngine {
         pageSize: 200
       }, token);
       
-      if (!contracts || contracts.length === 0) return;
+      if (!contracts || contracts.length === 0) return false;
       
       // Parse and filter orders for this pair
       const buyOrders = [];
@@ -264,7 +334,7 @@ class MatchingEngine {
         }
       }
       
-      if (buyOrders.length === 0 || sellOrders.length === 0) return;
+      if (buyOrders.length === 0 || sellOrders.length === 0) return false;
 
       // ═══ Throttled logging: only log order counts when they change ═══
       const stateKey = `${tradingPair}:${buyOrders.length}b:${sellOrders.length}s`;
@@ -294,7 +364,8 @@ class MatchingEngine {
       });
 
       // Find and execute ONE match per cycle (contract IDs become stale after match)
-      await this.findAndExecuteOneMatch(tradingPair, buyOrders, sellOrders, token);
+      const matched = await this.findAndExecuteOneMatch(tradingPair, buyOrders, sellOrders, token);
+      return matched;
       
     } catch (error) {
       if (error.message?.includes('401') || error.message?.includes('security-sensitive')) {
@@ -303,6 +374,7 @@ class MatchingEngine {
       if (!error.message?.includes('No contracts found')) {
         console.error(`[MatchingEngine] Error for ${tradingPair}:`, error.message);
       }
+      return false;
     }
   }
   
@@ -382,7 +454,7 @@ class MatchingEngine {
         try {
           await this.executeMatch(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, token);
           console.log(`[MatchingEngine] ✅ Match executed successfully via Canton SDK`);
-          return; // One match per cycle
+          return true; // One match per cycle — signal success
         } catch (error) {
           console.error(`[MatchingEngine] ❌ Match execution failed:`, error.message);
           
@@ -393,7 +465,7 @@ class MatchingEngine {
             continue;
           }
           
-          return; // Stop matching this cycle on unexpected error
+          return false; // Stop matching this cycle on unexpected error
         }
       }
     }
@@ -425,6 +497,7 @@ class MatchingEngine {
         }
       }
     }
+    return false; // No match found
   }
   
   /**
@@ -708,6 +781,9 @@ class MatchingEngine {
    * CONCURRENCY GUARD: Uses matchingInProgress to prevent overlapping cycles.
    */
   async triggerMatchingCycle(targetPair = null) {
+    // New order arrived → reset to fast polling
+    this._resetToFastPolling();
+
     if (this.matchingInProgress) {
       const elapsed = Date.now() - this.matchingStartTime;
       if (elapsed > 25000) {

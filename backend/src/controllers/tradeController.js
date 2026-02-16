@@ -1,8 +1,12 @@
 /**
  * Trade Controller
  * 
- * ALL DATA FROM CANTON API - NO IN-MEMORY CACHE
- * Queries Trade contracts directly from Canton ledger
+ * ALL DATA FROM CANTON API + FILE-BACKED IN-MEMORY CACHE
+ * 
+ * Queries Trade contracts directly from Canton ledger.
+ * When Settlement:Trade exceeds Canton's 200-element node limit,
+ * transparently falls back to the file-backed in-memory cache
+ * populated by the matching engine after each match.
  * 
  * Trade template is Settlement:Trade with fields:
  *   tradeId, operator, buyer, seller, baseInstrumentId, quoteInstrumentId,
@@ -19,12 +23,12 @@ const { getUpdateStream } = require('../services/cantonUpdateStream');
 
 class TradeController {
   /**
-   * Query trades from Canton API + in-memory cache (merged, deduplicated).
+   * Query trades from Canton API + file-backed cache (merged, deduplicated).
    * 
    * Canton's node has a 200-element limit per query. When Settlement:Trade
-   * contracts exceed 200, the Canton query returns 0. The in-memory cache
-   * (populated by the matching engine after each match) acts as fallback
-   * so recent trades are always visible in the UI.
+   * contracts exceed 200, the Canton query returns 0. The file-backed cache
+   * (populated by the matching engine after each match, persisted to disk)
+   * acts as fallback so recent trades are always visible in the UI.
    * 
    * Trade contracts are signed by operator, so we query as operator.
    * Template: Settlement:Trade (in the clobExchange package)
@@ -39,74 +43,15 @@ class TradeController {
       throw new Error('CLOB_EXCHANGE_PACKAGE_ID not configured');
     }
 
-    // ═══ STEP 1: Query Canton API for on-ledger trade contracts ═══
-    let contracts = [];
-    let cantonQueryFailed = false;
-
-    // 1a. Query current package for Settlement:Trade
-    try {
-      const currentPkgContracts = await cantonService.queryActiveContracts({
-        party: operatorPartyId,
-        templateIds: [`${packageId}:Settlement:Trade`],
-        pageSize: Math.min(limit * 2, 200)
-      }, token);
-      if (Array.isArray(currentPkgContracts)) {
-        contracts = contracts.concat(currentPkgContracts);
-      }
-    } catch (e) {
-      console.warn(`[TradeController] Settlement:Trade query failed: ${e.message}`);
-      cantonQueryFailed = true;
-    }
-
-    // 1b. Query legacy package for Trade:Trade (if different package)
-    if (legacyPackageId && legacyPackageId !== packageId) {
-      try {
-        const legacyContracts = await cantonService.queryActiveContracts({
-          party: operatorPartyId,
-          templateIds: [`${legacyPackageId}:Trade:Trade`],
-          pageSize: Math.min(limit * 2, 200)
-        }, token);
-        if (Array.isArray(legacyContracts)) {
-          contracts = contracts.concat(legacyContracts);
-        }
-      } catch (e) {
-        console.warn(`[TradeController] Legacy Trade:Trade query failed: ${e.message}`);
-      }
-    }
-
-    // Parse Canton contracts into trade objects
+    // ═══ STEP 1: Check file-backed in-memory cache FIRST ═══
+    // The cache is populated by the matching engine after each match and
+    // persisted to disk, so it survives server restarts.
     const tradeMap = new Map(); // keyed by tradeId for dedup
-    for (const c of (Array.isArray(contracts) ? contracts : [])) {
-      const payload = c.payload || c.createArgument || {};
-      
-      const baseSymbol = payload.baseInstrumentId?.symbol || '';
-      const quoteSymbol = payload.quoteInstrumentId?.symbol || '';
-      const tradingPair = (baseSymbol && quoteSymbol) 
-        ? `${baseSymbol}/${quoteSymbol}` 
-        : (payload.tradingPair || 'UNKNOWN');
+    let cacheCount = 0;
 
-      const tradeId = payload.tradeId || c.contractId;
-      tradeMap.set(tradeId, {
-        contractId: c.contractId,
-        tradeId,
-        tradingPair,
-        buyer: payload.buyer,
-        seller: payload.seller,
-        price: payload.price,
-        quantity: payload.baseAmount || payload.quantity,
-        quoteAmount: payload.quoteAmount,
-        buyOrderId: payload.buyOrderId,
-        sellOrderId: payload.sellOrderId,
-        timestamp: payload.timestamp,
-        source: 'canton',
-      });
-    }
-
-    // ═══ STEP 2: Merge with in-memory trade cache (fallback for 200+ limit) ═══
     try {
       const updateStream = getUpdateStream();
-      const cachedTrades = updateStream.getAllTrades(limit * 2);
-      let mergedCount = 0;
+      const cachedTrades = updateStream.getAllTrades(limit * 4);
       for (const ct of cachedTrades) {
         const tid = ct.tradeId;
         if (tid && !tradeMap.has(tid)) {
@@ -114,23 +59,120 @@ class TradeController {
             ...ct,
             source: 'cache',
           });
-          mergedCount++;
+          cacheCount++;
         }
-      }
-      if (mergedCount > 0) {
-        console.log(`[TradeController] Merged ${mergedCount} cached trades (Canton returned ${contracts.length}${cantonQueryFailed ? ', Settlement:Trade query hit 200+ limit' : ''})`);
       }
     } catch (e) {
       // Non-critical — cache is best-effort
+      console.warn(`[TradeController] Cache read failed: ${e.message}`);
     }
 
+    // ═══ STEP 2: Query Canton API for on-ledger trade contracts ═══
+    // This may return 0 for Settlement:Trade if there are 200+ active contracts.
+    let cantonCount = 0;
+
+    // 2a. Query current package for Settlement:Trade
+    try {
+      const currentPkgContracts = await cantonService.queryActiveContracts({
+        party: operatorPartyId,
+        templateIds: [`${packageId}:Settlement:Trade`],
+        pageSize: Math.min(limit * 2, 100)
+      }, token);
+      if (Array.isArray(currentPkgContracts) && currentPkgContracts.length > 0) {
+        for (const c of currentPkgContracts) {
+          const payload = c.payload || c.createArgument || {};
+          const baseSymbol = payload.baseInstrumentId?.symbol || '';
+          const quoteSymbol = payload.quoteInstrumentId?.symbol || '';
+          const tradingPair = (baseSymbol && quoteSymbol) 
+            ? `${baseSymbol}/${quoteSymbol}` 
+            : (payload.tradingPair || 'UNKNOWN');
+          const tradeId = payload.tradeId || c.contractId;
+          
+          // Canton is authoritative — overwrite cache entry if exists
+          tradeMap.set(tradeId, {
+            contractId: c.contractId,
+            tradeId,
+            tradingPair,
+            buyer: payload.buyer,
+            seller: payload.seller,
+            price: payload.price,
+            quantity: payload.baseAmount || payload.quantity,
+            quoteAmount: payload.quoteAmount,
+            buyOrderId: payload.buyOrderId,
+            sellOrderId: payload.sellOrderId,
+            timestamp: payload.timestamp,
+            source: 'canton',
+          });
+          cantonCount++;
+        }
+      } else {
+        // Settlement:Trade returned 0 — likely hit the 200+ node limit
+        if (cacheCount > 0) {
+          console.log(`[TradeController] ℹ️ Settlement:Trade returned 0 (200+ limit), using ${cacheCount} cached trades`);
+        } else {
+          console.log(`[TradeController] ℹ️ Settlement:Trade returned 0 (200+ limit) and cache is empty`);
+        }
+      }
+    } catch (e) {
+      console.warn(`[TradeController] Settlement:Trade query failed: ${e.message}`);
+    }
+
+    // 2b. Query legacy package for Trade:Trade (if different package)
+    if (legacyPackageId && legacyPackageId !== packageId) {
+      try {
+        const legacyContracts = await cantonService.queryActiveContracts({
+          party: operatorPartyId,
+          templateIds: [`${legacyPackageId}:Trade:Trade`],
+          pageSize: Math.min(limit * 2, 100)
+        }, token);
+        if (Array.isArray(legacyContracts)) {
+          for (const c of legacyContracts) {
+            const payload = c.payload || c.createArgument || {};
+            const baseSymbol = payload.baseInstrumentId?.symbol || '';
+            const quoteSymbol = payload.quoteInstrumentId?.symbol || '';
+            const tradingPair = (baseSymbol && quoteSymbol) 
+              ? `${baseSymbol}/${quoteSymbol}` 
+              : (payload.tradingPair || 'UNKNOWN');
+            const tradeId = payload.tradeId || c.contractId;
+            
+            if (!tradeMap.has(tradeId)) {
+              tradeMap.set(tradeId, {
+                contractId: c.contractId,
+                tradeId,
+                tradingPair,
+                buyer: payload.buyer,
+                seller: payload.seller,
+                price: payload.price,
+                quantity: payload.baseAmount || payload.quantity,
+                quoteAmount: payload.quoteAmount,
+                buyOrderId: payload.buyOrderId,
+                sellOrderId: payload.sellOrderId,
+                timestamp: payload.timestamp,
+                source: 'canton-legacy',
+              });
+              cantonCount++;
+            }
+          }
+        }
+      } catch (e) {
+        console.warn(`[TradeController] Legacy Trade:Trade query failed: ${e.message}`);
+      }
+    }
+
+    const totalSources = `${cantonCount} from Canton, ${cacheCount} from cache`;
     const allTrades = [...tradeMap.values()];
 
     // Apply filter, sort by timestamp (newest first), and limit
-    return allTrades
+    const result = allTrades
       .filter(filterFn || (() => true))
       .sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0))
       .slice(0, limit);
+
+    if (result.length > 0) {
+      console.log(`[TradeController] Returning ${result.length} trades (${totalSources})`);
+    }
+
+    return result;
   }
 
   // GET /api/trades - Get all trades from Canton API
@@ -145,7 +187,7 @@ class TradeController {
     return success(res, { 
       trades, 
       count: trades.length,
-      source: 'canton-api'
+      source: 'canton-api+cache'
     }, 'Trades retrieved from Canton API');
   });
 
@@ -167,7 +209,7 @@ class TradeController {
       tradingPair, 
       trades,
       count: trades.length,
-      source: 'canton-api'
+      source: 'canton-api+cache'
     }, 'Trades retrieved from Canton API');
   });
 
@@ -194,7 +236,7 @@ class TradeController {
       partyId, 
       trades: tradesWithRole,
       count: tradesWithRole.length,
-      source: 'canton-api'
+      source: 'canton-api+cache'
     }, 'Trades retrieved from Canton API');
   });
 }
