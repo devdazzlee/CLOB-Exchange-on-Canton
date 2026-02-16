@@ -29,27 +29,17 @@ const Decimal = require('decimal.js');
 // Configure decimal precision
 Decimal.set({ precision: 20, rounding: Decimal.ROUND_DOWN });
 
-// ─── Lazy-load SDK to avoid crashes if not installed ───────────────────────
+// ─── Lazy-load SDK — loaded via dynamic import() in _doInitialize ───────────
+// The SDK's CJS bundle require()s `jose` which is ESM-only (v5+).
+// Static require() fails on Vercel's Node runtime with ERR_REQUIRE_ESM.
+// Dynamic import() works universally for ESM modules.
 let WalletSDKImpl = null;
 let ClientCredentialOAuthController = null;
 let LedgerController = null;
 let TokenStandardController = null;
 let ValidatorController = null;
 let sdkLoadError = null;
-
-try {
-  const walletSdk = require('@canton-network/wallet-sdk');
-  WalletSDKImpl = walletSdk.WalletSDKImpl;
-  ClientCredentialOAuthController = walletSdk.ClientCredentialOAuthController;
-  LedgerController = walletSdk.LedgerController;
-  TokenStandardController = walletSdk.TokenStandardController;
-  ValidatorController = walletSdk.ValidatorController;
-  console.log('[CantonSDK] ✅ @canton-network/wallet-sdk loaded');
-} catch (e) {
-  sdkLoadError = `${e.code || 'UNKNOWN'}: ${e.message}`;
-  console.error('[CantonSDK] ❌ SDK require() failed:', e.code, e.message);
-  console.error('[CantonSDK] ❌ Stack:', (e.stack || '').split('\n').slice(0, 5).join('\n'));
-}
+let sdkLoaded = false;
 
 // ─── SDK Client ────────────────────────────────────────────────────────────
 
@@ -57,7 +47,7 @@ class CantonSDKClient {
   constructor() {
     this.sdk = null;
     this.initialized = false;
-    this.initError = sdkLoadError;
+    this.initError = null; // Set after initialize() if SDK fails to load
     this.instrumentAdminPartyId = null;
     this.currentPartyId = null;
     this._initPromise = null; // guards against concurrent initialize() calls
@@ -86,8 +76,30 @@ class CantonSDKClient {
 
   async _doInitialize() {
 
+    // ── Step 0: Load the SDK package via dynamic import() ─────────────
+    // Must use import() not require() because the SDK's CJS bundle
+    // transitively require()s jose v5+ which is ESM-only.
+    // Dynamic import() handles ESM modules correctly on all Node versions.
+    if (!sdkLoaded) {
+      try {
+        console.log('[CantonSDK] Loading SDK via dynamic import()...');
+        const walletSdk = await import('@canton-network/wallet-sdk');
+        WalletSDKImpl = walletSdk.WalletSDKImpl;
+        ClientCredentialOAuthController = walletSdk.ClientCredentialOAuthController;
+        LedgerController = walletSdk.LedgerController;
+        TokenStandardController = walletSdk.TokenStandardController;
+        ValidatorController = walletSdk.ValidatorController;
+        sdkLoaded = true;
+        console.log('[CantonSDK] ✅ @canton-network/wallet-sdk loaded via import()');
+      } catch (e) {
+        sdkLoadError = `${e.code || 'UNKNOWN'}: ${e.message}`;
+        console.error('[CantonSDK] ❌ SDK import() failed:', e.code, e.message);
+        console.error('[CantonSDK] ❌ Stack:', (e.stack || '').split('\n').slice(0, 5).join('\n'));
+      }
+    }
+
     if (!WalletSDKImpl) {
-      this.initError = `SDK package not loaded: ${sdkLoadError || 'require() failed'}`;
+      this.initError = `SDK package not loaded: ${sdkLoadError || 'import() failed'}`;
       console.error(`[CantonSDK] ❌ ${this.initError}`);
       return;
     }
