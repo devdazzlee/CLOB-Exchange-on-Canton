@@ -20,6 +20,27 @@ if (isVercel) {
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
   
   const { app } = createApp();
+
+  // ── Eagerly initialize Canton SDK at cold-start ──
+  // On local dev, this happens inside startServer(). On Vercel, startServer()
+  // is never called, so we must do it here. The middleware in createApp()
+  // also awaits this same singleton, ensuring every request waits for SDK readiness.
+  (async () => {
+    try {
+      console.log('[Server/Vercel] 🔄 Initializing Canton Wallet SDK at cold start...');
+      const { getCantonSDKClient } = require('./src/services/canton-sdk-client');
+      const sdkClient = getCantonSDKClient();
+      await sdkClient.initialize();
+      if (sdkClient.isReady()) {
+        console.log('[Server/Vercel] ✅ Canton Wallet SDK initialized and ready');
+      } else {
+        console.warn('[Server/Vercel] ⚠️  Canton Wallet SDK initialized but NOT ready');
+        console.warn('[Server/Vercel]    initError:', sdkClient.initError);
+      }
+    } catch (err) {
+      console.error('[Server/Vercel] ❌ Canton Wallet SDK init failed:', err.message);
+    }
+  })();
   
   // Export app as default for Vercel
   module.exports = app;

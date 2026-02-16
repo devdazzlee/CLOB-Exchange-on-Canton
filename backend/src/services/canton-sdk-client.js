@@ -60,6 +60,7 @@ class CantonSDKClient {
     this.initError = sdkLoadError;
     this.instrumentAdminPartyId = null;
     this.currentPartyId = null;
+    this._initPromise = null; // guards against concurrent initialize() calls
 
     // Simple sequential executor to prevent party-context races
     // SDK is stateful (setPartyId) so concurrent calls for different parties would conflict
@@ -69,12 +70,21 @@ class CantonSDKClient {
   /**
    * Initialize the SDK and connect to Canton
    * Call this once at server startup.
+   * Safe to call concurrently — only the first call runs, others await the same promise.
    */
   async initialize() {
     if (this.initialized) {
-      console.log('[CantonSDK] Already initialized');
       return;
     }
+    // If initialization is already in progress, await the same promise
+    if (this._initPromise) {
+      return this._initPromise;
+    }
+    this._initPromise = this._doInitialize();
+    return this._initPromise;
+  }
+
+  async _doInitialize() {
 
     if (!WalletSDKImpl) {
       this.initError = 'Canton Wallet SDK not installed. Run: yarn add @canton-network/wallet-sdk';
