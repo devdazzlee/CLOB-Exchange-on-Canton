@@ -4,10 +4,17 @@
  * Configures the SDK to connect to the WolfEdge DevNet Canton validator
  * and access the Splice Token Standard APIs.
  * 
+ * Two token systems are supported:
+ * - CC (Amulet): Splice Token Standard via Scan Proxy (SDK handles this)
+ * - CBTC: Utilities Token (CIP-0056) via Utilities Backend API (direct HTTP)
+ * 
  * Key endpoints:
  * - JSON Ledger API: For reading/writing contracts
- * - Scan Proxy: For Transfer Factory Registry (transfer instructions)
+ * - Scan Proxy: For CC Transfer Factory Registry (transfer instructions)
+ * - Utilities Backend: For CBTC Transfer Factory Registry
  * - Keycloak: For JWT authentication
+ * 
+ * @see https://docs.digitalasset.com/utilities/devnet/how-tos/registry/transfer/transfer.html
  */
 
 require('dotenv').config();
@@ -18,16 +25,15 @@ const CANTON_SDK_CONFIG = {
   // JSON Ledger API — primary for all reads/writes
   LEDGER_API_URL: process.env.CANTON_JSON_LEDGER_API_BASE || 'http://65.108.40.104:31539',
 
-  // Scan Proxy — serves the Transfer Factory Registry API
+  // Scan Proxy — serves the CC (Amulet) Transfer Factory Registry API
   // Route: /registry/transfer-instruction/v1/transfer-factory
   // Also exposes: /api/scan/v0/* for Amulet and other lookups
   SCAN_PROXY_URL: SCAN_PROXY_BASE,
 
   // Validator API URL — used by SDK's ValidatorController and TokenStandardController
-  // The SDK TokenStandardController takes this as its "base" URL
   VALIDATOR_API_URL: process.env.VALIDATOR_API_URL || `${SCAN_PROXY_BASE}/api/validator`,
 
-  // Registry API URL — used by SDK's setTransferFactoryRegistryUrl()
+  // Registry API URL — used by SDK's setTransferFactoryRegistryUrl() for CC (Amulet)
   // openapi-fetch concatenates this with "/registry/transfer-instruction/v1/..."
   // so it must be the bare host — NOT the scan-proxy sub-path
   REGISTRY_API_URL: process.env.REGISTRY_API_URL || SCAN_PROXY_BASE,
@@ -35,8 +41,8 @@ const CANTON_SDK_CONFIG = {
   // Scan API URL — used by SDK's TokenStandardController for scan-based lookups
   SCAN_API_URL: process.env.SCAN_API_URL || `${SCAN_PROXY_BASE}/api/scan`,
 
-  // Instrument admin party — discovered at runtime via sdk.tokenStandard.getInstrumentAdmin()
-  // Set this env var to skip discovery
+  // Instrument admin party for CC (Amulet) — discovered at runtime via sdk.tokenStandard.getInstrumentAdmin()
+  // This is the DSO party. Set this env var to skip discovery.
   INSTRUMENT_ADMIN_PARTY: process.env.INSTRUMENT_ADMIN_PARTY || null,
 
   // Operator party — the exchange service account
@@ -44,7 +50,7 @@ const CANTON_SDK_CONFIG = {
 
   // ─── Instrument mapping ────────────────────────────────────────────────────
   // Canton uses "Amulet" as the instrumentId for CC (Canton Coin).
-  // CBTC is "CBTC" (no mapping needed).
+  // CBTC is "CBTC" (Utilities Token).
   // This maps exchange symbols → Canton instrument IDs.
   INSTRUMENT_MAP: {
     'CC': 'Amulet',
@@ -81,16 +87,64 @@ const CANTON_SDK_CONFIG = {
       quoteInstrument: 'USDT',
     },
   },
-
-  // ─── Transfer Factory support ──────────────────────────────────────────────
-  // The Transfer Factory Registry (ExternalPartyAmuletRules) only supports
-  // Amulet (CC) transfers. Other instruments (CBTC, etc.) are not supported
-  // by the current factory contract and will fail with an instrumentId mismatch.
-  // 
-  // Instruments in this set will be transferred via the SDK 2-step flow.
-  // Others are handled as exchange-managed custodial balances.
-  FACTORY_SUPPORTED_INSTRUMENTS: new Set(['Amulet']),
 };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CBTC Utilities Token Configuration (CIP-0056)
+// 
+// CBTC uses a DIFFERENT Transfer Factory Registry than CC:
+// - CC  → Splice SDK → Scan Proxy at http://65.108.40.104:8088
+// - CBTC → Utilities Backend API → https://api.utilities.digitalasset-dev.com/api/utilities
+//
+// The Utilities Backend API has a different path structure:
+//   ${BACKEND}/v0/registrars/${ADMIN_PARTY}/registry/transfer-instruction/v1/transfer-factory
+//
+// Reference: https://docs.digitalasset.com/utilities/devnet/how-tos/registry/transfer/transfer.html
+// ═══════════════════════════════════════════════════════════════════════════
+const UTILITIES_CONFIG = {
+  // DevNet Utilities Backend API
+  BACKEND_URL: process.env.UTILITIES_BACKEND_URL || 'https://api.utilities.digitalasset-dev.com/api/utilities',
+
+  // CBTC Admin Party (cBTC Network registrar)
+  CBTC_ADMIN_PARTY: process.env.CBTC_ADMIN_PARTY || 'cbtc-network::12202a83c6f4082217c175e29bc53da5f2703ba2675778ab99217a5a881a949203ff',
+
+  // Token Standard Interface IDs (same interface, different underlying factory)
+  TRANSFER_FACTORY_INTERFACE: '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.TransferInstructionV1:TransferFactory',
+  TRANSFER_INSTRUCTION_INTERFACE: '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.TransferInstructionV1:TransferInstruction',
+  HOLDING_INTERFACE: '718a0f77e505a8de22f188bd4c87fe74101274e9d4cb1bfac7d09aec7158d35b:Splice.Api.Token.HoldingV1:Holding',
+};
+
+/**
+ * Determine the token system type for a given exchange symbol.
+ * - 'splice': CC (Amulet) — uses SDK + Scan Proxy
+ * - 'utilities': CBTC — uses Utilities Backend API
+ * - 'unknown': Other tokens (BTC, USDT, etc.) — no on-chain transfer configured
+ * 
+ * @param {string} symbol - Exchange symbol (e.g., 'CC', 'CBTC')
+ * @returns {'splice'|'utilities'|'unknown'} Token system type
+ */
+function getTokenSystemType(symbol) {
+  const instrumentId = CANTON_SDK_CONFIG.INSTRUMENT_MAP[symbol] || symbol;
+  if (instrumentId === 'Amulet') return 'splice';
+  if (instrumentId === 'CBTC') return 'utilities';
+  return 'unknown';
+}
+
+/**
+ * Get the instrument admin party for a given symbol.
+ * - CC (Amulet): Returns the DSO party (discovered at runtime)
+ * - CBTC: Returns the cbtc-network registrar party
+ * 
+ * @param {string} symbol - Exchange symbol
+ * @param {string} [discoveredDsoParty] - DSO party discovered at runtime (for CC)
+ * @returns {string|null} Admin party ID
+ */
+function getInstrumentAdmin(symbol, discoveredDsoParty = null) {
+  const type = getTokenSystemType(symbol);
+  if (type === 'splice') return discoveredDsoParty || CANTON_SDK_CONFIG.INSTRUMENT_ADMIN_PARTY;
+  if (type === 'utilities') return UTILITIES_CONFIG.CBTC_ADMIN_PARTY;
+  return null;
+}
 
 /**
  * Map exchange symbol to Canton instrument ID (always returns a string).
@@ -121,31 +175,18 @@ function extractInstrumentId(instrumentIdField) {
  * @returns {string} Exchange symbol (e.g., 'CC')
  */
 function toExchangeSymbol(instrumentId) {
-  // SDK returns instrumentId as { admin, id } object — extract the .id string
   const id = (typeof instrumentId === 'object' && instrumentId !== null)
     ? (instrumentId.id || instrumentId)
     : instrumentId;
   return CANTON_SDK_CONFIG.REVERSE_INSTRUMENT_MAP[id] || String(id);
 }
 
-/**
- * Check if an exchange symbol's Canton instrument is supported by the Transfer Factory.
- * Only instruments in FACTORY_SUPPORTED_INSTRUMENTS can be transferred via the SDK 2-step flow.
- * Others (CBTC, etc.) are handled as exchange-managed custodial balances.
- * 
- * @param {string} symbol - Exchange symbol (e.g., 'CC', 'CBTC')
- * @returns {boolean} true if the factory supports on-chain transfers for this instrument
- */
-function isFactoryTransferable(symbol) {
-  const cantonId = toCantonInstrument(symbol);
-  return CANTON_SDK_CONFIG.FACTORY_SUPPORTED_INSTRUMENTS.has(cantonId);
-}
-
 module.exports = {
   CANTON_SDK_CONFIG,
+  UTILITIES_CONFIG,
   toCantonInstrument,
   toExchangeSymbol,
   extractInstrumentId,
-  isFactoryTransferable,
+  getTokenSystemType,
+  getInstrumentAdmin,
 };
-

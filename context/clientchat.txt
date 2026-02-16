@@ -210,3 +210,21 @@ To fetch factoryID and context
 You can check this script for better undertstanding https://github.com/hyperledger-labs/splice/blob/main/token-standard/cli/src/commands/transfer.ts
 
 Or, you can use wallet-sdk for convenience https://docs.digitalasset.com/integrate/devnet/token-standard/index.html#how-do-i-quickly-perform-a-transfer-between-two-parties
+
+
+
+
+Client Share me This :
+
+Hey @AHMED yes cBTC needs to work. If it doesn’t, the transaction is incomplete and there’s no reason any user will deposit their CC if they aren’t getting cBTC back.
+
+
+Will integrating usdcx will be easy after you figure out cbtc?
+
+Just to confirm, you are using Allocations in matchmaking to resolve settlements between 2 parties
+
+As CBTC is a Utilties Token (CIP-0056), we need to use the utilities backend url (same as you must have used in accepting CBTC tokens).
+Can refer to this doc, https://docs.digitalasset.com/utilities/devnet/how-tos/registry/transfer/transfer.html. Heres the Backend API 
+${BACKEND_API}/v0/registrars/${ADMIN_PARTY_ID}/registry/transfer-instruction/v1/transfer-factory (this is for transferring of tokens)
+BACKEND_API=“https://api.utilities.digitalasset-dev.com/api/utilities” (for devnet)
+ADMIN_PARTY_ID=“cbtc-network::12202a83c6f4082217c175e29bc53da5f2703ba2675778ab99217a5a881a949203ff”

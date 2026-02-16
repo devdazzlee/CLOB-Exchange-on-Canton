@@ -1,0 +1,1136 @@
+# 🚨 CRITICAL DISCOVERY: CBTC USES A DIFFERENT API!
+
+Your client just revealed a **MAJOR MISSING PIECE**:
+
+---
+
+## 🔴 THE PROBLEM
+
+**You currently have:**
+- CC (Canton Coin) transfers working via Splice SDK
+- Using Scan Proxy at `http://65.108.40.104:8088`
+
+**But CBTC is DIFFERENT:**
+- CBTC is a **Utilities Token (CIP-0056)**
+- Uses a **completely separate backend API**
+- Different endpoint structure
+- Different admin party ID
+
+---
+
+## 📊 TWO SEPARATE SYSTEMS
+
+| Token | Type | Backend API | Admin Party |
+|-------|------|-------------|-------------|
+| **CC** | Splice Token Standard | `http://65.108.40.104:8088/api/validator/v0/scan-proxy` | `DSO::1220be58c29e65de40bf273be1dc2b266d4...` |
+| **CBTC** | Utilities Token (CIP-0056) | `https://api.utilities.digitalasset-dev.com/api/utilities` | `cbtc-network::12202a83c6f4082217c175e29bc53da5f2703ba2675778ab99217a5a881a949203ff` |
+
+---
+
+## 🎯 WHAT YOU NEED TO DO
+
+### 1. **Add CBTC Configuration**
+
+```javascript
+// canton-sdk.config.js
+
+const CANTON_SDK_CONFIG = {
+  // EXISTING: CC (Splice) configuration
+  SCAN_PROXY_BASE: 'http://65.108.40.104:8088',
+  SPLICE_REGISTRY_URL: 'http://65.108.40.104:8088/api/validator/v0/scan-proxy',
+  SPLICE_ADMIN_PARTY: 'DSO::1220be58c29e65de40bf273be1dc2b266d4...',
+  
+  // NEW: CBTC (Utilities) configuration
+  UTILITIES_BACKEND_URL: 'https://api.utilities.digitalasset-dev.com/api/utilities',
+  CBTC_ADMIN_PARTY: 'cbtc-network::12202a83c6f4082217c175e29bc53da5f2703ba2675778ab99217a5a881a949203ff',
+  
+  INSTRUMENT_MAP: {
+    'CC': 'Amulet',           // Splice token
+    'CBTC': 'CBTC',           // Utilities token - DIFFERENT SYSTEM!
+  }
+};
+```
+
+---
+
+### 2. **Create CBTC Transfer Client**
+
+```javascript
+// cbtc-utilities-client.js
+
+class CBTCUtilitiesClient {
+  constructor() {
+    this.backendUrl = 'https://api.utilities.digitalasset-dev.com/api/utilities';
+    this.adminParty = 'cbtc-network::12202a83c6f4082217c175e29bc53da5f2703ba2675778ab99217a5a881a949203ff';
+  }
+
+  /**
+   * Create CBTC transfer using Utilities API
+   * 
+   * Flow (from client's doc):
+   * 1. Get sender's holdings
+   * 2. Call /v0/registrars/{ADMIN}/registry/transfer-instruction/v1/transfer-factory
+   * 3. Submit exercise command to Canton Ledger
+   * 4. Receiver accepts transfer
+   */
+  async createCBTCTransfer(senderParty, receiverParty, amount, senderToken) {
+    // Step 1: Get holdings
+    const holdings = await this.getHoldings(senderParty, senderToken);
+    const holdingCids = holdings
+      .filter(h => h.instrumentId.id === 'CBTC')
+      .map(h => h.contractId);
+
+    // Step 2: Get transfer factory context
+    const transferFactoryUrl = `${this.backendUrl}/v0/registrars/${this.adminParty}/registry/transfer-instruction/v1/transfer-factory`;
+    
+    const now = new Date().toISOString();
+    const oneHour = new Date(Date.now() + 3600000).toISOString();
+    
+    const factoryResponse = await fetch(transferFactoryUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        choiceArguments: {
+          expectedAdmin: this.adminParty,
+          transfer: {
+            sender: senderParty,
+            receiver: receiverParty,
+            amount: amount.toString(),
+            instrumentId: {
+              admin: this.adminParty,
+              id: 'CBTC'
+            },
+            requestedAt: now,
+            executeBefore: oneHour,
+            inputHoldingCids: holdingCids,
+            meta: {
+              values: {
+                'splice.lfdecentralizedtrust.org/reason': 'exchange-settlement'
+              }
+            }
+          },
+          extraArgs: {
+            context: { values: {} },
+            meta: { values: {} }
+          }
+        },
+        excludeDebugFields: true
+      })
+    });
+
+    const factory = await factoryResponse.json();
+
+    // Step 3: Submit to Canton Ledger
+    return {
+      factoryId: factory.factoryId,
+      choiceContext: factory.choiceContext,
+      transferKind: factory.transferKind
+    };
+  }
+
+  async getHoldings(partyId, token) {
+    // Query Canton Ledger for CBTC holdings
+    const ledgerUrl = `${LEDGER_API_URL}/v2/state/active-contracts`;
+    
+    const response = await fetch(ledgerUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        verbose: false,
+        filter: {
+          filtersByParty: {
+            [partyId]: {
+              cumulative: [{
+                identifierFilter: {
+                  InterfaceFilter: {
+                    value: {
+                      interfaceId: UTILITIES_HOLDING_INTERFACE,
+                      includeInterfaceView: true
+                    }
+                  }
+                }
+              }]
+            }
+          }
+        }
+      })
+    });
+
+    return await response.json();
+  }
+}
+```
+
+---
+
+### 3. **Modify Matching Engine for Dual-Token Support**
+
+```javascript
+// matching-engine.js
+
+async executeSettlement({ buyOrder, sellOrder, matchQuantity, matchPrice }) {
+  const baseSymbol = 'CBTC';  // What seller gives
+  const quoteSymbol = 'CC';   // What buyer gives
+
+  console.log(`[Settlement] Transfer ${matchQuantity} ${baseSymbol} + ${matchPrice * matchQuantity} ${quoteSymbol}`);
+
+  // Transfer 1: CBTC (seller → buyer) via UTILITIES API
+  console.log('[Settlement] Creating CBTC transfer via Utilities API...');
+  const cbtcClient = new CBTCUtilitiesClient();
+  const cbtcTransferFactory = await cbtcClient.createCBTCTransfer(
+    sellOrder.partyId,
+    buyOrder.partyId,
+    matchQuantity,
+    sellOrder.token
+  );
+
+  // Submit CBTC transfer exercise command
+  await cantonService.exerciseChoice({
+    token: await tokenProvider.getServiceToken(),
+    actAsParty: [sellOrder.partyId],
+    templateId: UTILITIES_TRANSFER_FACTORY_INTERFACE,
+    contractId: cbtcTransferFactory.factoryId,
+    choice: 'TransferFactory_Transfer',
+    choiceArgument: {
+      expectedAdmin: CBTC_ADMIN_PARTY,
+      transfer: {
+        sender: sellOrder.partyId,
+        receiver: buyOrder.partyId,
+        amount: matchQuantity.toString(),
+        instrumentId: {
+          admin: CBTC_ADMIN_PARTY,
+          id: 'CBTC'
+        },
+        // ... rest from factory response
+      },
+      extraArgs: {
+        context: cbtcTransferFactory.choiceContext.choiceContextData,
+        meta: { values: {} }
+      }
+    },
+    disclosedContracts: cbtcTransferFactory.choiceContext.disclosedContracts
+  });
+
+  console.log('[Settlement] ✅ CBTC transfer created');
+
+  // Transfer 2: CC (buyer → seller) via SPLICE SDK
+  console.log('[Settlement] Creating CC transfer via Splice SDK...');
+  const ccTransfer = await cantonSDK.createAndSubmitTransfer(
+    buyOrder.partyId,
+    sellOrder.partyId,
+    (matchQuantity * matchPrice).toString(),
+    'CC',
+    'exchange-settlement'
+  );
+
+  console.log('[Settlement] ✅ CC transfer created');
+
+  // Step 3: Accept both transfers
+  // ... (similar to current implementation)
+}
+```
+
+---
+
+## 🔑 KEY DIFFERENCES
+
+### Splice (CC) Transfer:
+```
+1. Call Splice SDK: sdk.tokenStandard.createTransfer()
+2. SDK calls: /api/validator/v0/scan-proxy/registry/transfer-instruction/v1/transfer-factory
+3. Admin: DSO::1220be58c29e65de40bf273be1dc2b266d4...
+```
+
+### Utilities (CBTC) Transfer:
+```
+1. Manually call: https://api.utilities.digitalasset-dev.com/api/utilities/v0/registrars/{ADMIN}/registry/transfer-instruction/v1/transfer-factory
+2. Admin: cbtc-network::12202a83c6f4082217c175e29bc53da5f2703ba2675778ab99217a5a881a949203ff
+3. Different holding interface
+4. Same 2-step flow (offer → accept)
+```
+
+---
+
+## 📝 CONSTANTS NEEDED
+
+```javascript
+// Utilities Token Standard interfaces (from client's doc)
+const UTILITIES_HOLDING_INTERFACE = "718a0f77e505a8de22f188bd4c87fe74101274e9d4cb1bfac7d09aec7158d35b:Splice.Api.Token.HoldingV1:Holding";
+
+const UTILITIES_TRANSFER_FACTORY_INTERFACE = "55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.TransferInstructionV1:TransferFactory";
+
+const UTILITIES_TRANSFER_INSTRUCTION_INTERFACE = "55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.TransferInstructionV1:TransferInstruction";
+```
+
+---
+
+## ✅ CHECKLIST
+
+To support CBTC/CC trading pair:
+
+- [ ] Add Utilities Backend URL to config
+- [ ] Add CBTC admin party to config
+- [ ] Create `CBTCUtilitiesClient` class
+- [ ] Update matching engine to handle both token types
+- [ ] Add instrument detection (CC vs CBTC)
+- [ ] Test CBTC holdings query
+- [ ] Test CBTC transfer creation
+- [ ] Test CBTC transfer acceptance
+- [ ] Verify both transfers work in single trade
+- [ ] Add CBTC balance endpoint
+
+---
+
+## 🎯 CLIENT'S QUESTIONS ANSWERED
+
+**Q: "Are you using Allocations in matchmaking?"**
+A: No, you're using 2-step **Transfer Instructions** (offer → accept)
+
+**Q: "Will integrating USDCx be easy after CBTC?"**
+A: Yes! USDCx is also a Utilities token, so same pattern:
+- USDCx Backend: Same utilities URL
+- USDCx Admin Party: Different (will be provided)
+- Same transfer flow
+
+---
+
+## 🚨 WHY THIS WASN'T WORKING
+
+Your current system **ONLY supports CC** (Splice tokens).
+
+When a trade happens:
+1. ✅ CC transfer works (Splice SDK)
+2. ❌ CBTC transfer **DOESN'T HAPPEN** (not implemented!)
+
+**User deposits CBTC → Buys CC → Gets CC but CBTC isn't transferred back = broken trade!**
+
+---
+
+## 💡 NEXT STEPS
+
+1. **Confirm with client**: Is your current CC transfer working?
+2. **Add CBTC support** using the Utilities API pattern above
+3. **Test end-to-end**: Place CBTC/CC order → Match → Verify BOTH transfers complete
+4. **Verify on Canton Explorer**: Both CBTC and CC transfers visible
+
+**This is the missing 10% that makes your exchange functional for CBTC/CC trading!**
+
+
+
+
+
+# 🎯 COMPLETE CURSOR PROMPT FOR CBTC SUPPORT
+
+Copy this entire prompt to Cursor:
+
+---
+
+```markdown
+# ADD CBTC (UTILITIES TOKEN) SUPPORT TO EXCHANGE
+
+## CRITICAL CONTEXT
+
+The exchange currently ONLY supports CC (Splice tokens). CBTC is a **Utilities Token (CIP-0056)** that uses a COMPLETELY DIFFERENT API. We need to add support for CBTC transfers in the matching engine.
+
+**Key differences:**
+- CC uses: Splice SDK → `http://65.108.40.104:8088/api/validator/v0/scan-proxy`
+- CBTC uses: Utilities Backend API → `https://api.utilities.digitalasset-dev.com/api/utilities`
+- Different admin parties, different holding interfaces, same 2-step transfer flow
+
+## REFERENCE DOCUMENTATION
+
+Client provided this official example: https://docs.digitalasset.com/utilities/devnet/how-tos/registry/transfer/transfer.html
+
+The Utilities Token transfer flow:
+1. Get sender's holdings via Canton Ledger API
+2. Call `/v0/registrars/{ADMIN_PARTY}/registry/transfer-instruction/v1/transfer-factory`
+3. Submit ExerciseCommand to Canton Ledger API
+4. Receiver accepts the transfer instruction
+
+---
+
+## TASK 1: UPDATE CONFIG FILE
+
+**File**: `backend/src/config/canton-sdk.config.js`
+
+Add these new constants at the top:
+
+```javascript
+// Utilities Token Standard Configuration (for CBTC, USDCx, etc.)
+const UTILITIES_CONFIG = {
+  // DevNet Utilities Backend API
+  BACKEND_URL: process.env.UTILITIES_BACKEND_URL || 'https://api.utilities.digitalasset-dev.com/api/utilities',
+  
+  // CBTC Admin Party (cBTC Network)
+  CBTC_ADMIN_PARTY: 'cbtc-network::12202a83c6f4082217c175e29bc53da5f2703ba2675778ab99217a5a881a949203ff',
+  
+  // Utilities Token Standard Interface IDs
+  HOLDING_INTERFACE: '718a0f77e505a8de22f188bd4c87fe74101274e9d4cb1bfac7d09aec7158d35b:Splice.Api.Token.HoldingV1:Holding',
+  TRANSFER_FACTORY_INTERFACE: '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.TransferInstructionV1:TransferFactory',
+  TRANSFER_INSTRUCTION_INTERFACE: '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.TransferInstructionV1:TransferInstruction',
+};
+```
+
+Update the INSTRUMENT_MAP to include token type information:
+
+```javascript
+const CANTON_SDK_CONFIG = {
+  // ... existing config ...
+  
+  INSTRUMENT_MAP: {
+    'CC': {
+      cantonInstrument: 'Amulet',
+      type: 'splice',  // NEW: Token type
+      adminParty: null, // Will be auto-discovered from Scan API
+    },
+    'CBTC': {
+      cantonInstrument: 'CBTC',
+      type: 'utilities',  // NEW: Token type
+      adminParty: UTILITIES_CONFIG.CBTC_ADMIN_PARTY,
+    },
+  },
+};
+```
+
+Export the new config:
+
+```javascript
+module.exports = {
+  CANTON_SDK_CONFIG,
+  UTILITIES_CONFIG,  // NEW
+  toCantonInstrument,
+  toExchangeSymbol,
+  extractInstrumentId,
+};
+```
+
+---
+
+## TASK 2: CREATE CBTC UTILITIES CLIENT
+
+**File**: `backend/src/services/cbtc-utilities-client.js` (NEW FILE)
+
+```javascript
+const fetch = require('node-fetch');
+const { UTILITIES_CONFIG, CANTON_SDK_CONFIG } = require('../config/canton-sdk.config');
+const cantonService = require('./cantonService');
+const tokenProvider = require('./tokenProvider');
+
+/**
+ * CBTC Utilities Client
+ * 
+ * Handles CBTC transfers using the Utilities Token Standard API.
+ * CBTC is a CIP-0056 Utilities Token, NOT a Splice token like CC.
+ * 
+ * Reference: https://docs.digitalasset.com/utilities/devnet/how-tos/registry/transfer/transfer.html
+ */
+class CBTCUtilitiesClient {
+  constructor() {
+    this.backendUrl = UTILITIES_CONFIG.BACKEND_URL;
+    this.adminParty = UTILITIES_CONFIG.CBTC_ADMIN_PARTY;
+    this.ledgerApiUrl = process.env.CANTON_LEDGER_API_HTTP || 'http://65.108.40.104:31217';
+  }
+
+  /**
+   * Get CBTC holdings for a party
+   * 
+   * @param {string} partyId - Party ID
+   * @param {string} token - JWT token for authentication
+   * @returns {Array} Holdings with contractId and amount
+   */
+  async getHoldings(partyId, token) {
+    console.log(`[CBTC] Fetching holdings for ${partyId.substring(0, 30)}...`);
+
+    try {
+      const ledgerEndResponse = await fetch(`${this.ledgerApiUrl}/v2/state/ledger-end`, {
+        headers: {
+          'Accept': 'application/json',
+          'Authorization': `Bearer ${token}`
+        }
+      });
+
+      const ledgerEnd = await ledgerEndResponse.json();
+      const offset = ledgerEnd.offset;
+
+      const response = await fetch(`${this.ledgerApiUrl}/v2/state/active-contracts`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          verbose: false,
+          activeAtOffset: offset,
+          filter: {
+            filtersByParty: {
+              [partyId]: {
+                cumulative: [{
+                  identifierFilter: {
+                    InterfaceFilter: {
+                      value: {
+                        interfaceId: UTILITIES_CONFIG.HOLDING_INTERFACE,
+                        includeInterfaceView: true,
+                        includeCreatedEventBlob: false
+                      }
+                    }
+                  }
+                }]
+              }
+            }
+          }
+        })
+      });
+
+      const contracts = await response.json();
+
+      // Extract holdings for CBTC instrument
+      const holdings = [];
+      for (const contract of contracts) {
+        const createdEvent = contract.contractEntry?.JsActiveContract?.createdEvent;
+        if (!createdEvent) continue;
+
+        for (const view of createdEvent.interfaceViews || []) {
+          const viewValue = view.viewValue;
+          if (viewValue?.owner === partyId && 
+              viewValue?.instrumentId?.id === 'CBTC' &&
+              viewValue?.instrumentId?.admin === this.adminParty) {
+            holdings.push({
+              contractId: createdEvent.contractId,
+              amount: viewValue.amount,
+              lock: viewValue.lock
+            });
+          }
+        }
+      }
+
+      console.log(`[CBTC] Found ${holdings.length} holdings`);
+      return holdings;
+    } catch (error) {
+      console.error('[CBTC] Failed to get holdings:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Create CBTC transfer instruction
+   * 
+   * @param {string} senderParty - Sender party ID
+   * @param {string} receiverParty - Receiver party ID
+   * @param {string} amount - Amount to transfer
+   * @param {string} senderToken - Sender's JWT token
+   * @param {string} memo - Transfer reason/memo
+   * @returns {Object} { factoryId, choiceContext, transferKind }
+   */
+  async createTransfer(senderParty, receiverParty, amount, senderToken, memo = '') {
+    console.log(`[CBTC] Creating transfer: ${amount} CBTC from ${senderParty.substring(0, 30)}... to ${receiverParty.substring(0, 30)}...`);
+
+    try {
+      // Step 1: Get sender's holdings
+      const holdings = await this.getHoldings(senderParty, senderToken);
+      
+      // Filter out locked holdings
+      const availableHoldings = holdings.filter(h => h.lock === null);
+      
+      if (availableHoldings.length === 0) {
+        throw new Error('No available CBTC holdings found');
+      }
+
+      const holdingCids = availableHoldings.map(h => h.contractId);
+
+      // Step 2: Call Utilities Backend API for transfer factory
+      const now = new Date().toISOString();
+      const oneHour = new Date(Date.now() + 3600000).toISOString();
+
+      const transferFactoryUrl = `${this.backendUrl}/v0/registrars/${this.adminParty}/registry/transfer-instruction/v1/transfer-factory`;
+
+      console.log(`[CBTC] Calling transfer factory: ${transferFactoryUrl}`);
+
+      const response = await fetch(transferFactoryUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          choiceArguments: {
+            expectedAdmin: this.adminParty,
+            transfer: {
+              sender: senderParty,
+              receiver: receiverParty,
+              amount: amount,
+              instrumentId: {
+                admin: this.adminParty,
+                id: 'CBTC'
+              },
+              requestedAt: now,
+              executeBefore: oneHour,
+              inputHoldingCids: holdingCids,
+              meta: {
+                values: {
+                  'splice.lfdecentralizedtrust.org/reason': memo || 'exchange-settlement'
+                }
+              }
+            },
+            extraArgs: {
+              context: {
+                values: {}
+              },
+              meta: {
+                values: {}
+              }
+            }
+          },
+          excludeDebugFields: true
+        })
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Transfer factory API failed: ${response.status} - ${errorText}`);
+      }
+
+      const factory = await response.json();
+
+      console.log(`[CBTC] ✅ Transfer factory created: ${factory.factoryId.substring(0, 30)}...`);
+
+      return {
+        factoryId: factory.factoryId,
+        choiceContext: factory.choiceContext,
+        transferKind: factory.transferKind,
+        transfer: {
+          sender: senderParty,
+          receiver: receiverParty,
+          amount: amount,
+          instrumentId: {
+            admin: this.adminParty,
+            id: 'CBTC'
+          },
+          requestedAt: now,
+          executeBefore: oneHour,
+          inputHoldingCids: holdingCids,
+          meta: {
+            values: {
+              'splice.lfdecentralizedtrust.org/reason': memo || 'exchange-settlement'
+            }
+          }
+        }
+      };
+    } catch (error) {
+      console.error('[CBTC] Failed to create transfer:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Submit CBTC transfer to Canton Ledger
+   * 
+   * @param {Object} transferFactory - Factory response from createTransfer
+   * @param {string} senderParty - Sender party ID
+   * @returns {Object} Transaction result
+   */
+  async submitTransfer(transferFactory, senderParty) {
+    console.log(`[CBTC] Submitting transfer to Canton Ledger...`);
+
+    try {
+      const adminToken = await tokenProvider.getServiceToken();
+
+      const result = await cantonService.exerciseChoice({
+        token: adminToken,
+        actAsParty: [senderParty],
+        templateId: UTILITIES_CONFIG.TRANSFER_FACTORY_INTERFACE,
+        contractId: transferFactory.factoryId,
+        choice: 'TransferFactory_Transfer',
+        choiceArgument: {
+          expectedAdmin: this.adminParty,
+          transfer: transferFactory.transfer,
+          extraArgs: {
+            context: transferFactory.choiceContext.choiceContextData,
+            meta: {
+              values: {}
+            }
+          }
+        },
+        readAs: [senderParty, transferFactory.transfer.receiver],
+        disclosedContracts: transferFactory.choiceContext.disclosedContracts?.map(dc => ({
+          templateId: dc.templateId,
+          contractId: dc.contractId,
+          createdEventBlob: dc.createdEventBlob,
+          ...(dc.synchronizerId && { synchronizerId: dc.synchronizerId }),
+        })),
+      });
+
+      console.log(`[CBTC] ✅ Transfer submitted - updateId: ${result.transaction?.updateId}`);
+
+      // Extract the TransferInstruction contract ID from created events
+      let transferInstructionId = null;
+      for (const event of result.transaction?.events || []) {
+        if (event.CreatedEvent?.templateId?.includes('TransferOffer') ||
+            event.CreatedEvent?.templateId?.includes('TransferInstruction')) {
+          transferInstructionId = event.CreatedEvent.contractId;
+          break;
+        }
+      }
+
+      return {
+        updateId: result.transaction?.updateId,
+        transferInstructionId,
+        autoCompleted: transferFactory.transferKind === 'self', // Self-transfers auto-complete
+      };
+    } catch (error) {
+      console.error('[CBTC] Failed to submit transfer:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Accept CBTC transfer instruction
+   * 
+   * @param {string} transferInstructionId - Contract ID of transfer instruction
+   * @param {string} receiverParty - Receiver party ID
+   * @param {string} receiverToken - Receiver's JWT token
+   * @returns {Object} Transaction result
+   */
+  async acceptTransfer(transferInstructionId, receiverParty, receiverToken) {
+    console.log(`[CBTC] Accepting transfer instruction: ${transferInstructionId.substring(0, 30)}...`);
+
+    try {
+      // Step 1: Get accept context from Utilities Backend
+      const acceptContextUrl = `${this.backendUrl}/v0/registrars/${this.adminParty}/registry/transfer-instruction/v1/${transferInstructionId}/choice-contexts/accept`;
+
+      const contextResponse = await fetch(acceptContextUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          meta: {},
+          excludeDebugFields: true
+        })
+      });
+
+      if (!contextResponse.ok) {
+        const errorText = await contextResponse.text();
+        throw new Error(`Accept context API failed: ${contextResponse.status} - ${errorText}`);
+      }
+
+      const acceptContext = await contextResponse.json();
+
+      // Step 2: Submit accept command to Canton Ledger
+      const adminToken = await tokenProvider.getServiceToken();
+
+      const result = await cantonService.exerciseChoice({
+        token: adminToken,
+        actAsParty: [receiverParty],
+        templateId: UTILITIES_CONFIG.TRANSFER_INSTRUCTION_INTERFACE,
+        contractId: transferInstructionId,
+        choice: 'TransferInstruction_Accept',
+        choiceArgument: {
+          extraArgs: {
+            context: acceptContext.choiceContextData,
+            meta: {
+              values: {}
+            }
+          }
+        },
+        readAs: [receiverParty],
+        disclosedContracts: acceptContext.disclosedContracts?.map(dc => ({
+          templateId: dc.templateId,
+          contractId: dc.contractId,
+          createdEventBlob: dc.createdEventBlob,
+          ...(dc.synchronizerId && { synchronizerId: dc.synchronizerId }),
+        })),
+      });
+
+      console.log(`[CBTC] ✅ Transfer accepted - updateId: ${result.transaction?.updateId}`);
+
+      return {
+        updateId: result.transaction?.updateId,
+      };
+    } catch (error) {
+      console.error('[CBTC] Failed to accept transfer:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Full transfer flow: create + submit + accept
+   * 
+   * @param {string} senderParty - Sender party ID
+   * @param {string} receiverParty - Receiver party ID  
+   * @param {string} amount - Amount to transfer
+   * @param {string} senderToken - Sender's JWT token
+   * @param {string} receiverToken - Receiver's JWT token (for accept)
+   * @param {string} memo - Transfer memo
+   * @returns {Object} { createResult, acceptResult }
+   */
+  async executeFullTransfer(senderParty, receiverParty, amount, senderToken, receiverToken, memo = '') {
+    console.log(`[CBTC] ═══════════════════════════════════`);
+    console.log(`[CBTC] Executing full CBTC transfer`);
+    console.log(`[CBTC] Amount: ${amount}`);
+    console.log(`[CBTC] Sender: ${senderParty.substring(0, 40)}...`);
+    console.log(`[CBTC] Receiver: ${receiverParty.substring(0, 40)}...`);
+    console.log(`[CBTC] ═══════════════════════════════════`);
+
+    // Step 1: Create transfer instruction
+    const transferFactory = await this.createTransfer(
+      senderParty,
+      receiverParty,
+      amount,
+      senderToken,
+      memo
+    );
+
+    // Step 2: Submit to Canton
+    const createResult = await this.submitTransfer(transferFactory, senderParty);
+
+    // Step 3: Accept if not auto-completed
+    if (createResult.autoCompleted) {
+      console.log(`[CBTC] Transfer auto-completed (pre-approval)`);
+      return {
+        createResult,
+        acceptResult: null,
+        autoCompleted: true,
+      };
+    }
+
+    if (!createResult.transferInstructionId) {
+      throw new Error('Transfer instruction ID not found in create result');
+    }
+
+    const acceptResult = await this.acceptTransfer(
+      createResult.transferInstructionId,
+      receiverParty,
+      receiverToken
+    );
+
+    console.log(`[CBTC] ✅ Full transfer completed`);
+
+    return {
+      createResult,
+      acceptResult,
+      autoCompleted: false,
+    };
+  }
+}
+
+// Export singleton
+let cbtcUtilitiesClient = null;
+
+function getCBTCUtilitiesClient() {
+  if (!cbtcUtilitiesClient) {
+    cbtcUtilitiesClient = new CBTCUtilitiesClient();
+  }
+  return cbtcUtilitiesClient;
+}
+
+module.exports = { CBTCUtilitiesClient, getCBTCUtilitiesClient };
+```
+
+---
+
+## TASK 3: UPDATE MATCHING ENGINE
+
+**File**: `backend/src/services/matching-engine.js`
+
+Add imports at the top:
+
+```javascript
+const { getCBTCUtilitiesClient } = require('./cbtc-utilities-client');
+const { UTILITIES_CONFIG } = require('../config/canton-sdk.config');
+```
+
+Replace the `executeMatch` method's settlement section:
+
+```javascript
+async executeMatch(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, token) {
+  // ... existing code for match quantity, price calculation ...
+
+  const [baseSymbol, quoteSymbol] = tradingPair.split('/');
+  const matchQtyStr = matchQty.toString();
+  const quoteAmountStr = quoteAmount.toString();
+
+  console.log(`[MatchingEngine] ═══════════════════════════════════`);
+  console.log(`[MatchingEngine] Executing settlement`);
+  console.log(`[MatchingEngine] Pair: ${tradingPair}`);
+  console.log(`[MatchingEngine] Qty: ${matchQtyStr} @ ${matchPrice}`);
+  console.log(`[MatchingEngine] ═══════════════════════════════════`);
+
+  let instrumentTransferResult = null;
+  let paymentTransferResult = null;
+
+  try {
+    // Determine which token system to use based on instrument type
+    const baseTokenType = CANTON_SDK_CONFIG.INSTRUMENT_MAP[baseSymbol]?.type || 'splice';
+    const quoteTokenType = CANTON_SDK_CONFIG.INSTRUMENT_MAP[quoteSymbol]?.type || 'splice';
+
+    // ═══════════════════════════════════════════════════════════
+    // TRANSFER 1: BASE INSTRUMENT (seller → buyer)
+    // ═══════════════════════════════════════════════════════════
+    console.log(`[MatchingEngine] 📤 Transfer ${matchQtyStr} ${baseSymbol} (${baseTokenType}): seller → buyer`);
+
+    if (baseTokenType === 'utilities') {
+      // CBTC or other Utilities token
+      const cbtcClient = getCBTCUtilitiesClient();
+      const sellerToken = await tokenProvider.getServiceToken();
+      const buyerToken = await tokenProvider.getServiceToken();
+
+      instrumentTransferResult = await cbtcClient.executeFullTransfer(
+        sellOrder.owner,
+        buyOrder.owner,
+        matchQtyStr,
+        sellerToken,
+        buyerToken,
+        `settlement:${buyOrder.orderId}:${sellOrder.orderId}:base`
+      );
+
+      console.log(`[MatchingEngine] ✅ Base instrument (${baseSymbol}) transferred - updateId: ${instrumentTransferResult.createResult.updateId}`);
+    } else {
+      // CC or other Splice token
+      const sdkClient = getCantonSDKClient();
+      instrumentTransferResult = await sdkClient.executeFullTransfer(
+        sellOrder.owner,
+        buyOrder.owner,
+        matchQtyStr,
+        baseSymbol,
+        `settlement:${buyOrder.orderId}:${sellOrder.orderId}:base`
+      );
+
+      console.log(`[MatchingEngine] ✅ Base instrument (${baseSymbol}) transferred - updateId: ${instrumentTransferResult.updateId}`);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // TRANSFER 2: QUOTE INSTRUMENT (buyer → seller)
+    // ═══════════════════════════════════════════════════════════
+    console.log(`[MatchingEngine] 💰 Transfer ${quoteAmountStr} ${quoteSymbol} (${quoteTokenType}): buyer → seller`);
+
+    if (quoteTokenType === 'utilities') {
+      // CBTC or other Utilities token
+      const cbtcClient = getCBTCUtilitiesClient();
+      const buyerToken = await tokenProvider.getServiceToken();
+      const sellerToken = await tokenProvider.getServiceToken();
+
+      paymentTransferResult = await cbtcClient.executeFullTransfer(
+        buyOrder.owner,
+        sellOrder.owner,
+        quoteAmountStr,
+        buyerToken,
+        sellerToken,
+        `settlement:${buyOrder.orderId}:${sellOrder.orderId}:quote`
+      );
+
+      console.log(`[MatchingEngine] ✅ Quote instrument (${quoteSymbol}) transferred - updateId: ${paymentTransferResult.createResult.updateId}`);
+    } else {
+      // CC or other Splice token
+      const sdkClient = getCantonSDKClient();
+      paymentTransferResult = await sdkClient.executeFullTransfer(
+        buyOrder.owner,
+        sellOrder.owner,
+        quoteAmountStr,
+        quoteSymbol,
+        `settlement:${buyOrder.orderId}:${sellOrder.orderId}:quote`
+      );
+
+      console.log(`[MatchingEngine] ✅ Quote instrument (${quoteSymbol}) transferred - updateId: ${paymentTransferResult.updateId}`);
+    }
+
+    console.log(`[MatchingEngine] ✅ Both transfers completed successfully`);
+
+  } catch (transferError) {
+    console.error(`[MatchingEngine] ❌ Transfer failed:`, transferError);
+
+    // Log which transfer succeeded for manual recovery
+    if (instrumentTransferResult && !paymentTransferResult) {
+      console.error(`[MatchingEngine] CRITICAL: Base instrument transferred but quote failed!`);
+      console.error(`[MatchingEngine] Base updateId:`, instrumentTransferResult.updateId || instrumentTransferResult.createResult?.updateId);
+      console.error(`[MatchingEngine] Manual intervention required`);
+    }
+
+    if (!instrumentTransferResult && paymentTransferResult) {
+      console.error(`[MatchingEngine] CRITICAL: Quote instrument transferred but base failed!`);
+      console.error(`[MatchingEngine] Quote updateId:`, paymentTransferResult.updateId || paymentTransferResult.createResult?.updateId);
+      console.error(`[MatchingEngine] Manual intervention required`);
+    }
+
+    throw transferError;
+  }
+
+  // ... rest of existing code (FillOrder, trade record, etc.) ...
+}
+```
+
+---
+
+## TASK 4: ADD ENVIRONMENT VARIABLES
+
+**File**: `.env`
+
+Add:
+
+```bash
+# Utilities Token Standard (for CBTC)
+UTILITIES_BACKEND_URL=https://api.utilities.digitalasset-dev.com/api/utilities
+```
+
+---
+
+## TASK 5: UPDATE BALANCE ROUTES (OPTIONAL)
+
+**File**: `backend/src/routes/balanceRoutes.js`
+
+Add CBTC balance support:
+
+```javascript
+const { getCBTCUtilitiesClient } = require('../services/cbtc-utilities-client');
+
+router.get('/v2/:partyId', asyncHandler(async (req, res) => {
+  const { partyId } = req.params;
+  const sdkClient = getCantonSDKClient();
+
+  // Get CC balance from Splice SDK
+  const ccBalance = await sdkClient.getBalance(partyId, 'CC');
+
+  // Get CBTC balance from Utilities API
+  const cbtcClient = getCBTCUtilitiesClient();
+  const token = await tokenProvider.getServiceToken();
+  const cbtcHoldings = await cbtcClient.getHoldings(partyId, token);
+  
+  const cbtcTotal = cbtcHoldings
+    .reduce((sum, h) => sum + parseFloat(h.amount), 0);
+  
+  const cbtcLocked = cbtcHoldings
+    .filter(h => h.lock !== null)
+    .reduce((sum, h) => sum + parseFloat(h.amount), 0);
+  
+  const cbtcAvailable = cbtcTotal - cbtcLocked;
+
+  res.json({
+    success: true,
+    message: 'Balances retrieved',
+    data: {
+      partyId,
+      balance: {
+        CC: parseFloat(ccBalance.total),
+        CBTC: cbtcTotal,
+      },
+      available: {
+        CC: parseFloat(ccBalance.available),
+        CBTC: cbtcAvailable,
+      },
+      locked: {
+        CC: parseFloat(ccBalance.locked),
+        CBTC: cbtcLocked,
+      },
+      source: 'multi-token',
+    },
+  });
+}));
+```
+
+---
+
+## VERIFICATION STEPS
+
+After implementing:
+
+1. **Test CBTC holdings query**:
+```bash
+# Should return CBTC holdings
+GET /api/balance/v2/{partyId}
+```
+
+2. **Test CBTC/CC trade**:
+```bash
+# Place sell order (CBTC for CC)
+POST /api/orders
+{
+  "side": "sell",
+  "tradingPair": "CBTC/CC",
+  "quantity": 0.001,
+  "price": 7000
+}
+
+# Place matching buy order
+POST /api/orders
+{
+  "side": "buy",
+  "tradingPair": "CBTC/CC",
+  "quantity": 0.001,
+  "price": 7000
+}
+```
+
+3. **Check Canton Explorer**:
+- Should see TWO transfers (one CBTC, one CC)
+- Both should show as completed
+
+4. **Check balances**:
+- Seller: -0.001 CBTC, +7 CC
+- Buyer: +0.001 CBTC, -7 CC
+
+---
+
+## EXPECTED LOGS
+
+```
+[MatchingEngine] ═══════════════════════════════════
+[MatchingEngine] Executing settlement
+[MatchingEngine] Pair: CBTC/CC
+[MatchingEngine] Qty: 0.001 @ 7000
+[MatchingEngine] ═══════════════════════════════════
+[MatchingEngine] 📤 Transfer 0.001 CBTC (utilities): seller → buyer
+[CBTC] ═══════════════════════════════════
+[CBTC] Executing full CBTC transfer
+[CBTC] Amount: 0.001
+[CBTC] ═══════════════════════════════════
+[CBTC] Fetching holdings for seller...
+[CBTC] Found 3 holdings
+[CBTC] Calling transfer factory: https://api.utilities.digitalasset-dev.com/api/utilities/v0/registrars/...
+[CBTC] ✅ Transfer factory created
+[CBTC] Submitting transfer to Canton Ledger...
+[CBTC] ✅ Transfer submitted - updateId: 1220abc...
+[CBTC] Accepting transfer instruction...
+[CBTC] ✅ Transfer accepted - updateId: 1220def...
+[CBTC] ✅ Full transfer completed
+[MatchingEngine] ✅ Base instrument (CBTC) transferred - updateId: 1220abc...
+[MatchingEngine] 💰 Transfer 7 CC (splice): buyer → seller
+[CantonSDK] Executing full CC transfer...
+[CantonSDK] ✅ Transfer completed
+[MatchingEngine] ✅ Quote instrument (CC) transferred - updateId: 1220xyz...
+[MatchingEngine] ✅ Both transfers completed successfully
+```
+
+---
+
+## NOTES
+
+1. **JWT Tokens**: The CBTC client uses JWT admin tokens via `tokenProvider.getServiceToken()`. This is correct for backend service-to-service auth.
+
+2. **2-Step Flow**: Both CC and CBTC use 2-step transfer (create → accept). The code handles this consistently.
+
+3. **Auto-Completion**: If transfer has pre-approval setup, `transferKind === 'self'` and accept is skipped.
+
+4. **Error Handling**: Logs which transfer succeeded if one fails, for manual recovery.
+
+5. **Instrument Admin**: CBTC admin is hardcoded (`cbtc-network::1220...`), CC admin is auto-discovered.
+
+---
+
+## FINAL CHECKLIST
+
+- [ ] Update `canton-sdk.config.js` with UTILITIES_CONFIG
+- [ ] Create `cbtc-utilities-client.js`
+- [ ] Update `matching-engine.js` settlement logic
+- [ ] Add `UTILITIES_BACKEND_URL` to `.env`
+- [ ] Test CBTC holdings query
+- [ ] Test CBTC/CC trade end-to-end
+- [ ] Verify both transfers on Canton Explorer
+- [ ] Update balance routes (optional)
+
+Once complete, CBTC/CC trading will work with real token transfers for both instruments!
+```
+
+---
+
+**Copy everything above and paste into Cursor. It has all the code and instructions needed to add CBTC support.**

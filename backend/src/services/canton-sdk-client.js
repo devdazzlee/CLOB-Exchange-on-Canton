@@ -21,7 +21,7 @@
  * @see https://docs.sync.global/app_dev/token_standard/openapi/transfer_instruction.html
  */
 
-const { CANTON_SDK_CONFIG, toCantonInstrument, toExchangeSymbol, extractInstrumentId } = require('../config/canton-sdk.config');
+const { CANTON_SDK_CONFIG, UTILITIES_CONFIG, toCantonInstrument, toExchangeSymbol, extractInstrumentId, getTokenSystemType, getInstrumentAdmin } = require('../config/canton-sdk.config');
 const cantonService = require('./cantonService');
 const tokenProvider = require('./tokenProvider');
 const Decimal = require('decimal.js');
@@ -445,7 +445,26 @@ class CantonSDKClient {
     }
 
     const instrumentId = toCantonInstrument(symbol);
-    console.log(`[CantonSDK] 📤 Creating transfer: ${amount} ${symbol} (${instrumentId}) from ${senderPartyId.substring(0, 30)}... → ${receiverPartyId.substring(0, 30)}...`);
+    const tokenSystemType = getTokenSystemType(symbol);
+
+    console.log(`[CantonSDK] 📤 Creating transfer: ${amount} ${symbol} (${instrumentId}, ${tokenSystemType}) from ${senderPartyId.substring(0, 30)}... → ${receiverPartyId.substring(0, 30)}...`);
+
+    // Route to the correct transfer method based on token system type
+    if (tokenSystemType === 'utilities') {
+      // CBTC and other Utilities tokens use a different API
+      return this._createAndSubmitUtilitiesTransfer(senderPartyId, receiverPartyId, amount, symbol, memo);
+    }
+
+    // CC (Amulet) and other Splice tokens use the SDK
+    return this._createAndSubmitSpliceTransfer(senderPartyId, receiverPartyId, amount, symbol, memo);
+  }
+
+  /**
+   * Create and submit a transfer for Splice tokens (CC/Amulet) via SDK.
+   * Uses the SDK's createTransfer which calls the Scan Proxy Transfer Factory.
+   */
+  async _createAndSubmitSpliceTransfer(senderPartyId, receiverPartyId, amount, symbol, memo) {
+    const instrumentId = toCantonInstrument(symbol);
 
     return this._withPartyContext(senderPartyId, async () => {
       // Get sender's available holdings for auto-selection
@@ -487,7 +506,6 @@ class CantonSDKClient {
         // SDK wraps commands as { ExerciseCommand: { templateId, contractId, choice, choiceArgument } }
         const cmd = rawCmd.ExerciseCommand || rawCmd;
 
-        // Log command details for debugging
         console.log(`[CantonSDK]    Submitting exercise: ${cmd.choice || 'unknown'} on ${cmd.contractId?.substring(0, 30) || 'unknown'}...`);
 
         result = await cantonService.exerciseChoice({
@@ -507,36 +525,174 @@ class CantonSDKClient {
         });
       }
 
-      // Extract TransferInstruction contract ID from the result
-      let transferInstructionId = null;
-      const events = result?.transaction?.events || [];
-      for (const event of events) {
-        const created = event.created || event.CreatedEvent;
-        if (created?.contractId) {
-          const templateId = created.templateId || '';
-          // Look for TransferInstruction template
-          if (typeof templateId === 'string' && templateId.includes('TransferInstruction')) {
-            transferInstructionId = created.contractId;
-            break;
-          }
+      return this._extractTransferResult(result);
+    });
+  }
+
+  /**
+   * Create and submit a transfer for Utilities tokens (CBTC) via direct HTTP API.
+   * 
+   * CBTC is a CIP-0056 Utilities Token with a DIFFERENT Transfer Factory Registry:
+   *   ${BACKEND}/v0/registrars/${ADMIN}/registry/transfer-instruction/v1/transfer-factory
+   * 
+   * Reference: https://docs.digitalasset.com/utilities/devnet/how-tos/registry/transfer/transfer.html
+   */
+  async _createAndSubmitUtilitiesTransfer(senderPartyId, receiverPartyId, amount, symbol, memo) {
+    const instrumentId = toCantonInstrument(symbol);
+    const adminParty = getInstrumentAdmin(symbol);
+
+    if (!adminParty) {
+      throw new Error(`No admin party configured for ${symbol} (${instrumentId})`);
+    }
+
+    console.log(`[CantonSDK]    Using Utilities Backend API for ${symbol} transfer`);
+    console.log(`[CantonSDK]    Admin party: ${adminParty.substring(0, 40)}...`);
+
+    // Step 1: Get sender's CBTC holdings via SDK (SDK already sees all Holding interface UTXOs)
+    const holdings = await this._withPartyContext(senderPartyId, async () => {
+      return await this.sdk.tokenStandard?.listHoldingUtxos(false) || [];
+    });
+
+    const holdingCids = holdings
+      .filter(h => {
+        const hInstrumentId = extractInstrumentId(h.interfaceViewValue?.instrumentId);
+        return hInstrumentId === instrumentId;
+      })
+      .map(h => h.contractId);
+
+    if (holdingCids.length === 0) {
+      throw new Error(`No ${symbol} holdings found for sender ${senderPartyId.substring(0, 30)}...`);
+    }
+
+    console.log(`[CantonSDK]    Found ${holdingCids.length} ${symbol} holding UTXOs`);
+
+    // Step 2: Call Utilities Backend API for transfer factory context
+    const backendUrl = UTILITIES_CONFIG.BACKEND_URL;
+    const transferFactoryUrl = `${backendUrl}/v0/registrars/${adminParty}/registry/transfer-instruction/v1/transfer-factory`;
+
+    const now = new Date().toISOString();
+    const oneHour = new Date(Date.now() + 3600000).toISOString();
+
+    console.log(`[CantonSDK]    Calling Utilities transfer factory: ${transferFactoryUrl.substring(0, 60)}...`);
+
+    const factoryResponse = await fetch(transferFactoryUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        choiceArguments: {
+          expectedAdmin: adminParty,
+          transfer: {
+            sender: senderPartyId,
+            receiver: receiverPartyId,
+            amount: amount.toString(),
+            instrumentId: {
+              admin: adminParty,
+              id: instrumentId,
+            },
+            requestedAt: now,
+            executeBefore: oneHour,
+            inputHoldingCids: holdingCids,
+            meta: {
+              values: {
+                'splice.lfdecentralizedtrust.org/reason': memo || 'exchange-settlement',
+              },
+            },
+          },
+          extraArgs: {
+            context: { values: {} },
+            meta: { values: {} },
+          },
+        },
+        excludeDebugFields: true,
+      }),
+    });
+
+    if (!factoryResponse.ok) {
+      const errorText = await factoryResponse.text();
+      throw new Error(`Utilities transfer factory API failed (${factoryResponse.status}): ${errorText}`);
+    }
+
+    const factory = await factoryResponse.json();
+    console.log(`[CantonSDK]    ✅ Utilities transfer factory returned — factoryId: ${factory.factoryId?.substring(0, 30) || 'N/A'}...`);
+
+    // Step 3: Submit the transfer ExerciseCommand to Canton Ledger
+    const adminToken = await tokenProvider.getServiceToken();
+
+    const result = await cantonService.exerciseChoice({
+      token: adminToken,
+      actAsParty: [senderPartyId],
+      templateId: UTILITIES_CONFIG.TRANSFER_FACTORY_INTERFACE,
+      contractId: factory.factoryId,
+      choice: 'TransferFactory_Transfer',
+      choiceArgument: {
+        expectedAdmin: adminParty,
+        transfer: {
+          sender: senderPartyId,
+          receiver: receiverPartyId,
+          amount: amount.toString(),
+          instrumentId: {
+            admin: adminParty,
+            id: instrumentId,
+          },
+          requestedAt: now,
+          executeBefore: oneHour,
+          inputHoldingCids: holdingCids,
+          meta: {
+            values: {
+              'splice.lfdecentralizedtrust.org/reason': memo || 'exchange-settlement',
+            },
+          },
+        },
+        extraArgs: {
+          context: factory.choiceContext?.choiceContextData || { values: {} },
+          meta: { values: {} },
+        },
+      },
+      readAs: [senderPartyId, receiverPartyId],
+      disclosedContracts: (factory.choiceContext?.disclosedContracts || []).map(dc => ({
+        templateId: dc.templateId,
+        contractId: dc.contractId,
+        createdEventBlob: dc.createdEventBlob,
+        ...(dc.synchronizerId && { synchronizerId: dc.synchronizerId }),
+      })),
+    });
+
+    console.log(`[CantonSDK]    ✅ Utilities transfer submitted — updateId: ${result?.transaction?.updateId || 'N/A'}`);
+    return this._extractTransferResult(result);
+  }
+
+  /**
+   * Extract TransferInstruction contract ID from exercise result.
+   * Shared by both Splice and Utilities transfer flows.
+   */
+  _extractTransferResult(result) {
+    let transferInstructionId = null;
+    const events = result?.transaction?.events || [];
+    for (const event of events) {
+      const created = event.created || event.CreatedEvent;
+      if (created?.contractId) {
+        const templateId = created.templateId || '';
+        // Look for TransferInstruction or TransferOffer template
+        if (typeof templateId === 'string' && 
+            (templateId.includes('TransferInstruction') || templateId.includes('TransferOffer'))) {
+          transferInstructionId = created.contractId;
+          break;
         }
       }
+    }
 
-      // If no TransferInstruction found, the transfer may have auto-completed
-      // (e.g., Transfer Pre-approval was in place)
-      if (!transferInstructionId) {
-        console.log('[CantonSDK]    ℹ️ No pending TransferInstruction — transfer may have auto-completed (pre-approval)');
-      } else {
-        console.log(`[CantonSDK]    ✅ TransferInstruction created: ${transferInstructionId.substring(0, 30)}...`);
-      }
+    if (!transferInstructionId) {
+      console.log('[CantonSDK]    ℹ️ No pending TransferInstruction — transfer may have auto-completed (pre-approval)');
+    } else {
+      console.log(`[CantonSDK]    ✅ TransferInstruction created: ${transferInstructionId.substring(0, 30)}...`);
+    }
 
-      return {
-        transferInstructionId,
-        result,
-        autoCompleted: !transferInstructionId,
-        updateId: result?.transaction?.updateId,
-      };
-    });
+    return {
+      transferInstructionId,
+      result,
+      autoCompleted: !transferInstructionId,
+      updateId: result?.transaction?.updateId,
+    };
   }
 
   /**
@@ -550,7 +706,7 @@ class CantonSDKClient {
    * @param {string} receiverPartyId - The receiving party
    * @returns {Object} Canton exercise result
    */
-  async acceptTransfer(transferInstructionId, receiverPartyId) {
+  async acceptTransfer(transferInstructionId, receiverPartyId, symbol = null) {
     if (!this.isReady()) {
       throw new Error('Canton SDK not initialized');
     }
@@ -562,8 +718,21 @@ class CantonSDKClient {
 
     console.log(`[CantonSDK] ✅ Accepting transfer: ${transferInstructionId.substring(0, 30)}... by ${receiverPartyId.substring(0, 30)}...`);
 
+    // If symbol is provided and it's a Utilities token, use the Utilities Backend API
+    const tokenSystemType = symbol ? getTokenSystemType(symbol) : null;
+    if (tokenSystemType === 'utilities') {
+      return this._acceptUtilitiesTransfer(transferInstructionId, receiverPartyId, symbol);
+    }
+
+    // Default: use SDK for Splice tokens (CC/Amulet)
+    return this._acceptSpliceTransfer(transferInstructionId, receiverPartyId);
+  }
+
+  /**
+   * Accept a Splice token transfer via SDK.
+   */
+  async _acceptSpliceTransfer(transferInstructionId, receiverPartyId) {
     return this._withPartyContext(receiverPartyId, async () => {
-      // Get the accept command with disclosed contracts from SDK
       const [acceptCommand, disclosedContracts] = await this.sdk.tokenStandard.exerciseTransferInstructionChoice(
         transferInstructionId,
         'Accept'
@@ -571,13 +740,11 @@ class CantonSDKClient {
 
       console.log(`[CantonSDK]    Accept command created (${disclosedContracts?.length || 0} disclosed contracts)`);
 
-      // Submit via cantonService (JWT admin auth)
       const adminToken = await tokenProvider.getServiceToken();
       const commands = Array.isArray(acceptCommand) ? acceptCommand : [acceptCommand];
 
       let result = null;
       for (const rawCmd of commands) {
-        // SDK wraps commands as { ExerciseCommand: { templateId, contractId, choice, choiceArgument } }
         const cmd = rawCmd.ExerciseCommand || rawCmd;
 
         result = await cantonService.exerciseChoice({
@@ -600,6 +767,68 @@ class CantonSDKClient {
       console.log(`[CantonSDK]    ✅ Transfer accepted — updateId: ${result?.transaction?.updateId || 'N/A'}`);
       return result;
     });
+  }
+
+  /**
+   * Accept a Utilities token transfer (CBTC) via direct HTTP API.
+   * 
+   * Uses: ${BACKEND}/v0/registrars/${ADMIN}/registry/transfer-instruction/v1/${CID}/choice-contexts/accept
+   * Then submits TransferInstruction_Accept via Canton Ledger API.
+   * 
+   * Reference: https://docs.digitalasset.com/utilities/devnet/how-tos/registry/transfer/transfer.html
+   */
+  async _acceptUtilitiesTransfer(transferInstructionId, receiverPartyId, symbol) {
+    const adminParty = getInstrumentAdmin(symbol);
+    const backendUrl = UTILITIES_CONFIG.BACKEND_URL;
+
+    console.log(`[CantonSDK]    Using Utilities Backend API for ${symbol} accept`);
+
+    // Step 1: Get accept choice context from Utilities Backend
+    const acceptContextUrl = `${backendUrl}/v0/registrars/${adminParty}/registry/transfer-instruction/v1/${transferInstructionId}/choice-contexts/accept`;
+
+    const contextResponse = await fetch(acceptContextUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        meta: {},
+        excludeDebugFields: true,
+      }),
+    });
+
+    if (!contextResponse.ok) {
+      const errorText = await contextResponse.text();
+      throw new Error(`Utilities accept context API failed (${contextResponse.status}): ${errorText}`);
+    }
+
+    const acceptContext = await contextResponse.json();
+    console.log(`[CantonSDK]    ✅ Accept context received (${acceptContext.disclosedContracts?.length || 0} disclosed contracts)`);
+
+    // Step 2: Submit TransferInstruction_Accept to Canton Ledger
+    const adminToken = await tokenProvider.getServiceToken();
+
+    const result = await cantonService.exerciseChoice({
+      token: adminToken,
+      actAsParty: [receiverPartyId],
+      templateId: UTILITIES_CONFIG.TRANSFER_INSTRUCTION_INTERFACE,
+      contractId: transferInstructionId,
+      choice: 'TransferInstruction_Accept',
+      choiceArgument: {
+        extraArgs: {
+          context: acceptContext.choiceContextData || { values: {} },
+          meta: { values: {} },
+        },
+      },
+      readAs: [receiverPartyId],
+      disclosedContracts: (acceptContext.disclosedContracts || []).map(dc => ({
+        templateId: dc.templateId,
+        contractId: dc.contractId,
+        createdEventBlob: dc.createdEventBlob,
+        ...(dc.synchronizerId && { synchronizerId: dc.synchronizerId }),
+      })),
+    });
+
+    console.log(`[CantonSDK]    ✅ Utilities transfer accepted — updateId: ${result?.transaction?.updateId || 'N/A'}`);
+    return result;
   }
 
   /**
@@ -633,9 +862,11 @@ class CantonSDKClient {
       };
     }
 
+    // Pass symbol so acceptTransfer can route to the correct API (Splice vs Utilities)
     const acceptResult = await this.acceptTransfer(
       createResult.transferInstructionId,
-      receiverPartyId
+      receiverPartyId,
+      symbol
     );
 
     return {
