@@ -109,19 +109,23 @@ const UTILITIES_CONFIG = {
   // CBTC Admin Party (cBTC Network registrar)
   CBTC_ADMIN_PARTY: process.env.CBTC_ADMIN_PARTY || 'cbtc-network::12202a83c6f4082217c175e29bc53da5f2703ba2675778ab99217a5a881a949203ff',
 
-  // Token Standard Interface IDs (same interface, different underlying factory)
-  TRANSFER_FACTORY_INTERFACE: '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.TransferInstructionV1:TransferFactory',
-  TRANSFER_INSTRUCTION_INTERFACE: '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.TransferInstructionV1:TransferInstruction',
-  HOLDING_INTERFACE: '718a0f77e505a8de22f188bd4c87fe74101274e9d4cb1bfac7d09aec7158d35b:Splice.Api.Token.HoldingV1:Holding',
+  // ─── Token Standard Interface IDs ────────────────────────────────────────────
+  // CRITICAL: Use #package-name prefix (hash-independent interface reference).
+  // Canton resolves the interface by package name — NOT by a specific hash.
+  // This is version-stable and won't break across Splice upgrades.
+  // Ref: https://docs.digitalasset.com/build/3.4/reference/json-api/lf-value-specification.html
+  TRANSFER_FACTORY_INTERFACE: '#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferFactory',
+  TRANSFER_INSTRUCTION_INTERFACE: '#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction',
+  HOLDING_INTERFACE: '#splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:Holding',
 
   // ─── Allocation API Interface IDs ───────────────────────────────────────────
   // Allocation-based settlement: user authorizes exchange as executor at order time,
   // exchange settles with its own key at match time.
   // Ref: https://docs.sync.global/app_dev/api/splice-api-token-allocation-v1/
-  ALLOCATION_FACTORY_INTERFACE: '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.AllocationV1:AllocationFactory',
-  ALLOCATION_INTERFACE: '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.AllocationV1:Allocation',
-  ALLOCATION_INSTRUCTION_FACTORY_INTERFACE: '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.AllocationInstructionV1:AllocationInstructionFactory',
-  ALLOCATION_INSTRUCTION_INTERFACE: '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.AllocationInstructionV1:AllocationInstruction',
+  ALLOCATION_FACTORY_INTERFACE: '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:AllocationFactory',
+  ALLOCATION_INTERFACE: '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation',
+  ALLOCATION_INSTRUCTION_FACTORY_INTERFACE: '#splice-api-token-allocation-instruction-v1:Splice.Api.Token.AllocationInstructionV1:AllocationFactory',
+  ALLOCATION_INSTRUCTION_INTERFACE: '#splice-api-token-allocation-instruction-v1:Splice.Api.Token.AllocationInstructionV1:AllocationInstruction',
 };
 
 /**

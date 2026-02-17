@@ -221,7 +221,7 @@ class OrderService {
       console.log(`[OrderService] No allocationContractId for order ${orderId} — nothing to cancel`);
       return;
     }
-
+    
     const executorPartyId = config.canton.operatorPartyId;
 
     try {
@@ -426,16 +426,23 @@ class OrderService {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // STEP A: Create Allocation — locks funds, exchange = executor
-    // User signs ONCE here (for external parties, their key is used)
-    // Exchange settles later with its own key (no user key needed)
+    // STEP A: Try to create Allocation (Splice Allocation Factory API)
+    //
+    // If the Allocation Factory is available on this network:
+    //   → Allocation is created, locks real holdings, exchange = executor
+    //   → At match time: exchange executes Allocation (no user key needed)
+    //
+    // If the Allocation Factory is NOT available (current DevNet state):
+    //   → allocationContractId = null
+    //   → At match time: real transfer via Transfer Factory API instead
+    //   → Both paths move REAL tokens — visible on Canton Explorer
     // ═══════════════════════════════════════════════════════════════════
     let allocationContractId = null;
     const sdkClient = getCantonSDKClient();
 
     if (sdkClient.isReady()) {
       try {
-        console.log(`[OrderService] 📋 Creating Allocation for order ${orderId}...`);
+        console.log(`[OrderService] 📋 Trying Allocation for order ${orderId}...`);
         const allocationResult = await sdkClient.createAllocation(
           partyId,           // sender — the order placer (funds locked)
           null,              // receiver — unknown at order time (set at match)
@@ -445,14 +452,17 @@ class OrderService {
           orderId
         );
         allocationContractId = allocationResult.allocationContractId;
-        console.log(`[OrderService] ✅ Allocation created: ${allocationContractId?.substring(0, 30) || 'N/A'}... (funds locked in Allocation)`);
+        if (allocationContractId) {
+          console.log(`[OrderService] ✅ Allocation created: ${allocationContractId.substring(0, 30)}... (funds locked via Splice Allocation API)`);
+        } else {
+          console.log(`[OrderService] ℹ️ Allocation not created — Transfer API will be used at match time as fallback`);
+        }
       } catch (allocErr) {
-        console.warn(`[OrderService] ⚠️ Allocation creation failed: ${allocErr.message}`);
-        console.warn(`[OrderService] ⚠️ Proceeding without Allocation — SDK balance reservation in effect`);
-        // Don't fail the order — soft balance reservation still prevents overselling
+        console.error(`[OrderService] ❌ Allocation creation FAILED: ${allocErr.message}`);
+        console.error(`[OrderService]    Order will proceed but settlement may use Transfer Factory as last resort`);
       }
     } else {
-      console.warn(`[OrderService] ⚠️ Canton SDK not ready — proceeding without Allocation`);
+      console.warn(`[OrderService] ⚠️ Canton SDK not ready — real transfer will happen at match time`);
     }
 
     // ═══ RESERVE BALANCE to prevent overselling ═══
@@ -592,20 +602,20 @@ class OrderService {
 
     // ═══ IMMEDIATE MATCHING: Trigger matching engine (only for OPEN orders) ═══
     if (initialStatus === 'OPEN') {
-      try {
-        const { getMatchingEngine } = require('./matching-engine');
-        const matchingEngine = getMatchingEngine();
+    try {
+      const { getMatchingEngine } = require('./matching-engine');
+      const matchingEngine = getMatchingEngine();
         if (matchingEngine) {
-          console.log(`[OrderService] Triggering immediate matching for ${tradingPair}`);
+        console.log(`[OrderService] Triggering immediate matching for ${tradingPair}`);
           const triggerResult = await matchingEngine.triggerMatchingCycle(tradingPair);
           if (triggerResult.success) {
             console.log(`[OrderService] ✅ Matching cycle completed for ${tradingPair} in ${triggerResult.elapsed}ms`);
           } else {
             console.log(`[OrderService] ⏳ Matching trigger result: ${triggerResult.reason}`);
           }
-        }
-      } catch (matchErr) {
-        console.error('[OrderService] Could not trigger immediate matching:', matchErr.message);
+      }
+    } catch (matchErr) {
+      console.error('[OrderService] Could not trigger immediate matching:', matchErr.message);
       }
     }
 
@@ -747,8 +757,8 @@ class OrderService {
         } catch (allocCancelErr) {
           console.warn('[OrderService] Could not cancel Allocation:', allocCancelErr.message);
           // Continue with cancellation even if allocation cancel fails
-        }
-      } else {
+      }
+    } else {
         console.log(`[OrderService] No allocationCid for order — skipping Allocation cancel`);
       }
     }

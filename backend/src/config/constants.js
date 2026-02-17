@@ -111,7 +111,7 @@ const TEMPLATE_IDS = {
   // Splice Transfer Instruction interface (for accepting transfer offers)
   // This is the INTERFACE ID (not template ID) - used to exercise TransferInstruction_Accept
   spliceTransferInstruction: `#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction`,
-  spliceTransferInstructionInterfaceId: '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.TransferInstructionV1:TransferInstruction',
+  spliceTransferInstructionInterfaceId: '#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction',
   
   // Custom Token Standard Templates (clob-wolfedge-tokens v2.2.0)
   instrument: `${TOKEN_STANDARD_PACKAGE_ID}:Instrument:Instrument`,

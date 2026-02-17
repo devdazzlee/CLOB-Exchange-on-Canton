@@ -233,3 +233,41 @@ ADMIN_PARTY_ID=“cbtc-network::12202a83c6f4082217c175e29bc53da5f2703ba2675778ab
 The matchmaking is working and is getting settled instantly, but we are not using Allocations to transfer the assets, the transfer of assets is done by TransferInstruction which should not be the case. 
 As we are using internal parties in this app, we can create any transfer from the backend and the flow would work fine, but when we will switch to external parties then we would require a signature from user's private key owning the external party to create a TransferInstruction. Hence, we will need to use Allocations, this way we can set sender, receiver and executor beforehand, this will help us settle (using the executor, which will be us) the allocation when there is matching order also include stop loss order functionality
 
+[1:06 PM, 2/17/2026] +91 79903 24401: Hey @AHMED,
+The matchmaking is working and is getting settled instantly, but we are not using Allocations to transfer the assets, the transfer of assets is done by TransferInstruction which should not be the case. 
+
+As we are using internal parties in this app, we can create any transfer from the backend and the flow would work fine, but when we will switch to external parties then we would require a signature from user's private key owning the external party to create a TransferInstruction. Hence, we will need to use Allocations, this way we can set sender, receiver and executor beforehand, this will help us settle (using the executor, which will be us) the allocation when there is matching order
+[1:36 PM, 2/17/2026] AHMED: What is your OPERATOR_PARTY_ID? (the exchange operator party that will be the executor)
+Are the Allocation API endpoints available on your scan proxy? (/registry/allocation-instruction/v1/...)
+Does CBTC support Allocations via the Utilities Backend API?
+[1:48 PM, 2/17/2026] Konain Bhai: Hey @AHMED,
+The matchmaking is working and is getting settled instantly, but we are not using Allocations to transfer the assets, the transfer of assets is done by TransferInstruction which should not be the case. 
+
+As we are using internal parties in this app, we can create any transfer from the backend and the flow would work fine, but when we will switch to external parties then we would require a signature from user's private key owning the external party to create a TransferInstruction. Hence, we will need to use Allocations, this way we can set sender, receiver and executor beforehand, this will help us settle (using the executor, which will be us) the allocation when there is matching order
+Hello @~huz 
+
+We acknowledge that the current implementation uses TransferInstruction instead of Allocations for settlement.
+
+We will address this in Milestone 4, which will include:
+
+1. Replacing TransferInstruction with Allocation-based settlement (executor = exchange operator)
+2. Migration from internal parties to external wallet parties
+3. Full Allocation flow: create at order placement → execute at matching → withdraw on cancellation
+
+This will ensure the exchange works correctly with external parties and no user signatures are required at settlement time.
+
+We shall proceed with the 4th milestone now.
+[1:52 PM, 2/17/2026] +971 58 590 3850: Hi Zoya, to be honest this was part of milestone 2 (core functionality completion) and I missed that. This should be done in this milestone itself. We need to finish all the functionality in this milestone itself. The next milestone is just stop loss order, end to end testing, security audit, UI finishes and polishing.
+[1:53 PM, 2/17/2026] Konain Bhai: The functionality is completed, we need to understand this that the core functionality is working, this is the final part which has to be done while final implementation and deployment
+[1:53 PM, 2/17/2026] +971 58 590 3850: I didn’t realise in the milestone 2 that we weren’t doing any transfer of tokens, rather just changing the text.
+[1:54 PM, 2/17/2026] Konain Bhai: This is not something complicated or anything, right now we are only wasting time on going back and forth on this.
+The functionality is completed, we need to understand this that the core functionality is working, this is the final part which has to be done while final implementation and deployment
+[1:56 PM, 2/17/2026] Konain Bhai: On the development side, we always get bugs while we add on features, so not until all the features including stop loss and everything is deployed, we won’t know what other bugs we might face, so for that we would need to deploy all the fatures first and then do the debugging.
+On the development side, we always get bugs while we add on features, so not until all the features including stop loss and everything is deployed, we won’t know what other bugs we might face, so for that we would need to deploy all the fatures first and then do the debugging.
+[1:58 PM, 2/17/2026] Konain Bhai: 0:36
+Exactly, but while we will be deploying the stopp loss feature, it will disrupt this functionality as well.
+[1:59 PM, 2/17/2026] Konain Bhai: So we need to proceed with the deployment of all the remaining feature plus this so that we can finally initiate the proper flow
+[1:59 PM, 2/17/2026] +971 58 590 3850: Why would it disrupt the functionality? The stop loss is just an automated match making on a specific condition. The transfer of tokens using allocation remains the same there
+[2:01 PM, 2/17/2026] +971 58 590 3850: The transfer of tokens in the proper way was supposed to be completed in milestone 2, as that’s the basic but most important functionality of a clob after match making engine. If it’s even not completed yet, how will we feel confident that it will be done in milestone?
+[2:01 PM, 2/17/2026] +971 58 590 3850: We were told multiple times that it’s already done. Only during our testing we find out each time that it isn’t.
+[2:06 PM, 2/17/2026] Konain Bhai: I am not sure how to elaborate and explain the issues we might face but right now for us the best resolution is that we implement all the deployment at once which includes 4th milestone too. We are doing that today and then we’ll proceed to the bug fixing part.

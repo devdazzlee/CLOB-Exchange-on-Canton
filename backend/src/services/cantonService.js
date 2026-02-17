@@ -147,42 +147,73 @@ class CantonService {
    * @param {Object} body - JsSubmitAndWaitForTransactionRequest
    * @returns {Object} JsSubmitAndWaitForTransactionResponse with transaction
    */
-  async submitAndWaitForTransaction(token, body) {
+  async submitAndWaitForTransaction(token, body, { maxRetries = 3 } = {}) {
     const url = `${this.jsonApiBase}/v2/commands/submit-and-wait-for-transaction`;
 
-    console.log(`[CantonService] POST ${url}`);
     // Extract commandId from nested structure
     const commandId = body.commands?.commandId || body.commandId || 'unknown';
+    console.log(`[CantonService] POST ${url}`);
     console.log(`[CantonService] commandId: ${commandId}`);
     console.log(`[CantonService] Request body:`, JSON.stringify(body, null, 2));
 
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${token}`
-      },
-      body: JSON.stringify(body),
-    });
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${token}`
+          },
+          body: JSON.stringify(body),
+        });
 
-    const text = await res.text();
+        const text = await res.text();
 
-    if (!res.ok) {
-      const error = parseCantonError(text, res.status);
-      console.error(`[CantonService] ❌ Command failed:`, error);
+        if (!res.ok) {
+          const error = parseCantonError(text, res.status);
 
-      const err = new Error(error.message);
-      err.code = error.code;
-      err.correlationId = error.correlationId;
-      err.traceId = error.traceId;
-      err.httpStatus = error.httpStatus;
-      throw err;
+          // Retry on 503 (server overloaded / timeout) and 429 (rate limited)
+          if ((res.status === 503 || res.status === 429) && attempt < maxRetries) {
+            const delay = Math.min(2000 * attempt, 8000); // 2s, 4s, 8s
+            console.warn(`[CantonService] ⚠️ ${res.status} on attempt ${attempt}/${maxRetries} for ${commandId} — retrying in ${delay}ms...`);
+            await new Promise(r => setTimeout(r, delay));
+            lastError = error;
+            continue;
+          }
+
+          console.error(`[CantonService] ❌ Command failed:`, error);
+          const err = new Error(error.message);
+          err.code = error.code;
+          err.correlationId = error.correlationId;
+          err.traceId = error.traceId;
+          err.httpStatus = error.httpStatus;
+          throw err;
+        }
+
+        const result = JSON.parse(text);
+        if (attempt > 1) {
+          console.log(`[CantonService] ✅ Transaction completed on retry ${attempt}: ${result.transaction?.updateId || 'unknown'}`);
+        } else {
+          console.log(`[CantonService] ✅ Transaction completed: ${result.transaction?.updateId || 'unknown'}`);
+        }
+        return result;
+      } catch (fetchErr) {
+        // Network-level errors (ECONNRESET, timeout, etc.) — retry
+        if (fetchErr.httpStatus) throw fetchErr; // Already a Canton error, re-throw
+        if (attempt < maxRetries) {
+          const delay = Math.min(2000 * attempt, 8000);
+          console.warn(`[CantonService] ⚠️ Network error on attempt ${attempt}/${maxRetries}: ${fetchErr.message} — retrying in ${delay}ms...`);
+          await new Promise(r => setTimeout(r, delay));
+          lastError = fetchErr;
+          continue;
+        }
+        throw fetchErr;
+      }
     }
 
-    const result = JSON.parse(text);
-    console.log(`[CantonService] ✅ Transaction completed: ${result.transaction?.updateId || 'unknown'}`);
-
-    return result;
+    // Should not reach here, but safety net
+    throw lastError || new Error('submitAndWaitForTransaction: max retries exhausted');
   }
 
   /**

@@ -1,0 +1,13 @@
+✅ **Done:**
+- Integrated Splice Token Standard template: `splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:Holding`
+- System now queries this template for CBTC Holdings
+- Balance endpoint ready to show CBTC balances
+
+🔧 **What needs to be done:**
+1. Request CBTC from faucet: https://cbtc-faucet.bitsafe.finance/
+2. Accept the transfer offer in Utilities UI (Registry → Transfers)
+3. CBTC balance will appear automatically once transfer is accepted
+
+⚠️ **Note:** Please don't abuse the faucet with frequent requests.
+
+**Status:** Ready for CBTC integration. System will automatically detect CBTC Holdings once transfer offer is accepted.

@@ -261,15 +261,28 @@ class TransferOfferService {
           try {
             console.log(`[TransferOfferService] Trying: ${acceptContextUrl.substring(0, 120)}...`);
             
-            const contextResponse = await fetch(acceptContextUrl, {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${adminToken}`,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-              },
-              body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
-            });
+            // Scan proxy registry endpoints only support GET (POST returns 405).
+            // Backend/Validator wallet endpoints support POST.
+            const isScanProxy = acceptContextUrl.startsWith(scanProxyBase) && !acceptContextUrl.includes('/wallet/');
+            const fetchOpts = isScanProxy
+              ? {
+                  method: 'GET',
+                  headers: {
+                    'Authorization': `Bearer ${adminToken}`,
+                    'Accept': 'application/json',
+                  },
+                }
+              : {
+                  method: 'POST',
+                  headers: {
+                    'Authorization': `Bearer ${adminToken}`,
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                  },
+                  body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
+                };
+            
+            const contextResponse = await fetch(acceptContextUrl, fetchOpts);
             
             if (contextResponse.ok) {
               const acceptContext = await contextResponse.json();
@@ -325,26 +338,27 @@ class TransferOfferService {
       }
       
       // ─── Approach 3: Scan Proxy API (for CC/Amulet) ────────────────────────────
+      // NOTE: /api/validator/v0/scan-proxy/ prefix only supports GET (registry lookups),
+      //       NOT POST (choice-contexts). Using POST returns 405 Method Not Allowed.
+      //       Only use the direct registry path which supports POST for choice-contexts.
       if (detectedSymbol === 'CC' || !detectedSymbol) {
         const scanProxyBase = SCAN_PROXY_API || 'http://65.108.40.104:8088';
         
         const urlPatterns = [
           `${scanProxyBase}/registry/transfer-instruction/v1/${offerContractId}/choice-contexts/accept`,
-          `${scanProxyBase}/api/validator/v0/scan-proxy/registry/transfer-instruction/v1/${offerContractId}/choice-contexts/accept`,
         ];
         
         for (const acceptUrl of urlPatterns) {
           try {
             console.log(`[TransferOfferService] Trying Scan Proxy: ${acceptUrl.substring(0, 80)}...`);
             
+            // Scan proxy registry endpoints only support GET (POST returns 405 Method Not Allowed)
             const contextResponse = await fetch(acceptUrl, {
-              method: 'POST',
+              method: 'GET',
               headers: {
                 'Authorization': `Bearer ${adminToken}`,
-                'Content-Type': 'application/json',
                 'Accept': 'application/json',
               },
-              body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
             });
             
             if (!contextResponse.ok) {

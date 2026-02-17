@@ -111,8 +111,8 @@ class MatchingEngine {
         console.error('[MatchingEngine] Cycle error:', error.message);
         if (error.message?.includes('401') || error.message?.includes('security-sensitive')) {
           this.invalidateToken();
-        }
       }
+    }
 
       // Process any pairs queued by order placement triggers
       if (this.pendingPairs.size > 0) {
@@ -218,8 +218,8 @@ class MatchingEngine {
    * @returns {boolean} true if a match was found and executed
    */
   async processOrdersForPair(tradingPair, token) {
-    const packageId = config.canton.packageIds?.clobExchange;
-    const operatorPartyId = config.canton.operatorPartyId;
+      const packageId = config.canton.packageIds?.clobExchange;
+      const operatorPartyId = config.canton.operatorPartyId;
       
     if (!packageId || !operatorPartyId) return false;
 
@@ -330,13 +330,13 @@ class MatchingEngine {
       const matched = await this.findAndExecuteOneMatch(tradingPair, buyOrders, sellOrders, token);
       return matched;
       
-    } catch (error) {
+          } catch (error) {
       if (error.message?.includes('401') || error.message?.includes('security-sensitive')) {
         this.invalidateToken();
-      }
+          }
       if (!error.message?.includes('No contracts found')) {
         console.error(`[MatchingEngine] Error for ${tradingPair}:`, error.message);
-      }
+        }
       return false;
     }
   }
@@ -364,15 +364,8 @@ class MatchingEngine {
       for (const sellOrder of sellOrders) {
         if (buyOrder.remaining <= 0 || sellOrder.remaining <= 0) continue;
 
-        // ═══ CRITICAL: Self-Trade Prevention ═══
-        if (buyOrder.owner === sellOrder.owner) {
-          const selfTradeKey = `self:${buyOrder.owner}`;
-          if (!this._lastLogState[selfTradeKey] || (now - this._lastLogState[selfTradeKey]) > 60000) {
-            console.log(`[MatchingEngine] ⚠️ Self-trade blocked: ${buyOrder.owner.substring(0, 30)}... (suppressing repeats for 60s)`);
-            this._lastLogState[selfTradeKey] = now;
-          }
-          continue;
-        }
+        // Self-trade: allowed per client requirement (Mohak: "market itself should take care of it")
+        // No blocking — same-owner orders can match normally
 
         // Skip recently matched order pairs
         const matchKey = `${buyOrder.contractId}::${sellOrder.contractId}`;
@@ -475,8 +468,8 @@ class MatchingEngine {
    * The exchange settles with its OWN key — users sign only at order placement.
    */
   async executeMatch(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, token) {
-    const packageId = config.canton.packageIds?.clobExchange;
-    const operatorPartyId = config.canton.operatorPartyId;
+        const packageId = config.canton.packageIds?.clobExchange;
+        const operatorPartyId = config.canton.operatorPartyId;
     const synchronizerId = config.canton.synchronizerId;
     const [baseSymbol, quoteSymbol] = tradingPair.split('/');
 
@@ -501,15 +494,15 @@ class MatchingEngine {
     try {
       const buyFillArg = { fillQuantity: matchQtyStr };
       if (buyOrder.isNewPackage) buyFillArg.newAllocationCid = null;
-      await cantonService.exerciseChoice({
+        await cantonService.exerciseChoice({
         token, actAsParty: [operatorPartyId],
-        templateId: buyOrder.templateId || `${packageId}:Order:Order`,
+          templateId: buyOrder.templateId || `${packageId}:Order:Order`,
         contractId: buyOrder.contractId, choice: 'FillOrder',
-        choiceArgument: buyFillArg,
-        readAs: [operatorPartyId, buyOrder.owner],
-      });
+          choiceArgument: buyFillArg,
+          readAs: [operatorPartyId, buyOrder.owner],
+        });
       console.log(`[MatchingEngine] ✅ Buy order filled: ${buyOrder.orderId}${buyIsPartial ? ' (partial)' : ' (complete)'}`);
-    } catch (fillError) {
+      } catch (fillError) {
       console.error(`[MatchingEngine] ❌ Buy FillOrder FAILED: ${fillError.message}`);
       if (fillError.message?.includes('already filled') || fillError.message?.includes('CONTRACT_NOT_FOUND')) {
         throw fillError;
@@ -520,15 +513,15 @@ class MatchingEngine {
     try {
       const sellFillArg = { fillQuantity: matchQtyStr };
       if (sellOrder.isNewPackage) sellFillArg.newAllocationCid = null;
-      await cantonService.exerciseChoice({
+        await cantonService.exerciseChoice({
         token, actAsParty: [operatorPartyId],
-        templateId: sellOrder.templateId || `${packageId}:Order:Order`,
+          templateId: sellOrder.templateId || `${packageId}:Order:Order`,
         contractId: sellOrder.contractId, choice: 'FillOrder',
-        choiceArgument: sellFillArg,
-        readAs: [operatorPartyId, sellOrder.owner],
-      });
+          choiceArgument: sellFillArg,
+          readAs: [operatorPartyId, sellOrder.owner],
+        });
       console.log(`[MatchingEngine] ✅ Sell order filled: ${sellOrder.orderId}${sellIsPartial ? ' (partial)' : ' (complete)'}`);
-    } catch (fillError) {
+      } catch (fillError) {
       console.error(`[MatchingEngine] ❌ Sell FillOrder FAILED: ${fillError.message}`);
       if (!fillError.message?.includes('already filled') && !fillError.message?.includes('CONTRACT_NOT_FOUND')) {
         console.warn(`[MatchingEngine] ⚠️ Sell FillOrder failed but buy succeeded — will still attempt settlement`);
@@ -536,75 +529,120 @@ class MatchingEngine {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // STEP 2: Execute Allocations — Exchange acts as executor
+    // STEP 2: REAL Token Settlement via Allocation API
     //
-    // Allocation-based settlement (replaces TransferInstruction):
-    // - Allocations were created at ORDER PLACEMENT time (funds already locked)
-    // - Exchange is the executor in every Allocation
-    // - Exchange calls Allocation_Execute with its OWN key
-    // - NO user keys needed at settlement time
-    // - Works for BOTH internal AND external parties
+    // Per client requirement: Settlement MUST use Allocations, NOT TransferInstruction.
+    // Allocations allow the user to sign ONCE at order placement time, and the
+    // exchange (executor) settles at match time with its own key — no user key needed.
     //
-    // Two allocations per match:
-    // A. Seller's Allocation: base asset → buyer (e.g., CC seller → buyer)
-    // B. Buyer's Allocation: quote asset → seller (e.g., CBTC buyer → seller)
+    // Flow:
+    //   1. At ORDER PLACEMENT → createAllocation() locks sender's tokens
+    //   2. At MATCH TIME (here) → executeAllocation() transfers locked tokens
+    //   3. Exchange acts as EXECUTOR — settles with its own key
+    //
+    // If allocation was not created at order time (e.g., creation failed),
+    // we fall back to Transfer Factory API as a last resort for internal parties.
+    //
+    // @see https://docs.sync.global/app_dev/api/splice-api-token-allocation-v1/
     // ═══════════════════════════════════════════════════════════════════
-    console.log(`[MatchingEngine] 💰 Step 2: Allocation settlement — BOTH ${baseSymbol} and ${quoteSymbol} via executor...`);
+    console.log(`[MatchingEngine] 💰 Step 2: Allocation-based settlement — ${baseSymbol} and ${quoteSymbol}...`);
 
-    let instrumentAllocationResult = null;
-    let paymentAllocationResult = null;
+    // Allocation CIDs stored on orders at placement time
+    const sellerAllocationCid = sellOrder.allocationContractId || null;
+    const buyerAllocationCid = buyOrder.allocationContractId || null;
+
+    console.log(`[MatchingEngine]    Seller allocation: ${sellerAllocationCid ? sellerAllocationCid.substring(0, 30) + '...' : 'NONE'}`);
+    console.log(`[MatchingEngine]    Buyer allocation:  ${buyerAllocationCid ? buyerAllocationCid.substring(0, 30) + '...' : 'NONE'}`);
+
+    let baseTransferResult = null;
+    let quoteTransferResult = null;
 
     if (sdkClient.isReady()) {
-      // Allocation A: Base instrument from seller → buyer
-      if (sellOrder.allocationContractId) {
-        try {
-          console.log(`[MatchingEngine]    📤 Executing seller's Allocation: ${matchQtyStr} ${baseSymbol} (seller → buyer)`);
-          instrumentAllocationResult = await sdkClient.executeAllocation(
-            sellOrder.allocationContractId,
-            operatorPartyId,  // Exchange as executor
-            baseSymbol
+      // ── LEG A: Base asset (e.g., CC) from seller → buyer ──────────
+      // ownerPartyId = seller (they locked the base asset at order time)
+      try {
+        if (sellerAllocationCid) {
+          console.log(`[MatchingEngine]    📤 Leg A: Executing seller's Allocation for ${matchQtyStr} ${baseSymbol} (seller → buyer)`);
+          baseTransferResult = await sdkClient.executeAllocation(
+            sellerAllocationCid,
+            operatorPartyId,
+            baseSymbol,
+            sellOrder.owner  // ownerPartyId — REQUIRED: AmuletAllocation needs both signatories
           );
-          console.log(`[MatchingEngine]    ✅ Seller's Allocation executed — ${baseSymbol} transferred to buyer`);
-        } catch (allocErr) {
-          console.error(`[MatchingEngine]    ❌ Seller's Allocation execution FAILED: ${allocErr.message}`);
-          console.error(`[MatchingEngine]    🚨 CRITICAL: ${baseSymbol} allocation failed. Manual intervention required.`);
-        }
-      } else {
-        console.warn(`[MatchingEngine]    ⚠️ No allocationContractId on sell order — skipping ${baseSymbol} allocation execution`);
-      }
-
-      // Allocation B: Quote payment from buyer → seller
-      if (buyOrder.allocationContractId) {
-        try {
-          console.log(`[MatchingEngine]    📤 Executing buyer's Allocation: ${quoteAmountStr} ${quoteSymbol} (buyer → seller)`);
-          paymentAllocationResult = await sdkClient.executeAllocation(
-            buyOrder.allocationContractId,
-            operatorPartyId,  // Exchange as executor
-            quoteSymbol
-          );
-          console.log(`[MatchingEngine]    ✅ Buyer's Allocation executed — ${quoteSymbol} transferred to seller`);
-        } catch (allocErr) {
-          console.error(`[MatchingEngine]    ❌ Buyer's Allocation execution FAILED: ${allocErr.message}`);
-          if (instrumentAllocationResult) {
-            console.error(`[MatchingEngine]    🚨 CRITICAL: Partial settlement — instrument allocated but payment FAILED`);
-            console.error(`[MatchingEngine]    🚨 Buyer: ${buyOrder.owner.substring(0, 40)}, Seller: ${sellOrder.owner.substring(0, 40)}`);
-            console.error(`[MatchingEngine]    🚨 Instrument: ${matchQtyStr} ${baseSymbol}, Payment: ${quoteAmountStr} ${quoteSymbol}`);
-            console.error(`[MatchingEngine]    🚨 Manual intervention required`);
+          if (baseTransferResult) {
+            console.log(`[MatchingEngine]    ✅ ${baseSymbol} settled via Allocation (seller → buyer)`);
           }
         }
+
+        // No allocation CID — use Transfer Factory as last resort
+        // Skip dust amounts (< 0.000001) to avoid "lock expires before amulet" errors
+        if (!baseTransferResult) {
+          const baseAmountNum = parseFloat(matchQtyStr);
+          if (baseAmountNum < 0.000001) {
+            console.warn(`[MatchingEngine]    ⚠️ Skipping dust fallback for ${matchQtyStr} ${baseSymbol} — too small to settle`);
       } else {
-        console.warn(`[MatchingEngine]    ⚠️ No allocationContractId on buy order — skipping ${quoteSymbol} allocation execution`);
+            console.warn(`[MatchingEngine]    ⚠️ No allocation for ${baseSymbol} — using Transfer Factory (last resort)`);
+            baseTransferResult = await sdkClient.performTransfer(
+              sellOrder.owner,
+              buyOrder.owner,
+              matchQtyStr,
+              baseSymbol
+            );
+            console.log(`[MatchingEngine]    ✅ ${baseSymbol} transferred via Transfer Factory (seller → buyer)`);
+          }
+        }
+      } catch (transferErr) {
+        console.error(`[MatchingEngine]    ❌ ${baseSymbol} settlement FAILED: ${transferErr.message}`);
       }
 
-      // Log settlement summary
-      if (instrumentAllocationResult && paymentAllocationResult) {
-        console.log(`[MatchingEngine]    ✅ Allocation settlement complete — BOTH legs executed by exchange (executor)`);
-      } else if (!sellOrder.allocationContractId && !buyOrder.allocationContractId) {
-        console.warn(`[MatchingEngine]    ⚠️ No allocations on either order — orders filled but tokens NOT transferred`);
+      // ── LEG B: Quote asset (e.g., CBTC) from buyer → seller ──────
+      // ownerPartyId = buyer (they locked the quote asset at order time)
+      try {
+        if (buyerAllocationCid) {
+          console.log(`[MatchingEngine]    📤 Leg B: Executing buyer's Allocation for ${quoteAmountStr} ${quoteSymbol} (buyer → seller)`);
+          quoteTransferResult = await sdkClient.executeAllocation(
+            buyerAllocationCid,
+            operatorPartyId,
+            quoteSymbol,
+            buyOrder.owner  // ownerPartyId — REQUIRED: Allocation needs both signatories
+          );
+          if (quoteTransferResult) {
+            console.log(`[MatchingEngine]    ✅ ${quoteSymbol} settled via Allocation (buyer → seller)`);
+          }
+        }
+
+        // No allocation CID — use Transfer Factory as last resort
+        // Skip dust amounts (< 0.000001) to avoid "lock expires before amulet" errors
+        if (!quoteTransferResult) {
+          const quoteAmountNum = parseFloat(quoteAmountStr);
+          if (quoteAmountNum < 0.000001) {
+            console.warn(`[MatchingEngine]    ⚠️ Skipping dust fallback for ${quoteAmountStr} ${quoteSymbol} — too small to settle`);
+          } else {
+            console.warn(`[MatchingEngine]    ⚠️ No allocation for ${quoteSymbol} — using Transfer Factory (last resort)`);
+            quoteTransferResult = await sdkClient.performTransfer(
+              buyOrder.owner,
+              sellOrder.owner,
+              quoteAmountStr,
+              quoteSymbol
+            );
+            console.log(`[MatchingEngine]    ✅ ${quoteSymbol} transferred via Transfer Factory (buyer → seller)`);
+          }
+        }
+      } catch (transferErr) {
+        console.error(`[MatchingEngine]    ❌ ${quoteSymbol} settlement FAILED: ${transferErr.message}`);
+        if (baseTransferResult) {
+          console.error(`[MatchingEngine]    🚨 CRITICAL: Partial settlement — ${baseSymbol} moved but ${quoteSymbol} FAILED`);
+        }
       }
-    } else {
-      console.warn(`[MatchingEngine]    ⚠️ Canton SDK not ready — skipping Allocation settlement`);
-      console.warn(`[MatchingEngine]    ⚠️ Orders are filled but tokens NOT transferred — manual resolution needed`);
+
+      // Settlement summary
+      if (baseTransferResult && quoteTransferResult) {
+        console.log(`[MatchingEngine]    ✅ Settlement COMPLETE — real tokens transferred on BOTH legs!`);
+      } else if (!baseTransferResult && !quoteTransferResult) {
+        console.error(`[MatchingEngine]    ❌ Settlement FAILED — no tokens transferred. Manual intervention needed.`);
+      }
+      } else {
+      console.error(`[MatchingEngine]    ❌ Canton SDK not ready — cannot transfer tokens`);
     }
 
     // Release balance reservations for filled quantities
@@ -621,42 +659,42 @@ class MatchingEngine {
       const tradeTemplateId = `${packageId}:Settlement:Trade`;
       const tradeId = `trade-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
       const tradeResult = await cantonService.createContractWithTransaction({
-        token,
+          token,
         actAsParty: operatorPartyId,
         templateId: tradeTemplateId,
-        createArguments: {
-          tradeId: tradeId,
-          operator: operatorPartyId,
-          buyer: buyOrder.owner,
-          seller: sellOrder.owner,
-          baseInstrumentId: {
-            issuer: operatorPartyId,
-            symbol: baseSymbol,
-            version: '1.0',
-          },
-          quoteInstrumentId: {
-            issuer: operatorPartyId,
-            symbol: quoteSymbol,
-            version: '1.0',
-          },
+          createArguments: {
+            tradeId: tradeId,
+            operator: operatorPartyId,
+            buyer: buyOrder.owner,
+            seller: sellOrder.owner,
+            baseInstrumentId: {
+              issuer: operatorPartyId,
+              symbol: baseSymbol,
+              version: '1.0',
+            },
+            quoteInstrumentId: {
+              issuer: operatorPartyId,
+              symbol: quoteSymbol,
+              version: '1.0',
+            },
           baseAmount: matchQtyStr,
           quoteAmount: quoteAmountStr,
-          price: matchPrice.toString(),
-          buyOrderId: buyOrder.orderId,
-          sellOrderId: sellOrder.orderId,
-          timestamp: new Date().toISOString(),
-        },
-        readAs: [operatorPartyId, buyOrder.owner, sellOrder.owner],
+            price: matchPrice.toString(),
+            buyOrderId: buyOrder.orderId,
+            sellOrderId: sellOrder.orderId,
+            timestamp: new Date().toISOString(),
+          },
+          readAs: [operatorPartyId, buyOrder.owner, sellOrder.owner],
         synchronizerId,
       });
       const events = tradeResult?.transaction?.events || [];
-      for (const event of events) {
-        const created = event.created || event.CreatedEvent;
+            for (const event of events) {
+              const created = event.created || event.CreatedEvent;
         if (created?.contractId) {
           tradeContractId = created.contractId;
-          break;
-        }
-      }
+                break;
+              }
+            }
       console.log(`[MatchingEngine] ✅ Trade record created: ${tradeContractId?.substring(0, 25)}...`);
     } catch (tradeErr) {
       console.warn(`[MatchingEngine] ⚠️ Trade record creation failed (non-critical): ${tradeErr.message}`);

@@ -162,12 +162,9 @@ function createApp() {
   const { activityMarkerMiddleware } = require('./middleware/activityMarker');
   app.use(activityMarkerMiddleware);
 
-  // Request logging middleware
-  app.use((req, res, next) => {
-    const timestamp = new Date().toISOString();
-    console.log(`[${timestamp}] ${req.method} ${req.path}`);
-    next();
-  });
+  // Request logging middleware (logs to console + files via winston)
+  const logger = require('./utils/logger');
+  app.use(logger.requestMiddleware);
 
   // Health check (before API routes)
   app.get('/health', (req, res) => {

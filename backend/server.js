@@ -7,6 +7,9 @@
  * - Vercel serverless mode (for deployment)
  */
 
+// Initialize logger FIRST — overrides console.log/warn/error to write to files
+const logger = require('./src/utils/logger');
+
 const { createApp, startServer } = require('./src/app');
 
 // Check if running on Vercel (serverless)
@@ -76,7 +79,7 @@ if (isVercel) {
 
   // Handle unhandled promise rejections
   process.on('unhandledRejection', (err) => {
-    console.error('Unhandled Promise Rejection:', err);
+    logger.error('Unhandled Promise Rejection:', { error: err?.message || err, stack: err?.stack });
     if (server && typeof server.close === 'function') {
       server.close(() => {
         process.exit(1);
@@ -88,7 +91,7 @@ if (isVercel) {
 
   // Handle uncaught exceptions
   process.on('uncaughtException', (err) => {
-    console.error('Uncaught Exception:', err);
+    logger.error('Uncaught Exception:', { error: err?.message || err, stack: err?.stack });
     process.exit(1);
   });
 
