@@ -51,6 +51,7 @@ testAddBuyOrder = script do
       orderMode = "LIMIT"
       price = Some 42000.0
       quantity = 0.5
+      stopPrice = None
       allocationCid = "placeholder_allocation"
   
   -- The order should exist
@@ -88,6 +89,7 @@ testAddSellOrder = script do
       orderMode = "LIMIT"
       price = Some 43000.0
       quantity = 1.0
+      stopPrice = None
       allocationCid = "placeholder_allocation"
   
   -- The order should exist
@@ -125,6 +127,7 @@ testCancelOrderFromBook = script do
       orderMode = "LIMIT"
       price = Some 42000.0
       quantity = 0.5
+      stopPrice = None
       allocationCid = "placeholder_allocation"
   
   -- Query for the updated order book (since AddOrder consumes the original)
@@ -168,6 +171,7 @@ testMultipleOrders = script do
       orderMode = "LIMIT"
       price = Some 2500.0
       quantity = 1.0
+      stopPrice = None
       allocationCid = "placeholder_1"
   
   -- Query for the updated order book
@@ -182,6 +186,7 @@ testMultipleOrders = script do
       orderMode = "LIMIT"
       price = Some 2600.0
       quantity = 2.0
+      stopPrice = None
       allocationCid = "placeholder_2"
   
   -- Both orders should exist
@@ -221,6 +226,7 @@ testMarketOrder = script do
       orderMode = "MARKET"
       price = None
       quantity = 0.1
+      stopPrice = None
       allocationCid = "placeholder_market"
   
   -- Order should be created

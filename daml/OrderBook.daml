@@ -256,6 +256,7 @@ template OrderBook
             status = "OPEN"
             timestamp = now
             operator = operator
+            stopPrice = None  -- OrderBook.AddOrder doesn't support stop-loss; use Order:Order directly
             allocationCid = "placeholder_allocation_cid"  -- Placeholder until Splice is installed
         
         let updatedBuyOrders = if orderType == "BUY" then buyOrders ++ [orderCid] else buyOrders

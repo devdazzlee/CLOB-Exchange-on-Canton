@@ -481,7 +481,8 @@ class OrderService {
         status: initialStatus,
         timestamp: timestamp,
         operator: operatorPartyId,
-        allocationCid: allocationContractId || ''
+        allocationCid: allocationContractId || '',
+        stopPrice: stopPrice ? stopPrice.toString() : null
       },
       readAs: [operatorPartyId, partyId]
     });

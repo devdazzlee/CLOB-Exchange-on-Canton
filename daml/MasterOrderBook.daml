@@ -153,6 +153,7 @@ executeMatch buyCid buyOrder sellCid sellOrder = do
       status = "OPEN"
       timestamp = now2
       operator = buyOrder.operator
+      stopPrice = buyOrder.stopPrice
       allocationCid = buyOrder.allocationCid  -- Reuse same allocation (in Splice, you'd split it)
     return (False, sellFullyFilled)  -- Buy order not fully filled, remainder created
   else if sellRemainder > 0.0 && not sellFullyFilled then do
@@ -170,6 +171,7 @@ executeMatch buyCid buyOrder sellCid sellOrder = do
       status = "OPEN"
       timestamp = now2
       operator = sellOrder.operator
+      stopPrice = sellOrder.stopPrice
       allocationCid = sellOrder.allocationCid  -- Reuse same allocation (in Splice, you'd split it)
     return (buyFullyFilled, False)  -- Sell order not fully filled, remainder created
   else
@@ -199,10 +201,11 @@ template MasterOrderBook
         orderId : Text
         owner : Party
         orderType : Text  -- "BUY" or "SELL"
-        orderMode : Text  -- "LIMIT" or "MARKET"
+        orderMode : Text  -- "LIMIT" or "MARKET" or "STOP_LOSS"
         price : Optional Decimal
         quantity : Decimal
         allocationCid : Text  -- The locked Allocation (placeholder: will be ContractId Allocation when Splice is installed)
+        stopPrice : Optional Decimal  -- Trigger price for STOP_LOSS orders (must be at end for upgrade compat)
       controller owner
       do
         -- NOTE: Allocation verification commented out until Splice packages are installed
@@ -230,6 +233,7 @@ template MasterOrderBook
             status = "OPEN"
             timestamp = now
             operator = operator
+            stopPrice = stopPrice
             allocationCid = allocationCid
         
         -- Add to appropriate list

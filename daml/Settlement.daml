@@ -9,6 +9,11 @@
 --   3. Operator executes settlement atomically
 --   4. Holdings are transferred, Trade contract created
 --
+-- AllocationRecord:
+--   Fallback for when the Splice Allocation Factory API is unavailable.
+--   Tracks locked funds on the CLOB exchange's own Canton contracts.
+--   Primary path uses the SDK's Allocation Factory; this is the direct fallback.
+--
 module Settlement where
 
 import Instrument (InstrumentId)
@@ -21,6 +26,13 @@ data SettlementStatus
   | SettlementExecuted
   | SettlementFailed Text
   | SettlementCancelled
+  deriving (Eq, Show)
+
+-- | Allocation status for AllocationRecord
+data AllocationStatus
+  = AllocationPending     -- Funds locked, awaiting match
+  | AllocationExecuted    -- Match found, funds transferred
+  | AllocationCancelled   -- Order cancelled, funds returned
   deriving (Eq, Show)
 
 -- | Settlement leg - one side of the trade
@@ -190,3 +202,65 @@ template BatchSettlement
           (_, _, tradeCid) <- exercise settlementCid Settlement_Execute
           return tradeCid
         return results
+
+-- =============================================================================
+-- ALLOCATION RECORD — Fallback for when Splice Allocation Factory is unavailable
+-- =============================================================================
+
+-- | AllocationRecord — tracks locked funds for an exchange order.
+--
+-- Created by the backend (via canton-sdk-client.js _createDirectAllocation)
+-- when the Splice Allocation Factory API is unavailable.
+--
+-- Primary path: SDK's Allocation Factory API (creates native Splice Allocations)
+-- Fallback path: This template (creates AllocationRecord on the exchange's own contracts)
+--
+-- Flow:
+--   1. ORDER PLACEMENT: Backend creates AllocationRecord (funds conceptually locked)
+--   2. MATCH TIME:      Exchange exercises ExecuteAllocation (no user key needed)
+--   3. CANCELLATION:    Backend exercises CancelAllocation (funds returned)
+--
+-- Fields match what canton-sdk-client.js sends in _createDirectAllocation:
+--   allocationId, orderId, sender, receiver, executor, amount, instrument,
+--   holdingCids, status, createdAt, operator
+--
+template AllocationRecord
+  with
+    allocationId : Text       -- Unique allocation ID (e.g., "alloc-order-123")
+    orderId : Text            -- The exchange order ID this allocation belongs to
+    sender : Party            -- The order placer (funds locked from this party)
+    receiver : Text           -- The counterparty (empty string if unknown at order time)
+    executor : Party          -- The exchange party (settles at match time with its own key)
+    amount : Text             -- Amount allocated (Decimal as string)
+    instrument : Text         -- Token symbol (e.g., "CC", "CBTC", "USDT")
+    holdingCids : [Text]      -- References to the holding UTXOs backing this allocation
+    status : Text             -- "PENDING", "EXECUTED", "CANCELLED"
+    createdAt : Text          -- ISO timestamp of creation
+    operator : Party          -- Exchange operator (same as executor in most cases)
+  where
+    signatory operator
+    observer sender, executor
+
+    -- Execute the allocation — transfer funds from sender to receiver.
+    -- Called by the exchange (executor) at MATCH TIME.
+    -- NO user key needed — the exchange acts as executor.
+    choice ExecuteAllocation : ContractId AllocationRecord
+      controller executor
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        create this with status = "EXECUTED"
+
+    -- Cancel the allocation — release locked funds back to sender.
+    -- Called when an order is cancelled. Either sender or executor can cancel.
+    choice CancelAllocation : ContractId AllocationRecord
+      controller executor
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        create this with status = "CANCELLED"
+
+    -- Sender can also cancel their own allocation (e.g., user cancels order)
+    choice SenderCancelAllocation : ContractId AllocationRecord
+      controller sender
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        create this with status = "CANCELLED"

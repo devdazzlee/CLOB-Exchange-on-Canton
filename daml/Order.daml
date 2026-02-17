@@ -9,6 +9,12 @@ import DA.Optional
 -- Placeholder type for Allocation (remove when Splice packages are installed)
 type Allocation = ()
 
+-- | Order statuses:
+-- |   "OPEN"            — Active on the order book, eligible for matching
+-- |   "FILLED"          — Completely filled by one or more trades
+-- |   "CANCELLED"       — Cancelled by owner, Allocation released
+-- |   "PENDING_TRIGGER" — Stop-loss order waiting for trigger price (invisible to order book)
+
 -- | Order template for individual buy/sell orders
 -- | Uses Splice Allocation contracts instead of direct token transfers
 template Order
@@ -16,18 +22,22 @@ template Order
     orderId : Text
     owner : Party
     orderType : Text  -- "BUY" or "SELL"
-    orderMode : Text  -- "LIMIT" or "MARKET"
+    orderMode : Text  -- "LIMIT" or "MARKET" or "STOP_LOSS"
     tradingPair : Text  -- e.g., "BTC/USDT"
-    price : Optional Decimal  -- None for market orders
+    price : Optional Decimal  -- None for market orders; for STOP_LOSS this holds the stopPrice until triggered
     quantity : Decimal
     filled : Decimal
-    status : Text  -- "OPEN", "FILLED", "CANCELLED"
+    status : Text  -- "OPEN", "FILLED", "CANCELLED", "PENDING_TRIGGER"
     timestamp : Time
     operator : Party  -- The Venue/Operator who can execute the Allocation
     -- CRITICAL: The Allocation contract that locks the funds
     -- NOTE: Using Text as placeholder until Splice packages are installed
     -- Change to: ContractId Api.Token.AllocationV1.Allocation
     allocationCid : Text  -- Placeholder: will be ContractId Allocation when Splice is installed
+    -- Stop-loss trigger price (separate from limit price)
+    -- Set when orderMode == "STOP_LOSS"; None for LIMIT/MARKET orders
+    -- NOTE: Must be at end of record for Canton upgrade compatibility
+    stopPrice : Optional Decimal
   where
     signatory owner
     observer operator
@@ -37,7 +47,7 @@ template Order
     choice CancelOrder : ContractId Order
       controller owner
       do
-        assert (status == "OPEN")
+        assert (status == "OPEN" || status == "PENDING_TRIGGER")
         
         -- NOTE: Allocation cancellation commented out until Splice packages are installed
         -- When Splice is installed, uncomment and use:
@@ -86,3 +96,24 @@ template Order
       controller owner, operator
       do
         return allocationCid
+
+    -- Trigger a stop-loss order: converts PENDING_TRIGGER → OPEN market order
+    -- Called by the operator (matching engine / stop-loss service) when the
+    -- market price crosses the stop-loss trigger threshold.
+    --
+    -- SELL stop-loss: triggers when price DROPS to or below stopPrice
+    -- BUY stop-loss:  triggers when price RISES to or above stopPrice
+    choice TriggerStopLoss : ContractId Order
+      with
+        triggeredAt : Text   -- ISO timestamp when the trigger fired
+        triggerPrice : Text  -- The market price that crossed the threshold
+      controller operator
+      do
+        assert (status == "PENDING_TRIGGER")
+        assert (orderMode == "STOP_LOSS")
+        
+        -- Convert to a market order: clear the price, set status OPEN
+        create this with
+          status = "OPEN"
+          orderMode = "MARKET"
+          price = None  -- Market order has no price limit
