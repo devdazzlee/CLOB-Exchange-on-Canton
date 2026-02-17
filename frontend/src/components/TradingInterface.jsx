@@ -169,7 +169,9 @@ export default function TradingInterface({ partyId }) {
         remaining: order.remaining,
         status: order.status,
         tradingPair: order.tradingPair,
-        timestamp: order.timestamp
+        timestamp: order.timestamp,
+        stopPrice: order.stopPrice || null,
+        triggeredAt: order.triggeredAt || null,
       })));
     } catch (e) { console.warn('[Refresh] User orders error:', e.message); }
 
@@ -221,7 +223,8 @@ export default function TradingInterface({ partyId }) {
           orderMode: orderData.orderMode,
           price: orderData.price,
           quantity: orderData.quantity,
-          partyId: partyId
+          partyId: partyId,
+          stopPrice: orderData.stopPrice || null,
       }, {
         headers: {
           'x-user-id': partyId || 'anonymous'
@@ -239,10 +242,13 @@ export default function TradingInterface({ partyId }) {
       setQuantity('');
       
       // Show success toast
+      const priceLabel = orderData.orderMode === 'MARKET' ? 'Market Price' 
+        : orderData.orderMode === 'STOP_LOSS' ? `Stop @ ${orderData.stopPrice}` 
+        : orderData.price;
       toast.success(
-        `${orderData.orderType} ${orderData.quantity} ${orderData.tradingPair?.split('/')[0] || ''} @ ${orderData.orderMode === 'MARKET' ? 'Market Price' : orderData.price}`, 
+        `${orderData.orderType} ${orderData.quantity} ${orderData.tradingPair?.split('/')[0] || ''} @ ${priceLabel}`, 
         {
-          title: `✅ ${orderData.orderType} Order Placed`,
+          title: orderData.orderMode === 'STOP_LOSS' ? `🛡️ Stop-Loss ${orderData.orderType} Order Set` : `✅ ${orderData.orderType} Order Placed`,
           duration: 5000
         }
       );
@@ -254,7 +260,8 @@ export default function TradingInterface({ partyId }) {
         orderMode: orderData.orderMode,
         tradingPair: orderData.tradingPair,
         price: orderData.price,
-        quantity: orderData.quantity
+        quantity: orderData.quantity,
+        stopPrice: orderData.stopPrice || null,
       });
       setShowOrderSuccess(true);
       
@@ -333,10 +340,12 @@ export default function TradingInterface({ partyId }) {
             price: order.price,
             quantity: order.quantity,
             filled: order.filled || '0',
-        remaining: order.remaining,
+            remaining: order.remaining,
             status: order.status,
             tradingPair: order.tradingPair,
-            timestamp: order.timestamp
+            timestamp: order.timestamp,
+            stopPrice: order.stopPrice || null,
+            triggeredAt: order.triggeredAt || null,
           })));
     } catch (e) {
       console.warn('[Cancel Order] Failed to refresh orders:', e);
@@ -603,7 +612,9 @@ export default function TradingInterface({ partyId }) {
             remaining: order.remaining,
             status: order.status,
             tradingPair: order.tradingPair,
-            timestamp: order.timestamp
+            timestamp: order.timestamp,
+            stopPrice: order.stopPrice || null,
+            triggeredAt: order.triggeredAt || null,
           }));
           
           // CRITICAL FIX: ALWAYS set fresh data from API

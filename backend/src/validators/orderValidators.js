@@ -1,5 +1,7 @@
 /**
  * Order Validation Schemas
+ * 
+ * Supports: LIMIT, MARKET, STOP_LOSS order modes
  */
 
 const Joi = require('joi');
@@ -9,13 +11,19 @@ const placeOrderSchema = Joi.object({
   body: Joi.object({
     tradingPair: tradingPairSchema.required(),
     orderType: Joi.string().valid('BUY', 'SELL').required(),
-    orderMode: Joi.string().valid('LIMIT', 'MARKET').required(),
+    orderMode: Joi.string().valid('LIMIT', 'MARKET', 'STOP_LOSS').required(),
     price: Joi.when('orderMode', {
       is: 'LIMIT',
       then: Joi.number().positive().required(),
       otherwise: Joi.number().positive().allow(null),
     }),
     quantity: Joi.number().positive().required(),
+    // Stop-loss specific fields
+    stopPrice: Joi.when('orderMode', {
+      is: 'STOP_LOSS',
+      then: Joi.number().positive().required(),
+      otherwise: Joi.number().positive().allow(null),
+    }),
     partyId: Joi.string().required(),
     orderBookContractId: Joi.string().allow(null, ''),
     userAccountContractId: Joi.string().allow(null, ''),

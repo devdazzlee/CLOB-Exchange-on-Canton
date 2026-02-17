@@ -3,7 +3,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Button } from '../ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
 import { cn } from '@/lib/utils';
-import { Loader2, AlertTriangle, X } from 'lucide-react';
+import { Loader2, AlertTriangle, X, ShieldAlert } from 'lucide-react';
 
 // Cancel Confirmation Modal
 function CancelOrderModal({ isOpen, onClose, onConfirm, order, isLoading }) {
@@ -193,8 +193,8 @@ export default function ActiveOrdersTable({ orders, onCancelOrder }) {
               </thead>
               <tbody>
                 <AnimatePresence>
-                  {orders.filter(o => o.status === 'OPEN' || o.status === 'PARTIALLY_FILLED').length > 0 ? (
-                    orders.filter(o => o.status === 'OPEN' || o.status === 'PARTIALLY_FILLED').map((order) => (
+                  {orders.filter(o => o.status === 'OPEN' || o.status === 'PARTIALLY_FILLED' || o.status === 'PENDING_TRIGGER').length > 0 ? (
+                    orders.filter(o => o.status === 'OPEN' || o.status === 'PARTIALLY_FILLED' || o.status === 'PENDING_TRIGGER').map((order) => (
                       <motion.tr
                         key={order.id}
                         initial={{ opacity: 0, y: 10 }}
@@ -223,6 +223,9 @@ export default function ActiveOrdersTable({ orders, onCancelOrder }) {
                             if (price !== null && price !== undefined && price !== '' && price !== 'None') {
                               const numPrice = parseFloat(price);
                               if (!isNaN(numPrice) && numPrice > 0) return numPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 });
+                            }
+                            if (order.mode === 'STOP_LOSS' && order.stopPrice) {
+                              return `SL @ ${parseFloat(order.stopPrice).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 })}`;
                             }
                             return order.mode === 'MARKET' ? 'Market' : 'N/A';
                           })()}
@@ -266,16 +269,21 @@ export default function ActiveOrdersTable({ orders, onCancelOrder }) {
                         </td>
                         <td className="py-3 px-4">
                           <span className={cn(
-                            "px-2.5 py-1 rounded text-xs font-semibold",
+                            "px-2.5 py-1 rounded text-xs font-semibold inline-flex items-center gap-1",
                             order.status === 'OPEN' ? 'bg-primary/15 text-primary border border-primary/40' :
+                            order.status === 'PENDING_TRIGGER' ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/40' :
                             order.status === 'FILLED' ? 'bg-success/15 text-success border border-success/40' :
                             'bg-destructive/15 text-destructive border border-destructive/40'
                           )}>
-                            {order.status}
+                            {order.status === 'PENDING_TRIGGER' && <ShieldAlert className="w-3 h-3" />}
+                            {order.status === 'PENDING_TRIGGER' ? 'Stop-Loss' : order.status}
+                            {order.stopPrice && order.status === 'PENDING_TRIGGER' && (
+                              <span className="ml-1 font-mono">@ {parseFloat(order.stopPrice).toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                            )}
                           </span>
                         </td>
                         <td className="py-3 px-4">
-                          {order.status === 'OPEN' && (
+                          {(order.status === 'OPEN' || order.status === 'PENDING_TRIGGER') && (
                             <Button
                               onClick={() => handleCancelClick(order)}
                               variant="destructive"

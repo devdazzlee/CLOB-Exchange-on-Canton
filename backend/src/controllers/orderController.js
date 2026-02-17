@@ -30,7 +30,8 @@ class OrderController {
       orderMode,
       price,
       quantity,
-      partyId
+      partyId,
+      stopPrice,
     } = req.body;
 
     // Get partyId from request body or header
@@ -48,6 +49,10 @@ class OrderController {
       throw new ValidationError('Price is required for LIMIT orders');
     }
 
+    if (orderMode.toUpperCase() === 'STOP_LOSS' && !stopPrice) {
+      throw new ValidationError('stopPrice is required for STOP_LOSS orders');
+    }
+
     const decodedTradingPair = decodeURIComponent(tradingPair);
 
     console.log(`[OrderController] Placing order:`, {
@@ -56,6 +61,7 @@ class OrderController {
       orderMode,
       price,
       quantity,
+      stopPrice: stopPrice || null,
       partyId: effectivePartyId.substring(0, 30) + '...'
     });
 
@@ -66,10 +72,32 @@ class OrderController {
       orderType: orderType.toUpperCase(),
       orderMode: orderMode.toUpperCase(),
       price,
-      quantity
+      quantity,
+      stopPrice: stopPrice || null,
     });
 
     console.log(`[OrderController] ✅ Order placed: ${result.orderId}`);
+
+    // Register stop-loss with StopLossService if applicable
+    if (orderMode.toUpperCase() === 'STOP_LOSS' && result.contractId) {
+      try {
+        const { getStopLossService } = require('../services/stopLossService');
+        const stopLossService = getStopLossService();
+        stopLossService.registerStopLoss({
+          orderContractId: result.contractId,
+          orderId: result.orderId,
+          tradingPair: decodedTradingPair,
+          orderType: orderType.toUpperCase(),
+          stopPrice: stopPrice,
+          partyId: effectivePartyId,
+          quantity: quantity?.toString() || '0',
+          allocationContractId: result.allocationContractId || null,
+        });
+        console.log(`[OrderController] ✅ Stop-loss registered for ${result.orderId} (triggers at ${stopPrice})`);
+      } catch (slErr) {
+        console.warn(`[OrderController] ⚠️ Failed to register stop-loss:`, slErr.message);
+      }
+    }
 
     // ═══ AUTO-TRIGGER MATCHING ENGINE (FIRE-AND-FORGET) ═══
     // On serverless (Vercel), matching can't run in the background.

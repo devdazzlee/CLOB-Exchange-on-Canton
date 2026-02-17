@@ -165,8 +165,16 @@ class ExchangeController {
       throw new ValidationError('Invalid side. Must be BUY or SELL');
     }
 
-    if (!['LIMIT', 'MARKET'].includes(type.toUpperCase())) {
-      throw new ValidationError('Invalid type. Must be LIMIT or MARKET');
+    if (!['LIMIT', 'MARKET', 'STOP_LOSS'].includes(type.toUpperCase())) {
+      throw new ValidationError('Invalid type. Must be LIMIT, MARKET, or STOP_LOSS');
+    }
+
+    // Validate STOP_LOSS specific fields
+    if (type.toUpperCase() === 'STOP_LOSS') {
+      const stopLossPrice = req.body.stopLossPrice || req.body.stopPrice;
+      if (!stopLossPrice || parseFloat(stopLossPrice) <= 0) {
+        throw new ValidationError('stopLossPrice (or stopPrice) is required and must be positive for STOP_LOSS orders');
+      }
     }
 
     // Get party from authenticated request (WALLET AUTH, NOT KEYCLOAK)
@@ -188,6 +196,21 @@ class ExchangeController {
       const { orderTemplateId } = require('../../utils/templateId');
       const templateId = orderTemplateId();
 
+      // Determine initial status (STOP_LOSS starts as PENDING_TRIGGER)
+      const isStopLoss = type.toUpperCase() === 'STOP_LOSS';
+      const initialStatus = isStopLoss ? 'PENDING_TRIGGER' : 'OPEN';
+      const stopLossPrice = req.body.stopLossPrice || req.body.stopPrice || null;
+
+      // Determine price to store
+      let orderPrice;
+      if (type.toUpperCase() === 'LIMIT' && price) {
+        orderPrice = price.toString();
+      } else if (isStopLoss && stopLossPrice) {
+        orderPrice = stopLossPrice.toString();
+      } else {
+        orderPrice = null;
+      }
+
       // Submit CreateCommand via submit-and-wait-for-transaction
       const result = await cantonService.createContractWithTransaction({
         token,
@@ -199,10 +222,10 @@ class ExchangeController {
           orderType: side.toUpperCase(),
           orderMode: type.toUpperCase(),
           tradingPair: pair,
-          price: type.toUpperCase() === 'LIMIT' ? { Some: price.toString() } : { None: null },
+          price: orderPrice,
           quantity: quantity.toString(),
           filled: "0.0",
-          status: "OPEN",
+          status: initialStatus,
           timestamp: new Date().toISOString(),
           operator: config.canton.operatorPartyId,
           allocationCid: ""
@@ -218,24 +241,27 @@ class ExchangeController {
 
       console.log(`[ExchangeAPI] ✅ Order placed: ${orderId} -> ${contractId}`);
 
-      // Milestone 4: Register stop-loss if provided
+      // Register stop-loss if this is a STOP_LOSS order or has stopLossPrice
       let stopLossRegistered = false;
-      if (req.body.stopLossPrice && parseFloat(req.body.stopLossPrice) > 0) {
+      const effectiveStopPrice = stopLossPrice || req.body.stopLossPrice || null;
+      if (isStopLoss || (effectiveStopPrice && parseFloat(effectiveStopPrice) > 0)) {
         try {
           const { getStopLossService } = require('../../services/stopLossService');
           const stopLossService = getStopLossService();
           
           stopLossService.registerStopLoss({
             orderContractId: contractId,
+            orderId,
             tradingPair: pair,
             orderType: side.toUpperCase(),
-            stopLossPrice: req.body.stopLossPrice,
+            stopPrice: effectiveStopPrice,
             partyId: partyId,
-            originalPrice: price || null
+            quantity: quantity?.toString() || '0',
+            allocationContractId: null, // Set by order-service when using Allocation flow
           });
           
           stopLossRegistered = true;
-          console.log(`[ExchangeAPI] ✅ Stop-loss registered for order ${orderId}`);
+          console.log(`[ExchangeAPI] ✅ Stop-loss registered for order ${orderId} (triggers at ${effectiveStopPrice})`);
         } catch (stopLossError) {
           console.warn(`[ExchangeAPI] ⚠️  Failed to register stop-loss:`, stopLossError.message);
           // Don't fail the order placement if stop-loss registration fails
@@ -252,9 +278,9 @@ class ExchangeController {
           price: type.toUpperCase() === 'LIMIT' ? price : null,
           quantity,
           filledQuantity: '0',
-          status: 'OPEN',
+          status: initialStatus,
           createdAt: new Date().toISOString(),
-          stopLossPrice: req.body.stopLossPrice || null,
+          stopPrice: effectiveStopPrice,
           stopLossRegistered
         }
       }, {
@@ -294,6 +320,18 @@ class ExchangeController {
     const readModel = getReadModelService();
     let orders = readModel?.getUserOrders(partyId, { status: status === 'ALL' ? null : status, pair }) || [];
 
+    // When requesting 'OPEN', include 'PENDING_TRIGGER' stop-loss orders too
+    if (status.toUpperCase() === 'OPEN') {
+      const pendingTrigger = readModel?.getUserOrders(partyId, { status: 'PENDING_TRIGGER', pair }) || [];
+      // Merge, avoiding duplicates
+      const existingIds = new Set(orders.map(o => o.contractId));
+      for (const pt of pendingTrigger) {
+        if (!existingIds.has(pt.contractId)) {
+          orders.push(pt);
+        }
+      }
+    }
+
     const limitedOrders = orders.slice(0, parseInt(limit));
 
     return success(res, {
@@ -307,7 +345,9 @@ class ExchangeController {
         quantity: order.quantity,
         filledQuantity: order.filled || '0',
         status: order.status,
-        createdAt: order.timestamp
+        createdAt: order.timestamp,
+        stopPrice: order.stopPrice || null,
+        triggeredAt: order.triggeredAt || null,
       })),
       pagination: {
         limit: parseInt(limit),
@@ -352,7 +392,7 @@ class ExchangeController {
         throw new LedgerError(ErrorCodes.FORBIDDEN, 'Cannot cancel orders you do not own');
       }
 
-      if (order.status !== 'OPEN') {
+      if (order.status !== 'OPEN' && order.status !== 'PENDING_TRIGGER') {
         throw new LedgerError(
           order.status === 'CANCELLED' ? ErrorCodes.ORDER_ALREADY_CANCELLED : ErrorCodes.ORDER_ALREADY_FILLED,
           `Order is ${order.status}, cannot cancel`
@@ -377,6 +417,18 @@ class ExchangeController {
       });
 
       console.log(`[ExchangeAPI] ✅ Order cancelled: ${contractId}`);
+
+      // Unregister stop-loss if it was a pending stop-loss order
+      if (order.status === 'PENDING_TRIGGER' || order.orderMode === 'STOP_LOSS') {
+        try {
+          const { getStopLossService } = require('../../services/stopLossService');
+          const stopLossService = getStopLossService();
+          stopLossService.unregisterStopLoss(contractId);
+          console.log(`[ExchangeAPI] ✅ Stop-loss unregistered for cancelled order ${contractId}`);
+        } catch (slErr) {
+          console.warn(`[ExchangeAPI] ⚠️  Could not unregister stop-loss:`, slErr.message);
+        }
+      }
 
       return success(res, {
         cancelled: true,

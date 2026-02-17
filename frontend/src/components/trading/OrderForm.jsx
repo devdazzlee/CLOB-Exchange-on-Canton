@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
-import { AlertTriangle, Loader2, Info, Calculator, TrendingUp, TrendingDown, Coins } from 'lucide-react';
+import { AlertTriangle, Loader2, Info, Calculator, TrendingUp, TrendingDown, Coins, ShieldAlert } from 'lucide-react';
 import { Button } from '../ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
 import { Input } from '../ui/input';
@@ -34,6 +34,7 @@ export default function OrderForm({
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [stopLoss, setStopLoss] = useState('');
   const [takeProfit, setTakeProfit] = useState('');
+  const [stopPrice, setStopPrice] = useState(''); // For STOP_LOSS order mode
 
   // Get base and quote tokens
   const [baseToken, quoteToken] = tradingPair.split('/');
@@ -130,6 +131,9 @@ export default function OrderForm({
     if (orderMode === 'LIMIT' && (!price || parseFloat(price) <= 0)) {
       errors.push('Price is required for limit orders');
     }
+    if (orderMode === 'STOP_LOSS' && (!stopPrice || parseFloat(stopPrice) <= 0)) {
+      errors.push('Stop price is required for stop-loss orders');
+    }
 
     // Balance checks (only if quantity is valid)
     if (qty > 0) {
@@ -151,7 +155,7 @@ export default function OrderForm({
     }
 
     return { errors, warnings, isValid: errors.length === 0 };
-  }, [orderType, orderMode, price, quantity, estimatedCost, baseBalance, quoteBalance, baseToken, quoteToken, bestBid, bestAsk]);
+  }, [orderType, orderMode, price, quantity, stopPrice, estimatedCost, baseBalance, quoteBalance, baseToken, quoteToken, bestBid, bestAsk]);
 
   // Format number with proper decimals
   const formatNumber = (num, decimals = 8) => {
@@ -185,9 +189,11 @@ export default function OrderForm({
               tradingPair,
               orderType,
               orderMode,
-              price: orderMode === 'MARKET' ? null : price,
+              price: orderMode === 'LIMIT' ? price : null,
               quantity,
               timeInForce,
+              // Stop-loss: send stopPrice for STOP_LOSS mode, or optional stop-loss from advanced options
+              stopPrice: orderMode === 'STOP_LOSS' ? stopPrice : (showAdvanced && stopLoss ? stopLoss : null),
               stopLoss: showAdvanced ? stopLoss : null,
               takeProfit: showAdvanced ? takeProfit : null
             };
@@ -260,10 +266,10 @@ export default function OrderForm({
             </div>
           </div>
 
-          {/* Order Mode - Limit/Market */}
+          {/* Order Mode - Limit/Market/Stop-Loss */}
           <div className="space-y-2">
             <Label>Order Mode</Label>
-            <div className="flex gap-4">
+            <div className="flex gap-2">
               <div className="flex items-center space-x-2">
                 <RadioGroupItem 
                   value="LIMIT" 
@@ -290,10 +296,23 @@ export default function OrderForm({
                   Market
                 </RadioGroupItem>
               </div>
+              <div className="flex items-center space-x-2">
+                <RadioGroupItem 
+                  value="STOP_LOSS" 
+                  id="stop_loss"
+                  checked={orderMode === 'STOP_LOSS'}
+                  onChange={() => {
+                    console.log('[OrderForm] Order mode changed to STOP_LOSS');
+                    onOrderModeChange({ target: { value: 'STOP_LOSS' } });
+                  }}
+                >
+                  Stop-Loss
+                </RadioGroupItem>
+              </div>
             </div>
           </div>
 
-          {/* Price */}
+          {/* Price (Limit orders) */}
           {orderMode === 'LIMIT' && (
             <div className="space-y-2">
               <div className="flex items-center justify-between">
@@ -329,6 +348,47 @@ export default function OrderForm({
                 placeholder="Enter price"
                 className="font-mono"
               />
+            </div>
+          )}
+
+          {/* Stop Price (Stop-Loss orders) */}
+          {orderMode === 'STOP_LOSS' && (
+            <div className="space-y-3">
+              <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-lg">
+                <div className="flex items-center gap-2 text-sm text-amber-600 dark:text-amber-400">
+                  <ShieldAlert className="w-4 h-4" />
+                  <span className="font-medium">
+                    {orderType === 'SELL' 
+                      ? 'Triggers a market sell when price drops to or below stop price' 
+                      : 'Triggers a market buy when price rises to or above stop price'}
+                  </span>
+                </div>
+              </div>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <Label>Stop Price ({quoteToken})</Label>
+                  {marketPrice && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-6 text-xs"
+                      onClick={() => setStopPrice(marketPrice.toString())}
+                    >
+                      Market: {formatNumber(marketPrice, 2)}
+                    </Button>
+                  )}
+                </div>
+                <Input
+                  type="number"
+                  step="0.01"
+                  value={stopPrice}
+                  onChange={(e) => setStopPrice(e.target.value)}
+                  placeholder={orderType === 'SELL' ? 'Sell trigger price' : 'Buy trigger price'}
+                  className="font-mono"
+                  required
+                />
+              </div>
             </div>
           )}
 
@@ -412,6 +472,14 @@ export default function OrderForm({
                     <div className="text-muted-foreground">Limit Price</div>
                     <div className="font-semibold font-mono">
                       {formatNumber(price, 2)} {quoteToken}
+                    </div>
+                  </div>
+                )}
+                {orderMode === 'STOP_LOSS' && stopPrice && (
+                  <div>
+                    <div className="text-muted-foreground">Stop Price</div>
+                    <div className="font-semibold font-mono text-amber-600 dark:text-amber-400">
+                      {formatNumber(stopPrice, 2)} {quoteToken}
                     </div>
                   </div>
                 )}
@@ -513,10 +581,12 @@ export default function OrderForm({
             {loading ? (
               <span className="flex items-center justify-center">
                 <Loader2 className="animate-spin -ml-1 mr-3 h-5 w-5" />
-                Placing Order...
+                {orderMode === 'STOP_LOSS' ? 'Setting Stop-Loss...' : 'Placing Order...'}
               </span>
             ) : (
-              `${orderType} ${baseToken}`
+              orderMode === 'STOP_LOSS' 
+                ? `Stop-Loss ${orderType} ${baseToken}`
+                : `${orderType} ${baseToken}`
             )}
           </Button>
         </form>

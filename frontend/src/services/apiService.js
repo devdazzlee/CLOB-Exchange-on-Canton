@@ -48,11 +48,12 @@ export async function placeOrder(orderData) {
   const backendOrderData = {
     pair: orderData.tradingPair,
     side: orderData.orderType, // BUY or SELL
-    type: orderData.orderMode, // LIMIT or MARKET
+    type: orderData.orderMode, // LIMIT, MARKET, or STOP_LOSS
     price: orderData.price || null,
     quantity: orderData.quantity,
     timeInForce: orderData.timeInForce || 'GTC',
-    stopLossPrice: orderData.stopLoss || orderData.stopLossPrice || null, // Support both field names
+    // Stop-loss: send stopPrice for STOP_LOSS orders AND for optional stop-loss on limit/market orders
+    stopPrice: orderData.stopPrice || orderData.stopLoss || orderData.stopLossPrice || null,
     clientOrderId: orderData.clientOrderId || null
   };
 

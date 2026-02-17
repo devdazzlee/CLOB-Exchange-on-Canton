@@ -1,31 +1,34 @@
 /**
- * Matching Engine Bot
+ * Matching Engine Bot — Allocation-Based Settlement
  * 
  * Core exchange functionality — matches buy/sell orders and settles trades
- * using the Canton Wallet SDK (2-step transfer flow).
+ * using the Allocation API (replaces TransferInstruction 2-step flow).
  * 
- * Flow:
+ * Settlement Flow:
  * 1. Poll Canton for OPEN Order contracts every N seconds
  * 2. Separate into buys/sells per trading pair
  * 3. Sort by price-time priority (FIFO)
  * 4. Find crossing orders (buy price >= sell price)
  * 5. For each match:
  *    a. FillOrder on both Canton contracts (prevents re-matching loop)
- *    b. Transfer instrument (seller→buyer) via SDK 2-step transfer
- *    c. Transfer payment (buyer→seller) via SDK 2-step transfer
+ *    b. Execute buyer's Allocation (exchange acts as executor — NO buyer key needed)
+ *    c. Execute seller's Allocation (exchange acts as executor — NO seller key needed)
  *    d. Create Trade record on Canton for history
- *    e. Broadcast via WebSocket
+ *    e. Trigger stop-loss checks at the new trade price
+ *    f. Broadcast via WebSocket
  * 
- * Settlement uses Canton Wallet SDK:
- * - sdk.tokenStandard.createTransfer() → creates TransferInstruction (locks UTXOs)
- * - sdk.tokenStandard.exerciseTransferInstructionChoice(cid, 'Accept') → completes transfer
+ * Settlement uses Allocation API:
+ * - Allocations are created at ORDER PLACEMENT time (funds locked)
+ * - Exchange is set as executor in every Allocation
+ * - At match time, exchange calls Allocation_Execute with ITS OWN KEY
+ * - No user keys needed at settlement → works for external parties
  * 
- * All transfers are REAL Canton token movements visible on Canton Explorer.
+ * Why Allocations instead of TransferInstruction:
+ * - TransferInstruction requires sender's private key at SETTLEMENT time
+ * - With external parties, backend has no user keys → TransferInstruction breaks
+ * - Allocation: User signs ONCE at order time, exchange settles as executor
  * 
- * Uses Canton JSON Ledger API v2:
- * - POST /v2/state/active-contracts — Query orders
- * - POST /v2/commands/submit-and-wait-for-transaction — Execute matches & transfers
- * 
+ * @see https://docs.sync.global/app_dev/api/splice-api-token-allocation-v1/
  * @see https://docs.digitalasset.com/integrate/devnet/token-standard/index.html
  */
 
@@ -34,7 +37,6 @@ const cantonService = require('./cantonService');
 const config = require('../config');
 const tokenProvider = require('./tokenProvider');
 const { getCantonSDKClient } = require('./canton-sdk-client');
-// All instruments (CC + CBTC) use real on-chain transfers — no filtering needed
 
 // Configure decimal.js for financial precision
 Decimal.set({ precision: 20, rounding: Decimal.ROUND_DOWN });
@@ -45,46 +47,32 @@ class MatchingEngine {
     this.basePollingInterval = parseInt(config.matchingEngine?.intervalMs) || 2000;
     this.pollingInterval = this.basePollingInterval;
     this.matchingInProgress = false;
-    this.matchingStartTime = 0; // Track start time for deadlock detection
+    this.matchingStartTime = 0;
     this.adminToken = null;
     this.tokenExpiry = null;
     this.tradingPairs = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'CC/CBTC'];
 
-    // ═══ Log throttling — suppress noisy repeat messages ═══
-    this._lastLogState = {};          // Per-pair last log message hash
-    this._cyclesSinceLastLog = 0;     // Cycles since we printed a status
-    this._LOG_THROTTLE_CYCLES = 30;   // Print status every N cycles even if unchanged
+    // ═══ Log throttling ═══
+    this._lastLogState = {};
+    this._cyclesSinceLastLog = 0;
+    this._LOG_THROTTLE_CYCLES = 30;
 
     // ═══ CRITICAL: Recently matched orders guard ═══
-    // Prevents catastrophic re-matching loop where:
-    // 1. Orders match → tokens transfer → FillOrder fails silently
-    // 2. Orders remain OPEN → next cycle matches them AGAIN → tokens transfer AGAIN
-    // 3. Infinite loop: duplicate trades + repeated token transfers
-    // 
-    // Key: "buyContractId::sellContractId" → timestamp of last match attempt
     this.recentlyMatchedOrders = new Map();
     this.RECENTLY_MATCHED_TTL = 30000; // 30 seconds cooldown
 
     // ═══ Pending pairs queue ═══
-    // When a matching trigger arrives while a cycle is already running,
-    // queue the pair so it's processed immediately after the current cycle.
     this.pendingPairs = new Set();
 
-    // ═══ Adaptive polling — reduces load when no matches are happening ═══
-    // Starts at basePollingInterval (2s). After consecutive idle cycles,
-    // backs off to longer intervals. Resets to fast polling when a new
-    // order triggers matching.
+    // ═══ Adaptive polling ═══
     this._consecutiveIdleCycles = 0;
-    this._IDLE_THRESHOLD_MEDIUM = 5;   // After 5 idle cycles → 10s
-    this._IDLE_THRESHOLD_SLOW = 20;    // After 20 idle cycles → 30s
-    this._MEDIUM_INTERVAL = 10000;     // 10 seconds
-    this._SLOW_INTERVAL = 30000;       // 30 seconds
-    this._lastMatchTime = 0;           // Timestamp of last successful match
+    this._IDLE_THRESHOLD_MEDIUM = 5;
+    this._IDLE_THRESHOLD_SLOW = 20;
+    this._MEDIUM_INTERVAL = 10000;
+    this._SLOW_INTERVAL = 30000;
+    this._lastMatchTime = 0;
   }
 
-  /**
-   * Get admin token with caching (refreshes every 25 min)
-   */
   async getAdminToken() {
     if (this.adminToken && this.tokenExpiry && Date.now() < this.tokenExpiry) {
       return this.adminToken;
@@ -106,7 +94,7 @@ class MatchingEngine {
       return;
     }
     this.isRunning = true;
-    console.log(`[MatchingEngine] Started (interval: ${this.pollingInterval}ms, pairs: ${this.tradingPairs.join(', ')})`);
+    console.log(`[MatchingEngine] Started (interval: ${this.pollingInterval}ms, pairs: ${this.tradingPairs.join(', ')}) [Allocation-based settlement]`);
     this.matchLoop();
   }
 
@@ -126,11 +114,9 @@ class MatchingEngine {
         }
       }
 
-      // ═══ Process any pairs queued by order placement triggers ═══
+      // Process any pairs queued by order placement triggers
       if (this.pendingPairs.size > 0) {
-        // New order arrived — reset to fast polling
         this._resetToFastPolling();
-
         const pending = [...this.pendingPairs];
         this.pendingPairs.clear();
         console.log(`[MatchingEngine] ⚡ Processing ${pending.length} queued pair(s): ${pending.join(', ')}`);
@@ -154,15 +140,11 @@ class MatchingEngine {
         }
       }
 
-      // ═══ Adaptive polling — sleep longer when idle ═══
       await new Promise(r => setTimeout(r, this.pollingInterval));
     }
     console.log('[MatchingEngine] Stopped');
   }
 
-  /**
-   * Called after a successful match to reset polling to fast mode
-   */
   _onMatchExecuted() {
     this._consecutiveIdleCycles = 0;
     this._lastMatchTime = Date.now();
@@ -172,9 +154,6 @@ class MatchingEngine {
     }
   }
 
-  /**
-   * Called after a cycle with no matches to potentially slow down polling
-   */
   _onIdleCycle() {
     this._consecutiveIdleCycles++;
     const oldInterval = this.pollingInterval;
@@ -190,9 +169,6 @@ class MatchingEngine {
     }
   }
 
-  /**
-   * Reset to fast polling when a new order triggers matching
-   */
   _resetToFastPolling() {
     this._consecutiveIdleCycles = 0;
     if (this.pollingInterval !== this.basePollingInterval) {
@@ -201,18 +177,13 @@ class MatchingEngine {
     }
   }
 
-  /**
-   * Run one matching cycle across all trading pairs.
-   * Tracks idle cycles and adjusts polling interval adaptively.
-   */
   async runMatchingCycle() {
     if (this.matchingInProgress) {
-      // Deadlock prevention for Vercel serverless.
       if (Date.now() - this.matchingStartTime > 25000) {
         console.warn('[MatchingEngine] ⚠️ matchingInProgress stuck for >25s — force-resetting');
         this.matchingInProgress = false;
       } else {
-        return; // Silently skip — no need to log every skip
+        return;
       }
     }
 
@@ -228,7 +199,6 @@ class MatchingEngine {
         if (hadMatch) matchFoundThisCycle = true;
       }
 
-      // ═══ Adaptive polling update ═══
       if (matchFoundThisCycle) {
         this._onMatchExecuted();
       } else {
@@ -245,9 +215,6 @@ class MatchingEngine {
   }
   
   /**
-   * Process orders for a single trading pair
-   */
-  /**
    * @returns {boolean} true if a match was found and executed
    */
   async processOrdersForPair(tradingPair, token) {
@@ -257,7 +224,6 @@ class MatchingEngine {
     if (!packageId || !operatorPartyId) return false;
 
     try {
-      // Query Canton for active Order contracts from BOTH packages
       const legacyPackageId = config.canton.packageIds?.legacy;
       const templateIdsToQuery = [`${packageId}:Order:Order`];
       if (legacyPackageId && legacyPackageId !== packageId) {
@@ -272,17 +238,16 @@ class MatchingEngine {
       
       if (!contracts || contracts.length === 0) return false;
       
-      // Parse and filter orders for this pair
       const buyOrders = [];
       const sellOrders = [];
       
       for (const c of contracts) {
         const payload = c.payload || c.createArgument || {};
         
+        // Only match OPEN orders (not PENDING_TRIGGER stop-loss orders)
         if (payload.tradingPair !== tradingPair || payload.status !== 'OPEN') continue;
 
         const rawPrice = payload.price;
-        // Handle DAML Optional: could be { Some: "123" } or direct string or null
         let parsedPrice = null;
         if (rawPrice !== null && rawPrice !== undefined && rawPrice !== '') {
           if (typeof rawPrice === 'object' && rawPrice.Some !== undefined) {
@@ -299,14 +264,13 @@ class MatchingEngine {
 
         if (remaining.lte(0)) continue;
 
-        // Detect which package this contract belongs to
         const contractTemplateId = c.templateId || `${packageId}:Order:Order`;
         const isNewPackage = contractTemplateId.startsWith(packageId);
 
-        // Extract lockId from allocationCid (Transfer Registry lock reference)
-        const rawLockId = payload.allocationCid || '';
-        const lockId = (rawLockId && rawLockId !== 'FILL_ONLY' && rawLockId !== 'NONE' && rawLockId.length >= 10)
-          ? rawLockId
+        // Extract allocationCid (Allocation contract ID for settlement)
+        const rawAllocationCid = payload.allocationCid || '';
+        const allocationCid = (rawAllocationCid && rawAllocationCid !== 'FILL_ONLY' && rawAllocationCid !== 'NONE' && rawAllocationCid.length >= 10)
+          ? rawAllocationCid
           : null;
         
         const order = {
@@ -319,10 +283,10 @@ class MatchingEngine {
           quantity: qty,
           filled: filled,
           remaining: remaining.toNumber(),
-          remainingDecimal: remaining,   // Keep Decimal for precise matching
+          remainingDecimal: remaining,
           timestamp: payload.timestamp,
           tradingPair: payload.tradingPair,
-          lockId: lockId,                // Transfer Registry lockId (was allocationCid)
+          allocationContractId: allocationCid,  // Allocation contract ID for settlement
           templateId: contractTemplateId,
           isNewPackage: isNewPackage,
         };
@@ -336,7 +300,7 @@ class MatchingEngine {
       
       if (buyOrders.length === 0 || sellOrders.length === 0) return false;
 
-      // ═══ Throttled logging: only log order counts when they change ═══
+      // Throttled logging
       const stateKey = `${tradingPair}:${buyOrders.length}b:${sellOrders.length}s`;
       this._cyclesSinceLastLog++;
       const shouldLogStatus = (this._lastLogState[tradingPair] !== stateKey) || (this._cyclesSinceLastLog >= this._LOG_THROTTLE_CYCLES);
@@ -363,7 +327,6 @@ class MatchingEngine {
         return new Date(a.timestamp) - new Date(b.timestamp);
       });
 
-      // Find and execute ONE match per cycle (contract IDs become stale after match)
       const matched = await this.findAndExecuteOneMatch(tradingPair, buyOrders, sellOrders, token);
       return matched;
       
@@ -382,9 +345,10 @@ class MatchingEngine {
    * Find ONE crossing match and execute it.
    * Only one per cycle because contract IDs change after exercise.
    * 
-   * Settlement uses Transfer Registry API exclusively:
-   * Two transfer() calls per match — instrument (seller→buyer) + payment (buyer→seller).
-   * Fully-filled orders have their locked funds released via unlockFunds().
+   * Settlement uses Allocation API:
+   * - Execute buyer's Allocation (exchange is executor — sends quote to seller)
+   * - Execute seller's Allocation (exchange is executor — sends base to buyer)
+   * - Both legs settled atomically by the exchange's own key
    */
   async findAndExecuteOneMatch(tradingPair, buyOrders, sellOrders, token) {
     const now = Date.now();
@@ -400,12 +364,8 @@ class MatchingEngine {
       for (const sellOrder of sellOrders) {
         if (buyOrder.remaining <= 0 || sellOrder.remaining <= 0) continue;
 
-        // ═══════════════════════════════════════════════════════════
-        // CRITICAL: Self-Trade Prevention
-        // A party must NEVER trade with itself — regulatory requirement.
-        // ═══════════════════════════════════════════════════════════
+        // ═══ CRITICAL: Self-Trade Prevention ═══
         if (buyOrder.owner === sellOrder.owner) {
-          // Throttled: only log once per party per 60 seconds
           const selfTradeKey = `self:${buyOrder.owner}`;
           if (!this._lastLogState[selfTradeKey] || (now - this._lastLogState[selfTradeKey]) > 60000) {
             console.log(`[MatchingEngine] ⚠️ Self-trade blocked: ${buyOrder.owner.substring(0, 30)}... (suppressing repeats for 60s)`);
@@ -414,7 +374,7 @@ class MatchingEngine {
           continue;
         }
 
-        // Skip recently matched order pairs (prevents re-matching loop)
+        // Skip recently matched order pairs
         const matchKey = `${buyOrder.contractId}::${sellOrder.contractId}`;
         if (this.recentlyMatchedOrders.has(matchKey)) {
           continue;
@@ -441,20 +401,19 @@ class MatchingEngine {
 
         if (!canMatch || matchPrice <= 0) continue;
 
-        // Precise quantity calculation with Decimal
         const matchQty = Decimal.min(buyOrder.remainingDecimal, sellOrder.remainingDecimal);
-        const matchQtyStr = matchQty.toFixed(10);  // String for API calls
-        const matchQtyNum = matchQty.toNumber();    // Number for comparisons
+        const matchQtyStr = matchQty.toFixed(10);
+        const matchQtyNum = matchQty.toNumber();
 
         console.log(`[MatchingEngine] ✅ MATCH FOUND: BUY ${buyPrice !== null ? buyPrice : 'MARKET'} x ${buyOrder.remaining} ↔ SELL ${sellPrice !== null ? sellPrice : 'MARKET'} x ${sellOrder.remaining}`);
-        console.log(`[MatchingEngine]    Fill: ${matchQtyStr} @ ${matchPrice} | Settlement: Canton SDK (2-step transfer)`);
+        console.log(`[MatchingEngine]    Fill: ${matchQtyStr} @ ${matchPrice} | Settlement: Allocation API (exchange as executor)`);
 
         this.recentlyMatchedOrders.set(matchKey, Date.now());
 
         try {
           await this.executeMatch(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, token);
-          console.log(`[MatchingEngine] ✅ Match executed successfully via Canton SDK`);
-          return true; // One match per cycle — signal success
+          console.log(`[MatchingEngine] ✅ Match executed successfully via Allocation API`);
+          return true;
         } catch (error) {
           console.error(`[MatchingEngine] ❌ Match execution failed:`, error.message);
           
@@ -465,12 +424,12 @@ class MatchingEngine {
             continue;
           }
           
-          return false; // Stop matching this cycle on unexpected error
+          return false;
         }
       }
     }
 
-    // ═══ DIAGNOSTIC: Log why no match was found (throttled) ═══
+    // Diagnostic: Log why no match was found (throttled)
     const bestBuy = buyOrders.find(o => o.remaining > 0 && o.price !== null);
     const bestSell = sellOrders.find(o => o.remaining > 0 && o.price !== null);
     if (bestBuy && bestSell) {
@@ -489,7 +448,6 @@ class MatchingEngine {
           console.warn(`[MatchingEngine] ⚠️ ${tradingPair}: Crossing orders blocked by recentlyMatched cache: ${skippedByCache.join(', ')}`);
         }
       } else {
-        // Throttle "no crossing" message — only log when spread changes
         const spreadKey = `spread:${tradingPair}:${bestBuy.price}:${bestSell.price}`;
         if (this._lastLogState[`spread:${tradingPair}`] !== spreadKey) {
           console.log(`[MatchingEngine] ${tradingPair}: No crossing (bid=${bestBuy.price} < ask=${bestSell.price}, spread=${spread.toFixed(4)})`);
@@ -497,32 +455,24 @@ class MatchingEngine {
         }
       }
     }
-    return false; // No match found
+    return false;
   }
   
   /**
-   * Execute a match using Canton Wallet SDK for REAL token transfers.
+   * Execute a match using Allocation API for settlement.
    * 
-   * Settlement flow (2-step transfer via SDK):
+   * Settlement flow (Allocation-based):
    * 1. FillOrder on BOTH Canton order contracts FIRST (prevents re-matching loop)
-   * 2. Transfer instrument (e.g., CC) from seller → buyer:
-   *    a. SDK createTransfer → creates TransferInstruction (locks seller's UTXOs)
-   *    b. SDK exerciseTransferInstructionChoice('Accept') → completes transfer
-   * 3. Transfer payment (e.g., CBTC) from buyer → seller:
-   *    a. SDK createTransfer → creates TransferInstruction (locks buyer's UTXOs)
-   *    b. SDK exerciseTransferInstructionChoice('Accept') → completes transfer
+   * 2. Execute seller's Allocation: base asset (e.g., CC) → buyer
+   *    → Exchange calls Allocation_Execute as executor — NO seller key needed
+   * 3. Execute buyer's Allocation: quote asset (e.g., CBTC) → seller
+   *    → Exchange calls Allocation_Execute as executor — NO buyer key needed
    * 4. Create Trade record on Canton for history
-   * 5. Broadcast via WebSocket
+   * 5. Trigger stop-loss checks at the new trade price
+   * 6. Broadcast via WebSocket
    * 
-   * All transfers are REAL Canton token movements visible on Canton Explorer.
-   * No custom minting, no fake APIs — pure Splice Token Standard.
-   * 
-   * @param {string} tradingPair
-   * @param {object} buyOrder
-   * @param {object} sellOrder
-   * @param {Decimal} matchQty - precise Decimal quantity
-   * @param {number} matchPrice
-   * @param {string} token - admin auth token
+   * Both transfers are REAL Canton token movements visible on Canton Explorer.
+   * The exchange settles with its OWN key — users sign only at order placement.
    */
   async executeMatch(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, token) {
     const packageId = config.canton.packageIds?.clobExchange;
@@ -530,11 +480,9 @@ class MatchingEngine {
     const synchronizerId = config.canton.synchronizerId;
     const [baseSymbol, quoteSymbol] = tradingPair.split('/');
 
-    // Precise arithmetic with Decimal
     const quoteAmount = matchQty.times(new Decimal(matchPrice));
     const matchQtyStr = matchQty.toFixed(10);
     const quoteAmountStr = quoteAmount.toFixed(10);
-    const matchQtyNum = matchQty.toNumber();
     
     let tradeContractId = null;
     const buyIsPartial = new Decimal(buyOrder.remaining).gt(matchQty);
@@ -545,7 +493,7 @@ class MatchingEngine {
     // ═══════════════════════════════════════════════════════════════════
     // STEP 1: FillOrder on BOTH Canton orders FIRST
     // This prevents the re-matching loop: once filled, the matching
-    // engine won't pick them up again even if transfers take time.
+    // engine won't pick them up again even if settlement takes time.
     // ═══════════════════════════════════════════════════════════════════
     console.log(`[MatchingEngine] 🔄 Settlement: ${matchQtyStr} ${baseSymbol} @ ${matchPrice} ${quoteSymbol}`);
     console.log(`[MatchingEngine] 📝 Step 1: Filling orders on-chain (prevents re-matching)...`);
@@ -583,75 +531,79 @@ class MatchingEngine {
     } catch (fillError) {
       console.error(`[MatchingEngine] ❌ Sell FillOrder FAILED: ${fillError.message}`);
       if (!fillError.message?.includes('already filled') && !fillError.message?.includes('CONTRACT_NOT_FOUND')) {
-        console.warn(`[MatchingEngine] ⚠️ Sell FillOrder failed but buy succeeded — will still attempt transfers`);
+        console.warn(`[MatchingEngine] ⚠️ Sell FillOrder failed but buy succeeded — will still attempt settlement`);
       }
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // STEP 2: Transfer REAL tokens via Canton (2-step flow)
+    // STEP 2: Execute Allocations — Exchange acts as executor
     //
-    // BOTH CC and CBTC use real on-chain transfers:
-    //   - CC (Amulet): via Splice SDK → Scan Proxy Transfer Factory
-    //   - CBTC: via Utilities Backend API → Utilities Transfer Factory
+    // Allocation-based settlement (replaces TransferInstruction):
+    // - Allocations were created at ORDER PLACEMENT time (funds already locked)
+    // - Exchange is the executor in every Allocation
+    // - Exchange calls Allocation_Execute with its OWN key
+    // - NO user keys needed at settlement time
+    // - Works for BOTH internal AND external parties
     //
-    // The SDK client routes to the correct API automatically based on
-    // the instrument's token system type (splice vs utilities).
-    //
-    // Flow for each transfer:
-    //   1. createTransfer → locks sender's UTXOs, creates TransferInstruction
-    //   2. acceptTransfer → completes transfer, receiver gets holdings
-    //
-    // Both transfers MUST succeed for complete settlement.
+    // Two allocations per match:
+    // A. Seller's Allocation: base asset → buyer (e.g., CC seller → buyer)
+    // B. Buyer's Allocation: quote asset → seller (e.g., CBTC buyer → seller)
     // ═══════════════════════════════════════════════════════════════════
-    console.log(`[MatchingEngine] 💰 Step 2: Token settlement — BOTH ${baseSymbol} and ${quoteSymbol} via real on-chain transfers...`);
+    console.log(`[MatchingEngine] 💰 Step 2: Allocation settlement — BOTH ${baseSymbol} and ${quoteSymbol} via executor...`);
 
-    let instrumentTransferResult = null;
-    let paymentTransferResult = null;
+    let instrumentAllocationResult = null;
+    let paymentAllocationResult = null;
 
     if (sdkClient.isReady()) {
-      // Transfer A: Instrument (base) from seller → buyer
-      try {
-        console.log(`[MatchingEngine]    📤 Transfer ${matchQtyStr} ${baseSymbol}: seller → buyer (2-step on-chain)`);
-        instrumentTransferResult = await sdkClient.executeFullTransfer(
-          sellOrder.owner,
-          buyOrder.owner,
-          matchQtyStr,
-          baseSymbol,
-          `settlement:${buyOrder.orderId}:${sellOrder.orderId}:instrument`
-        );
-        console.log(`[MatchingEngine]    ✅ Instrument transfer completed — updateId: ${instrumentTransferResult.updateId || 'N/A'}${instrumentTransferResult.autoCompleted ? ' (auto-completed via pre-approval)' : ''}`);
-      } catch (transferError) {
-        console.error(`[MatchingEngine]    ❌ Instrument transfer FAILED: ${transferError.message}`);
-        console.error(`[MatchingEngine]    🚨 CRITICAL: ${baseSymbol} transfer failed. Manual intervention required.`);
+      // Allocation A: Base instrument from seller → buyer
+      if (sellOrder.allocationContractId) {
+        try {
+          console.log(`[MatchingEngine]    📤 Executing seller's Allocation: ${matchQtyStr} ${baseSymbol} (seller → buyer)`);
+          instrumentAllocationResult = await sdkClient.executeAllocation(
+            sellOrder.allocationContractId,
+            operatorPartyId,  // Exchange as executor
+            baseSymbol
+          );
+          console.log(`[MatchingEngine]    ✅ Seller's Allocation executed — ${baseSymbol} transferred to buyer`);
+        } catch (allocErr) {
+          console.error(`[MatchingEngine]    ❌ Seller's Allocation execution FAILED: ${allocErr.message}`);
+          console.error(`[MatchingEngine]    🚨 CRITICAL: ${baseSymbol} allocation failed. Manual intervention required.`);
+        }
+      } else {
+        console.warn(`[MatchingEngine]    ⚠️ No allocationContractId on sell order — skipping ${baseSymbol} allocation execution`);
       }
 
-      // Transfer B: Payment (quote) from buyer → seller
-      try {
-        console.log(`[MatchingEngine]    📤 Transfer ${quoteAmountStr} ${quoteSymbol}: buyer → seller (2-step on-chain)`);
-        paymentTransferResult = await sdkClient.executeFullTransfer(
-          buyOrder.owner,
-          sellOrder.owner,
-          quoteAmountStr,
-          quoteSymbol,
-          `settlement:${buyOrder.orderId}:${sellOrder.orderId}:payment`
-        );
-        console.log(`[MatchingEngine]    ✅ Payment transfer completed — updateId: ${paymentTransferResult.updateId || 'N/A'}${paymentTransferResult.autoCompleted ? ' (auto-completed via pre-approval)' : ''}`);
-      } catch (transferError) {
-        console.error(`[MatchingEngine]    ❌ Payment transfer FAILED: ${transferError.message}`);
-        if (instrumentTransferResult) {
-          console.error(`[MatchingEngine]    🚨 CRITICAL: Partial settlement — instrument transferred but payment FAILED`);
-          console.error(`[MatchingEngine]    🚨 Buyer: ${buyOrder.owner.substring(0, 40)}, Seller: ${sellOrder.owner.substring(0, 40)}`);
-          console.error(`[MatchingEngine]    🚨 Instrument: ${matchQtyStr} ${baseSymbol}, Payment: ${quoteAmountStr} ${quoteSymbol}`);
-          console.error(`[MatchingEngine]    🚨 Manual intervention required`);
+      // Allocation B: Quote payment from buyer → seller
+      if (buyOrder.allocationContractId) {
+        try {
+          console.log(`[MatchingEngine]    📤 Executing buyer's Allocation: ${quoteAmountStr} ${quoteSymbol} (buyer → seller)`);
+          paymentAllocationResult = await sdkClient.executeAllocation(
+            buyOrder.allocationContractId,
+            operatorPartyId,  // Exchange as executor
+            quoteSymbol
+          );
+          console.log(`[MatchingEngine]    ✅ Buyer's Allocation executed — ${quoteSymbol} transferred to seller`);
+        } catch (allocErr) {
+          console.error(`[MatchingEngine]    ❌ Buyer's Allocation execution FAILED: ${allocErr.message}`);
+          if (instrumentAllocationResult) {
+            console.error(`[MatchingEngine]    🚨 CRITICAL: Partial settlement — instrument allocated but payment FAILED`);
+            console.error(`[MatchingEngine]    🚨 Buyer: ${buyOrder.owner.substring(0, 40)}, Seller: ${sellOrder.owner.substring(0, 40)}`);
+            console.error(`[MatchingEngine]    🚨 Instrument: ${matchQtyStr} ${baseSymbol}, Payment: ${quoteAmountStr} ${quoteSymbol}`);
+            console.error(`[MatchingEngine]    🚨 Manual intervention required`);
+          }
         }
+      } else {
+        console.warn(`[MatchingEngine]    ⚠️ No allocationContractId on buy order — skipping ${quoteSymbol} allocation execution`);
       }
 
       // Log settlement summary
-      if (instrumentTransferResult && paymentTransferResult) {
-        console.log(`[MatchingEngine]    ✅ Settlement complete — BOTH ${baseSymbol} and ${quoteSymbol} transfers successful`);
+      if (instrumentAllocationResult && paymentAllocationResult) {
+        console.log(`[MatchingEngine]    ✅ Allocation settlement complete — BOTH legs executed by exchange (executor)`);
+      } else if (!sellOrder.allocationContractId && !buyOrder.allocationContractId) {
+        console.warn(`[MatchingEngine]    ⚠️ No allocations on either order — orders filled but tokens NOT transferred`);
       }
     } else {
-      console.warn(`[MatchingEngine]    ⚠️ Canton SDK not ready — skipping token transfers`);
+      console.warn(`[MatchingEngine]    ⚠️ Canton SDK not ready — skipping Allocation settlement`);
       console.warn(`[MatchingEngine]    ⚠️ Orders are filled but tokens NOT transferred — manual resolution needed`);
     }
 
@@ -711,6 +663,19 @@ class MatchingEngine {
       tradeContractId = `trade-${Date.now()}`;
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // STEP 4: Trigger stop-loss checks at the new trade price
+    // After every successful trade, check if any stop-loss orders
+    // should be triggered by the new price.
+    // ═══════════════════════════════════════════════════════════════════
+    try {
+      const { getStopLossService } = require('./stopLossService');
+      const stopLossService = getStopLossService();
+      await stopLossService.checkTriggers(tradingPair, matchPrice);
+    } catch (slErr) {
+      console.warn(`[MatchingEngine] ⚠️ Stop-loss trigger check failed (non-critical): ${slErr.message}`);
+    }
+
     // ═══════════════════════════════════════════════════
     // FINAL: Record trade and broadcast via WebSocket
     // ═══════════════════════════════════════════════════
@@ -724,12 +689,12 @@ class MatchingEngine {
       buyOrderId: buyOrder.orderId,
       sellOrderId: sellOrder.orderId,
       timestamp: new Date().toISOString(),
-      settlementType: 'CantonSDK',
-      instrumentUpdateId: instrumentTransferResult?.updateId || null,
-      paymentUpdateId: paymentTransferResult?.updateId || null,
+      settlementType: 'Allocation',
+      instrumentAllocationId: sellOrder.allocationContractId || null,
+      paymentAllocationId: buyOrder.allocationContractId || null,
     };
 
-    // Add to UpdateStream for persistence (so trades API can serve it)
+    // Add to UpdateStream for persistence
     try {
       const { getUpdateStream } = require('./cantonUpdateStream');
       const updateStream = getUpdateStream();
@@ -740,7 +705,7 @@ class MatchingEngine {
       // Non-critical
     }
 
-    // Broadcast via WebSocket for real-time UI updates
+    // Broadcast via WebSocket
     if (global.broadcastWebSocket) {
       global.broadcastWebSocket(`trades:${tradingPair}`, { type: 'NEW_TRADE', ...tradeRecord });
       global.broadcastWebSocket('trades:all', { type: 'NEW_TRADE', ...tradeRecord });
@@ -752,7 +717,6 @@ class MatchingEngine {
         fillPrice: matchPrice,
       });
 
-      // Broadcast balance updates for both parties so UI refreshes immediately
       global.broadcastWebSocket(`balance:${buyOrder.owner}`, {
         type: 'BALANCE_UPDATE',
         partyId: buyOrder.owner,
@@ -765,7 +729,7 @@ class MatchingEngine {
       });
     }
 
-    console.log(`[MatchingEngine] ═══ Match complete: ${matchQtyStr} ${baseSymbol} @ ${matchPrice} ${quoteSymbol} (CantonSDK) ═══`);
+    console.log(`[MatchingEngine] ═══ Match complete: ${matchQtyStr} ${baseSymbol} @ ${matchPrice} ${quoteSymbol} (Allocation) ═══`);
   }
 
   setPollingInterval(ms) {
@@ -775,13 +739,8 @@ class MatchingEngine {
 
   /**
    * Run a single matching cycle on-demand (for serverless / API trigger).
-   * @param {string|null} targetPair - If provided, only match this pair (faster).
-   *                                   If null, process all pairs.
-   * 
-   * CONCURRENCY GUARD: Uses matchingInProgress to prevent overlapping cycles.
    */
   async triggerMatchingCycle(targetPair = null) {
-    // New order arrived → reset to fast polling
     this._resetToFastPolling();
 
     if (this.matchingInProgress) {
@@ -800,7 +759,6 @@ class MatchingEngine {
       }
     }
 
-    // Rate limit: Don't trigger more than once per 2 seconds
     const now = Date.now();
     if (this._lastTriggerTime && (now - this._lastTriggerTime) < 2000) {
       if (targetPair) {

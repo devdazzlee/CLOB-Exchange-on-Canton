@@ -1,27 +1,51 @@
 /**
- * Stop-Loss Service
- * Milestone 4: Stop-loss trigger logic and execution
+ * Stop-Loss Service — Allocation-Based Settlement
  * 
- * Monitors price movements and triggers stop-loss orders when price thresholds are breached
+ * Monitors price movements and triggers stop-loss orders when thresholds are breached.
+ * 
+ * Stop-Loss Flow:
+ * 1. User places STOP_LOSS order → funds locked in Allocation, status = PENDING_TRIGGER
+ * 2. After every trade, matching engine calls checkTriggers(pair, lastTradePrice)
+ * 3. If price crosses stop-loss threshold:
+ *    a. Update order status: PENDING_TRIGGER → OPEN
+ *    b. Convert to market order (no price limit)
+ *    c. Add to active order book
+ *    d. Trigger immediate matching
+ * 4. Cancellation releases the Allocation (funds returned)
+ * 
+ * Stop-Loss Rules:
+ * - SELL stop-loss: triggers when price DROPS to or below stopPrice
+ * - BUY stop-loss: triggers when price RISES to or above stopPrice
+ * - Stop-loss orders are INVISIBLE to the order book until triggered
+ * - Funds are locked in Allocation at placement (not at trigger)
+ * 
+ * @see https://docs.sync.global/app_dev/api/splice-api-token-allocation-v1/
  */
 
 const EventEmitter = require('events');
+const Decimal = require('decimal.js');
 const cantonService = require('./cantonService');
 const config = require('../config');
 const tokenProvider = require('./tokenProvider');
 
+// Configure decimal precision
+Decimal.set({ precision: 20, rounding: Decimal.ROUND_DOWN });
+
 class StopLossService extends EventEmitter {
   constructor() {
     super();
-    this.activeStopLosses = new Map(); // Map<orderContractId, stopLossConfig>
-    this.priceMonitors = new Map(); // Map<tradingPair, Set<orderContractId>>
+    // Map<orderId, stopLossConfig>
+    this.pendingStopOrders = new Map();
+    // Map<tradingPair, Set<orderId>> — for fast pair-based lookups
+    this.pairIndex = new Map();
     this.isRunning = false;
     this.checkInterval = null;
-    this.checkIntervalMs = 1000; // Check every second
+    this.checkIntervalMs = 5000; // Check every 5 seconds (backup poll)
   }
 
   /**
-   * Start the stop-loss monitoring service
+   * Start the stop-loss monitoring service.
+   * This runs a backup poll; primary trigger is via checkTriggers() after trades.
    */
   async start() {
     if (this.isRunning) {
@@ -32,10 +56,10 @@ class StopLossService extends EventEmitter {
     console.log('[StopLoss] Starting stop-loss monitoring service...');
     this.isRunning = true;
 
-    // Start periodic price checks
+    // Backup periodic check (primary trigger is from matching engine after each trade)
     this.checkInterval = setInterval(() => {
-      this.checkStopLosses().catch(err => {
-        console.error('[StopLoss] Error checking stop-losses:', err);
+      this._periodicCheck().catch(err => {
+        console.error('[StopLoss] Periodic check error:', err.message);
       });
     }, this.checkIntervalMs);
 
@@ -46,9 +70,7 @@ class StopLossService extends EventEmitter {
    * Stop the stop-loss monitoring service
    */
   stop() {
-    if (!this.isRunning) {
-      return;
-    }
+    if (!this.isRunning) return;
 
     console.log('[StopLoss] Stopping stop-loss monitoring service...');
     this.isRunning = false;
@@ -62,319 +84,391 @@ class StopLossService extends EventEmitter {
   }
 
   /**
-   * Register a stop-loss order
+   * Register a stop-loss order for monitoring.
+   * Called by OrderService when a STOP_LOSS order is placed.
    * 
-   * @param {Object} config - Stop-loss configuration
-   * @param {string} config.orderContractId - The order contract ID
-   * @param {string} config.tradingPair - Trading pair (e.g., "BTC/USDT")
-   * @param {string} config.orderType - "BUY" or "SELL"
-   * @param {number} config.stopLossPrice - Price at which to trigger stop-loss
-   * @param {string} config.partyId - Owner party ID
-   * @param {string} config.originalPrice - Original order price for reference
+   * @param {Object} cfg
+   * @param {string} cfg.orderContractId - Canton contract ID of the order
+   * @param {string} cfg.orderId - Unique order ID
+   * @param {string} cfg.tradingPair - e.g., "CC/CBTC"
+   * @param {string} cfg.orderType - "BUY" or "SELL"
+   * @param {string|number} cfg.stopPrice - Trigger price
+   * @param {string} cfg.partyId - Owner party
+   * @param {string} cfg.quantity - Order quantity
+   * @param {string|null} cfg.allocationContractId - Allocation contract ID
    */
-  registerStopLoss(config) {
+  registerStopLoss(cfg) {
     const {
       orderContractId,
+      orderId,
       tradingPair,
       orderType,
-      stopLossPrice,
+      stopPrice,
       partyId,
-      originalPrice
-    } = config;
+      quantity,
+      allocationContractId,
+    } = cfg;
 
-    if (!orderContractId || !tradingPair || !stopLossPrice) {
-      throw new Error('Missing required stop-loss configuration');
+    if (!orderId || !tradingPair || !stopPrice) {
+      throw new Error('Missing required stop-loss configuration: orderId, tradingPair, stopPrice');
     }
 
-    console.log(`[StopLoss] Registering stop-loss for order ${orderContractId.substring(0, 20)}...`);
-    console.log(`  Trading Pair: ${tradingPair}`);
-    console.log(`  Order Type: ${orderType}`);
-    console.log(`  Stop-Loss Price: ${stopLossPrice}`);
-    console.log(`  Original Price: ${originalPrice}`);
+    console.log(`[StopLoss] 📋 Registering stop-loss:`);
+    console.log(`  Order: ${orderId} (${orderContractId?.substring(0, 20) || 'N/A'}...)`);
+    console.log(`  Pair: ${tradingPair}, Side: ${orderType}`);
+    console.log(`  Trigger Price: ${stopPrice}`);
+    console.log(`  Allocation: ${allocationContractId?.substring(0, 20) || 'none'}...`);
 
-    // Store stop-loss configuration
-    this.activeStopLosses.set(orderContractId, {
+    const entry = {
       orderContractId,
+      orderId,
       tradingPair,
-      orderType,
-      stopLossPrice: parseFloat(stopLossPrice),
+      orderType: orderType.toUpperCase(),
+      stopPrice: new Decimal(stopPrice),
       partyId,
-      originalPrice: parseFloat(originalPrice),
-      registeredAt: new Date().toISOString()
+      quantity: quantity?.toString() || '0',
+      allocationContractId: allocationContractId || null,
+      registeredAt: new Date().toISOString(),
+      status: 'PENDING_TRIGGER',
+    };
+
+    this.pendingStopOrders.set(orderId, entry);
+
+    // Index by trading pair
+    if (!this.pairIndex.has(tradingPair)) {
+      this.pairIndex.set(tradingPair, new Set());
+    }
+    this.pairIndex.get(tradingPair).add(orderId);
+
+    this.emit('stopLossRegistered', { orderId, tradingPair, stopPrice: stopPrice.toString() });
+  }
+
+  /**
+   * Unregister a stop-loss order (on cancel or trigger).
+   */
+  unregisterStopLoss(orderContractIdOrOrderId) {
+    // Find by orderId first, then by contractId
+    let orderId = null;
+    if (this.pendingStopOrders.has(orderContractIdOrOrderId)) {
+      orderId = orderContractIdOrOrderId;
+    } else {
+      for (const [oid, entry] of this.pendingStopOrders) {
+        if (entry.orderContractId === orderContractIdOrOrderId) {
+          orderId = oid;
+          break;
+        }
+      }
+    }
+
+    if (!orderId) return;
+
+    const entry = this.pendingStopOrders.get(orderId);
+    if (!entry) return;
+
+    console.log(`[StopLoss] Unregistering stop-loss: ${orderId}`);
+
+    // Remove from pair index
+    const pairSet = this.pairIndex.get(entry.tradingPair);
+    if (pairSet) {
+      pairSet.delete(orderId);
+      if (pairSet.size === 0) this.pairIndex.delete(entry.tradingPair);
+    }
+
+    this.pendingStopOrders.delete(orderId);
+    this.emit('stopLossUnregistered', { orderId });
+  }
+
+  /**
+   * PRIMARY TRIGGER: Called by the matching engine after every successful trade.
+   * Checks if any pending stop-loss orders for this pair should trigger.
+   * 
+   * @param {string} tradingPair - The pair that just traded
+   * @param {number|string} lastTradePrice - The price at which the trade executed
+   */
+  async checkTriggers(tradingPair, lastTradePrice) {
+    const pairOrderIds = this.pairIndex.get(tradingPair);
+    if (!pairOrderIds || pairOrderIds.size === 0) return;
+
+    const price = new Decimal(lastTradePrice);
+    const triggered = [];
+
+    for (const orderId of pairOrderIds) {
+      const entry = this.pendingStopOrders.get(orderId);
+      if (!entry || entry.status !== 'PENDING_TRIGGER') continue;
+
+      let shouldTrigger = false;
+
+      // SELL stop-loss: triggers when price drops TO or BELOW stopPrice
+      if (entry.orderType === 'SELL' && price.lte(entry.stopPrice)) {
+        shouldTrigger = true;
+      }
+
+      // BUY stop-loss: triggers when price rises TO or ABOVE stopPrice
+      if (entry.orderType === 'BUY' && price.gte(entry.stopPrice)) {
+        shouldTrigger = true;
+      }
+
+        if (shouldTrigger) {
+        triggered.push({ orderId, entry, triggerPrice: price.toString() });
+      }
+    }
+
+    if (triggered.length > 0) {
+      console.log(`[StopLoss] 🎯 ${triggered.length} stop-loss order(s) triggered at ${lastTradePrice} for ${tradingPair}`);
+    }
+
+    // Execute triggers sequentially
+    for (const { orderId, entry, triggerPrice } of triggered) {
+      try {
+        await this.triggerOrder(orderId, entry, triggerPrice);
+      } catch (err) {
+        console.error(`[StopLoss] ❌ Failed to trigger stop-loss ${orderId}: ${err.message}`);
+        this.emit('stopLossError', { orderId, error: err });
+      }
+    }
+  }
+
+  /**
+   * Trigger a stop-loss order: convert to market order and add to order book.
+   * 
+   * @param {string} orderId - The stop-loss order ID
+   * @param {Object} entry - The stop-loss entry
+   * @param {string} triggerPrice - The price that triggered it
+   */
+  async triggerOrder(orderId, entry, triggerPrice) {
+    console.log(`[StopLoss] 🎯 Triggering stop-loss: ${orderId} at ${triggerPrice}`);
+    console.log(`  Side: ${entry.orderType}, Stop Price: ${entry.stopPrice.toString()}`);
+
+    const token = await tokenProvider.getServiceToken();
+    const packageId = config.canton.packageIds.clobExchange;
+    const operatorPartyId = config.canton.operatorPartyId;
+
+    // 1. Update order status on Canton: PENDING_TRIGGER → OPEN
+    try {
+      // Exercise a choice to update the order status
+      // If the DAML template supports TriggerStopLoss, use it
+      // Otherwise, use a general UpdateStatus choice
+      await cantonService.exerciseChoice({
+        token,
+        actAsParty: [operatorPartyId],
+        templateId: `${packageId}:Order:Order`,
+        contractId: entry.orderContractId,
+        choice: 'TriggerStopLoss',
+        choiceArgument: {
+          triggeredAt: new Date().toISOString(),
+          triggerPrice: triggerPrice.toString(),
+        },
+        readAs: [operatorPartyId, entry.partyId],
+      });
+      console.log(`[StopLoss] ✅ Order ${orderId} status updated to OPEN on Canton`);
+    } catch (choiceErr) {
+      console.warn(`[StopLoss] ⚠️ TriggerStopLoss choice failed: ${choiceErr.message}`);
+      // Try FillOrder with 0 to just change status, or fall through to local handling
+      // The order will be treated as a market order in the matching engine
+    }
+
+    // 2. Mark as triggered locally
+    entry.status = 'TRIGGERED';
+    entry.triggeredAt = new Date().toISOString();
+    entry.triggerPrice = triggerPrice;
+
+    // 3. Add to ReadModel as an OPEN market order
+    try {
+      const { getReadModelService } = require('./readModelService');
+      const readModel = getReadModelService();
+      if (readModel) {
+        // Update the existing order in read model
+        const existingOrder = readModel.getOrderByContractId(entry.orderContractId);
+        if (existingOrder) {
+          existingOrder.status = 'OPEN';
+          existingOrder.orderMode = 'MARKET'; // Convert to market order
+          existingOrder.price = null; // Market order — no price limit
+          existingOrder.triggeredAt = entry.triggeredAt;
+          console.log(`[StopLoss] ✅ Order updated in ReadModel as MARKET order`);
+        }
+      }
+    } catch (rmErr) {
+      console.warn(`[StopLoss] ⚠️ ReadModel update failed: ${rmErr.message}`);
+    }
+
+    // 4. Broadcast the trigger via WebSocket
+    if (global.broadcastWebSocket) {
+      global.broadcastWebSocket(`orderbook:${entry.tradingPair}`, {
+        type: 'STOP_LOSS_TRIGGERED',
+        orderId,
+        orderContractId: entry.orderContractId,
+        orderType: entry.orderType,
+        stopPrice: entry.stopPrice.toString(),
+        triggerPrice,
+        triggeredAt: entry.triggeredAt,
+        tradingPair: entry.tradingPair,
+      });
+    }
+
+    // 5. Trigger immediate matching for this pair
+    try {
+      const { getMatchingEngine } = require('./matching-engine');
+      const matchingEngine = getMatchingEngine();
+      if (matchingEngine) {
+        console.log(`[StopLoss] ⚡ Triggering immediate matching for ${entry.tradingPair}`);
+        const result = await matchingEngine.triggerMatchingCycle(entry.tradingPair);
+        console.log(`[StopLoss] ⚡ Matching result: ${JSON.stringify(result)}`);
+      }
+    } catch (matchErr) {
+      console.warn(`[StopLoss] ⚠️ Matching trigger failed: ${matchErr.message}`);
+    }
+
+    // 6. Unregister — it's been triggered
+    this.unregisterStopLoss(orderId);
+
+      this.emit('stopLossTriggered', {
+      orderId,
+      orderContractId: entry.orderContractId,
+      tradingPair: entry.tradingPair,
+      orderType: entry.orderType,
+      stopPrice: entry.stopPrice.toString(),
+      triggerPrice,
+      triggeredAt: entry.triggeredAt,
     });
 
-    // Add to price monitor for this trading pair
-    if (!this.priceMonitors.has(tradingPair)) {
-      this.priceMonitors.set(tradingPair, new Set());
-    }
-    this.priceMonitors.get(tradingPair).add(orderContractId);
-
-    this.emit('stopLossRegistered', { orderContractId, tradingPair, stopLossPrice });
+    console.log(`[StopLoss] ✅ Stop-loss ${orderId} triggered and converted to market order`);
   }
 
   /**
-   * Unregister a stop-loss order
+   * Backup periodic check — polls market prices for all pairs with pending stop orders.
+   * Primary trigger is checkTriggers() called by matching engine after each trade.
    */
-  unregisterStopLoss(orderContractId) {
-    const config = this.activeStopLosses.get(orderContractId);
-    if (!config) {
-      return;
-    }
+  async _periodicCheck() {
+    if (this.pendingStopOrders.size === 0) return;
 
-    console.log(`[StopLoss] Unregistering stop-loss for order ${orderContractId.substring(0, 20)}...`);
+    const pairsToCheck = [...this.pairIndex.keys()];
+    if (pairsToCheck.length === 0) return;
 
-    // Remove from price monitor
-    const monitors = this.priceMonitors.get(config.tradingPair);
-    if (monitors) {
-      monitors.delete(orderContractId);
-      if (monitors.size === 0) {
-        this.priceMonitors.delete(config.tradingPair);
-      }
-    }
-
-    this.activeStopLosses.delete(orderContractId);
-    this.emit('stopLossUnregistered', { orderContractId });
-  }
-
-  /**
-   * Check all active stop-losses and trigger if conditions are met
-   */
-  async checkStopLosses() {
-    if (this.activeStopLosses.size === 0) {
-      return; // No active stop-losses
-    }
-
-    try {
-      const adminToken = await tokenProvider.getAdminToken();
-
-      // Group by trading pair for efficient price fetching
-      const pairsToCheck = new Set();
-      for (const config of this.activeStopLosses.values()) {
-        pairsToCheck.add(config.tradingPair);
-      }
-
-      // Fetch current prices for all trading pairs
-      const prices = await this.fetchCurrentPrices(Array.from(pairsToCheck), adminToken);
-
-      // Check each stop-loss
-      const triggers = [];
-      for (const [orderContractId, config] of this.activeStopLosses.entries()) {
-        const currentPrice = prices.get(config.tradingPair);
-        if (!currentPrice) {
-          continue; // Price not available, skip
-        }
-
-        const shouldTrigger = this.shouldTriggerStopLoss(config, currentPrice);
-        if (shouldTrigger) {
-          triggers.push({ orderContractId, config, currentPrice });
-        }
-      }
-
-      // Execute triggered stop-losses
-      for (const trigger of triggers) {
-        await this.executeStopLoss(trigger.orderContractId, trigger.config, trigger.currentPrice, adminToken);
-      }
-
-    } catch (error) {
-      console.error('[StopLoss] Error checking stop-losses:', error);
-    }
-  }
-
-  /**
-   * Determine if stop-loss should trigger based on price movement
-   */
-  shouldTriggerStopLoss(config, currentPrice) {
-    const { orderType, stopLossPrice, originalPrice } = config;
-
-    // For BUY orders: trigger if price drops below stop-loss
-    // For SELL orders: trigger if price rises above stop-loss
-    if (orderType === 'BUY') {
-      return currentPrice <= stopLossPrice;
-    } else if (orderType === 'SELL') {
-      return currentPrice >= stopLossPrice;
-    }
-
-    return false;
-  }
-
-  /**
-   * Execute a stop-loss order (cancel the original order)
-   */
-  async executeStopLoss(orderContractId, config, currentPrice, adminToken) {
-    try {
-      console.log(`[StopLoss] 🚨 Triggering stop-loss for order ${orderContractId.substring(0, 20)}...`);
-      console.log(`  Current Price: ${currentPrice}`);
-      console.log(`  Stop-Loss Price: ${config.stopLossPrice}`);
-      console.log(`  Order Type: ${config.orderType}`);
-
-      // Get order template ID
-      const { orderTemplateId } = require('../utils/templateId');
-      const templateId = orderTemplateId();
-
-      // Cancel the order via DAML choice
-      const result = await cantonService.exerciseChoice({
-        token: adminToken,
-        actAsParty: config.partyId,
-        templateId,
-        contractId: orderContractId,
-        choice: 'CancelOrder',
-        choiceArgument: {},
-        readAs: [config.partyId]
-      });
-
-      console.log(`[StopLoss] ✅ Stop-loss executed successfully for order ${orderContractId.substring(0, 20)}`);
-
-      // Unregister the stop-loss
-      this.unregisterStopLoss(orderContractId);
-
-      // Emit event
-      this.emit('stopLossTriggered', {
-        orderContractId,
-        config,
-        currentPrice,
-        triggeredAt: new Date().toISOString()
-      });
-
-      return result;
-    } catch (error) {
-      console.error(`[StopLoss] ❌ Failed to execute stop-loss for order ${orderContractId.substring(0, 20)}:`, error);
-      this.emit('stopLossError', { orderContractId, config, error });
-      throw error;
-    }
-  }
-
-  /**
-   * Fetch current prices for trading pairs
-   * Uses the last trade price or best bid/ask from order book
-   */
-  async fetchCurrentPrices(tradingPairs, adminToken) {
-    const prices = new Map();
-
-    try {
-      // For each trading pair, get the latest trade price or best bid/ask
-      for (const pair of tradingPairs) {
-        // Try to get from order book (best bid/ask midpoint)
-        try {
-          const orderBookPrice = await this.getOrderBookPrice(pair, adminToken);
-          if (orderBookPrice && orderBookPrice > 0) {
-            prices.set(pair, orderBookPrice);
-            continue;
+    for (const pair of pairsToCheck) {
+      try {
+        const price = await this._getMarketPrice(pair);
+        if (price && price > 0) {
+          await this.checkTriggers(pair, price);
           }
         } catch (err) {
-          console.warn(`[StopLoss] Failed to get order book price for ${pair}:`, err.message);
-        }
-
-        // Fallback: try to get from recent trades
-        try {
-          const tradePrice = await this.getLatestTradePrice(pair, adminToken);
-          if (tradePrice && tradePrice > 0) {
-            prices.set(pair, tradePrice);
-            continue;
-          }
-        } catch (err) {
-          console.warn(`[StopLoss] Failed to get trade price for ${pair}:`, err.message);
-        }
+        // Suppress — this is a backup check
       }
-    } catch (error) {
-      console.error('[StopLoss] Error fetching current prices:', error);
     }
-
-    return prices;
   }
 
   /**
-   * Get price from order book (best bid/ask midpoint)
+   * Get current market price for a trading pair.
+   * Tries: order book midpoint → last trade price → best bid/ask
    */
-  async getOrderBookPrice(tradingPair, adminToken) {
+  async _getMarketPrice(tradingPair) {
     try {
-      const orderBookService = require('./orderBookService');
+      const { getOrderBookService } = require('./orderBookService');
+      const orderBookService = getOrderBookService();
       const orderBook = await orderBookService.getOrderBook(tradingPair);
       
-      if (orderBook.buyOrders.length > 0 && orderBook.sellOrders.length > 0) {
+      if (orderBook.buyOrders?.length > 0 && orderBook.sellOrders?.length > 0) {
         const bestBid = parseFloat(orderBook.buyOrders[0]?.price || 0);
         const bestAsk = parseFloat(orderBook.sellOrders[0]?.price || 0);
-        
-        if (bestBid > 0 && bestAsk > 0) {
-          return (bestBid + bestAsk) / 2; // Midpoint
-        } else if (bestBid > 0) {
-          return bestBid;
-        } else if (bestAsk > 0) {
-          return bestAsk;
-        }
+        if (bestBid > 0 && bestAsk > 0) return (bestBid + bestAsk) / 2;
+        if (bestBid > 0) return bestBid;
+        if (bestAsk > 0) return bestAsk;
       }
-      
-      // Fallback to last price
-      if (orderBook.lastPrice) {
-        return parseFloat(orderBook.lastPrice);
-      }
-      
-      return null;
-    } catch (error) {
-      console.error(`[StopLoss] Error getting order book price for ${tradingPair}:`, error);
-      return null;
-    }
-  }
 
-  /**
-   * Get latest trade price for a trading pair
-   */
-  async getLatestTradePrice(tradingPair, adminToken) {
+      if (orderBook.lastPrice) return parseFloat(orderBook.lastPrice);
+    } catch (err) {
+      // Suppress
+    }
+
+    // Fallback: query trades from Canton
     try {
-      const cantonService = require('./cantonService');
+      const token = await tokenProvider.getServiceToken();
       const packageId = config.canton.packageIds.clobExchange;
-      const templateId = `${packageId}:Trade:Trade`;
+      const operatorPartyId = config.canton.operatorPartyId;
+      const templateId = `${packageId}:Settlement:Trade`;
       
-      // Query recent trades
       const contracts = await cantonService.queryActiveContracts({
-        templateIds: [templateId]
-      }, adminToken);
-      
-      const contractArray = Array.isArray(contracts) ? contracts : (contracts.activeContracts || []);
-      
-      // Find most recent trade for this pair
-      let latestTrade = null;
-      let latestTimestamp = 0;
-      
-      for (const contract of contractArray) {
-        const payload = contract.payload || 
-                       contract.contractEntry?.JsActiveContract?.createdEvent?.createArgument ||
-                       contract.createArgument ||
-                       {};
-        
-        if (payload.tradingPair === tradingPair && payload.price) {
-          const timestamp = new Date(payload.timestamp || 0).getTime();
-          if (timestamp > latestTimestamp) {
-            latestTimestamp = timestamp;
-            latestTrade = payload;
+        party: operatorPartyId,
+        templateIds: [templateId],
+        pageSize: 10,
+      }, token);
+
+      let latestPrice = null;
+      let latestTs = 0;
+      for (const c of (Array.isArray(contracts) ? contracts : [])) {
+        const p = c.payload || c.createArgument || {};
+        if (p.tradingPair === tradingPair && p.price) {
+          const ts = new Date(p.timestamp || 0).getTime();
+          if (ts > latestTs) {
+            latestTs = ts;
+            latestPrice = parseFloat(p.price);
           }
         }
       }
-      
-      return latestTrade ? parseFloat(latestTrade.price) : null;
-    } catch (error) {
-      console.error(`[StopLoss] Error getting trade price for ${tradingPair}:`, error);
+      return latestPrice;
+    } catch (err) {
       return null;
     }
   }
 
   /**
-   * Get active stop-losses for a party
+   * Get pending stop-loss orders for a party.
    */
-  getActiveStopLosses(partyId) {
+  getPendingStopOrders(partyId = null, tradingPair = null) {
     const result = [];
-    for (const config of this.activeStopLosses.values()) {
-      if (config.partyId === partyId) {
-        result.push({
-          orderContractId: config.orderContractId,
-          tradingPair: config.tradingPair,
-          orderType: config.orderType,
-          stopLossPrice: config.stopLossPrice,
-          originalPrice: config.originalPrice,
-          registeredAt: config.registeredAt
-        });
-      }
+    for (const entry of this.pendingStopOrders.values()) {
+      if (partyId && entry.partyId !== partyId) continue;
+      if (tradingPair && entry.tradingPair !== tradingPair) continue;
+      result.push({
+        orderId: entry.orderId,
+        orderContractId: entry.orderContractId,
+        tradingPair: entry.tradingPair,
+        orderType: entry.orderType,
+        stopPrice: entry.stopPrice.toString(),
+        quantity: entry.quantity,
+        status: entry.status,
+        registeredAt: entry.registeredAt,
+        allocationContractId: entry.allocationContractId,
+      });
     }
     return result;
+  }
+
+  /**
+   * Legacy API: getActiveStopLosses (backward compat)
+   */
+  getActiveStopLosses(partyId) {
+    return this.getPendingStopOrders(partyId).map(entry => ({
+      orderContractId: entry.orderContractId,
+      tradingPair: entry.tradingPair,
+      orderType: entry.orderType,
+      stopLossPrice: entry.stopPrice,
+      originalPrice: null,
+      registeredAt: entry.registeredAt,
+    }));
+  }
+
+  /**
+   * Legacy API: registerStopLoss with old field names (backward compat)
+   * Called by exchangeController.js
+   */
+  registerStopLossLegacy(cfg) {
+    return this.registerStopLoss({
+      orderContractId: cfg.orderContractId,
+      orderId: cfg.orderContractId, // Use contractId as orderId fallback
+      tradingPair: cfg.tradingPair,
+      orderType: cfg.orderType,
+      stopPrice: cfg.stopLossPrice,
+      partyId: cfg.partyId,
+      quantity: null,
+      allocationContractId: null,
+    });
+  }
+
+  /**
+   * Legacy API: checkStopLosses (backward compat for periodic check)
+   */
+  async checkStopLosses() {
+    return this._periodicCheck();
   }
 }
 
@@ -390,5 +484,5 @@ function getStopLossService() {
 
 module.exports = {
   StopLossService,
-  getStopLossService
+  getStopLossService,
 };

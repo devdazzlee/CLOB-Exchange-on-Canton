@@ -113,6 +113,15 @@ const UTILITIES_CONFIG = {
   TRANSFER_FACTORY_INTERFACE: '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.TransferInstructionV1:TransferFactory',
   TRANSFER_INSTRUCTION_INTERFACE: '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.TransferInstructionV1:TransferInstruction',
   HOLDING_INTERFACE: '718a0f77e505a8de22f188bd4c87fe74101274e9d4cb1bfac7d09aec7158d35b:Splice.Api.Token.HoldingV1:Holding',
+
+  // ─── Allocation API Interface IDs ───────────────────────────────────────────
+  // Allocation-based settlement: user authorizes exchange as executor at order time,
+  // exchange settles with its own key at match time.
+  // Ref: https://docs.sync.global/app_dev/api/splice-api-token-allocation-v1/
+  ALLOCATION_FACTORY_INTERFACE: '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.AllocationV1:AllocationFactory',
+  ALLOCATION_INTERFACE: '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.AllocationV1:Allocation',
+  ALLOCATION_INSTRUCTION_FACTORY_INTERFACE: '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.AllocationInstructionV1:AllocationInstructionFactory',
+  ALLOCATION_INSTRUCTION_INTERFACE: '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.AllocationInstructionV1:AllocationInstruction',
 };
 
 /**

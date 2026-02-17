@@ -228,3 +228,8 @@ Can refer to this doc, https://docs.digitalasset.com/utilities/devnet/how-tos/re
 ${BACKEND_API}/v0/registrars/${ADMIN_PARTY_ID}/registry/transfer-instruction/v1/transfer-factory (this is for transferring of tokens)
 BACKEND_API=“https://api.utilities.digitalasset-dev.com/api/utilities” (for devnet)
 ADMIN_PARTY_ID=“cbtc-network::12202a83c6f4082217c175e29bc53da5f2703ba2675778ab99217a5a881a949203ff”
+
+
+The matchmaking is working and is getting settled instantly, but we are not using Allocations to transfer the assets, the transfer of assets is done by TransferInstruction which should not be the case. 
+As we are using internal parties in this app, we can create any transfer from the backend and the flow would work fine, but when we will switch to external parties then we would require a signature from user's private key owning the external party to create a TransferInstruction. Hence, we will need to use Allocations, this way we can set sender, receiver and executor beforehand, this will help us settle (using the executor, which will be us) the allocation when there is matching order also include stop loss order functionality
+
