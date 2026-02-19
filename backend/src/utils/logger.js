@@ -19,10 +19,16 @@ const winston = require('winston');
 const path = require('path');
 const fs = require('fs');
 
-// Ensure logs directory exists
-const LOGS_DIR = path.join(__dirname, '..', '..', 'logs');
-if (!fs.existsSync(LOGS_DIR)) {
-  fs.mkdirSync(LOGS_DIR, { recursive: true });
+// Detect serverless / read-only environments (Vercel, AWS Lambda, etc.)
+const isServerless = !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.LAMBDA_TASK_ROOT);
+
+// Ensure logs directory exists (only when filesystem is writable)
+let LOGS_DIR = null;
+if (!isServerless) {
+  LOGS_DIR = path.join(__dirname, '..', '..', 'logs');
+  if (!fs.existsSync(LOGS_DIR)) {
+    fs.mkdirSync(LOGS_DIR, { recursive: true });
+  }
 }
 
 // ── Custom format for log files (structured, timestamped) ──
@@ -58,29 +64,26 @@ const consoleFormat = winston.format.combine(
   })
 );
 
-// ── Create the logger ──
-const logger = winston.createLogger({
-  level: process.env.LOG_LEVEL || 'info',
-  defaultMeta: { service: 'clob-exchange' },
-  transports: [
-    // ── Console transport (always active) ──
-    new winston.transports.Console({
-      format: consoleFormat,
-      // In production, only info+
-      level: process.env.NODE_ENV === 'production' ? 'info' : 'debug',
-    }),
+// ── Build transports ──
+const transports = [
+  // Console transport (always active — Vercel captures stdout/stderr natively)
+  new winston.transports.Console({
+    format: consoleFormat,
+    level: process.env.NODE_ENV === 'production' ? 'info' : 'debug',
+  }),
+];
 
-    // ── Combined log file (all levels) ──
+// File transports only when we have a writable filesystem
+if (LOGS_DIR) {
+  transports.push(
     new winston.transports.File({
       filename: path.join(LOGS_DIR, 'combined.log'),
       format: fileFormat,
       level: 'debug',
-      maxsize: 10 * 1024 * 1024, // 10 MB per file
-      maxFiles: 5,                // Keep 5 rotated files
+      maxsize: 10 * 1024 * 1024,
+      maxFiles: 5,
       tailable: true,
     }),
-
-    // ── Error log file (error level only) ──
     new winston.transports.File({
       filename: path.join(LOGS_DIR, 'error.log'),
       format: fileFormat,
@@ -89,9 +92,14 @@ const logger = winston.createLogger({
       maxFiles: 5,
       tailable: true,
     }),
-  ],
+  );
+}
 
-  // Don't exit on uncaught errors in transports
+// ── Create the logger ──
+const logger = winston.createLogger({
+  level: process.env.LOG_LEVEL || 'info',
+  defaultMeta: { service: 'clob-exchange' },
+  transports,
   exitOnError: false,
 });
 
@@ -147,7 +155,7 @@ logger.requestMiddleware = (req, res, next) => {
 logger.originalConsole = originalConsole;
 
 // ── Log the logger itself being initialized ──
-logger.info(`Logger initialized — logs directory: ${LOGS_DIR}`);
+logger.info(`Logger initialized — ${LOGS_DIR ? `logs directory: ${LOGS_DIR}` : 'console-only (serverless)'}`);
 logger.info(`Log level: ${logger.level}`);
 
 module.exports = logger;
