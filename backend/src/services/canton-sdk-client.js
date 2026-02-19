@@ -63,6 +63,7 @@ class CantonSDKClient {
    * Initialize the SDK and connect to Canton
    * Call this once at server startup.
    * Safe to call concurrently — only the first call runs, others await the same promise.
+   * Automatically retries with exponential backoff if initialization fails.
    */
   async initialize() {
     if (this.initialized) {
@@ -72,8 +73,68 @@ class CantonSDKClient {
     if (this._initPromise) {
       return this._initPromise;
     }
-    this._initPromise = this._doInitialize();
+    this._initPromise = this._doInitializeWithRetry();
     return this._initPromise;
+  }
+
+  /**
+   * Retry wrapper around _doInitialize with exponential backoff.
+   * Retries up to MAX_RETRIES times with delays of 5s, 10s, 20s, 40s, 60s.
+   * If all retries fail, starts a background retry loop (every 60s).
+   */
+  async _doInitializeWithRetry() {
+    const MAX_RETRIES = 5;
+    const BASE_DELAY_MS = 5000;
+    const MAX_DELAY_MS = 60000;
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      await this._doInitialize();
+      if (this.initialized) {
+        return; // Success
+      }
+
+      if (attempt < MAX_RETRIES) {
+        const delay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt - 1), MAX_DELAY_MS);
+        console.warn(`[CantonSDK] ⏳ Retry ${attempt}/${MAX_RETRIES} in ${delay / 1000}s... (error: ${this.initError})`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        // Reset state for retry
+        this.initError = null;
+        this.sdk = null;
+      }
+    }
+
+    // All retries exhausted — start background retry loop
+    if (!this.initialized) {
+      console.error(`[CantonSDK] ❌ All ${MAX_RETRIES} initialization attempts failed. Starting background retry (every 60s)...`);
+      this._startBackgroundRetry();
+    }
+  }
+
+  /**
+   * Background retry: Periodically attempts SDK initialization.
+   * Stops once initialized successfully.
+   */
+  _startBackgroundRetry() {
+    if (this._backgroundRetryTimer) return; // Already running
+
+    this._backgroundRetryTimer = setInterval(async () => {
+      if (this.initialized) {
+        clearInterval(this._backgroundRetryTimer);
+        this._backgroundRetryTimer = null;
+        return;
+      }
+      console.log('[CantonSDK] 🔄 Background retry: attempting SDK initialization...');
+      this.initError = null;
+      this.sdk = null;
+      await this._doInitialize();
+      if (this.initialized) {
+        console.log('[CantonSDK] ✅ Background retry SUCCEEDED — SDK is now ready!');
+        clearInterval(this._backgroundRetryTimer);
+        this._backgroundRetryTimer = null;
+      } else {
+        console.warn(`[CantonSDK] ⚠️ Background retry failed: ${this.initError}. Will retry in 60s...`);
+      }
+    }, 60000);
   }
 
   async _doInitialize() {
@@ -561,7 +622,7 @@ class CantonSDKClient {
         templateId: dc.templateId,
         contractId: dc.contractId,
         createdEventBlob: dc.createdEventBlob,
-        ...(dc.synchronizerId && { synchronizerId: dc.synchronizerId }),
+        synchronizerId: dc.synchronizerId || synchronizerId,
       })),
     });
 
@@ -618,7 +679,7 @@ class CantonSDKClient {
               templateId: dc.templateId,
               contractId: dc.contractId,
               createdEventBlob: dc.createdEventBlob,
-              ...(dc.synchronizerId && { synchronizerId: dc.synchronizerId }),
+              synchronizerId: dc.synchronizerId || synchronizerId,
             })),
           });
         }
@@ -656,7 +717,7 @@ class CantonSDKClient {
             templateId: dc.templateId,
             contractId: dc.contractId,
             createdEventBlob: dc.createdEventBlob,
-            ...(dc.synchronizerId && { synchronizerId: dc.synchronizerId }),
+            synchronizerId: dc.synchronizerId || synchronizerId,
           })),
         });
         console.log(`[CantonSDK]    ✅ Transfer ACCEPTED via registry API — real ${symbol} tokens moved!`);
@@ -726,7 +787,7 @@ class CantonSDKClient {
                 templateId: dc.templateId,
                 contractId: dc.contractId,
                 createdEventBlob: dc.createdEventBlob,
-                ...(dc.synchronizerId && { synchronizerId: dc.synchronizerId }),
+                synchronizerId: dc.synchronizerId || synchronizerId,
               })),
             });
           }
@@ -776,7 +837,7 @@ class CantonSDKClient {
         templateId: dc.templateId,
         contractId: dc.contractId,
         createdEventBlob: dc.createdEventBlob,
-        ...(dc.synchronizerId && { synchronizerId: dc.synchronizerId }),
+        synchronizerId: dc.synchronizerId || synchronizerId,
       })),
     });
 
@@ -1004,7 +1065,7 @@ class CantonSDKClient {
             templateId: dc.templateId,
             contractId: dc.contractId,
             createdEventBlob: dc.createdEventBlob,
-            ...(dc.synchronizerId && { synchronizerId: dc.synchronizerId }),
+            synchronizerId: dc.synchronizerId || synchronizerId,
           })),
         });
 
@@ -1093,7 +1154,7 @@ class CantonSDKClient {
         templateId: dc.templateId,
         contractId: dc.contractId,
         createdEventBlob: dc.createdEventBlob,
-        ...(dc.synchronizerId && { synchronizerId: dc.synchronizerId }),
+        synchronizerId: dc.synchronizerId || synchronizerId,
       })),
     });
 
@@ -1214,21 +1275,26 @@ class CantonSDKClient {
    * @param {string} ownerPartyId - The allocation owner (user who locked tokens) — REQUIRED for authorization
    * @returns {Object} Exercise result
    */
-  async executeAllocation(allocationContractId, executorPartyId, symbol = null, ownerPartyId = null) {
-    if (!this.isReady()) {
-      throw new Error('Canton SDK not initialized');
-    }
-
+  async executeAllocation(allocationContractId, executorPartyId, symbol = null, ownerPartyId = null, receiverPartyId = null) {
     if (!allocationContractId) {
       console.warn('[CantonSDK] No allocationContractId — skipping execution');
       return null;
     }
 
-    // Build the actAs list: MUST include BOTH executor AND allocation owner
-    // The AmuletAllocation / Allocation contract requires both as signatories
+    // Build the actAs list: MUST include ALL THREE parties:
+    //   1. executorPartyId  — the exchange (settlement executor)
+    //   2. ownerPartyId     — the sender (allocation owner, whose funds are locked)
+    //   3. receiverPartyId  — the receiver (who will receive the funds)
+    //
+    // The AmuletAllocation / DvpLegAllocation contract requires ALL THREE as
+    // authorizers for Allocation_ExecuteTransfer. Missing ANY party causes:
+    //   DAML_AUTHORIZATION_ERROR: requires authorizers [executor, sender, receiver]
     const actAsParties = [executorPartyId];
     if (ownerPartyId && ownerPartyId !== executorPartyId) {
       actAsParties.push(ownerPartyId);
+    }
+    if (receiverPartyId && !actAsParties.includes(receiverPartyId)) {
+      actAsParties.push(receiverPartyId);
     }
     const readAsParties = [...actAsParties];
 
@@ -1238,145 +1304,86 @@ class CantonSDKClient {
 
     console.log(`[CantonSDK] ✅ Executing Allocation: ${allocationContractId.substring(0, 30)}...`);
     console.log(`[CantonSDK]    Executor: ${executorPartyId.substring(0, 30)}...`);
-    console.log(`[CantonSDK]    Owner: ${ownerPartyId ? ownerPartyId.substring(0, 30) + '...' : 'N/A'}`);
-    console.log(`[CantonSDK]    actAs: [${actAsParties.map(p => p.substring(0, 20) + '...').join(', ')}]`);
+    console.log(`[CantonSDK]    Owner/Sender: ${ownerPartyId ? ownerPartyId.substring(0, 30) + '...' : 'N/A'}`);
+    console.log(`[CantonSDK]    Receiver: ${receiverPartyId ? receiverPartyId.substring(0, 30) + '...' : 'N/A'}`);
+    console.log(`[CantonSDK]    actAs (${actAsParties.length} parties): [${actAsParties.map(p => p.substring(0, 20) + '...').join(', ')}]`);
 
     const tokenSystemType = symbol ? getTokenSystemType(symbol) : null;
-      const adminToken = await tokenProvider.getServiceToken();
+    const adminToken = await tokenProvider.getServiceToken();
 
-    // Try SDK method first
-    try {
-      if (this.sdk.tokenStandard && typeof this.sdk.tokenStandard.exerciseAllocationChoice === 'function') {
-        return await this._withPartyContext(executorPartyId, async () => {
-          const [executeCmd, disclosed] = await this.sdk.tokenStandard.exerciseAllocationChoice(
-            allocationContractId,
-            'ExecuteTransfer'
-          );
-
-          const commands = Array.isArray(executeCmd) ? executeCmd : [executeCmd];
-      let result = null;
-      for (const rawCmd of commands) {
-        const cmd = rawCmd.ExerciseCommand || rawCmd;
-        result = await cantonService.exerciseChoice({
-          token: adminToken,
-              actAsParty: actAsParties,
-          templateId: cmd.templateId,
-          contractId: cmd.contractId,
-          choice: cmd.choice,
-          choiceArgument: cmd.choiceArgument,
-              readAs: readAsParties,
-              synchronizerId,
-              disclosedContracts: (disclosed || []).map(dc => ({
-            templateId: dc.templateId,
-            contractId: dc.contractId,
-            createdEventBlob: dc.createdEventBlob,
-            ...(dc.synchronizerId && { synchronizerId: dc.synchronizerId }),
-          })),
-        });
-      }
-
-          console.log(`[CantonSDK]    ✅ Allocation executed via SDK — updateId: ${result?.transaction?.updateId || 'N/A'}`);
-      return result;
-    });
-      }
-    } catch (sdkErr) {
-      console.warn(`[CantonSDK]    SDK exerciseAllocationChoice failed: ${sdkErr.message} — trying direct API`);
+    // ── Route Utilities tokens (CBTC) directly to Utilities API ──────────
+    // The SDK's exerciseAllocationChoice looks for AmuletAllocation (Splice-specific).
+    // Utilities tokens use a DIFFERENT allocation contract type that the SDK
+    // will NEVER find, resulting in "AmuletAllocation '...' not found" every time.
+    // Skip the SDK entirely for Utilities tokens — go straight to the API.
+    if (tokenSystemType === 'utilities') {
+      console.log(`[CantonSDK]    ${symbol} is a Utilities token — using Utilities API directly (not SDK)`);
+      return this._executeUtilitiesAllocation(allocationContractId, executorPartyId, symbol, adminToken, ownerPartyId, receiverPartyId);
     }
 
-    // Fallback: Try registry API for execution context
-    if (tokenSystemType === 'utilities') {
-      return this._executeUtilitiesAllocation(allocationContractId, executorPartyId, symbol, adminToken, ownerPartyId);
+    // ── Splice tokens (CC/Amulet): Try SDK method first ──────────────────
+    if (this.isReady()) {
+      try {
+        if (this.sdk.tokenStandard && typeof this.sdk.tokenStandard.exerciseAllocationChoice === 'function') {
+          return await this._withPartyContext(executorPartyId, async () => {
+            const [executeCmd, disclosed] = await this.sdk.tokenStandard.exerciseAllocationChoice(
+              allocationContractId,
+              'ExecuteTransfer'
+            );
+
+            const commands = Array.isArray(executeCmd) ? executeCmd : [executeCmd];
+            let result = null;
+            for (const rawCmd of commands) {
+              const cmd = rawCmd.ExerciseCommand || rawCmd;
+              result = await cantonService.exerciseChoice({
+                token: adminToken,
+                actAsParty: actAsParties,
+                templateId: cmd.templateId,
+                contractId: cmd.contractId,
+                choice: cmd.choice,
+                choiceArgument: cmd.choiceArgument,
+                readAs: readAsParties,
+                synchronizerId,
+                disclosedContracts: (disclosed || []).map(dc => ({
+                  templateId: dc.templateId,
+                  contractId: dc.contractId,
+                  createdEventBlob: dc.createdEventBlob,
+                  synchronizerId: dc.synchronizerId || synchronizerId,
+                })),
+              });
+            }
+
+            console.log(`[CantonSDK]    ✅ Allocation executed via SDK — updateId: ${result?.transaction?.updateId || 'N/A'}`);
+            return result;
+          });
+        }
+      } catch (sdkErr) {
+        console.warn(`[CantonSDK]    SDK exerciseAllocationChoice failed: ${sdkErr.message} — trying registry API`);
+      }
+    } else {
+      console.warn(`[CantonSDK]    SDK not ready — attempting registry API execution for allocation`);
     }
 
     // Fallback for Splice: Try the Scan Proxy execute-transfer endpoint directly
     try {
       const registryUrl = CANTON_SDK_CONFIG.REGISTRY_API_URL;
-    const encodedCid = encodeURIComponent(allocationContractId);
+      const encodedCid = encodeURIComponent(allocationContractId);
       const executeContextUrl = `${registryUrl}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
 
       console.log(`[CantonSDK]    Trying Splice registry execute-transfer API...`);
       const resp = await fetch(executeContextUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ excludeDebugFields: true }),
-        });
-        
-        if (resp.ok) {
-        const context = await resp.json();
-        const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
-    const result = await cantonService.exerciseChoice({
-      token: adminToken,
-          actAsParty: actAsParties,
-          templateId: ALLOCATION_INTERFACE,
-          contractId: allocationContractId,
-          choice: 'Allocation_ExecuteTransfer',
-      choiceArgument: {
-        extraArgs: {
-              context: context.choiceContextData || { values: {} },
-          meta: { values: {} },
-        },
-      },
-          readAs: readAsParties,
-          synchronizerId,
-          disclosedContracts: (context.disclosedContracts || []).map(dc => ({
-        templateId: dc.templateId,
-        contractId: dc.contractId,
-        createdEventBlob: dc.createdEventBlob,
-            ...(dc.synchronizerId && { synchronizerId: dc.synchronizerId }),
-      })),
-    });
-
-        console.log(`[CantonSDK]    ✅ Splice allocation executed via registry API — updateId: ${result?.transaction?.updateId || 'N/A'}`);
-    return result;
-      } else {
-        const errText = await resp.text();
-        console.warn(`[CantonSDK]    ⚠️ Registry execute-transfer returned ${resp.status}: ${errText.substring(0, 200)}`);
-      }
-    } catch (registryErr) {
-      console.warn(`[CantonSDK]    ⚠️ Splice registry execute-transfer failed: ${registryErr.message}`);
-    }
-
-    // Allocation execution failed — caller may attempt Transfer Factory as last resort
-    console.error(`[CantonSDK]    ❌ Splice allocation execution failed — all methods exhausted`);
-    return null;
-  }
-
-  /**
-   * Execute Utilities allocation via backend API.
-   * 
-   * CRITICAL: Must include both executor AND owner in actAs (dual signatory).
-   * CRITICAL: Must include synchronizerId in command body.
-   */
-  async _executeUtilitiesAllocation(allocationContractId, executorPartyId, symbol, adminToken, ownerPartyId = null) {
-    const adminParty = getInstrumentAdmin(symbol);
-    const backendUrl = UTILITIES_CONFIG.BACKEND_URL;
-    const encodedCid = encodeURIComponent(allocationContractId);
-    const executeContextUrl = `${backendUrl}/v0/registrars/${encodeURIComponent(adminParty)}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
-
-    // Build actAs: BOTH executor AND allocation owner required
-    const actAsParties = [executorPartyId];
-    if (ownerPartyId && ownerPartyId !== executorPartyId) {
-      actAsParties.push(ownerPartyId);
-    }
-    const readAsParties = [...actAsParties];
-
-    // Get synchronizerId — REQUIRED for Canton command submission
-    const configModule = require('../config');
-    const synchronizerId = configModule.canton.synchronizerId;
-
-    try {
-      const resp = await fetch(executeContextUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
+        body: JSON.stringify({ excludeDebugFields: true }),
       });
-        
+
       if (resp.ok) {
         const context = await resp.json();
+        const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
         const result = await cantonService.exerciseChoice({
           token: adminToken,
           actAsParty: actAsParties,
-          templateId: UTILITIES_CONFIG.ALLOCATION_INTERFACE,
+          templateId: ALLOCATION_INTERFACE,
           contractId: allocationContractId,
           choice: 'Allocation_ExecuteTransfer',
           choiceArgument: {
@@ -1391,15 +1398,97 @@ class CantonSDKClient {
             templateId: dc.templateId,
             contractId: dc.contractId,
             createdEventBlob: dc.createdEventBlob,
-            ...(dc.synchronizerId && { synchronizerId: dc.synchronizerId }),
+            synchronizerId: dc.synchronizerId || synchronizerId,
           })),
         });
 
-        console.log(`[CantonSDK]    ✅ Utilities allocation executed — updateId: ${result?.transaction?.updateId || 'N/A'}`);
+        console.log(`[CantonSDK]    ✅ Splice allocation executed via registry API — updateId: ${result?.transaction?.updateId || 'N/A'}`);
         return result;
+      } else {
+        const errText = await resp.text();
+        console.warn(`[CantonSDK]    ⚠️ Registry execute-transfer returned ${resp.status}: ${errText.substring(0, 200)}`);
       }
-      } catch (err) {
-      console.warn(`[CantonSDK]    ⚠️ Utilities allocation execute context failed: ${err.message}`);
+    } catch (registryErr) {
+      console.warn(`[CantonSDK]    ⚠️ Splice registry execute-transfer failed: ${registryErr.message}`);
+    }
+
+    // Allocation execution failed
+    console.error(`[CantonSDK]    ❌ Splice allocation execution failed — all methods exhausted`);
+    return null;
+  }
+
+  /**
+   * Execute Utilities allocation via backend API.
+   * 
+   * CRITICAL: Must include both executor AND owner in actAs (dual signatory).
+   * CRITICAL: Must include synchronizerId in command body.
+   */
+  async _executeUtilitiesAllocation(allocationContractId, executorPartyId, symbol, adminToken, ownerPartyId = null, receiverPartyId = null) {
+    const adminParty = getInstrumentAdmin(symbol);
+    const backendUrl = UTILITIES_CONFIG.BACKEND_URL;
+    const encodedCid = encodeURIComponent(allocationContractId);
+    const executeContextUrl = `${backendUrl}/v0/registrars/${encodeURIComponent(adminParty)}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
+
+    // Build actAs: ALL THREE parties required — executor, sender (owner), AND receiver
+    // The DvpLegAllocation contract requires all three as authorizers for ExecuteTransfer
+    const actAsParties = [executorPartyId];
+    if (ownerPartyId && ownerPartyId !== executorPartyId) {
+      actAsParties.push(ownerPartyId);
+    }
+    if (receiverPartyId && !actAsParties.includes(receiverPartyId)) {
+      actAsParties.push(receiverPartyId);
+    }
+    const readAsParties = [...actAsParties];
+
+    // Get synchronizerId — REQUIRED for Canton command submission
+    const configModule = require('../config');
+    const synchronizerId = configModule.canton.synchronizerId;
+
+    try {
+      console.log(`[CantonSDK]    📤 Calling Utilities execute-transfer API: ${executeContextUrl}`);
+      const resp = await fetch(executeContextUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
+      });
+
+      if (!resp.ok) {
+        const errText = await resp.text();
+        console.warn(`[CantonSDK]    ⚠️ Utilities execute-transfer API returned ${resp.status}: ${errText.substring(0, 200)}`);
+        console.error(`[CantonSDK]    ❌ Utilities allocation execution failed — API error`);
+        return null;
+      }
+
+      const context = await resp.json();
+      const result = await cantonService.exerciseChoice({
+        token: adminToken,
+        actAsParty: actAsParties,
+        templateId: UTILITIES_CONFIG.ALLOCATION_INTERFACE,
+        contractId: allocationContractId,
+        choice: 'Allocation_ExecuteTransfer',
+        choiceArgument: {
+          extraArgs: {
+            context: context.choiceContextData || { values: {} },
+            meta: { values: {} },
+          },
+        },
+        readAs: readAsParties,
+        synchronizerId,
+        // CRITICAL: Every disclosed contract MUST have synchronizerId.
+        // The Utilities Backend API may return some contracts (e.g., FeaturedAppRight)
+        // WITHOUT synchronizerId. Backfill with command-level synchronizerId.
+        disclosedContracts: (context.disclosedContracts || []).map(dc => ({
+          templateId: dc.templateId,
+          contractId: dc.contractId,
+          createdEventBlob: dc.createdEventBlob,
+          synchronizerId: dc.synchronizerId || synchronizerId,
+        })),
+      });
+
+      console.log(`[CantonSDK]    ✅ Utilities allocation executed — updateId: ${result?.transaction?.updateId || 'N/A'}`);
+      return result;
+    } catch (err) {
+      console.warn(`[CantonSDK]    ⚠️ Utilities allocation execution failed: ${err.message}`);
     }
 
     // Utilities allocation execution failed
@@ -1423,10 +1512,6 @@ class CantonSDKClient {
    * @returns {Object} Exercise result
    */
   async cancelAllocation(allocationContractId, senderPartyId, executorPartyId, symbol = null) {
-    if (!this.isReady()) {
-      throw new Error('Canton SDK not initialized');
-    }
-
     if (!allocationContractId) {
       console.log('[CantonSDK] No allocationContractId — skipping cancellation');
       return null;
@@ -1436,75 +1521,222 @@ class CantonSDKClient {
 
     const adminToken = await tokenProvider.getServiceToken();
     const configRef = require('../config');
-    const packageId = configRef.canton.packageIds.clobExchange;
     const operatorPartyId = configRef.canton.operatorPartyId;
     const synchronizerId = configRef.canton.synchronizerId;
+    const tokenSystemType = symbol ? getTokenSystemType(symbol) : null;
 
-    // Try SDK method first
-    try {
-      if (this.sdk.tokenStandard && typeof this.sdk.tokenStandard.exerciseAllocationChoice === 'function') {
-        return await this._withPartyContext(senderPartyId, async () => {
-          const [cancelCmd, disclosed] = await this.sdk.tokenStandard.exerciseAllocationChoice(
-            allocationContractId,
-            'Cancel'
-          );
-          const commands = Array.isArray(cancelCmd) ? cancelCmd : [cancelCmd];
-          let result = null;
-          for (const rawCmd of commands) {
-            const cmd = rawCmd.ExerciseCommand || rawCmd;
-            result = await cantonService.exerciseChoice({
-              token: adminToken,
-              actAsParty: [senderPartyId, executorPartyId],
-              templateId: cmd.templateId,
-              contractId: cmd.contractId,
-              choice: cmd.choice,
-              choiceArgument: cmd.choiceArgument,
-              readAs: [senderPartyId, executorPartyId],
-              synchronizerId,
-              disclosedContracts: (disclosed || []).map(dc => ({
-                templateId: dc.templateId,
-                contractId: dc.contractId,
-                createdEventBlob: dc.createdEventBlob,
-                ...(dc.synchronizerId && { synchronizerId: dc.synchronizerId }),
-              })),
-            });
-          }
-          console.log(`[CantonSDK]    ✅ Allocation cancelled via SDK — funds released`);
-          return result;
-        });
-      }
-    } catch (sdkErr) {
-      console.warn(`[CantonSDK]    SDK cancelAllocation failed: ${sdkErr.message} — trying direct API`);
+    // ALL parties needed for cancel authorization
+    const actAsParties = [...new Set([senderPartyId, executorPartyId, operatorPartyId].filter(Boolean))];
+    const readAsParties = [...actAsParties];
+
+    // ── Route Utilities tokens (CBTC) to Utilities cancel API ──────────
+    if (tokenSystemType === 'utilities') {
+      console.log(`[CantonSDK]    ${symbol} is a Utilities token — using Utilities cancel API`);
+      return this._cancelUtilitiesAllocation(allocationContractId, senderPartyId, executorPartyId, symbol, adminToken);
     }
 
-    // Fallback: direct exercise
-    const templateIdsToTry = [
-      UTILITIES_CONFIG.ALLOCATION_INTERFACE,
-      `${packageId}:Settlement:AllocationRecord`,
-    ];
-
-    for (const templateId of templateIdsToTry) {
+    // ── Splice tokens (CC/Amulet): Try SDK method first ──────────────
+    if (this.isReady()) {
       try {
+        if (this.sdk.tokenStandard && typeof this.sdk.tokenStandard.exerciseAllocationChoice === 'function') {
+          return await this._withPartyContext(senderPartyId, async () => {
+            const [cancelCmd, disclosed] = await this.sdk.tokenStandard.exerciseAllocationChoice(
+              allocationContractId,
+              'Cancel'
+            );
+            const commands = Array.isArray(cancelCmd) ? cancelCmd : [cancelCmd];
+            let result = null;
+            for (const rawCmd of commands) {
+              const cmd = rawCmd.ExerciseCommand || rawCmd;
+              result = await cantonService.exerciseChoice({
+                token: adminToken,
+                actAsParty: actAsParties,
+                templateId: cmd.templateId,
+                contractId: cmd.contractId,
+                choice: cmd.choice,
+                choiceArgument: cmd.choiceArgument,
+                readAs: readAsParties,
+                synchronizerId,
+                disclosedContracts: (disclosed || []).map(dc => ({
+                  templateId: dc.templateId,
+                  contractId: dc.contractId,
+                  createdEventBlob: dc.createdEventBlob,
+                  synchronizerId: dc.synchronizerId || synchronizerId,
+                })),
+              });
+            }
+            console.log(`[CantonSDK]    ✅ Allocation cancelled via SDK — funds released`);
+            return result;
+          });
+        }
+      } catch (sdkErr) {
+        console.warn(`[CantonSDK]    SDK cancelAllocation failed: ${sdkErr.message} — trying registry cancel API`);
+      }
+    } else {
+      console.warn(`[CantonSDK]    SDK not ready — attempting registry cancel API for allocation`);
+    }
+
+    // ── Splice direct cancel via registry cancel-context endpoint ──────
+    try {
+      const registryUrl = CANTON_SDK_CONFIG.REGISTRY_API_URL;
+      const encodedCid = encodeURIComponent(allocationContractId);
+      const cancelContextUrl = `${registryUrl}/registry/allocations/v1/${encodedCid}/choice-contexts/cancel`;
+
+      console.log(`[CantonSDK]    Trying Splice registry cancel API: ${cancelContextUrl}`);
+      const resp = await fetch(cancelContextUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ excludeDebugFields: true }),
+      });
+
+      if (resp.ok) {
+        const context = await resp.json();
+        const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
         const result = await cantonService.exerciseChoice({
           token: adminToken,
-          actAsParty: [senderPartyId, executorPartyId, operatorPartyId],
-          templateId,
+          actAsParty: actAsParties,
+          templateId: ALLOCATION_INTERFACE,
           contractId: allocationContractId,
-          choice: templateId.includes('AllocationRecord') ? 'CancelAllocation' : 'Allocation_Cancel',
-          choiceArgument: {},
-          readAs: [senderPartyId, executorPartyId, operatorPartyId],
+          choice: 'Allocation_Cancel',
+          choiceArgument: {
+            extraArgs: {
+              context: context.choiceContextData || { values: {} },
+              meta: { values: {} },
+            },
+          },
+          readAs: readAsParties,
           synchronizerId,
+          disclosedContracts: (context.disclosedContracts || []).map(dc => ({
+            templateId: dc.templateId,
+            contractId: dc.contractId,
+            createdEventBlob: dc.createdEventBlob,
+            synchronizerId: dc.synchronizerId || synchronizerId,
+          })),
         });
 
-        console.log(`[CantonSDK]    ✅ Allocation cancelled (direct) — funds released`);
+        console.log(`[CantonSDK]    ✅ Allocation cancelled via registry API — funds released`);
         return result;
-      } catch (err) {
-        console.warn(`[CantonSDK]    ⚠️ Direct allocation cancel failed with ${templateId}: ${err.message}`);
-        continue;
+      } else {
+        const errText = await resp.text();
+        console.warn(`[CantonSDK]    ⚠️ Registry cancel API returned ${resp.status}: ${errText.substring(0, 200)}`);
       }
+    } catch (registryErr) {
+      console.warn(`[CantonSDK]    ⚠️ Splice registry cancel failed: ${registryErr.message}`);
+    }
+
+    // Last resort: direct exercise with extraArgs (required by Splice API)
+    try {
+      const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
+      const result = await cantonService.exerciseChoice({
+        token: adminToken,
+        actAsParty: actAsParties,
+        templateId: ALLOCATION_INTERFACE,
+        contractId: allocationContractId,
+        choice: 'Allocation_Cancel',
+        choiceArgument: {
+          extraArgs: {
+            context: { values: {} },
+            meta: { values: {} },
+          },
+        },
+        readAs: readAsParties,
+        synchronizerId,
+      });
+
+      console.log(`[CantonSDK]    ✅ Allocation cancelled (direct) — funds released`);
+      return result;
+    } catch (err) {
+      console.warn(`[CantonSDK]    ⚠️ Direct allocation cancel failed: ${err.message}`);
     }
 
     console.warn(`[CantonSDK]    ⚠️ Could not cancel allocation ${allocationContractId.substring(0, 30)}... — may already be cancelled`);
+    return null;
+  }
+
+  /**
+   * Cancel a Utilities token allocation (CBTC) via Utilities registry cancel API.
+   */
+  async _cancelUtilitiesAllocation(allocationContractId, senderPartyId, executorPartyId, symbol, adminToken) {
+    const adminParty = getInstrumentAdmin(symbol);
+    const backendUrl = UTILITIES_CONFIG.BACKEND_URL;
+    const encodedCid = encodeURIComponent(allocationContractId);
+    const cancelContextUrl = `${backendUrl}/v0/registrars/${encodeURIComponent(adminParty)}/registry/allocations/v1/${encodedCid}/choice-contexts/cancel`;
+
+    const configRef = require('../config');
+    const operatorPartyId = configRef.canton.operatorPartyId;
+    const synchronizerId = configRef.canton.synchronizerId;
+
+    const actAsParties = [...new Set([senderPartyId, executorPartyId, operatorPartyId].filter(Boolean))];
+    const readAsParties = [...actAsParties];
+
+    try {
+      console.log(`[CantonSDK]    📤 Calling Utilities cancel API: ${cancelContextUrl}`);
+      const resp = await fetch(cancelContextUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
+      });
+
+      if (!resp.ok) {
+        const errText = await resp.text();
+        console.warn(`[CantonSDK]    ⚠️ Utilities cancel API returned ${resp.status}: ${errText.substring(0, 200)}`);
+        // Fall through to direct exercise below
+      } else {
+        const context = await resp.json();
+        const result = await cantonService.exerciseChoice({
+          token: adminToken,
+          actAsParty: actAsParties,
+          templateId: UTILITIES_CONFIG.ALLOCATION_INTERFACE,
+          contractId: allocationContractId,
+          choice: 'Allocation_Cancel',
+          choiceArgument: {
+            extraArgs: {
+              context: context.choiceContextData || { values: {} },
+              meta: { values: {} },
+            },
+          },
+          readAs: readAsParties,
+          synchronizerId,
+          disclosedContracts: (context.disclosedContracts || []).map(dc => ({
+            templateId: dc.templateId,
+            contractId: dc.contractId,
+            createdEventBlob: dc.createdEventBlob,
+            synchronizerId: dc.synchronizerId || synchronizerId,
+          })),
+        });
+
+        console.log(`[CantonSDK]    ✅ Utilities allocation cancelled — funds released`);
+        return result;
+      }
+    } catch (err) {
+      console.warn(`[CantonSDK]    ⚠️ Utilities cancel API failed: ${err.message}`);
+    }
+
+    // Direct exercise with extraArgs
+    try {
+      const result = await cantonService.exerciseChoice({
+        token: adminToken,
+        actAsParty: actAsParties,
+        templateId: UTILITIES_CONFIG.ALLOCATION_INTERFACE,
+        contractId: allocationContractId,
+        choice: 'Allocation_Cancel',
+        choiceArgument: {
+          extraArgs: {
+            context: { values: {} },
+            meta: { values: {} },
+          },
+        },
+        readAs: readAsParties,
+        synchronizerId,
+      });
+
+      console.log(`[CantonSDK]    ✅ Utilities allocation cancelled (direct) — funds released`);
+      return result;
+    } catch (err) {
+      console.warn(`[CantonSDK]    ⚠️ Direct Utilities cancel failed: ${err.message}`);
+    }
+
+    console.warn(`[CantonSDK]    ⚠️ Could not cancel Utilities allocation ${allocationContractId.substring(0, 30)}... — may already be cancelled`);
     return null;
   }
 

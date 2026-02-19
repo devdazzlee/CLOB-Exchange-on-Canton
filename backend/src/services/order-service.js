@@ -205,13 +205,6 @@ class OrderService {
   async cancelAllocationForOrder(orderId, allocationContractId, partyId) {
     console.log(`[OrderService] 🔓 Cancelling Allocation for order ${orderId}`);
 
-    const sdkClient = getCantonSDKClient();
-    
-    if (!sdkClient.isReady()) {
-      console.warn('[OrderService] ⚠️ Canton SDK not ready — skipping Allocation cancellation');
-      return;
-    }
-
     // Find the allocationContractId from the reservation if not provided
     if (!allocationContractId) {
       allocationContractId = getAllocationContractIdForOrder(orderId);
@@ -223,8 +216,10 @@ class OrderService {
     }
     
     const executorPartyId = config.canton.operatorPartyId;
+    const sdkClient = getCantonSDKClient();
 
     try {
+      // cancelAllocation now works with or without SDK (has direct API fallback)
       await sdkClient.cancelAllocation(allocationContractId, partyId, executorPartyId);
       console.log(`[OrderService] ✅ Allocation cancelled for order ${orderId} — funds released`);
     } catch (cancelErr) {
@@ -426,44 +421,22 @@ class OrderService {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // STEP A: Try to create Allocation (Splice Allocation Factory API)
+    // STEP A: Balance verified — Allocations are created at MATCH TIME
     //
-    // If the Allocation Factory is available on this network:
-    //   → Allocation is created, locks real holdings, exchange = executor
-    //   → At match time: exchange executes Allocation (no user key needed)
+    // Per client requirement: Settlement MUST use Allocations, NOT TransferInstruction.
+    // The exchange (executor) settles at match time with its own key.
     //
-    // If the Allocation Factory is NOT available (current DevNet state):
-    //   → allocationContractId = null
-    //   → At match time: real transfer via Transfer Factory API instead
-    //   → Both paths move REAL tokens — visible on Canton Explorer
+    // WHY allocations are created at match time, NOT order placement:
+    //   - Allocation contracts are SINGLE-USE on Canton (consumed on execute)
+    //   - Allocation_ExecuteTransfer transfers the FULL locked amount
+    //   - For partial fills, a full-order allocation would over-transfer
+    //   - Creating per-match allocations with exact amounts prevents this
+    //   - The receiver is also known at match time (counterparty)
+    //
+    // Fund safety: In-memory balance reservation prevents double-spending.
+    // At match time: createAllocation(exact_match_amount) → executeAllocation()
     // ═══════════════════════════════════════════════════════════════════
     let allocationContractId = null;
-    const sdkClient = getCantonSDKClient();
-
-    if (sdkClient.isReady()) {
-      try {
-        console.log(`[OrderService] 📋 Trying Allocation for order ${orderId}...`);
-        const allocationResult = await sdkClient.createAllocation(
-          partyId,           // sender — the order placer (funds locked)
-          null,              // receiver — unknown at order time (set at match)
-          lockInfo.amount.toString(),
-          lockInfo.asset,    // instrument symbol
-          operatorPartyId,   // executor — the exchange (settles at match time)
-          orderId
-        );
-        allocationContractId = allocationResult.allocationContractId;
-        if (allocationContractId) {
-          console.log(`[OrderService] ✅ Allocation created: ${allocationContractId.substring(0, 30)}... (funds locked via Splice Allocation API)`);
-        } else {
-          console.log(`[OrderService] ℹ️ Allocation not created — Transfer API will be used at match time as fallback`);
-        }
-      } catch (allocErr) {
-        console.error(`[OrderService] ❌ Allocation creation FAILED: ${allocErr.message}`);
-        console.error(`[OrderService]    Order will proceed but settlement may use Transfer Factory as last resort`);
-      }
-    } else {
-      console.warn(`[OrderService] ⚠️ Canton SDK not ready — real transfer will happen at match time`);
-    }
 
     // ═══ RESERVE BALANCE to prevent overselling ═══
     addReservation(orderId, partyId, lockInfo.asset, lockInfo.amount, allocationContractId);

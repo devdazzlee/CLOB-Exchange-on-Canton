@@ -258,6 +258,9 @@ class CantonService {
     // Convert templateId to string format (required by JSON Ledger API v2)
     const templateIdString = templateIdToString(templateId);
 
+    // Resolve synchronizerId — use passed value, or fall back to config default
+    const effectiveSyncId = synchronizerId || this.synchronizerId;
+
     // Build correct v2 API structure with top-level "commands" object
     // CRITICAL: Use "CreateCommand" (capitalized) not "create" per JSON Ledger API v2 spec
     // CRITICAL: domainId is REQUIRED when parties are on multiple synchronizers
@@ -268,7 +271,7 @@ class CantonService {
         ...(readAs.length > 0 && { readAs }),
         // domainId tells Canton which synchronizer to use for this transaction
         // Required when parties may be on different domains
-        ...(synchronizerId && { domainId: synchronizerId }),
+        ...(effectiveSyncId && { domainId: effectiveSyncId }),
         commands: [{
           CreateCommand: {
             templateId: templateIdString,
@@ -331,6 +334,22 @@ class CantonService {
     // Convert templateId to string format (required by JSON Ledger API v2)
     const templateIdString = templateIdToString(templateId);
 
+    // Resolve synchronizerId — use passed value, or fall back to config default
+    const effectiveSyncId = synchronizerId || this.synchronizerId;
+
+    // CRITICAL: Every disclosed contract MUST have synchronizerId.
+    // Some upstream APIs (e.g., Utilities Backend) return disclosed contracts
+    // WITHOUT synchronizerId, causing Canton to reject with:
+    //   "Invalid value for: body (Missing required field at 'synchronizerId')"
+    // Fix: backfill missing synchronizerId with the command-level synchronizerId.
+    let normalizedDisclosed = null;
+    if (disclosedContracts && disclosedContracts.length > 0) {
+      normalizedDisclosed = disclosedContracts.map(dc => ({
+        ...dc,
+        synchronizerId: dc.synchronizerId || effectiveSyncId,
+      }));
+    }
+
     // Build correct v2 API structure with top-level "commands" object
     // CRITICAL: Use "ExerciseCommand" (capitalized) not "exercise" per JSON Ledger API v2 spec
     const body = {
@@ -338,8 +357,8 @@ class CantonService {
         commandId: commandId || `cmd-exercise-${crypto.randomUUID()}`,
         actAs,
         ...(readAs.length > 0 && { readAs }),
-        // domainId / synchronizerId - required when using disclosed contracts (e.g., Splice transfers)
-        ...(synchronizerId && { domainId: synchronizerId }),
+        // domainId — REQUIRED when using disclosed contracts (e.g., Splice/Utilities transfers)
+        ...(effectiveSyncId && { domainId: effectiveSyncId }),
         commands: [{
           ExerciseCommand: {
             templateId: templateIdString,
@@ -349,7 +368,7 @@ class CantonService {
           }
         }],
         // Include disclosed contracts if provided (needed for Splice Token Standard transfers)
-        ...(disclosedContracts && disclosedContracts.length > 0 && { disclosedContracts })
+        ...(normalizedDisclosed && { disclosedContracts: normalizedDisclosed })
       }
     };
 

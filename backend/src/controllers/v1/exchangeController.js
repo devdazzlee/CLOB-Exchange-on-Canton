@@ -18,6 +18,7 @@ const config = require('../../config');
 const cantonService = require('../../services/cantonService');
 const tokenProvider = require('../../services/tokenProvider');
 const { getReadModelService } = require('../../services/readModelService');
+const OrderService = require('../../services/order-service');
 const asyncHandler = require('../../middleware/asyncHandler');
 const {
   ValidationError,
@@ -26,6 +27,15 @@ const {
   ErrorCodes
 } = require('../../utils/ledgerError');
 const { createLedgerErrorFromResponse } = require('../../utils/ledgerError');
+
+// Singleton OrderService instance for cancel flow (allocation release + ledger cancel)
+let _orderServiceInstance = null;
+function getOrderServiceInstance() {
+  if (!_orderServiceInstance) {
+    _orderServiceInstance = new OrderService();
+  }
+  return _orderServiceInstance;
+}
 
 /**
  * Generate structured API response
@@ -359,7 +369,9 @@ class ExchangeController {
 
   /**
    * POST /v1/orders/:contractId/cancel
-   * Cancel an order using Canton ledger
+   * Cancel an order using Canton ledger — delegates to OrderService
+   * which handles: Allocation release (funds unlocked) → CancelOrder on Canton
+   *                → stop-loss unregister → WebSocket broadcast → refund info
    */
   cancelOrder = asyncHandler(async (req, res) => {
     const requestId = crypto.randomUUID();
@@ -375,12 +387,10 @@ class ExchangeController {
       throw new LedgerError(ErrorCodes.UNAUTHORIZED, 'Wallet authentication required');
     }
 
-    const commandId = `cmd-cancel-${contractId.slice(0, 16)}`;
-
     console.log(`[ExchangeAPI] Cancelling order: ${contractId}`);
 
     try {
-      // Verify ownership from read model
+      // Verify ownership from read model before delegating
       const readModel = getReadModelService();
       const order = readModel?.getOrderByContractId(contractId);
 
@@ -399,45 +409,21 @@ class ExchangeController {
         );
       }
 
-      const token = await tokenProvider.getServiceToken();
+      // Delegate to OrderService — handles allocation release + Canton cancel + stop-loss + WebSocket
+      const orderService = getOrderServiceInstance();
+      const result = await orderService.cancelOrder(contractId, partyId, order.tradingPair);
 
-      // Use template ID helper for proper format
-      const { orderTemplateId } = require('../../utils/templateId');
-      const templateId = orderTemplateId();
-
-      // Submit ExerciseCommand via submit-and-wait-for-transaction
-      const result = await cantonService.exerciseChoice({
-        token,
-        actAsParty: partyId,
-        templateId,
-        contractId,
-        choice: 'CancelOrder',
-        choiceArgument: {},
-        readAs: [config.canton.operatorPartyId]
-      });
-
-      console.log(`[ExchangeAPI] ✅ Order cancelled: ${contractId}`);
-
-      // Unregister stop-loss if it was a pending stop-loss order
-      if (order.status === 'PENDING_TRIGGER' || order.orderMode === 'STOP_LOSS') {
-        try {
-          const { getStopLossService } = require('../../services/stopLossService');
-          const stopLossService = getStopLossService();
-          stopLossService.unregisterStopLoss(contractId);
-          console.log(`[ExchangeAPI] ✅ Stop-loss unregistered for cancelled order ${contractId}`);
-        } catch (slErr) {
-          console.warn(`[ExchangeAPI] ⚠️  Could not unregister stop-loss:`, slErr.message);
-        }
-      }
+      console.log(`[ExchangeAPI] ✅ Order cancelled: ${contractId} (allocation released, funds unlocked)`);
 
       return success(res, {
         cancelled: true,
         order: {
           contractId,
-          status: 'CANCELLED'
+          orderId: result.orderId,
+          status: 'CANCELLED',
+          tradingPair: result.tradingPair,
+          refund: result.refund
         }
-      }, {
-        updateId: result.updateId
       });
 
     } catch (err) {
