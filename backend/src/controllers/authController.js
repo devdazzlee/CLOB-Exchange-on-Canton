@@ -6,7 +6,7 @@
  * 2. POST /auth/verify - Verify signature, issue session token
  * 
  * NO KEYCLOAK LOGIN FOR END-USERS.
- * Backend manages tokens internally.
+ * Backend manages OAuth tokens on behalf of external party users.
  */
 
 const crypto = require('crypto');

@@ -53,6 +53,10 @@ class WalletService {
       // Step 2: Generate topology transactions
       const generateUrl = `${this.jsonApiBase}/v2/parties/external/generate-topology`;
       
+      // Permission "Confirmation" ensures the external party can confirm (sign) transactions
+      // but does not need to directly submit commands — the participant/validator does that.
+      // This is required for external parties: the exchange submits commands,
+      // the user's key is used for confirmation, ensuring all transactions have user authority.
       const generatePayload = {
         synchronizer: synchronizerId,
         partyHint: partyHint || `wallet-${Date.now()}`,
@@ -61,6 +65,7 @@ class WalletService {
           keyData: publicKeyBase64Der,
           keySpec: "SIGNING_KEY_SPEC_EC_CURVE25519"
         },
+        permission: 'Confirmation', // External party: user controls key, confirms transactions
         otherConfirmingParticipantUids: []
       };
 

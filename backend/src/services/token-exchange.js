@@ -166,7 +166,7 @@ class TokenExchangeService {
           details: error.message
         });
       }
-      res.status(500).json({ error: 'Internal server error' });
+      res.status(500).json({ error: 'Server error' });
     }
   }
 

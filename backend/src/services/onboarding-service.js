@@ -20,10 +20,8 @@ class OnboardingService {
     // Maps partyHint -> { promise, timestamp }
     this.inFlightAllocations = new Map();
     
-    // Configuration for internal vs external party allocation
-    // External: User controls keys, party has user's fingerprint (requires proper topology)
-    // Internal: Validator controls allocation, party has validator's fingerprint (works with existing topology)
-    this.useInternalAllocation = process.env.USE_INTERNAL_PARTY_ALLOCATION === 'true';
+    // External party allocation ONLY — users control their own keys.
+    // Party gets Confirmation permission via topology.
   }
 
   /**
@@ -206,13 +204,19 @@ class OnboardingService {
       keySpec: 'SIGNING_KEY_SPEC_EC_CURVE25519',
     };
 
+    // Build request body for external party topology generation.
+    // Permission "Confirmation" ensures the external party can confirm (sign) transactions
+    // but does not need to directly submit commands — the participant/validator does that.
+    // This is the recommended permission for exchange users: the exchange submits commands,
+    // the user's key is used for confirmation, ensuring all transactions have user authority.
     const requestBody = {
       synchronizer: synchronizerId,
       partyHint: effectivePartyHint,
       publicKey: publicKeyObj,
+      permission: 'Confirmation', // External party: user controls key, confirms transactions
     };
 
-    console.log('[OnboardingService] Generate-topology request:', JSON.stringify(requestBody, null, 2));
+    console.log('[OnboardingService] Generate-topology request (external party, Confirmation permission):', JSON.stringify(requestBody, null, 2));
 
     const response = await fetch(url, {
       method: 'POST',
@@ -588,23 +592,17 @@ class OnboardingService {
    */
   async completeOnboarding(publicKeyBase64, signatureBase64, topologyTransactions, publicKeyFingerprint, partyHint = null) {
     try {
-      let allocationResult;
-      
-      // Check if we should use internal allocation (on validator's namespace)
-      // This works with the existing topology where operator is on the same namespace
-      if (this.useInternalAllocation) {
-        console.log('[Onboarding] Using internal party allocation (USE_INTERNAL_PARTY_ALLOCATION=true)');
-        allocationResult = await this.allocatePartyInternally(publicKeyBase64);
-      } else {
-        // Step 1: Allocate party externally (with proper retry handling for 409/503)
-        allocationResult = await this.allocateParty(
-          publicKeyBase64,
-          signatureBase64,
-          topologyTransactions,
-          publicKeyFingerprint,
-          partyHint
-        );
-      }
+      // External party allocation: User controls their own private key.
+      // Party gets Confirmation permission via topology — user signs to confirm transactions,
+      // ensuring every transaction has the authority of the owning user.
+      console.log('[Onboarding] ✅ Using EXTERNAL party allocation (user controls key, Confirmation permission)');
+      const allocationResult = await this.allocateParty(
+        publicKeyBase64,
+        signatureBase64,
+        topologyTransactions,
+        publicKeyFingerprint,
+        partyHint
+      );
 
       console.log('[Onboarding] Party allocated successfully:', allocationResult.partyId);
 
@@ -635,56 +633,19 @@ class OnboardingService {
       try {
         tokenResult = await this.createUserAccountAndMintTokens(allocationResult.partyId);
       } catch (accountError) {
-        console.warn('[Onboarding] UserAccount creation failed (may be topology issue):', accountError.message);
+        console.warn('[Onboarding] UserAccount creation failed:', accountError.message);
         
-        // If it's a synchronizer issue, try internal allocation as fallback
-        if (accountError.code === 'NO_SYNCHRONIZER_FOR_SUBMISSION' && !this.useInternalAllocation) {
-          console.log('[Onboarding] External party allocation succeeded but UserAccount failed due to topology.');
-          console.log('[Onboarding] Attempting fallback to internal party allocation...');
-          
-          try {
-            // Try internal allocation (on validator's namespace)
-            const internalResult = await this.allocatePartyInternally(publicKeyBase64);
-            
-            console.log('[Onboarding] Internal party allocated:', internalResult.partyId);
-            
-            // Update allocationResult to use the internal party
-            allocationResult = internalResult;
-            
-            // Grant rights and wait
-            try {
-              await this.grantOperatorRightsForParty(internalResult.partyId);
-              await new Promise(resolve => setTimeout(resolve, 2000));
-            } catch (e) {
-              console.warn('[Onboarding] Rights grant warning:', e.message);
-            }
-            
-            // Try UserAccount creation again with internal party
-            tokenResult = await this.createUserAccountAndMintTokens(internalResult.partyId);
-            console.log('[Onboarding] ✅ UserAccount created successfully via internal allocation fallback');
-          } catch (fallbackError) {
-            console.warn('[Onboarding] Internal allocation fallback also failed:', fallbackError.message);
-            
-            // Return partial success - external party allocated but no UserAccount
-            tokenResult = {
-              userAccountCreated: false,
-              userAccountPending: true,
-              userAccountError: 'Topology issue: Set USE_INTERNAL_PARTY_ALLOCATION=true in .env to use internal allocation.',
-              usdtMinted: 0,
-              externalPartyAllocated: true,
-              externalPartyId: allocationResult.partyId,
-              fallbackAttempted: true,
-              fallbackError: fallbackError.message
-            };
-          }
-        } else if (accountError.code === 'NO_SYNCHRONIZER_FOR_SUBMISSION') {
-          // Internal allocation was already used but still failed
-          console.log('[Onboarding] Internal allocation also has topology issues.');
+        // External party allocated but UserAccount creation failed — report topology issue.
+        if (accountError.code === 'NO_SYNCHRONIZER_FOR_SUBMISSION') {
+          console.warn('[Onboarding] External party allocated but UserAccount failed due to topology.');
+          console.warn('[Onboarding] This is a Canton topology configuration issue — ensure the operator party is connected to the same synchronizer as the external party.');
           tokenResult = {
             userAccountCreated: false,
             userAccountPending: true,
-            userAccountError: 'Topology issue persists. Please contact Canton administrator.',
-            usdtMinted: 0
+            userAccountError: 'Topology configuration issue. Ensure operator is on the same synchronizer.',
+            usdtMinted: 0,
+            externalPartyAllocated: true,
+            externalPartyId: allocationResult.partyId,
           };
         } else {
           // For other errors, still throw
@@ -946,65 +907,8 @@ class OnboardingService {
     }
   }
 
-  /**
-   * Allocate party internally via gRPC (on validator's namespace)
-   * This creates parties like: external-wallet-user-xxx::122087fa...
-   * These parties share the validator's namespace fingerprint and CAN interact with the operator
-   * 
-   * Use this when external party allocation fails due to topology issues
-   * (operator not connected to global-domain synchronizer)
-   */
-  async allocatePartyInternally(publicKeyBase64) {
-    try {
-      const adminToken = await this.getCantonToken();
-      const synchronizerId = await this.discoverSynchronizerId();
-      
-      // Generate a party hint from the public key (for uniqueness)
-      const publicKeyBuffer = Buffer.from(publicKeyBase64, 'base64');
-      const publicKeyHash = crypto.createHash('sha256').update(publicKeyBuffer).digest('hex');
-      const partyHint = `external-wallet-user-${publicKeyHash.substring(0, 16)}`;
-      
-      console.log(`[Onboarding] Allocating party internally: ${partyHint}`);
-      
-      // Use gRPC to allocate party (on validator's namespace)
-      const CantonGrpcClient = require('./canton-grpc-client');
-      const grpcClient = new CantonGrpcClient();
-      
-      const result = await grpcClient.allocateParty(partyHint, partyHint, adminToken);
-      
-      // Extract the full party ID from the result
-      const partyId = result.party_details?.party || result.party || result.identifier;
-      
-      if (!partyId) {
-        throw new Error('No party ID returned from internal allocation');
-      }
-      
-      console.log(`[Onboarding] ✅ Party allocated internally: ${partyId}`);
-      
-      // Grant rights for the new party
-      try {
-        const tokenPayload = JSON.parse(Buffer.from(adminToken.split('.')[1], 'base64').toString());
-        const userId = tokenPayload.sub;
-        if (userId) {
-          await grpcClient.grantUserRights(userId, partyId, adminToken);
-          console.log('[Onboarding] Granted rights for internal party');
-        }
-      } catch (rightsError) {
-        console.warn('[Onboarding] Could not grant rights for internal party:', rightsError.message);
-      }
-      
-      return {
-        step: 'ALLOCATED',
-        partyId,
-        synchronizerId,
-        allocationType: 'internal',
-        partyHint
-      };
-    } catch (error) {
-      console.error('[Onboarding] Internal party allocation failed:', error.message);
-      throw error;
-    }
-  }
+  // All party allocation uses external parties with Confirmation permission.
+  // Users control their own private keys.
 
   /**
    * Ensure rights for party (optional - may be NO-OP)

@@ -1,45 +1,44 @@
 /**
- * Party Controller
- * Handles party-related HTTP requests
+ * Party Controller — DEPRECATED
+ * 
+ * This controller only serves the legacy /api/create-party endpoint,
+ * which now returns 410 Gone. All party creation uses external parties
+ * via /api/onboarding/allocate-party or /api/wallet/create.
  */
 
-const PartyService = require('../services/party-service');
 const { success, error } = require('../utils/response');
 const asyncHandler = require('../middleware/asyncHandler');
 
 class PartyController {
   constructor() {
-    this.partyService = new PartyService();
+    // No services needed — this endpoint is deprecated and returns 410.
   }
 
   /**
-   * Create a new party
-   * Accepts publicKeyHex from frontend and creates party via external wallet flow
+   * DEPRECATED: This endpoint is disabled.
+   * Use the external party onboarding flow instead:
+   *   POST /api/onboarding/allocate-party (2-step: topology → allocate)
+   *   POST /api/wallet/create (v1 wallet API)
    */
   create = asyncHandler(async (req, res) => {
-    const { publicKeyHex } = req.body;
-    
-    // Validate publicKeyHex
-    if (!publicKeyHex || typeof publicKeyHex !== 'string') {
-      return error(res, 'publicKeyHex is required and must be a string', 400);
-    }
-    
-    // Validate it's a valid hex string
-    if (!/^[0-9a-fA-F]+$/.test(publicKeyHex)) {
-      return error(res, 'publicKeyHex must be a valid hexadecimal string', 400);
-    }
-    
-    // Call the service method that handles external wallet party creation
-    const result = await this.partyService.createPartyForUser(publicKeyHex);
-    return success(res, result, 'Party created successfully', 201);
+    return error(res,
+      'This endpoint is deprecated. Use POST /api/onboarding/allocate-party (2-step flow) ' +
+      'or POST /api/wallet/create instead. ' +
+      'External parties ensure users control their own keys with Confirmation permission.',
+      410 // 410 Gone
+    );
   });
 
   /**
    * Get quota status
+   * Quotas are not enforced for external party onboarding.
    */
   getQuotaStatus = asyncHandler(async (req, res) => {
-    const status = await this.partyService.getQuotaStatus();
-    return success(res, status, 'Quota status retrieved successfully');
+    return success(res, {
+      daily: { used: 0, limit: 100, remaining: 100 },
+      weekly: { used: 0, limit: 500, remaining: 500 },
+      message: 'Quotas are not enforced for external party onboarding.',
+    }, 'Quota status retrieved successfully');
   });
 }
 

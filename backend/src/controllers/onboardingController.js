@@ -40,7 +40,7 @@ class OnboardingController {
 
     // If publicKeyBase64 is an object, reject it (backend must construct the publicKey object)
     if (typeof publicKeyBase64 !== 'string') {
-      return error(res, 'publicKeyBase64 must be a base64 string, not an object. Backend will construct the publicKey object internally.', 400);
+      return error(res, 'publicKeyBase64 must be a base64 string, not an object. Backend constructs the publicKey object from this string.', 400);
     }
 
     // Ensure it's not empty after trimming

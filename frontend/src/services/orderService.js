@@ -10,8 +10,8 @@
 
 import { apiClient, API_ROUTES } from '../config/config';
 
-// TOKEN STANDARD: Orders use legacy route but backend now locks Holdings
-// The backend has been updated to use Token Standard internally
+// TOKEN STANDARD: Orders use legacy route but backend uses Holdings + Allocations
+// Settlement uses Allocation-based flow with external parties
 const USE_TOKEN_STANDARD = false; // Legacy route, but backend uses Holdings
 
 /**

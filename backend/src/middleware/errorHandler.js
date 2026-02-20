@@ -13,7 +13,7 @@ const errorHandler = (err, req, res, next) => {
 
   // Default error
   let statusCode = err.statusCode || err.status || 500;
-  let message = err.message || 'Internal Server Error';
+  let message = err.message || 'Server Error';
 
   // Handle specific error types
   if (err.name === 'ValidationError') {

@@ -16,7 +16,7 @@
  * - TransferInstruction requires the sender's private key at SETTLEMENT time
  * - With external parties, the backend has no user keys → TransferInstruction breaks
  * - Allocation: User signs ONCE at order time, exchange settles with its own key
- * - Works for BOTH internal AND external parties
+ * - Works with external parties (users control their own keys, Confirmation permission)
  * 
  * @see https://docs.sync.global/app_dev/api/splice-api-token-allocation-v1/
  * @see https://docs.sync.global/app_dev/api/splice-api-token-allocation-instruction-v1/

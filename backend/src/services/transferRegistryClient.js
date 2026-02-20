@@ -360,7 +360,7 @@ class TransferRegistryClient {
     }
   }
 
-  // ─── INTERNAL: Response validation ─────────────────────────────────────────
+  // ─── PRIVATE: Response validation ────────────────────────────────────────
 
   async _ensureJsonResponse(response, operation) {
     const contentType = response.headers.get('content-type') || '';
@@ -376,7 +376,7 @@ class TransferRegistryClient {
     }
   }
 
-  // ─── INTERNAL: Fetch helpers ─────────────────────────────────────────────────
+  // ─── PRIVATE: Fetch helpers ──────────────────────────────────────────────────
 
   async _doFetch(url, options, timeoutMs) {
     const effectiveTimeout = timeoutMs || this.timeout;

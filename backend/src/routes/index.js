@@ -42,7 +42,7 @@ router.use('/orderbooks', orderBookRoutes);
 router.use('/orders', orderRoutes);
 router.use('/trades', tradeRoutes);
 router.use('/admin', adminRoutes);
-router.use('/create-party', partyRoutes); // POST /api/create-party (legacy)
+router.use('/create-party', partyRoutes); // DEPRECATED: returns 410 — use /api/onboarding/allocate-party (external parties)
 router.use('/onboarding', onboardingRoutes); // POST /api/onboarding/* (new external party flow)
 router.use('/quota-status', quotaRoutes); // GET /api/quota-status
 router.use('/token-exchange', authRoutes); // POST /api/token-exchange (legacy)
@@ -104,7 +104,7 @@ router.get('/match/trigger', matchTriggerHandler); // For Vercel Cron
 
 // Debug: Log all registered routes
 console.log('[Routes] Registered routes:');
-console.log('  POST /api/create-party (legacy)');
+console.log('  POST /api/create-party (DEPRECATED → returns 410, use /api/onboarding/allocate-party)');
 console.log('  POST /api/onboarding/allocate-party (new 2-step)');
 console.log('  POST /api/onboarding/ensure-rights');
 console.log('  POST /api/onboarding/create-preapproval');

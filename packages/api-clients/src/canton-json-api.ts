@@ -73,6 +73,7 @@ export interface GenerateTopologyRequest {
     keyData: string; // base64 encoded
     keySpec: string; // e.g., "SIGNING_KEY_SPEC_EC_CURVE25519"
   };
+  permission?: string; // e.g., "Confirmation" — ensures external party can confirm/sign transactions
 }
 
 export interface GenerateTopologyResponse {
