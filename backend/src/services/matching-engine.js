@@ -37,6 +37,7 @@ const cantonService = require('./cantonService');
 const config = require('../config');
 const tokenProvider = require('./tokenProvider');
 const { getCantonSDKClient } = require('./canton-sdk-client');
+const { getGlobalOpenOrders } = require('./order-service');
 
 // Configure decimal.js for financial precision
 Decimal.set({ precision: 20, rounding: Decimal.ROUND_DOWN });
@@ -230,11 +231,58 @@ class MatchingEngine {
         templateIdsToQuery.push(`${legacyPackageId}:Order:Order`);
       }
 
-      const contracts = await cantonService.queryActiveContracts({
+      // Primary query: operator party (sees most orders)
+      let contracts = await cantonService.queryActiveContracts({
         party: operatorPartyId,
         templateIds: templateIdsToQuery,
         pageSize: 200
       }, token);
+      
+      // Secondary: Merge with global open orders registry
+      // This catches orders that are invisible to operator-level Canton queries
+      // due to the 200-element limit on the 273cbc package.
+      try {
+        const globalOrders = getGlobalOpenOrders();
+        if (Array.isArray(globalOrders) && globalOrders.length > 0) {
+          const existingIds = new Set((Array.isArray(contracts) ? contracts : []).map(c => c.contractId));
+          const extra = globalOrders
+            .filter(o => o.status === 'OPEN' && !existingIds.has(o.contractId))
+            .map(o => ({
+              contractId: o.contractId,
+              templateId: `${packageId}:Order:Order`,
+              payload: o,
+              createArgument: o,
+            }));
+          if (extra.length > 0) {
+            console.log(`[MatchingEngine] Found ${extra.length} additional orders via global registry`);
+            contracts = [...(Array.isArray(contracts) ? contracts : []), ...extra];
+          }
+
+          // Tertiary: For each unique owner party in the global registry,
+          // do a user-specific Canton query to get their COMPLETE set of orders.
+          // This bypasses the 200-element limit that blocks operator-level queries.
+          const ownerParties = new Set(globalOrders.filter(o => o.owner && o.owner !== operatorPartyId).map(o => o.owner));
+          for (const ownerParty of ownerParties) {
+            try {
+              const userContracts = await cantonService.queryActiveContracts({
+                party: ownerParty,
+                templateIds: templateIdsToQuery,
+                pageSize: 200
+              }, token);
+              if (Array.isArray(userContracts) && userContracts.length > 0) {
+                const currentIds = new Set((Array.isArray(contracts) ? contracts : []).map(c => c.contractId));
+                const userExtra = userContracts.filter(c => !currentIds.has(c.contractId));
+                if (userExtra.length > 0) {
+                  console.log(`[MatchingEngine] Found ${userExtra.length} additional orders via user-specific query for ${ownerParty.substring(0, 30)}...`);
+                  contracts = [...contracts, ...userExtra];
+                }
+              }
+            } catch (userErr) {
+              // Non-critical — global registry orders are already merged above
+            }
+          }
+        }
+      } catch (_) { /* non-critical */ }
       
       if (!contracts || contracts.length === 0) return false;
       

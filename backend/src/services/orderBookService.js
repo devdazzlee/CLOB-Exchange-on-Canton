@@ -11,6 +11,7 @@ const config = require('../config');
 const { LEGACY_PACKAGE_ID } = require('../config/constants');
 const cantonService = require('./cantonService');
 const tokenProvider = require('./tokenProvider');
+const { getGlobalOpenOrders } = require('./order-service');
 
 class OrderBookService {
     constructor() {
@@ -23,8 +24,8 @@ class OrderBookService {
      * Canton JSON API returns data in nested format that is now properly parsed
      * by cantonService.queryActiveContracts()
      */
-    async getOrderBook(tradingPair) {
-        console.log(`[OrderBookService] Querying Canton for ${tradingPair}`);
+    async getOrderBook(tradingPair, userPartyId = null) {
+        console.log(`[OrderBookService] Querying Canton for ${tradingPair}${userPartyId ? ` (user: ${userPartyId.substring(0, 30)}...)` : ''}`);
         
         const packageId = config.canton.packageIds?.clobExchange;
         const operatorPartyId = config.canton.operatorPartyId;
@@ -42,22 +43,96 @@ class OrderBookService {
             if (LEGACY_PACKAGE_ID && LEGACY_PACKAGE_ID !== packageId) {
                 templateIds.push(`${LEGACY_PACKAGE_ID}:Order:Order`);
             }
-            const contracts = await cantonService.queryActiveContracts({
+            
+            // Primary query: operator party (sees most orders in legacy package)
+            // NOTE: This may hit the 200-element limit for the new package (273cbc)
+            // if there are 200+ total Order contracts across all users. Orders stuck
+            // behind the limit are recovered via the user-specific query below.
+            let contracts = await cantonService.queryActiveContracts({
                 party: operatorPartyId,
                 templateIds,
                 pageSize: 200
             }, token);
+            
+            // ═══════════════════════════════════════════════════════════════════
+            // USER-SPECIFIC QUERY: Bypass the 200-element limit
+            //
+            // Canton's 200-element limit applies to the TOTAL matching contracts
+            // for a party+template combination. The operator party is an observer
+            // on ALL orders, so their count easily exceeds 200.
+            //
+            // But each individual USER typically has <200 orders. By querying
+            // with the specific user's party, we get THEIR orders even when
+            // the operator-level query is blocked by the 200 limit.
+            //
+            // This is the KEY fix for "I can't see my orders in orderbook".
+            // ═══════════════════════════════════════════════════════════════════
+            if (userPartyId && userPartyId !== operatorPartyId) {
+                try {
+                    const userContracts = await cantonService.queryActiveContracts({
+                        party: userPartyId,
+                        templateIds,
+                        pageSize: 200
+                    }, token);
+                    
+                    if (Array.isArray(userContracts) && userContracts.length > 0) {
+                        const existingIds = new Set((Array.isArray(contracts) ? contracts : []).map(c => c.contractId));
+                        const extra = userContracts.filter(c => !existingIds.has(c.contractId));
+                        if (extra.length > 0) {
+                            console.log(`[OrderBookService] Found ${extra.length} additional orders via user-specific query`);
+                            contracts = [...(Array.isArray(contracts) ? contracts : []), ...extra];
+                        }
+                    }
+                } catch (userErr) {
+                    console.warn(`[OrderBookService] User-specific query failed: ${userErr.message}`);
+                }
+            }
+
+            // Tertiary: Merge with global open orders registry (populated by getUserOrders)
+            try {
+                const globalOrders = getGlobalOpenOrders();
+                if (Array.isArray(globalOrders) && globalOrders.length > 0) {
+                    const existingIds = new Set((Array.isArray(contracts) ? contracts : []).map(c => c.contractId));
+                    const extra = globalOrders
+                        .filter(o => o.status === 'OPEN' && o.tradingPair === tradingPair && !existingIds.has(o.contractId))
+                        .map(o => ({
+                            contractId: o.contractId,
+                            templateId: `${packageId}:Order:Order`,
+                            payload: o,
+                            createArgument: o,
+                        }));
+                    if (extra.length > 0) {
+                        console.log(`[OrderBookService] Found ${extra.length} additional orders via global registry`);
+                        contracts = [...(Array.isArray(contracts) ? contracts : []), ...extra];
+                    }
+                }
+            } catch (globalErr) {
+                // Non-critical
+            }
 
             const contractArray = Array.isArray(contracts) ? contracts : [];
             console.log(`[OrderBookService] Canton returned ${contractArray.length} Order contracts`);
 
             const buyOrders = [];
             const sellOrders = [];
+
+            // Debug: count contracts by pair (only log once for the requested pair)
+            let pairMatchCount = 0;
+            let pairWrongStatus = 0;
             
             for (const c of contractArray) {
                 // cantonService.queryActiveContracts now normalizes the response
                 // payload contains the actual contract data (createArgument)
                 const payload = c.payload || c.createArgument || {};
+                
+                // Debug: track matching
+                if (payload.tradingPair === tradingPair) {
+                    pairMatchCount++;
+                    if (payload.status !== 'OPEN') {
+                        pairWrongStatus++;
+                        console.log(`[OrderBookService] DEBUG: ${tradingPair} order ${payload.orderId} has status="${payload.status}" (not OPEN)`);
+                    }
+                }
                 
                 // Filter for this trading pair and OPEN status
                 if (payload.tradingPair !== tradingPair || payload.status !== 'OPEN') {
@@ -92,7 +167,7 @@ class OrderBookService {
             buyOrders.sort((a, b) => parseFloat(b.price || 0) - parseFloat(a.price || 0));
             sellOrders.sort((a, b) => parseFloat(a.price || Infinity) - parseFloat(b.price || Infinity));
             
-            console.log(`[OrderBookService] Filtered: ${buyOrders.length} buys, ${sellOrders.length} sells for ${tradingPair}`);
+            console.log(`[OrderBookService] Filtered: ${buyOrders.length} buys, ${sellOrders.length} sells for ${tradingPair} (${pairMatchCount} total for pair, ${pairWrongStatus} wrong status)`);
 
             // lastPrice should be from the most recent trade, NOT from order book
             // For now, leave it null — the frontend derives market price from trades[]

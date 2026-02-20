@@ -157,7 +157,20 @@ export async function getAvailableTradingPairs(_party = null) {
 export async function getGlobalOrderBook(tradingPair) {
   // Use aggregated order book endpoint (Milestone 3)
   // Use precision=8 so small prices (e.g. 0.005 vs 0.009) aren't incorrectly merged
-  const res = await fetch(`${API_BASE_URL}/orderbooks/${encodeURIComponent(tradingPair)}?aggregate=true&precision=8&depth=50`, { 
+  // Include partyId so the backend can query specifically for this user's orders
+  // (bypasses Canton's 200-element limit that blocks global queries)
+  const partyId = typeof localStorage !== 'undefined'
+    ? localStorage.getItem('canton_party_id')
+    : null;
+  const params = new URLSearchParams({
+    aggregate: 'true',
+    precision: '8',
+    depth: '50',
+  });
+  if (partyId) {
+    params.set('partyId', partyId);
+  }
+  const res = await fetch(`${API_BASE_URL}/orderbooks/${encodeURIComponent(tradingPair)}?${params.toString()}`, { 
     method: 'GET' 
   });
   const json = await res.json().catch(() => ({}));

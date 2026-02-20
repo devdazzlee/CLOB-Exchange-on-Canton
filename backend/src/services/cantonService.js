@@ -692,22 +692,9 @@ class CantonService {
           return mergedResults;
         }
         
-        // Single template but still 200+ — try to get partial results
-        console.warn(`[CantonService] ⚠️ 200+ contracts for single template query (pageSize=${effectivePageSize}). Raw error: ${text.substring(0, 200)}`);
-        try {
-          const errorResult = JSON.parse(text);
-          const partialContracts = errorResult.activeContracts || [];
-          if (partialContracts.length > 0) {
-            allContracts.push(...this._normalizeContracts(partialContracts));
-            console.log(`[CantonService] 📋 Extracted ${partialContracts.length} partial contracts from error response`);
-          }
-          if (errorResult.nextPageToken) {
-            currentPageToken = errorResult.nextPageToken;
-            effectivePageSize = Math.min(effectivePageSize, 50);
-            iterations++;
-            continue;
-          }
-        } catch (_) { /* Can't parse error response */ }
+        // Single template but still 200+ — Canton hard limit, cannot paginate past it.
+        // Log warning and continue with whatever contracts we have from other templates.
+        console.warn(`[CantonService] ⚠️ 200+ contracts for single template query (pageSize=${effectivePageSize}). Skipping — use per-user queries to bypass this limit.`);
         break;
       }
       

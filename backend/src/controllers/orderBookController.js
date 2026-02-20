@@ -41,12 +41,17 @@ class OrderBookController {
   getByTradingPair = asyncHandler(async (req, res) => {
     const { tradingPair } = req.params;
     const decodedTradingPair = decodeURIComponent(tradingPair);
-    const { aggregate = 'true', precision = '2', depth = '50' } = req.query;
+    const { aggregate = 'true', precision = '2', depth = '50', partyId } = req.query;
+
+    // Extract user's partyId from query param, header, or wallet auth
+    const userPartyId = partyId || req.headers['x-party-id'] || req.walletId || null;
 
     // NOTE: Matching trigger REMOVED from here — see comment at top of file
     try {
       // getOrderBook is now async - queries Canton directly
-      const orderBook = await orderBookService.getOrderBook(decodedTradingPair);
+      // Pass userPartyId so the service can query specifically for this user's orders
+      // (bypasses the 200-element limit that blocks operator-level queries)
+      const orderBook = await orderBookService.getOrderBook(decodedTradingPair, userPartyId);
       
       // Milestone 3: Aggregate price levels for professional UI
       const aggregated = formatOrderBook(orderBook, {

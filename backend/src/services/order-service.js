@@ -47,6 +47,54 @@ Decimal.set({ precision: 20, rounding: Decimal.ROUND_DOWN });
 const _reservations = new Map();    // "partyId::asset" → Decimal amount
 const _orderReservations = new Map(); // "orderId" → { partyId, asset, amount, allocationContractId }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// GLOBAL OPEN ORDER REGISTRY
+// 
+// Canton's party-based access control means the operator may NOT see orders
+// created through other backend instances (e.g. Vercel) if those instances
+// used a different operator party or a code path that didn't include the
+// operator as a stakeholder.
+//
+// This registry is populated when user-specific order queries return OPEN
+// orders. The OrderBookService merges these into the global order book view.
+//
+// Key: contractId → { orderId, owner, tradingPair, orderType, price, quantity, filled, status, timestamp }
+// ═══════════════════════════════════════════════════════════════════════════
+const _globalOpenOrders = new Map();
+
+function registerOpenOrders(orders) {
+  if (!Array.isArray(orders)) return;
+  // Collect current contractIds for this batch to detect stale entries
+  for (const order of orders) {
+    if (order.status === 'OPEN' && order.contractId) {
+      _globalOpenOrders.set(order.contractId, {
+        contractId: order.contractId,
+        orderId: order.orderId,
+        owner: order.owner,
+        tradingPair: order.tradingPair,
+        orderType: order.orderType,
+        orderMode: order.orderMode,
+        price: order.price,
+        quantity: order.quantity,
+        filled: order.filled || '0',
+        remaining: parseFloat(order.quantity || 0) - parseFloat(order.filled || 0),
+        status: 'OPEN',
+        timestamp: order.timestamp,
+      });
+    }
+  }
+  // Remove orders that are no longer OPEN (their status changed to FILLED/CANCELLED)
+  for (const order of orders) {
+    if (order.status !== 'OPEN' && order.contractId && _globalOpenOrders.has(order.contractId)) {
+      _globalOpenOrders.delete(order.contractId);
+    }
+  }
+}
+
+function getGlobalOpenOrders() {
+  return [..._globalOpenOrders.values()];
+}
+
 function _reservationKey(partyId, asset) {
   return `${partyId}::${asset}`;
 }
@@ -506,6 +554,15 @@ class OrderService {
       lockedAsset: lockInfo.asset,
       allocationContractId: allocationContractId || null,
     };
+
+    // ═══ IMMEDIATELY register in global open orders registry ═══
+    // This ensures the orderbook and matching engine can see this order
+    // even if Canton queries hit the 200-element limit (which blocks
+    // operator-level and anyParty queries for templates with 200+ contracts).
+    if (initialStatus === 'OPEN') {
+      registerOpenOrders([orderRecord]);
+      console.log(`[OrderService] Registered order ${orderId} in global registry`);
+    }
     
     const updateStream = getUpdateStream();
     if (updateStream) {
@@ -935,6 +992,11 @@ class OrderService {
         });
 
       console.log(`[OrderService] Found ${orders.length} orders from Canton for ${partyId.substring(0, 30)}...`);
+      
+      // Register OPEN orders in the global registry so the OrderBookService can see them
+      // (handles orders placed through other backend instances where operator is not a stakeholder)
+      registerOpenOrders(orders);
+      
       return orders;
     } catch (error) {
       if (error.message?.includes('200') || error.message?.includes('MAXIMUM_LIST')) {
@@ -1112,3 +1174,4 @@ module.exports.releaseReservation = releaseReservation;
 module.exports.releasePartialReservation = releasePartialReservation;
 module.exports.getReservedBalance = getReservedBalance;
 module.exports.getAllocationContractIdForOrder = getAllocationContractIdForOrder;
+module.exports.getGlobalOpenOrders = getGlobalOpenOrders;
