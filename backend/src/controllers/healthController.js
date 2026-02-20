@@ -36,6 +36,41 @@ class HealthController {
       channels: Array.from(channels),
     }, 'WebSocket status retrieved');
   });
+
+  /**
+   * Streaming read model stats — monitor the WebSocket-backed in-memory state
+   */
+  streamingStats = asyncHandler(async (req, res) => {
+    let streamingStats = { ready: false, mode: 'not-initialized' };
+    let readModelStats = null;
+
+    try {
+      const { getStreamingReadModel } = require('../services/streamingReadModel');
+      const streaming = getStreamingReadModel();
+      if (streaming) {
+        streamingStats = streaming.getStats();
+      }
+    } catch (_) { /* not available */ }
+
+    try {
+      const { getReadModelService } = require('../services/readModelService');
+      const readModel = getReadModelService();
+      if (readModel) {
+        readModelStats = readModel.getStreamingStats();
+      }
+    } catch (_) { /* not available */ }
+
+    const wsClients = global.wsClients || new Map();
+
+    return success(res, {
+      streaming: streamingStats,
+      readModel: readModelStats,
+      websocket: {
+        connectedClients: wsClients.size,
+      },
+      timestamp: new Date().toISOString(),
+    }, 'Streaming stats retrieved');
+  });
 }
 
 module.exports = new HealthController();

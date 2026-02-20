@@ -1,8 +1,12 @@
 /**
- * Read Model Service - DIRECT API QUERIES ONLY
+ * Read Model Service — Streaming-First with REST Fallback
  * 
- * NO IN-MEMORY CACHE - All data queried directly from Canton API
- * Every method queries Canton in real-time
+ * PRIMARY: WebSocket streaming read model (bypasses 200-element limit)
+ * FALLBACK: Direct Canton REST API queries (when streaming unavailable)
+ * 
+ * The streaming read model bootstraps from /v2/state/active-contracts (WebSocket)
+ * and subscribes to /v2/updates (WebSocket) for real-time incremental updates.
+ * This completely eliminates the 200-element REST API limit.
  */
 
 const EventEmitter = require('events');
@@ -13,16 +17,43 @@ class ReadModelService extends EventEmitter {
     constructor(cantonService) {
         super();
         this.cantonService = cantonService;
+        this.streamingModel = null;
     }
 
     async initialize() {
-        console.log('[ReadModel] Initialized - NO CACHE MODE, all queries go directly to Canton API');
+        // Try to initialize streaming read model first
+        try {
+            const { getStreamingReadModel } = require('./streamingReadModel');
+            this.streamingModel = getStreamingReadModel();
+            await this.streamingModel.initialize();
+            console.log('[ReadModel] ✅ Streaming mode active — bypasses 200-element limit');
+        } catch (err) {
+            console.warn(`[ReadModel] ⚠️ Streaming init failed: ${err.message}`);
+            console.warn('[ReadModel]   Falling back to direct Canton REST queries (200-element limit applies)');
+            this.streamingModel = null;
+        }
     }
 
     /**
-     * Query orders directly from Canton API
+     * Check if streaming mode is active
+     */
+    isStreaming() {
+        return this.streamingModel?.isReady() || false;
+    }
+
+    /**
+     * Query orders — streaming first, REST fallback
      */
     async queryOrdersFromCanton(tradingPair = null) {
+        // PRIMARY: Streaming read model (no 200 limit)
+        if (this.streamingModel?.isReady()) {
+            const orders = tradingPair
+                ? this.streamingModel.getOpenOrdersForPair(tradingPair)
+                : this.streamingModel.getAllOpenOrders();
+            return orders;
+        }
+
+        // FALLBACK: REST API (200 limit applies)
         const token = await tokenProvider.getServiceToken();
         const packageId = config.canton.packageIds?.clobExchange;
         const operatorPartyId = config.canton.operatorPartyId;
@@ -64,9 +95,13 @@ class ReadModelService extends EventEmitter {
     }
 
     /**
-     * Get order book for a trading pair - DIRECT FROM CANTON
+     * Get order book for a trading pair — streaming first
      */
     async getOrderBook(tradingPair) {
+        if (this.streamingModel?.isReady()) {
+            return this.streamingModel.getOrderBook(tradingPair);
+        }
+
         const orders = await this.queryOrdersFromCanton(tradingPair);
         
         const bids = orders
@@ -81,35 +116,55 @@ class ReadModelService extends EventEmitter {
     }
 
     /**
-     * Get order by ID - DIRECT FROM CANTON
+     * Get order by ID
      */
     async getOrderById(orderId) {
+        if (this.streamingModel?.isReady()) {
+            const allOrders = this.streamingModel.getAllOpenOrders();
+            return allOrders.find(o => o.orderId === orderId) || null;
+        }
+
         const orders = await this.queryOrdersFromCanton();
         return orders.find(o => o.orderId === orderId) || null;
     }
 
     /**
-     * Get order by contract ID - DIRECT FROM CANTON
+     * Get order by contract ID
      */
     async getOrderByContractId(contractId) {
+        if (this.streamingModel?.isReady()) {
+            const allOrders = this.streamingModel.getAllOpenOrders();
+            return allOrders.find(o => o.contractId === contractId) || null;
+        }
+
         const orders = await this.queryOrdersFromCanton();
         return orders.find(o => o.contractId === contractId) || null;
     }
 
     /**
-     * Get orders for a party - DIRECT FROM CANTON
+     * Get orders for a party
      */
     async getOrdersForParty(partyId) {
+        if (this.streamingModel?.isReady()) {
+            return this.streamingModel.getOrdersForParty(partyId);
+        }
+
         const orders = await this.queryOrdersFromCanton();
         return orders.filter(o => o.owner === partyId);
     }
 
     /**
-     * Get recent trades — from file-backed cache (primary) + Canton API (fallback).
-     * The in-memory cache is populated by the matching engine after each match
-     * and persisted to disk, surviving server restarts.
+     * Get recent trades — streaming first, then file cache, then REST
      */
     getRecentTrades(tradingPair = null, limit = 50) {
+        // PRIMARY: Streaming read model
+        if (this.streamingModel?.isReady()) {
+            return tradingPair
+                ? this.streamingModel.getTradesForPair(tradingPair, limit)
+                : this.streamingModel.getAllTrades(limit);
+        }
+
+        // FALLBACK: File-backed cache
         try {
             const { getUpdateStream } = require('./cantonUpdateStream');
             const updateStream = getUpdateStream();
@@ -140,12 +195,30 @@ class ReadModelService extends EventEmitter {
      * Get trades for a party
      */
     async getTradesForParty(partyId) {
+        if (this.streamingModel?.isReady()) {
+            return this.streamingModel.getTradesForParty(partyId);
+        }
+
         const trades = this.getRecentTrades(null, 500);
         return trades.filter(t => t.buyer === partyId || t.seller === partyId);
     }
 
+    /**
+     * Get streaming stats for health check / monitoring
+     */
+    getStreamingStats() {
+        if (this.streamingModel) {
+            return this.streamingModel.getStats();
+        }
+        return { ready: false, mode: 'rest-only' };
+    }
+
     // Compatibility methods (no-ops since there's no cache)
-    stop() {}
+    stop() {
+        if (this.streamingModel) {
+            this.streamingModel.stop();
+        }
+    }
     addOrder() {}
     removeOrder() {}
     addTrade() {}

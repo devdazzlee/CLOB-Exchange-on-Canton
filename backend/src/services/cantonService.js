@@ -490,238 +490,203 @@ class CantonService {
   }
 
   /**
-   * Query active contracts
-   * POST /v2/state/active-contracts
+   * Query active contracts — WebSocket PRIMARY
    * 
-   * Note: activeAtOffset is required. If not provided, fetches from ledger-end first.
-   * Supports pagination to handle large result sets (Canton has 200 element limit)
+   * Uses WebSocket ws://.../v2/state/active-contracts as the PRIMARY method
+   * (per client requirement). WebSocket streams ALL contracts with no 200-element
+   * limit. REST is only used as a last-resort fallback if WebSocket fails.
+   * 
+   * Auth: subprotocol ['daml.ws.auth'] + Authorization: Bearer header.
    */
-  async queryActiveContracts({ party, templateIds = [], interfaceIds = [], activeAtOffset = null, verbose = false, pageSize = 100, pageToken = null, _splitQuery = false }, token) {
-    const url = `${this.jsonApiBase}/v2/state/active-contracts`;
+  async queryActiveContracts({ party, templateIds = [], interfaceIds = [], activeAtOffset = null, verbose = false, pageSize = 100, pageToken = null }, token) {
 
-    // If activeAtOffset not provided, fetch from ledger-end (required field)
+    // Get the offset (required for WebSocket filter)
     let effectiveOffset = activeAtOffset;
     if (effectiveOffset === null || effectiveOffset === undefined) {
       try {
         effectiveOffset = await this.getLedgerEndOffset(token);
-        console.log(`[CantonService] Using ledger-end offset: ${effectiveOffset}`);
       } catch (error) {
         console.warn(`[CantonService] Failed to get ledger-end, using 0:`, error.message);
         effectiveOffset = 0;
       }
     }
 
-    // Build the correct v2 filter structure using CUMULATIVE format
-    // IMPORTANT: The 'cumulative' format with TemplateFilter inside identifierFilter
-    // correctly returns only matching contracts and avoids the 413 error.
-    // The simpler 'templateFilters' format triggers 413 when total contracts > 200.
-    const filter = {};
-    
-    if (party) {
-      // Separate interfaces from templates (interfaces start with "#")
-      const allIds = [...interfaceIds, ...templateIds];
-      const interfaces = allIds.filter(t => typeof t === 'string' && t.startsWith('#'));
-      const templates = allIds.filter(t => !(typeof t === 'string' && t.startsWith('#')));
-      
-      const filters = [];
-      
-      // Add interface filters (per client instructions - use InterfaceFilter)
-      if (interfaces.length > 0) {
-        filters.push(...interfaces.map(interfaceId => ({
-          identifierFilter: {
-            InterfaceFilter: {
-              value: {
-                interfaceId: interfaceId, // Keep as string with # prefix
-                includeCreatedEventBlob: true,
-                includeInterfaceView: true
-              }
+    // Separate interfaces from templates
+    const allIds = [...interfaceIds, ...templateIds];
+    const interfaces = allIds.filter(t => typeof t === 'string' && t.startsWith('#'));
+    const templates = allIds.filter(t => !(typeof t === 'string' && t.startsWith('#')));
+
+    // Build cumulative filters
+    const cumulativeFilters = [];
+
+    if (interfaces.length > 0) {
+      cumulativeFilters.push(...interfaces.map(interfaceId => ({
+        identifierFilter: {
+          InterfaceFilter: {
+            value: {
+              interfaceId,
+              includeCreatedEventBlob: true,
+              includeInterfaceView: true
             }
           }
-        })));
-      }
-      
-      // Add template filters
-      if (templates.length > 0) {
-        filters.push(...templates.map(t => ({
-            identifierFilter: {
-              TemplateFilter: {
-                value: {
-                  templateId: typeof t === 'string' ? t : `${t.packageId}:${t.moduleName}:${t.entityName}`,
-                  includeCreatedEventBlob: false
-                }
-              }
-            }
-        })));
-      }
-      
-      filter.filtersByParty = {
-        [party]: filters.length > 0 ? {
-          cumulative: filters
-        } : {
-          // Wildcard filter for all templates
-          cumulative: [{
-            identifierFilter: {
-              WildcardFilter: {
-                value: {
-                  includeCreatedEventBlob: false
-                }
-              }
-            }
-          }]
         }
-      };
-    } else {
-      // If no party specified, use filtersForAnyParty
-      // Separate interfaces from templates
-      const allIds = [...interfaceIds, ...templateIds];
-      const interfaces = allIds.filter(t => typeof t === 'string' && t.startsWith('#'));
-      const templates = allIds.filter(t => !(typeof t === 'string' && t.startsWith('#')));
-      
-      const filters = [];
-      
-      // Add interface filters
-      if (interfaces.length > 0) {
-        filters.push(...interfaces.map(interfaceId => ({
-          identifierFilter: {
-            InterfaceFilter: {
-              value: {
-                interfaceId: interfaceId,
-                includeCreatedEventBlob: true,
-                includeInterfaceView: true
-              }
-            }
-          }
-        })));
-      }
-      
-      // Add template filters
-      if (templates.length > 0) {
-        filters.push(...templates.map(t => ({
-          identifierFilter: {
-            TemplateFilter: {
-              value: {
-                templateId: typeof t === 'string' ? t : `${t.packageId}:${t.moduleName}:${t.entityName}`,
-                includeCreatedEventBlob: false
-              }
-            }
-          }
-        })));
-      }
-      
-      filter.filtersForAnyParty = filters.length > 0 ? {
-        cumulative: filters
-      } : {
-        cumulative: [{
-          identifierFilter: {
-            WildcardFilter: {
-              value: {
-                includeCreatedEventBlob: false
-              }
-            }
-          }
-        }]
-      };
+      })));
     }
 
-    // ─── Pagination loop ─────────────────────────────────────────────────
-    // Canton JSON API v2 has a hard limit of ~200 total elements per response.
-    // We use a smaller pageSize and follow nextPageToken to get ALL results.
-    // ────────────────────────────────────────────────────────────────────
-    const allContracts = [];
-    let currentPageToken = pageToken || null;
-    let effectivePageSize = Math.min(pageSize, 100); // Cap at 100 to stay under 200 limit
-    let iterations = 0;
-    const maxIterations = 20; // Safety limit (20 × 100 = 2000 contracts max)
-    let loggedQuery = false;
+    if (templates.length > 0) {
+      cumulativeFilters.push(...templates.map(t => ({
+        identifierFilter: {
+          TemplateFilter: {
+            value: {
+              templateId: typeof t === 'string' ? t : `${t.packageId}:${t.moduleName}:${t.entityName}`,
+              includeCreatedEventBlob: false
+            }
+          }
+        }
+      })));
+    }
 
-    // Use while(true) with explicit breaks so that 'continue' for page-size
-    // retries works correctly (a do-while condition would exit on null pageToken).
+    // Default to wildcard if no filters specified
+    if (cumulativeFilters.length === 0) {
+      cumulativeFilters.push({
+        identifierFilter: {
+          WildcardFilter: { value: { includeCreatedEventBlob: false } }
+        }
+      });
+    }
+
+    // Build the filter object (party-scoped or any-party)
+    const filter = {};
+    if (party) {
+      filter.filtersByParty = { [party]: { cumulative: cumulativeFilters } };
+    } else {
+      filter.filtersForAnyParty = { cumulative: cumulativeFilters };
+    }
+
+    const templateLabel = templateIds.join(', ') || 'all';
+    console.log(`[CantonService] 🔌 WebSocket query — party: ${party || 'any'}, templates: ${templateLabel}`);
+
+    // ─── PRIMARY: WebSocket ──────────────────────────────────────────────
+    try {
+      const contracts = await this._queryViaWebSocket(filter, effectiveOffset, token);
+      console.log(`[CantonService] ✅ WebSocket returned ${contracts.length} contracts`);
+      return contracts;
+    } catch (wsErr) {
+      console.warn(`[CantonService] ⚠️ WebSocket query failed: ${wsErr.message} — falling back to REST`);
+    }
+
+    // ─── FALLBACK: REST (only if WebSocket fails) ────────────────────────
+    return this._queryViaREST(filter, effectiveOffset, verbose, token, templateLabel);
+  }
+
+  /**
+   * WebSocket query for active contracts — PRIMARY method.
+   * Streams ALL contracts from ws://.../v2/state/active-contracts (no 200 limit).
+   */
+  async _queryViaWebSocket(filter, offset, token) {
+    const WebSocket = require('ws');
+    const httpBase = config.canton.jsonApiBase || 'http://localhost:31539';
+    const wsBase = httpBase.replace(/^http/, 'ws');
+    const url = `${wsBase}/v2/state/active-contracts`;
+
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(url, ['daml.ws.auth'], {
+        handshakeTimeout: 15000,
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+
+      const contracts = [];
+      const timeout = setTimeout(() => {
+        ws.close();
+        resolve(contracts);
+      }, 60000);
+
+      ws.on('open', () => {
+        ws.send(JSON.stringify({
+          filter,
+          verbose: false,
+          activeAtOffset: offset
+        }));
+      });
+
+      ws.on('message', (data) => {
+        try {
+          const msg = JSON.parse(data.toString());
+          if (msg.code && msg.cause) {
+            // Canton error message — reject
+            clearTimeout(timeout);
+            ws.close();
+            reject(new Error(msg.cause || msg.code));
+            return;
+          }
+          const normalized = this._normalizeContracts([msg]);
+          contracts.push(...normalized.filter(c => c.contractId));
+        } catch (_) { /* ignore non-JSON frames */ }
+      });
+
+      ws.on('close', () => {
+        clearTimeout(timeout);
+        resolve(contracts);
+      });
+
+      ws.on('error', (err) => {
+        clearTimeout(timeout);
+        reject(new Error(`WebSocket ACS error: ${err.message}`));
+      });
+    });
+  }
+
+  /**
+   * REST fallback for active contract queries — only used when WebSocket fails.
+   * POST /v2/state/active-contracts with pagination.
+   */
+  async _queryViaREST(filter, offset, verbose, token, templateLabel) {
+    const url = `${this.jsonApiBase}/v2/state/active-contracts`;
+    const allContracts = [];
+    let currentPageToken = null;
+    let iterations = 0;
+    const maxIterations = 20;
+    const effectivePageSize = 100;
+
+    console.log(`[CantonService] 📡 REST fallback query — templates: ${templateLabel}`);
+
     while (iterations < maxIterations) {
-    const body = {
-      filter: filter,
-      verbose: verbose,
-        activeAtOffset: effectiveOffset,
+      const body = {
+        filter,
+        verbose: verbose || false,
+        activeAtOffset: offset,
         pageSize: effectivePageSize,
       };
-      
-      if (currentPageToken) {
-        body.pageToken = currentPageToken;
+      if (currentPageToken) body.pageToken = currentPageToken;
+
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify(body)
+      });
+
+      const text = await res.text();
+
+      if (!res.ok) {
+        const error = parseCantonError(text, res.status);
+        console.error(`[CantonService] ❌ REST query failed:`, error);
+        throw new Error(error.message);
       }
 
-      if (!loggedQuery) {
-        console.log(`[CantonService] Querying for party: ${party || 'any'}, templates: ${templateIds.join(', ') || 'all'}, offset: ${effectiveOffset}, pageSize: ${effectivePageSize}`);
-        loggedQuery = true;
-      }
-
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${token}`
-      },
-      body: JSON.stringify(body)
-    });
-
-    const text = await res.text();
-
-    if (!res.ok) {
-      const error = parseCantonError(text, res.status);
-      
-      // Handle the 200 element limit
-      if (error.code === 'JSON_API_MAXIMUM_LIST_ELEMENTS_NUMBER_REACHED') {
-        // If we have multiple templates, split into individual queries and merge
-        const currentTemplateIds = templateIds.filter(t => !(typeof t === 'string' && t.startsWith('#')));
-        if (currentTemplateIds.length > 1 && !body._splitQuery) {
-          console.log(`[CantonService] ℹ️ 200+ contracts with ${currentTemplateIds.length} templates. Splitting into individual queries...`);
-          const mergedResults = [];
-          for (const singleTemplate of currentTemplateIds) {
-            try {
-              const singleResult = await this.queryActiveContracts({
-                party, templateIds: [singleTemplate], interfaceIds: interfaceIds || [],
-                activeAtOffset: effectiveOffset, verbose, pageSize: effectivePageSize,
-                pageToken: null, _splitQuery: true
-              }, token);
-              if (Array.isArray(singleResult)) {
-                mergedResults.push(...singleResult);
-              }
-            } catch (splitErr) {
-              console.warn(`[CantonService] ⚠️ Split query for ${singleTemplate} failed: ${splitErr.message}`);
-            }
-          }
-          console.log(`[CantonService] ✅ Split query returned ${mergedResults.length} total contracts`);
-          return mergedResults;
-        }
-        
-        // Single template but still 200+ — Canton hard limit, cannot paginate past it.
-        // Log warning and continue with whatever contracts we have from other templates.
-        console.warn(`[CantonService] ⚠️ 200+ contracts for single template query (pageSize=${effectivePageSize}). Skipping — use per-user queries to bypass this limit.`);
-        break;
-      }
-      
-      console.error(`[CantonService] ❌ Query failed:`, error);
-      throw new Error(error.message);
-    }
-
-    const result = JSON.parse(text);
-    const rawContracts = result.activeContracts || result || [];
-      
+      const result = JSON.parse(text);
+      const rawContracts = result.activeContracts || result || [];
       allContracts.push(...this._normalizeContracts(rawContracts));
-      
-      // Check for next page
+
       currentPageToken = result.nextPageToken || null;
       iterations++;
-      
-      if (currentPageToken) {
-        if (iterations > 1) {
-          console.log(`[CantonService] 📄 Page ${iterations}: +${rawContracts.length} contracts (total: ${allContracts.length})`);
-        }
-      } else {
-        // No more pages — exit loop
-        break;
-      }
+
+      if (!currentPageToken) break;
     }
 
-    console.log(`[CantonService] ✅ Found ${allContracts.length} contracts${iterations > 1 ? ` (${iterations} pages)` : ''}`);
+    console.log(`[CantonService] ✅ REST returned ${allContracts.length} contracts`);
     return allContracts;
   }
 
@@ -1450,14 +1415,22 @@ class CantonService {
    * 3. Executed with the signature
    * 
    * This replaces submitAndWaitForTransaction when any actAs party is external.
+   * 
+   * Supports TWO command types:
+   *   - ExerciseCommand: { templateId, contractId, choice, choiceArgument }
+   *   - CreateCommand:   { templateId, createArguments }
+   * 
+   * If `createArguments` is provided (and no `contractId`), uses CreateCommand.
+   * Otherwise uses ExerciseCommand.
    */
   async prepareInteractiveSubmission({
     token,
     actAsParty,
     templateId,
-    contractId,
-    choice,
+    contractId = null,
+    choice = null,
     choiceArgument = {},
+    createArguments = null,
     readAs = [],
     synchronizerId = null,
     disclosedContracts = null,
@@ -1484,21 +1457,40 @@ class CantonService {
     // Build FLAT request body for /v2/interactive-submission/prepare
     // IMPORTANT: This endpoint uses a FLAT structure (NOT the nested "commands" wrapper
     // that submit-and-wait-for-transaction uses). All fields are at the root level.
-    // CRITICAL: Use "ExerciseCommand" (capitalized) not "exercise" per JSON Ledger API v2 spec
-    const readAsList = Array.isArray(readAs) ? readAs : (readAs ? [readAs] : []);
-    const body = {
-      commandId: `cmd-prep-${crypto.randomUUID()}`,
-      actAs,
-      ...(readAsList.length > 0 && { readAs: readAsList }),
-      synchronizerId: effectiveSyncId,
-      commands: [{
+    //
+    // Determine command type:
+    //   - CreateCommand for contract creation (when createArguments is provided)
+    //   - ExerciseCommand for exercising choices (when contractId + choice are provided)
+    let command;
+    if (createArguments && !contractId) {
+      // CreateCommand
+      command = {
+        CreateCommand: {
+          templateId: templateIdString,
+          createArguments
+        }
+      };
+      console.log(`[CantonService] Preparing CreateCommand for template: ${templateIdString}`);
+    } else {
+      // ExerciseCommand
+      command = {
         ExerciseCommand: {
           templateId: templateIdString,
           contractId,
           choice,
           choiceArgument
         }
-      }],
+      };
+      console.log(`[CantonService] Preparing ExerciseCommand: ${choice} on ${contractId?.substring(0, 20)}...`);
+    }
+
+    const readAsList = Array.isArray(readAs) ? readAs : (readAs ? [readAs] : []);
+    const body = {
+      commandId: `cmd-prep-${crypto.randomUUID()}`,
+      actAs,
+      ...(readAsList.length > 0 && { readAs: readAsList }),
+      synchronizerId: effectiveSyncId,
+      commands: [command],
       ...(normalizedDisclosed && { disclosedContracts: normalizedDisclosed }),
       packageIdSelectionPreference: [],
       verboseHashing

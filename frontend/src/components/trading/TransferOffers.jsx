@@ -26,6 +26,7 @@ import { Button } from '../ui/button';
 import { useToast } from '../ui/toast';
 import { apiClient } from '../../config/config';
 import { loadWallet, decryptPrivateKey, signMessage } from '../../wallet/keyManager';
+import websocketService from '../../services/websocketService';
 
 export default function TransferOffers({ partyId, onTransferAccepted }) {
   const [offers, setOffers] = useState([]);
@@ -39,7 +40,7 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
   const [walletPassword, setWalletPassword] = useState('');
   const [signingError, setSigningError] = useState(null);
 
-  // Fetch pending transfer offers (silent polling — only logs on changes)
+  // Fetch pending transfer offers (one-time REST, then WebSocket updates)
   const prevCountRef = React.useRef(-1);
   
   const fetchOffers = useCallback(async (isInitial = false) => {
@@ -54,7 +55,6 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
       if (response.success) {
         const newOffers = response.data?.offers || [];
         setOffers(newOffers);
-        // Only log when count changes (not every poll)
         if (newOffers.length !== prevCountRef.current) {
           console.log('[TransferOffers] Offers:', newOffers.length);
           prevCountRef.current = newOffers.length;
@@ -63,7 +63,6 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
         throw new Error(response.error || 'Failed to fetch offers');
       }
     } catch (err) {
-      // Only log errors on initial fetch, not on every poll
       if (isInitial) console.error('[TransferOffers] Error:', err);
       setError(err.message);
     } finally {
@@ -71,15 +70,46 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
     }
   }, [partyId]);
 
-  // Initial fetch + poll every 30s
+  // Initial fetch + WebSocket subscription (no polling)
   useEffect(() => {
     fetchOffers(true);
-    
-    const interval = setInterval(() => {
-      if (!document.hidden) fetchOffers(false);
-    }, 30000);
-    return () => clearInterval(interval);
-  }, [fetchOffers]);
+
+    // Connect WebSocket if not connected
+    if (!websocketService.isConnected()) {
+      websocketService.connect();
+    }
+
+    // WebSocket handler for transfer offer updates
+    const onTransferUpdate = (data) => {
+      if (data?.type === 'TRANSFER_CREATED') {
+        // New transfer offer received — add to list
+        if (data.offer) {
+          setOffers(prev => {
+            const exists = prev.some(o => o.contractId === data.offer.contractId);
+            if (exists) return prev;
+            return [...prev, data.offer];
+          });
+        }
+      } else if (data?.type === 'TRANSFER_ACCEPTED' || data?.type === 'TRANSFER_REJECTED') {
+        // Transfer accepted/rejected — remove from list
+        const cid = data.contractId || data.offer?.contractId;
+        if (cid) {
+          setOffers(prev => prev.filter(o => o.contractId !== cid));
+        }
+      } else if (data?.type === 'TRANSFERS_SNAPSHOT' && Array.isArray(data.offers)) {
+        // Full snapshot pushed by backend
+        setOffers(data.offers);
+      }
+    };
+
+    websocketService.subscribe(`transfers:${partyId}`, onTransferUpdate);
+
+    // No polling — all subsequent updates come via WebSocket
+
+    return () => {
+      websocketService.unsubscribe(`transfers:${partyId}`, onTransferUpdate);
+    };
+  }, [fetchOffers, partyId]);
 
   // Accept a transfer offer (2-step interactive signing for external parties)
   const handleAccept = async (offer) => {

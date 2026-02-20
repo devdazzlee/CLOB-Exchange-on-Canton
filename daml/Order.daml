@@ -117,3 +117,11 @@ template Order
           status = "OPEN"
           orderMode = "MARKET"
           price = None  -- Market order has no price limit
+
+    -- Archive a completed order to free ACS space.
+    -- Only FILLED or CANCELLED orders can be archived.
+    -- This is a consuming choice — the contract is removed from the ACS.
+    choice ArchiveOrder : ()
+      controller operator
+      do
+        assert (status == "FILLED" || status == "CANCELLED")

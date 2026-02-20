@@ -166,6 +166,11 @@ template SettlementInstruction
         return ()
 
 -- | Trade - Record of an executed trade
+-- 
+-- ACS Optimization: Trade contracts remain active for history queries.
+-- The operator can archive old trades via ArchiveTrade to keep the
+-- Active Contract Set lean. Archived trades should first be persisted
+-- to the file-backed cache (cantonUpdateStream.js) before archival.
 template Trade
   with
     tradeId : Text
@@ -183,6 +188,13 @@ template Trade
   where
     signatory operator
     observer buyer, seller
+
+    -- Archive this trade record to free ACS space.
+    -- Call ONLY after the trade has been persisted to off-ledger storage
+    -- (file cache, database, etc.) to avoid data loss.
+    choice ArchiveTrade : ()
+      controller operator
+      do return ()
 
 -- | Batch settlement for multiple trades
 template BatchSettlement
@@ -264,3 +276,10 @@ template AllocationRecord
       do
         assertMsg "Allocation not in PENDING status" (status == "PENDING")
         create this with status = "CANCELLED"
+
+    -- Archive a completed allocation to free ACS space.
+    -- Only EXECUTED or CANCELLED allocations can be archived.
+    choice ArchiveAllocation : ()
+      controller operator
+      do
+        assertMsg "Can only archive completed allocations" (status == "EXECUTED" || status == "CANCELLED")

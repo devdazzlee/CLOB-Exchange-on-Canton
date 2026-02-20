@@ -76,6 +76,26 @@ class OrderController {
       stopPrice: stopPrice || null,
     });
 
+    // For external parties: return requiresSignature so frontend can sign
+    if (result.requiresSignature) {
+      console.log(`[OrderController] External party — returning prepared transaction for signing`);
+      return success(res, {
+        requiresSignature: true,
+        orderId: result.orderId,
+        preparedTransaction: result.preparedTransaction,
+        preparedTransactionHash: result.preparedTransactionHash,
+        hashingSchemeVersion: result.hashingSchemeVersion,
+        partyId: result.partyId,
+        tradingPair: result.tradingPair,
+        orderType: result.orderType,
+        orderMode: result.orderMode,
+        price: result.price,
+        quantity: result.quantity,
+        stopPrice: result.stopPrice,
+        lockInfo: result.lockInfo,
+      }, 'Transaction prepared. Sign the hash and call /execute-place.');
+    }
+
     console.log(`[OrderController] ✅ Order placed: ${result.orderId}`);
 
     // Register stop-loss with StopLossService if applicable
@@ -100,15 +120,6 @@ class OrderController {
     }
 
     // ═══ AUTO-TRIGGER MATCHING ENGINE (FIRE-AND-FORGET) ═══
-    // On serverless (Vercel), matching can't run in the background.
-    // We trigger it ASYNCHRONOUSLY after responding to the client.
-    // This prevents the order placement response from being blocked by matching
-    // (which can take 5-15s with Splice transfers).
-    //
-    // The client gets an instant response, and matching happens in the background.
-    // The frontend polls every 3s for order book updates, which also triggers matching.
-
-    // Return response immediately — don't wait for matching
     const response = success(res, { ...result, matchTriggered: true }, 'Order placed successfully', 201);
 
     // Fire-and-forget: trigger matching after a short delay for Canton propagation
@@ -159,6 +170,12 @@ class OrderController {
       tradingPair
     );
 
+    // For external parties: return requiresSignature so frontend can sign
+    if (result.requiresSignature) {
+      console.log(`[OrderController] External party — returning prepared CancelOrder for signing`);
+      return success(res, result, 'Transaction prepared. Sign the hash and call /execute-cancel.');
+    }
+
     console.log(`[OrderController] ✅ Order cancelled`);
 
     return success(res, result, 'Order cancelled successfully');
@@ -186,6 +203,67 @@ class OrderController {
   });
 
   /**
+   * Execute a prepared order placement with user's signature
+   * POST /api/orders/execute-place
+   * 
+   * Body: { preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, orderMeta }
+   */
+  executePlace = asyncHandler(async (req, res) => {
+    const { preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, orderMeta } = req.body;
+
+    if (!preparedTransaction || !partyId || !signatureBase64 || !signedBy) {
+      throw new ValidationError('preparedTransaction, partyId, signatureBase64, and signedBy are required');
+    }
+
+    console.log(`[OrderController] EXECUTE place for ${partyId.substring(0, 30)}... signedBy: ${signedBy.substring(0, 20)}...`);
+
+    const result = await this.orderService.executeOrderPlacement(
+      preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, orderMeta || {}
+    );
+
+    console.log(`[OrderController] ✅ Order placed via interactive submission: ${result.orderId}`);
+
+    // Fire-and-forget matching
+    if (result.tradingPair && result.status === 'OPEN') {
+      setTimeout(async () => {
+        try {
+          const { getMatchingEngine } = require('../services/matching-engine');
+          const engine = getMatchingEngine();
+          await engine.triggerMatchingCycle(result.tradingPair);
+        } catch (matchErr) {
+          console.warn(`[OrderController] ⚠️ Auto-match failed:`, matchErr.message);
+        }
+      }, 1500);
+    }
+
+    return success(res, { ...result, matchTriggered: true }, 'Order placed via interactive submission', 201);
+  });
+
+  /**
+   * Execute a prepared order cancellation with user's signature
+   * POST /api/orders/execute-cancel
+   * 
+   * Body: { preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, cancelMeta }
+   */
+  executeCancel = asyncHandler(async (req, res) => {
+    const { preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, cancelMeta } = req.body;
+
+    if (!preparedTransaction || !partyId || !signatureBase64 || !signedBy) {
+      throw new ValidationError('preparedTransaction, partyId, signatureBase64, and signedBy are required');
+    }
+
+    console.log(`[OrderController] EXECUTE cancel for ${partyId.substring(0, 30)}... signedBy: ${signedBy.substring(0, 20)}...`);
+
+    const result = await this.orderService.executeOrderCancel(
+      preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, cancelMeta || {}
+    );
+
+    console.log(`[OrderController] ✅ Order cancelled via interactive submission`);
+
+    return success(res, result, 'Order cancelled via interactive submission');
+  });
+
+  /**
    * Cancel order by ID
    * POST /api/orders/:orderId/cancel
    */
@@ -205,6 +283,11 @@ class OrderController {
 
     // orderId might be a contract ID or order ID - try both
     const result = await this.orderService.cancelOrder(orderId, partyId);
+
+    // For external parties: return requiresSignature so frontend can sign
+    if (result.requiresSignature) {
+      return success(res, result, 'Transaction prepared. Sign the hash and call /execute-cancel.');
+    }
 
     return success(res, result, 'Order cancelled successfully');
   });

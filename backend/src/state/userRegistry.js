@@ -83,12 +83,26 @@ function requirePublicKey(userId) {
   return u.publicKeyBase64;
 }
 
+/**
+ * Get all registered party IDs (for sharded queries)
+ */
+function getAllPartyIds() {
+  const partyIds = [];
+  for (const [, entry] of registry) {
+    if (entry.partyId) {
+      partyIds.push(entry.partyId);
+    }
+  }
+  return [...new Set(partyIds)]; // deduplicate
+}
+
 module.exports = {
   upsertUser,
   getUser,
   requireUser,
   requirePartyId,
   requirePublicKey,
+  getAllPartyIds,
 };
 
 

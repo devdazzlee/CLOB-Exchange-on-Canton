@@ -1,21 +1,24 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { TrendingUp, TrendingDown } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
 import { cn } from '@/lib/utils';
 import { apiClient, API_ROUTES } from '@/config/config';
+import websocketService from '../../services/websocketService';
 
 /**
  * GlobalTrades Component - Shows ALL trades across ALL users (global view)
  * Like Binance's "Recent Trades" panel
+ * 
+ * Pure WebSocket — initial load via REST, then all updates via WebSocket.
  */
 export default function GlobalTrades({ tradingPair, limit = 50 }) {
   const [trades, setTrades] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  // Load trades from backend
-  const loadTrades = async () => {
+  // Initial load from backend (one-time REST)
+  const loadTrades = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
@@ -35,19 +38,55 @@ export default function GlobalTrades({ tradingPair, limit = 50 }) {
     } finally {
       setLoading(false);
     }
-  };
-
-  // Initial load + polling (no WebSocket — doesn't work on Vercel)
-  useEffect(() => {
-    loadTrades();
-    
-    // Poll every 5 seconds for fresh trade data
-    const pollInterval = setInterval(() => {
-      if (!document.hidden) loadTrades();
-    }, 5000);
-
-    return () => clearInterval(pollInterval);
   }, [tradingPair, limit]);
+
+  // Initial load + WebSocket subscription (no polling)
+  useEffect(() => {
+    // One-time initial load
+    loadTrades();
+
+    // Connect WebSocket if not connected
+    if (!websocketService.isConnected()) {
+      websocketService.connect();
+    }
+
+    // WebSocket handler for new trades
+    const onTradeUpdate = (data) => {
+      if (data?.type === 'NEW_TRADE') {
+        setTrades(prev => {
+          const newTrade = {
+            tradeId: data.tradeId,
+            tradingPair: data.tradingPair,
+            price: data.price,
+            quantity: data.quantity || data.baseAmount,
+            buyer: data.buyer,
+            seller: data.seller,
+            timestamp: data.timestamp,
+            side: data.side,
+          };
+          // Prepend (newest first) and deduplicate
+          const updated = [newTrade, ...prev];
+          const seen = new Set();
+          return updated.filter(t => {
+            const key = t.tradeId || `${t.price}-${t.quantity}-${t.timestamp}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          }).slice(0, limit);
+        });
+      }
+    };
+
+    // Subscribe to trade channels
+    const pairChannel = tradingPair ? `trades:${tradingPair}` : 'trades:all';
+    websocketService.subscribe(pairChannel, onTradeUpdate);
+    websocketService.subscribe('trades:all', onTradeUpdate);
+
+    return () => {
+      websocketService.unsubscribe(pairChannel, onTradeUpdate);
+      websocketService.unsubscribe('trades:all', onTradeUpdate);
+    };
+  }, [tradingPair, limit, loadTrades]);
 
   // Format time
   const formatTime = (timestamp) => {

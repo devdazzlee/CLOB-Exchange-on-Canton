@@ -216,6 +216,19 @@ class MatchingEngine {
   }
   
   /**
+   * Get the streaming read model (lazy init)
+   */
+  _getStreamingModel() {
+    if (!this._streamingModel) {
+      try {
+        const { getStreamingReadModel } = require('./streamingReadModel');
+        this._streamingModel = getStreamingReadModel();
+      } catch (_) { /* streaming not available */ }
+    }
+    return this._streamingModel?.isReady() ? this._streamingModel : null;
+  }
+
+  /**
    * @returns {boolean} true if a match was found and executed
    */
   async processOrdersForPair(tradingPair, token) {
@@ -225,75 +238,77 @@ class MatchingEngine {
     if (!packageId || !operatorPartyId) return false;
 
     try {
-      const legacyPackageId = config.canton.packageIds?.legacy;
-      const templateIdsToQuery = [`${packageId}:Order:Order`];
-      if (legacyPackageId && legacyPackageId !== packageId) {
-        templateIdsToQuery.push(`${legacyPackageId}:Order:Order`);
-      }
-
-      // Primary query: operator party (sees most orders)
-      let contracts = await cantonService.queryActiveContracts({
-        party: operatorPartyId,
-        templateIds: templateIdsToQuery,
-        pageSize: 200
-      }, token);
+      // ═══ PRIMARY: Streaming Read Model (no 200 limit) ═══
+      const streaming = this._getStreamingModel();
+      let rawOrders = null;
       
-      // Secondary: Merge with global open orders registry
-      // This catches orders that are invisible to operator-level Canton queries
-      // due to the 200-element limit on the 273cbc package.
-      try {
-        const globalOrders = getGlobalOpenOrders();
-        if (Array.isArray(globalOrders) && globalOrders.length > 0) {
-          const existingIds = new Set((Array.isArray(contracts) ? contracts : []).map(c => c.contractId));
-          const extra = globalOrders
-            .filter(o => o.status === 'OPEN' && !existingIds.has(o.contractId))
-            .map(o => ({
-              contractId: o.contractId,
-              templateId: `${packageId}:Order:Order`,
-              payload: o,
-              createArgument: o,
-            }));
-          if (extra.length > 0) {
-            console.log(`[MatchingEngine] Found ${extra.length} additional orders via global registry`);
-            contracts = [...(Array.isArray(contracts) ? contracts : []), ...extra];
-          }
+      if (streaming) {
+        // Instant in-memory lookup — ALL orders, no REST call, no 200 limit
+        rawOrders = streaming.getOpenOrdersForPair(tradingPair);
+      }
+      
+      // ═══ FALLBACK: REST API (200 limit applies) ═══
+      if (!rawOrders) {
+        const legacyPackageId = config.canton.packageIds?.legacy;
+        const templateIdsToQuery = [`${packageId}:Order:Order`];
+        if (legacyPackageId && legacyPackageId !== packageId) {
+          templateIdsToQuery.push(`${legacyPackageId}:Order:Order`);
+        }
 
-          // Tertiary: For each unique owner party in the global registry,
-          // do a user-specific Canton query to get their COMPLETE set of orders.
-          // This bypasses the 200-element limit that blocks operator-level queries.
-          const ownerParties = new Set(globalOrders.filter(o => o.owner && o.owner !== operatorPartyId).map(o => o.owner));
-          for (const ownerParty of ownerParties) {
-            try {
-              const userContracts = await cantonService.queryActiveContracts({
-                party: ownerParty,
-                templateIds: templateIdsToQuery,
-                pageSize: 200
-              }, token);
-              if (Array.isArray(userContracts) && userContracts.length > 0) {
-                const currentIds = new Set((Array.isArray(contracts) ? contracts : []).map(c => c.contractId));
-                const userExtra = userContracts.filter(c => !currentIds.has(c.contractId));
-                if (userExtra.length > 0) {
-                  console.log(`[MatchingEngine] Found ${userExtra.length} additional orders via user-specific query for ${ownerParty.substring(0, 30)}...`);
-                  contracts = [...contracts, ...userExtra];
-                }
-              }
-            } catch (userErr) {
-              // Non-critical — global registry orders are already merged above
+        let contracts = await cantonService.queryActiveContracts({
+          party: operatorPartyId,
+          templateIds: templateIdsToQuery,
+          pageSize: 200
+        }, token);
+        
+        // Merge with global open orders registry (catches orders behind 200 limit)
+        try {
+          const globalOrders = getGlobalOpenOrders();
+          if (Array.isArray(globalOrders) && globalOrders.length > 0) {
+            const existingIds = new Set((Array.isArray(contracts) ? contracts : []).map(c => c.contractId));
+            const extra = globalOrders
+              .filter(o => o.status === 'OPEN' && !existingIds.has(o.contractId))
+              .map(o => ({
+                contractId: o.contractId,
+                templateId: `${packageId}:Order:Order`,
+                payload: o,
+                createArgument: o,
+              }));
+            if (extra.length > 0) {
+              contracts = [...(Array.isArray(contracts) ? contracts : []), ...extra];
             }
           }
-        }
-      } catch (_) { /* non-critical */ }
+        } catch (_) { /* non-critical */ }
+        
+        // Convert REST contracts to normalized rawOrders format
+        rawOrders = (Array.isArray(contracts) ? contracts : []).map(c => {
+          const payload = c.payload || c.createArgument || {};
+          return {
+            contractId: c.contractId,
+            templateId: c.templateId || `${packageId}:Order:Order`,
+            orderId: payload.orderId,
+            owner: payload.owner,
+            orderType: payload.orderType,
+            orderMode: payload.orderMode || 'LIMIT',
+            tradingPair: payload.tradingPair,
+            price: payload.price,
+            quantity: payload.quantity,
+            filled: payload.filled || '0',
+            status: payload.status,
+            timestamp: payload.timestamp,
+            allocationCid: payload.allocationCid,
+          };
+        }).filter(o => o.tradingPair === tradingPair && o.status === 'OPEN');
+      }
       
-      if (!contracts || contracts.length === 0) return false;
+      if (!rawOrders || rawOrders.length === 0) return false;
       
       const buyOrders = [];
       const sellOrders = [];
       
-      for (const c of contracts) {
-        const payload = c.payload || c.createArgument || {};
-        
+      for (const payload of rawOrders) {
         // Only match OPEN orders (not PENDING_TRIGGER stop-loss orders)
-        if (payload.tradingPair !== tradingPair || payload.status !== 'OPEN') continue;
+        if (payload.status !== 'OPEN') continue;
 
         const rawPrice = payload.price;
         let parsedPrice = null;
@@ -312,7 +327,7 @@ class MatchingEngine {
 
         if (remaining.lte(0)) continue;
 
-        const contractTemplateId = c.templateId || `${packageId}:Order:Order`;
+        const contractTemplateId = payload.templateId || `${packageId}:Order:Order`;
         const isNewPackage = contractTemplateId.startsWith(packageId);
 
         // Extract allocationCid (Allocation contract ID for settlement)
@@ -322,7 +337,7 @@ class MatchingEngine {
           : null;
         
         const order = {
-          contractId: c.contractId,
+          contractId: payload.contractId,
           orderId: payload.orderId,
           owner: payload.owner,
           orderType: payload.orderType,
@@ -334,7 +349,7 @@ class MatchingEngine {
           remainingDecimal: remaining,
           timestamp: payload.timestamp,
           tradingPair: payload.tradingPair,
-          allocationContractId: allocationCid,  // Allocation contract ID for settlement
+          allocationContractId: allocationCid,
           templateId: contractTemplateId,
           isNewPackage: isNewPackage,
         };

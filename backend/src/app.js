@@ -12,8 +12,8 @@ const http = require('http');
 const config = require('./config');
 const routes = require('./routes');
 const errorHandler = require('./middleware/errorHandler');
-// WebSocket DISABLED — all real-time updates use HTTP polling from frontend
-// const { initializeWebSocketService } = require('./services/websocketService');
+// WebSocket RE-ENABLED — streaming read model pushes real-time updates to frontend
+const { initializeWebSocketService } = require('./services/websocketService');
 
 // Validate configuration on startup - FAIL FAST
 console.log('');
@@ -217,9 +217,9 @@ function createApp() {
   // Global error handler (must be last)
   app.use(errorHandler);
 
-  // WebSocket DISABLED — frontend uses HTTP polling (3s order book, 5s trades)
-  // global.broadcastWebSocket calls in services are no-ops (all guarded with `if (global.broadcastWebSocket)`)
-  console.log('[App] WebSocket disabled — using HTTP polling for real-time updates');
+  // WebSocket RE-ENABLED — streaming read model feeds real-time updates to frontend
+  const wsService = initializeWebSocketService(server);
+  console.log('[App] ✅ WebSocket service initialized (frontend receives real-time pushes)');
 
   // Milestone 4: Start stop-loss service (skip in serverless mode)
   if (!isServerless) {
@@ -239,6 +239,10 @@ function createApp() {
 
 /**
  * Initialize the Read Model Service for real-time ledger updates
+ * 
+ * When the streaming read model is active, it emits events on every
+ * contract create/archive. We wire these events to global.broadcastWebSocket
+ * so the frontend receives instant updates.
  */
 async function initializeReadModel() {
   try {
@@ -253,6 +257,97 @@ async function initializeReadModel() {
     if (readModel) {
       await readModel.initialize();
       console.log('✅ Read Model initialized');
+      
+      // Wire streaming events → WebSocket broadcasts for real-time frontend updates
+      // No polling on the frontend — ALL data flows through these WebSocket channels
+      try {
+        const { getStreamingReadModel } = require('./services/streamingReadModel');
+        const streaming = getStreamingReadModel();
+        if (streaming?.isReady()) {
+          // Push order book changes to subscribed frontend clients
+          streaming.on('orderCreated', (order) => {
+            if (!global.broadcastWebSocket) return;
+            if (order.tradingPair) {
+              global.broadcastWebSocket(`orderbook:${order.tradingPair}`, {
+                type: 'ORDER_CREATED',
+                order,
+              });
+            }
+            // Also push to user-specific order channel
+            if (order.owner) {
+              global.broadcastWebSocket(`orders:${order.owner}`, {
+                type: 'ORDER_CREATED',
+                order,
+              });
+            }
+          });
+          streaming.on('orderArchived', (order) => {
+            if (!global.broadcastWebSocket) return;
+            if (order.tradingPair) {
+              global.broadcastWebSocket(`orderbook:${order.tradingPair}`, {
+                type: 'ORDER_ARCHIVED',
+                orderId: order.orderId,
+                contractId: order.contractId,
+              });
+            }
+            // Also push to user-specific order channel
+            if (order.owner) {
+              global.broadcastWebSocket(`orders:${order.owner}`, {
+                type: 'ORDER_ARCHIVED',
+                orderId: order.orderId,
+                contractId: order.contractId,
+              });
+            }
+          });
+          // Push trade events — also push balance updates for buyer & seller
+          streaming.on('tradeCreated', (trade) => {
+            if (!global.broadcastWebSocket) return;
+            if (trade.tradingPair) {
+              global.broadcastWebSocket(`trades:${trade.tradingPair}`, {
+                type: 'NEW_TRADE',
+                ...trade,
+              });
+              global.broadcastWebSocket('trades:all', {
+                type: 'NEW_TRADE',
+                ...trade,
+              });
+            }
+            // After a trade, both buyer and seller balances change
+            // Fetch fresh balances via Canton SDK and push to their channels
+            if (trade.buyer || trade.seller) {
+              const refreshAndBroadcast = async (party) => {
+                try {
+                  if (!party) return;
+                  const { getCantonSDKClient } = require('./services/canton-sdk-client');
+                  const sdkClient = getCantonSDKClient();
+                  const bal = await sdkClient.getAllBalances(party);
+                  global.broadcastWebSocket(`balance:${party}`, {
+                    type: 'BALANCE_UPDATE',
+                    partyId: party,
+                    balances: bal?.available || {},
+                    lockedBalances: bal?.locked || {},
+                    timestamp: Date.now(),
+                  });
+                } catch (_) { /* non-critical */ }
+              };
+              refreshAndBroadcast(trade.buyer);
+              refreshAndBroadcast(trade.seller);
+            }
+          });
+          // Push generic update events (offset changes)
+          streaming.on('update', (info) => {
+            if (global.broadcastWebSocket) {
+              global.broadcastWebSocket('ledger:updates', {
+                type: 'LEDGER_UPDATE',
+                offset: info.offset,
+              });
+            }
+          });
+          console.log('✅ Streaming events wired to WebSocket broadcasts (pure WS, no polling)');
+        }
+      } catch (_) {
+        // Streaming not available — WebSocket still works but no auto-push
+      }
     }
     return readModel;
   } catch (error) {
@@ -296,7 +391,7 @@ async function startServer() {
     console.log('╚═══════════════════════════════════════════════════════════════╝');
     console.log('');
     console.log(`✅ Server running on port ${PORT}`);
-    console.log(`✅ Real-time updates via HTTP polling (WebSocket disabled)`);
+    console.log(`✅ Real-time updates via WebSocket streaming (polling as fallback)`);
     console.log(`✅ Environment: ${config.server.env}`);
     console.log('');
 
@@ -352,6 +447,18 @@ async function startServer() {
       console.log('✅ Stop-Loss Service started');
     } catch (error) {
       console.warn('⚠️  Stop-loss service not available:', error.message);
+    }
+
+    // ACS Cleanup Service — archives completed contracts to keep ACS lean
+    console.log('');
+    console.log('🧹 Starting ACS Cleanup Service...');
+    try {
+      const { getACSCleanupService } = require('./services/acsCleanupService');
+      const cleanupService = getACSCleanupService();
+      await cleanupService.start();
+      console.log('✅ ACS Cleanup Service started (archives FILLED/CANCELLED orders, old trades)');
+    } catch (error) {
+      console.warn('⚠️  ACS Cleanup service not available:', error.message);
     }
 
     console.log('');

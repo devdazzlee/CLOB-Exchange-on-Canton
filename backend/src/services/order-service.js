@@ -493,33 +493,82 @@ class OrderService {
     // STOP_LOSS orders start as 'PENDING_TRIGGER' — NOT added to active order book
     const initialStatus = orderMode === 'STOP_LOSS' ? 'PENDING_TRIGGER' : 'OPEN';
 
-    // Create Order contract on Canton using submit-and-wait-for-transaction
+    // Create Order contract on Canton
     const timestamp = new Date().toISOString();
+    const isExternalParty = partyId.startsWith('ext-') || partyId.includes('external');
     
-    const result = await cantonService.createContractWithTransaction({
+    const createArgs = {
+      orderId: orderId,
+      owner: partyId,
+      orderType: orderType.toUpperCase(),
+      orderMode: orderMode.toUpperCase(),
+      tradingPair: tradingPair,
+      price: orderMode.toUpperCase() === 'LIMIT' && price ? price.toString() : (stopPrice ? stopPrice.toString() : null),
+      quantity: quantity.toString(),
+      filled: '0.0',
+      status: initialStatus,
+      timestamp: timestamp,
+      operator: operatorPartyId,
+      allocationCid: allocationContractId || '',
+      stopPrice: stopPrice ? stopPrice.toString() : null
+    };
+
+    let result;
+    let contractId = null;
+
+    if (isExternalParty) {
+      // ═══ EXTERNAL PARTY: Use interactive submission (prepare → sign → execute) ═══
+      // External parties have Confirmation permission — the participant cannot sign
+      // on their behalf. The user must sign the transaction with their private key.
+      //
+      // For Order creation: signatory is "owner" (the external party).
+      // We only include the external party in actAs — the operator is an observer,
+      // not a signatory, so it doesn't need to sign.
+      console.log(`[OrderService] External party detected — using interactive submission for order creation`);
+      
+      const prepareResult = await cantonService.prepareInteractiveSubmission({
+        token,
+        actAsParty: [partyId],
+        templateId: `${packageId}:Order:Order`,
+        createArguments: createArgs,
+        readAs: [operatorPartyId, partyId],
+      });
+      
+      if (!prepareResult.preparedTransaction || !prepareResult.preparedTransactionHash) {
+        throw new Error('Prepare returned incomplete result: missing preparedTransaction or preparedTransactionHash');
+      }
+      
+      console.log(`[OrderService] ✅ Order creation prepared. Hash to sign: ${prepareResult.preparedTransactionHash.substring(0, 40)}...`);
+      
+      // Return the prepared transaction for the frontend to sign
+      return {
+        requiresSignature: true,
+        step: 'PREPARED',
+        orderId,
+        tradingPair,
+        orderType: orderType.toUpperCase(),
+        orderMode: orderMode.toUpperCase(),
+        price: createArgs.price,
+        quantity: createArgs.quantity,
+        stopPrice: stopPrice || null,
+        preparedTransaction: prepareResult.preparedTransaction,
+        preparedTransactionHash: prepareResult.preparedTransactionHash,
+        hashingSchemeVersion: prepareResult.hashingSchemeVersion,
+        partyId,
+        lockInfo,
+      };
+    }
+
+    // ═══ INTERNAL PARTY: Direct submission ═══
+    result = await cantonService.createContractWithTransaction({
       token,
       actAsParty: [partyId, operatorPartyId],
       templateId: `${packageId}:Order:Order`,
-      createArguments: {
-        orderId: orderId,
-        owner: partyId,
-        orderType: orderType.toUpperCase(),
-        orderMode: orderMode.toUpperCase(),
-        tradingPair: tradingPair,
-        price: orderMode.toUpperCase() === 'LIMIT' && price ? price.toString() : (stopPrice ? stopPrice.toString() : null),
-        quantity: quantity.toString(),
-        filled: '0.0',
-        status: initialStatus,
-        timestamp: timestamp,
-        operator: operatorPartyId,
-        allocationCid: allocationContractId || '',
-        stopPrice: stopPrice ? stopPrice.toString() : null
-      },
+      createArguments: createArgs,
       readAs: [operatorPartyId, partyId]
     });
 
     // Extract created contract ID from result
-    let contractId = null;
     if (result.transaction?.events) {
       const createdEvent = result.transaction.events.find(e => 
         e.created?.templateId?.includes('Order') || 
@@ -717,6 +766,164 @@ class OrderService {
   }
 
   /**
+   * STEP 2: Execute a prepared order placement with the user's signature
+   * 
+   * Called after the frontend signs the preparedTransactionHash from placeOrder()
+   * 
+   * @param {string} preparedTransaction - Opaque blob from prepare step
+   * @param {string} partyId - The external party that signed
+   * @param {string} signatureBase64 - User's Ed25519 signature of preparedTransactionHash
+   * @param {string} signedBy - Public key fingerprint that signed
+   * @param {string|number} hashingSchemeVersion - From prepare response
+   * @param {object} orderMeta - { orderId, tradingPair, orderType, orderMode, price, quantity, stopPrice, lockInfo }
+   * @returns {Object} Order result with contractId
+   */
+  async executeOrderPlacement(preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, orderMeta = {}) {
+    const token = await tokenProvider.getServiceToken();
+    const operatorPartyId = config.canton.operatorPartyId;
+    
+    try {
+      console.log(`[OrderService] EXECUTE order placement for ${partyId.substring(0, 30)}...`);
+      
+      const partySignatures = {
+        signatures: [
+          {
+            party: partyId,
+            signatures: [{
+              format: 'SIGNATURE_FORMAT_RAW',
+              signature: signatureBase64,
+              signedBy: signedBy,
+              signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519'
+            }]
+          }
+        ]
+      };
+      
+      const result = await cantonService.executeInteractiveSubmission({
+        preparedTransaction,
+        partySignatures,
+        hashingSchemeVersion,
+      }, token);
+      
+      // Extract created contract ID from result
+      let contractId = null;
+      if (result.transaction?.events) {
+        const createdEvent = result.transaction.events.find(e => 
+          e.created?.templateId?.includes('Order') || 
+          e.CreatedEvent?.templateId?.includes('Order')
+        );
+        contractId = createdEvent?.created?.contractId || 
+                     createdEvent?.CreatedEvent?.contractId;
+      }
+      
+      if (!contractId) {
+        contractId = result.transaction?.updateId || result.updateId || `${orderMeta.orderId}-pending`;
+      }
+      
+      console.log(`[OrderService] ✅ Order placed via interactive submission: ${orderMeta.orderId} (${contractId?.substring(0, 20)}...)`);
+      
+      // Register in tracking systems
+      const orderRecord = {
+        contractId,
+        orderId: orderMeta.orderId,
+        owner: partyId,
+        tradingPair: orderMeta.tradingPair,
+        orderType: orderMeta.orderType,
+        orderMode: orderMeta.orderMode,
+        price: orderMeta.price,
+        stopPrice: orderMeta.stopPrice || null,
+        quantity: orderMeta.quantity,
+        filled: '0',
+        status: orderMeta.orderMode === 'STOP_LOSS' ? 'PENDING_TRIGGER' : 'OPEN',
+        timestamp: new Date().toISOString(),
+        lockId: null,
+        lockedAmount: orderMeta.lockInfo?.amount || '0',
+        lockedAsset: orderMeta.lockInfo?.asset || '',
+        allocationContractId: null,
+      };
+      
+      // Register in global open orders registry
+      if (orderRecord.status === 'OPEN') {
+        registerOpenOrders([orderRecord]);
+      }
+      
+      const updateStream = getUpdateStream();
+      if (updateStream) {
+        updateStream.addOrder(orderRecord);
+      }
+      
+      const readModel = getReadModelService();
+      if (readModel) {
+        readModel.addOrder({
+          ...orderRecord,
+          quantity: parseFloat(orderRecord.quantity),
+          filled: 0,
+          operator: operatorPartyId,
+        });
+      }
+      
+      // Broadcast via WebSocket
+      if (global.broadcastWebSocket && orderRecord.status === 'OPEN') {
+        global.broadcastWebSocket(`orderbook:${orderMeta.tradingPair}`, {
+          type: 'NEW_ORDER',
+          orderId: orderMeta.orderId,
+          contractId: contractId,
+          owner: partyId,
+          orderType: orderMeta.orderType,
+          orderMode: orderMeta.orderMode,
+          price: orderMeta.price,
+          quantity: orderMeta.quantity,
+          remaining: orderMeta.quantity,
+          tradingPair: orderMeta.tradingPair,
+          timestamp: new Date().toISOString()
+        });
+      }
+      
+      // Trigger matching engine for OPEN orders
+      if (orderRecord.status === 'OPEN') {
+        try {
+          const { getMatchingEngine } = require('./matching-engine');
+          const matchingEngine = getMatchingEngine();
+          if (matchingEngine) {
+            console.log(`[OrderService] Triggering matching for ${orderMeta.tradingPair}`);
+            matchingEngine.triggerMatchingCycle(orderMeta.tradingPair).catch(err => {
+              console.warn(`[OrderService] ⚠️ Matching cycle error: ${err.message}`);
+            });
+          }
+        } catch (matchErr) {
+          console.warn('[OrderService] Could not trigger matching:', matchErr.message);
+        }
+      }
+      
+      return {
+        success: true,
+        usedInteractiveSubmission: true,
+        orderId: orderMeta.orderId,
+        contractId,
+        status: orderRecord.status,
+        tradingPair: orderMeta.tradingPair,
+        orderType: orderMeta.orderType,
+        orderMode: orderMeta.orderMode,
+        price: orderMeta.price,
+        stopPrice: orderMeta.stopPrice || null,
+        quantity: orderMeta.quantity,
+        filled: '0',
+        remaining: orderMeta.quantity,
+        timestamp: new Date().toISOString()
+      };
+      
+    } catch (error) {
+      console.error('[OrderService] Failed to execute order placement:', error.message);
+      
+      // Release reservation on failure
+      if (orderMeta.orderId) {
+        removeReservation(orderMeta.orderId);
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Cancel order: cancels the Allocation (releases locked funds),
    * then exercises CancelOrder on Canton to archive the Order contract.
    */
@@ -806,7 +1013,47 @@ class OrderService {
     }
 
     // Exercise CancelOrder choice on the Order contract
+    // CancelOrder is controlled by "owner" — external parties need interactive submission
+    const isExternalParty = partyId.startsWith('ext-') || partyId.includes('external');
     let result;
+    
+    if (isExternalParty) {
+      // ═══ EXTERNAL PARTY: Prepare for interactive signing ═══
+      console.log(`[OrderService] External party detected — preparing CancelOrder for interactive signing`);
+      
+      const prepareResult = await cantonService.prepareInteractiveSubmission({
+        token,
+        actAsParty: [partyId],
+        templateId: `${packageId}:Order:Order`,
+        contractId: orderContractId,
+        choice: 'CancelOrder',
+        choiceArgument: {},
+        readAs: [operatorPartyId, partyId],
+      });
+      
+      if (!prepareResult.preparedTransaction || !prepareResult.preparedTransactionHash) {
+        throw new Error('Prepare returned incomplete result for CancelOrder');
+      }
+      
+      console.log(`[OrderService] ✅ CancelOrder prepared. Hash to sign: ${prepareResult.preparedTransactionHash.substring(0, 40)}...`);
+      
+      // Return the prepared transaction for the frontend to sign
+      return {
+        requiresSignature: true,
+        step: 'PREPARED',
+        action: 'CANCEL',
+        orderContractId,
+        orderId: orderDetails?.orderId,
+        tradingPair: orderDetails?.tradingPair || tradingPair,
+        preparedTransaction: prepareResult.preparedTransaction,
+        preparedTransactionHash: prepareResult.preparedTransactionHash,
+        hashingSchemeVersion: prepareResult.hashingSchemeVersion,
+        partyId,
+        orderDetails,
+      };
+    }
+    
+    // ═══ INTERNAL PARTY: Direct submission ═══
     try {
       result = await cantonService.exerciseChoice({
         token,
@@ -916,6 +1163,95 @@ class OrderService {
     userAccountContractId = null
   ) {
     return this.cancelOrder(orderContractId, partyId);
+  }
+
+  /**
+   * STEP 2: Execute a prepared order cancellation with the user's signature
+   * 
+   * Called after the frontend signs the preparedTransactionHash from cancelOrder()
+   * 
+   * @param {string} preparedTransaction - Opaque blob from prepare step
+   * @param {string} partyId - The external party that signed
+   * @param {string} signatureBase64 - User's Ed25519 signature
+   * @param {string} signedBy - Public key fingerprint
+   * @param {string|number} hashingSchemeVersion - From prepare response
+   * @param {object} cancelMeta - { orderContractId, orderId, tradingPair, orderDetails }
+   * @returns {Object} Cancellation result
+   */
+  async executeOrderCancel(preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, cancelMeta = {}) {
+    const token = await tokenProvider.getServiceToken();
+    const operatorPartyId = config.canton.operatorPartyId;
+    
+    try {
+      console.log(`[OrderService] EXECUTE order cancel for ${partyId.substring(0, 30)}...`);
+      
+      const partySignatures = {
+        signatures: [
+          {
+            party: partyId,
+            signatures: [{
+              format: 'SIGNATURE_FORMAT_RAW',
+              signature: signatureBase64,
+              signedBy: signedBy,
+              signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519'
+            }]
+          }
+        ]
+      };
+      
+      const result = await cantonService.executeInteractiveSubmission({
+        preparedTransaction,
+        partySignatures,
+        hashingSchemeVersion,
+      }, token);
+      
+      console.log(`[OrderService] ✅ Order cancelled via interactive submission: ${cancelMeta.orderContractId?.substring(0, 20)}...`);
+      
+      // Release balance reservation
+      if (cancelMeta.orderId) {
+        releaseReservation(cancelMeta.orderId);
+      }
+      
+      // Remove from tracking systems
+      const updateStream = getUpdateStream();
+      if (updateStream) {
+        updateStream.removeOrder(cancelMeta.orderContractId);
+      }
+      
+      const readModel = getReadModelService();
+      if (readModel) {
+        readModel.removeOrder(cancelMeta.orderContractId);
+      }
+      
+      // Unregister from global registry
+      if (cancelMeta.orderContractId) {
+        _globalOpenOrders.delete(cancelMeta.orderContractId);
+      }
+      
+      // Broadcast via WebSocket
+      if (global.broadcastWebSocket && cancelMeta.tradingPair) {
+        global.broadcastWebSocket(`orderbook:${cancelMeta.tradingPair}`, {
+          type: 'ORDER_CANCELLED',
+          contractId: cancelMeta.orderContractId,
+          orderId: cancelMeta.orderId,
+          tradingPair: cancelMeta.tradingPair,
+          timestamp: new Date().toISOString()
+        });
+      }
+      
+      return {
+        success: true,
+        usedInteractiveSubmission: true,
+        cancelled: true,
+        orderContractId: cancelMeta.orderContractId,
+        orderId: cancelMeta.orderId,
+        tradingPair: cancelMeta.tradingPair,
+      };
+      
+    } catch (error) {
+      console.error('[OrderService] Failed to execute order cancel:', error.message);
+      throw error;
+    }
   }
 
   /**

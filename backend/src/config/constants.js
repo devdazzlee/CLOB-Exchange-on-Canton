@@ -70,7 +70,7 @@ const AMULET_PACKAGE_ID = process.env.AMULET_PACKAGE_ID ||
  * v2.1.0 changes: FillOrder choice now has Optional newAllocationCid
  * for partial fill allocation tracking (DvP settlement)
  */
-const TOKEN_STANDARD_PACKAGE_ID = process.env.TOKEN_STANDARD_PACKAGE_ID || '273cbc0098ac95a8f355998d808688ebca6c0a80ee2f494c7f737b6a66ea15b7';
+const TOKEN_STANDARD_PACKAGE_ID = process.env.TOKEN_STANDARD_PACKAGE_ID || '8f68102fce27f5a9ac2a34cf44882ab5cb7fa8d2c45d4873b2bbaf7de35c2371';
 
 /**
  * Legacy Package (clob-exchange v1.0.0)
@@ -113,7 +113,7 @@ const TEMPLATE_IDS = {
   spliceTransferInstruction: `#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction`,
   spliceTransferInstructionInterfaceId: '#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction',
   
-  // Custom Token Standard Templates (clob-wolfedge-tokens v2.2.0)
+  // Custom Token Standard Templates (clob-wolfedge-tokens v2.3.0 — with Archive choices)
   instrument: `${TOKEN_STANDARD_PACKAGE_ID}:Instrument:Instrument`,
   tradingPair: `${TOKEN_STANDARD_PACKAGE_ID}:Instrument:TradingPair`,
   holding: `${TOKEN_STANDARD_PACKAGE_ID}:Holding:Holding`,
