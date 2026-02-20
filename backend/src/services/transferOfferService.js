@@ -206,6 +206,19 @@ class TransferOfferService {
         console.log(`[TransferOfferService] Template hint: ${templateId.substring(0, 60)}...`);
       }
       
+      // ─── Resolve operator party ────────────────────────────────────────────────
+      // The operator party is needed in actAs because the service token has canActAs
+      // rights for the operator, and the operator hosts external parties.
+      const operatorPartyId = config.canton.operatorPartyId;
+      const synchronizerId = config.canton.synchronizerId;
+      
+      // Build actAs list: receiver (user) + operator (validator/exchange)
+      const actAsParties = [partyId];
+      if (operatorPartyId && operatorPartyId !== partyId) {
+        actAsParties.push(operatorPartyId);
+      }
+      console.log(`[TransferOfferService] actAs parties: [${actAsParties.map(p => p.substring(0, 30) + '...').join(', ')}]`);
+      
       // ─── Detect token type from template ID ────────────────────────────────────
       // Utility.Registry.App → CBTC (Utilities token)
       // Splice.Amulet → CC (Amulet/Splice token)
@@ -251,7 +264,7 @@ class TransferOfferService {
           `${backendUrl}/v0/registrars/${encodeURIComponent(adminParty)}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`,
           // Pattern 2: Without encoding admin party
           `${backendUrl}/v0/registrars/${adminParty}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`,
-          // Pattern 3: Scan Proxy registry endpoint
+          // Pattern 3: Scan Proxy registry endpoint (requires POST)
           `${scanProxyBase}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`,
           // Pattern 4: Validator API direct accept
           `${scanProxyBase}/api/validator/v0/wallet/transfer-offers/${encodedCid}/accept`,
@@ -261,26 +274,17 @@ class TransferOfferService {
           try {
             console.log(`[TransferOfferService] Trying: ${acceptContextUrl.substring(0, 120)}...`);
             
-            // Scan proxy registry endpoints only support GET (POST returns 405).
-            // Backend/Validator wallet endpoints support POST.
-            const isScanProxy = acceptContextUrl.startsWith(scanProxyBase) && !acceptContextUrl.includes('/wallet/');
-            const fetchOpts = isScanProxy
-              ? {
-                  method: 'GET',
-                  headers: {
-                    'Authorization': `Bearer ${adminToken}`,
-                    'Accept': 'application/json',
-                  },
-                }
-              : {
-                  method: 'POST',
-                  headers: {
-                    'Authorization': `Bearer ${adminToken}`,
-                    'Content-Type': 'application/json',
-                    'Accept': 'application/json',
-                  },
-                  body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
-                };
+            // All choice-context endpoints use POST.
+            // Only validator wallet direct-accept uses POST with different body.
+            const fetchOpts = {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${adminToken}`,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+              },
+              body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
+            };
             
             const contextResponse = await fetch(acceptContextUrl, fetchOpts);
             
@@ -295,14 +299,11 @@ class TransferOfferService {
               
               console.log(`[TransferOfferService] ✅ Got accept context (${acceptContext.disclosedContracts?.length || 0} disclosed contracts)`);
               
-              // Default synchronizerId from config (REQUIRED by Canton JSON API v2)
-              const defaultSyncId = config.canton.synchronizerId;
-              
               const disclosedContracts = (acceptContext.disclosedContracts || []).map(dc => ({
                 templateId: dc.templateId,
                 contractId: dc.contractId,
                 createdEventBlob: dc.createdEventBlob,
-                synchronizerId: dc.synchronizerId || defaultSyncId,
+                synchronizerId: dc.synchronizerId || synchronizerId,
               }));
               
               const choiceContextData = acceptContext.choiceContextData || acceptContext.choiceContext?.choiceContextData || { values: {} };
@@ -319,9 +320,10 @@ class TransferOfferService {
                     meta: { values: {} },
                   },
                 },
-                actAsParty: [partyId],
+                actAsParty: actAsParties,
+                readAs: actAsParties,
                 disclosedContracts,
-                synchronizerId: defaultSyncId,
+                synchronizerId,
               });
               
               console.log('[TransferOfferService] ✅ Transfer accepted via Utilities Backend API!');
@@ -338,9 +340,6 @@ class TransferOfferService {
       }
       
       // ─── Approach 3: Scan Proxy API (for CC/Amulet) ────────────────────────────
-      // NOTE: /api/validator/v0/scan-proxy/ prefix only supports GET (registry lookups),
-      //       NOT POST (choice-contexts). Using POST returns 405 Method Not Allowed.
-      //       Only use the direct registry path which supports POST for choice-contexts.
       if (detectedSymbol === 'CC' || !detectedSymbol) {
         const scanProxyBase = SCAN_PROXY_API || 'http://65.108.40.104:8088';
         
@@ -352,13 +351,15 @@ class TransferOfferService {
           try {
             console.log(`[TransferOfferService] Trying Scan Proxy: ${acceptUrl.substring(0, 80)}...`);
             
-            // Scan proxy registry endpoints only support GET (POST returns 405 Method Not Allowed)
+            // Registry choice-context endpoints require POST
             const contextResponse = await fetch(acceptUrl, {
-              method: 'GET',
+              method: 'POST',
               headers: {
                 'Authorization': `Bearer ${adminToken}`,
+                'Content-Type': 'application/json',
                 'Accept': 'application/json',
               },
+              body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
             });
             
             if (!contextResponse.ok) {
@@ -370,12 +371,11 @@ class TransferOfferService {
             const contextData = await contextResponse.json();
             console.log(`[TransferOfferService] ✅ Got choice context (${contextData.disclosedContracts?.length || 0} disclosed contracts)`);
             
-            const defaultSyncId2 = config.canton.synchronizerId;
             const disclosedContracts = (contextData.disclosedContracts || []).map(dc => ({
               templateId: dc.templateId,
               contractId: dc.contractId,
               createdEventBlob: dc.createdEventBlob,
-              synchronizerId: dc.synchronizerId || defaultSyncId2,
+              synchronizerId: dc.synchronizerId || synchronizerId,
             }));
             
             const choiceContextData = contextData.choiceContextData || contextData.choiceContext?.choiceContextData || { values: {} };
@@ -391,9 +391,10 @@ class TransferOfferService {
                   meta: { values: {} },
                 },
               },
-              actAsParty: [partyId],
+              actAsParty: actAsParties,
+              readAs: actAsParties,
               disclosedContracts,
-              synchronizerId: defaultSyncId2,
+              synchronizerId,
             });
             
             console.log('[TransferOfferService] ✅ Transfer accepted via Scan Proxy!');

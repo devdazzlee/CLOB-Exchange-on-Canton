@@ -801,7 +801,7 @@ class CantonSDKClient {
 
     // Fallback: Get accept choice context from registry API, then exercise directly
     const registryBase = this._getRegistryBaseUrl(tokenType);
-    const acceptContextUrl = `${registryBase}/registry/transfer-instructions/v1/${encodeURIComponent(transferInstructionCid)}/choice-contexts/accept`;
+    const acceptContextUrl = `${registryBase}/registry/transfer-instruction/v1/${encodeURIComponent(transferInstructionCid)}/choice-contexts/accept`;
 
     console.log(`[CantonSDK]    Trying registry accept context: ${acceptContextUrl.substring(0, 100)}...`);
 
