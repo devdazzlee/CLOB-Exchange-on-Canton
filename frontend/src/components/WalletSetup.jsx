@@ -163,10 +163,13 @@ export default function WalletSetup({ onWalletReady }) {
 
       console.log('[WalletSetup] Party allocated:', result);
 
-      // 5. Store party ID
+      // 5. Store party ID and key fingerprint (needed for interactive signing)
       const allocatedPartyId = result.partyId;
       setPartyId(allocatedPartyId);
       localStorage.setItem('canton_party_id', allocatedPartyId);
+      if (topology.publicKeyFingerprint) {
+        localStorage.setItem('canton_key_fingerprint', topology.publicKeyFingerprint);
+      }
 
       setStep('ready');
       if (onWalletReady) {
@@ -235,10 +238,13 @@ export default function WalletSetup({ onWalletReady }) {
 
       console.log('[WalletSetup] Party allocated:', result);
 
-      // 5. Store party ID
+      // 5. Store party ID and key fingerprint (needed for interactive signing)
       const allocatedPartyId = result.partyId;
       setPartyId(allocatedPartyId);
       localStorage.setItem('canton_party_id', allocatedPartyId);
+      if (topology.publicKeyFingerprint) {
+        localStorage.setItem('canton_key_fingerprint', topology.publicKeyFingerprint);
+      }
 
       setStep('ready');
       if (onWalletReady) {
@@ -301,10 +307,13 @@ export default function WalletSetup({ onWalletReady }) {
 
       console.log('[WalletSetup] Party allocated:', result);
 
-      // 4. Store party ID
+      // 4. Store party ID and key fingerprint (needed for interactive signing)
       const allocatedPartyId = result.partyId;
       setPartyId(allocatedPartyId);
       localStorage.setItem('canton_party_id', allocatedPartyId);
+      if (topologyData.publicKeyFingerprint) {
+        localStorage.setItem('canton_key_fingerprint', topologyData.publicKeyFingerprint);
+      }
 
       setShowUnlockModal(false);
       setStep('ready');

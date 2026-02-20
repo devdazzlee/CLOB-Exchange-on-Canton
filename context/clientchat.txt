@@ -271,3 +271,30 @@ Exactly, but while we will be deploying the stopp loss feature, it will disrupt 
 [2:01 PM, 2/17/2026] +971 58 590 3850: The transfer of tokens in the proper way was supposed to be completed in milestone 2, as that’s the basic but most important functionality of a clob after match making engine. If it’s even not completed yet, how will we feel confident that it will be done in milestone?
 [2:01 PM, 2/17/2026] +971 58 590 3850: We were told multiple times that it’s already done. Only during our testing we find out each time that it isn’t.
 [2:06 PM, 2/17/2026] Konain Bhai: I am not sure how to elaborate and explain the issues we might face but right now for us the best resolution is that we implement all the deployment at once which includes 4th milestone too. We are doing that today and then we’ll proceed to the bug fixing part.
+
+
+[4:42 PM, 2/20/2026] +91 79903 24401: @AHMED, we are using internal parties in the app, we need to shift to external parties.
+Internal parties are created from the same namespace keys and hence can be controlled by the validator. External parties are created by private keys outside the validator, ensuring that the user has all the control, every transaction submitted will require signature from this private key which ensure that the transaction was submitted with the authorithy of the owning user
+[4:45 PM, 2/20/2026] +91 79903 24401: Please ensure the created party have “Confirmation” permission
+[5:04 PM, 2/20/2026] AHMED: Please ensure the created party have “Confirmation” permission
+Ok
+[5:04 PM, 2/20/2026] AHMED: Also share your wallet id
+?
+[5:15 PM, 2/20/2026] +91 79903 24401: external-wallet-user-cadd0aa928c2a0cf::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292
+[6:29 PM, 2/20/2026] AHMED: @~huz The issue is that the orderbook can't see them due to the 200-element limit on the 273cbc package.
+[7:08 PM, 2/20/2026] AHMED: Hey @~huz ,
+The orderbook issue is fixed. The problem was a Canton API query limit when there are 200+ Order contracts (including old filled ones), the API blocks the response. I've added user-specific queries that bypass this limit, so your orders will now show up correctly in the orderbook. Please refresh and check.
+
+Also just a heads up  on Canton, every order stays as an active contract on the ledger even after it's FILLED or CANCELLED. Right now there are 200+ old Order contracts sitting there. Would be good to archive the old filled/cancelled ones when you get a chance, just to keep things clean.
+[7:09 PM, 2/20/2026] +971 58 590 3850: Are these with external party id now?
+[10:21 PM, 2/20/2026] +91 79903 24401: Hey @~huz ,
+The orderbook issue is fixed. The problem was a Canton API query limit when there are 200+ Order contracts (including old filled ones), the API blocks the response. I've added user-specific queries that bypass this limit, so your orders will now show up correctly in the orderbook. Please refresh and check.
+
+Also just a heads up  on Canton, every order stays as an active contract on the ledger even after it's FILLED or CANCELLED. Right now there are 200+ old Order contracts sitting there. Would be good to archive the old filled/cancelled ones when you get a chance, just to keep things clean.
+@AHMED In production the 200 limit will reach very soon, we need to use ledger-api or web sockets to get stream of data. Also we need to optimise the daml choices in such a way that only useful contracts are in active set and rest are archived…
+[10:42 PM, 2/20/2026] AHMED: Are these with external party id now?
+Yes
+[10:46 PM, 2/20/2026] AHMED: @AHMED In production the 200 limit will reach very soon, we need to use ledger-api or web sockets to get stream of data. Also we need to optimise the daml choices in such a way that only useful contracts are in active set and rest are archived…
+Ok
+[10:46 PM, 2/20/2026] AHMED: I have switch from internal to external party
+[10:47 PM, 2/20/2026] AHMED: Just few changes remain I'm working then I'll push my changes

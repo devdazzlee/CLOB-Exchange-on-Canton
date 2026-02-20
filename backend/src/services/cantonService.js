@@ -1444,7 +1444,12 @@ class CantonService {
    * Prepare interactive submission
    * POST /v2/interactive-submission/prepare
    * 
-   * Correct JSON Ledger API v2 structure with top-level "commands" object
+   * For external parties with Confirmation permission, every transaction must be:
+   * 1. Prepared (returns hash for the external party to sign)
+   * 2. Signed by the external party's private key (browser-side)
+   * 3. Executed with the signature
+   * 
+   * This replaces submitAndWaitForTransaction when any actAs party is external.
    */
   async prepareInteractiveSubmission({
     token,
@@ -1453,7 +1458,10 @@ class CantonService {
     contractId,
     choice,
     choiceArgument = {},
-    synchronizerId = null
+    readAs = [],
+    synchronizerId = null,
+    disclosedContracts = null,
+    verboseHashing = false
   }) {
     const url = `${this.jsonApiBase}/v2/interactive-submission/prepare`;
     const actAs = Array.isArray(actAsParty) ? actAsParty : [actAsParty];
@@ -1461,25 +1469,44 @@ class CantonService {
     // Convert templateId to string format (required by JSON Ledger API v2)
     const templateIdString = templateIdToString(templateId);
 
-    // Build correct v2 API structure with top-level "commands" object
-    // NOTE: synchronizerId is NOT a valid field in prepare-interactive-submission
+    // Resolve synchronizerId — use passed value, or fall back to config default
+    const effectiveSyncId = synchronizerId || this.synchronizerId;
+
+    // Normalize disclosed contracts (ensure synchronizerId is present)
+    let normalizedDisclosed = null;
+    if (disclosedContracts && disclosedContracts.length > 0) {
+      normalizedDisclosed = disclosedContracts.map(dc => ({
+        ...dc,
+        synchronizerId: dc.synchronizerId || effectiveSyncId,
+      }));
+    }
+
+    // Build FLAT request body for /v2/interactive-submission/prepare
+    // IMPORTANT: This endpoint uses a FLAT structure (NOT the nested "commands" wrapper
+    // that submit-and-wait-for-transaction uses). All fields are at the root level.
     // CRITICAL: Use "ExerciseCommand" (capitalized) not "exercise" per JSON Ledger API v2 spec
+    const readAsList = Array.isArray(readAs) ? readAs : (readAs ? [readAs] : []);
     const body = {
-      commands: {
-        commandId: `cmd-prep-${crypto.randomUUID()}`,
-        actAs,
-        commands: [{
-          ExerciseCommand: {
-            templateId: templateIdString,
-            contractId,
-            choice,
-            choiceArgument
-          }
-        }]
-      }
+      commandId: `cmd-prep-${crypto.randomUUID()}`,
+      actAs,
+      ...(readAsList.length > 0 && { readAs: readAsList }),
+      synchronizerId: effectiveSyncId,
+      commands: [{
+        ExerciseCommand: {
+          templateId: templateIdString,
+          contractId,
+          choice,
+          choiceArgument
+        }
+      }],
+      ...(normalizedDisclosed && { disclosedContracts: normalizedDisclosed }),
+      packageIdSelectionPreference: [],
+      verboseHashing
     };
 
     console.log(`[CantonService] POST ${url}`);
+    console.log(`[CantonService] Prepare request actAs:`, actAs.map(p => p.substring(0, 30) + '...'));
+    console.log(`[CantonService] Prepare request body:`, JSON.stringify(body, null, 2));
 
     const res = await fetch(url, {
       method: "POST",
@@ -1494,25 +1521,69 @@ class CantonService {
 
     if (!res.ok) {
       const error = parseCantonError(text, res.status);
+      console.error(`[CantonService] ❌ Prepare failed:`, error);
       throw new Error(`Prepare failed: ${error.message}`);
     }
 
-    return JSON.parse(text);
+    const result = JSON.parse(text);
+    console.log(`[CantonService] ✅ Prepare succeeded, hashToSign length: ${result.preparedTransactionHash?.length || 0}`);
+    console.log(`[CantonService] Prepare response keys:`, Object.keys(result));
+    if (result.hashingSchemeVersion !== undefined) {
+      console.log(`[CantonService] hashingSchemeVersion: ${result.hashingSchemeVersion}`);
+    }
+    return result;
   }
 
   /**
-   * Execute interactive submission
+   * Execute interactive submission with external party signatures
    * POST /v2/interactive-submission/execute
+   * 
+   * Uses FLAT request body per Canton OpenAPI spec (JsExecuteSubmissionRequest).
+   * Required fields: preparedTransaction, submissionId, hashingSchemeVersion,
+   *                  deduplicationPeriod, partySignatures
+   * 
+   * deduplicationPeriod is a tagged union (oneOf):
+   *   { "DeduplicationDuration": { "value": { "seconds": N, "nanos": 0 } } }
+   *   { "DeduplicationOffset": { "value": offsetInt } }
+   *   { "Empty": {} }
+   * 
+   * partySignatures is:
+   *   { "signatures": [ { "party": "...", "signatures": [ { format, signature, signedBy, signingAlgorithmSpec } ] } ] }
+   * 
+   * @param {Object} params
+   * @param {string} params.preparedTransaction - Base64 opaque blob from prepare step
+   * @param {Object} params.partySignatures - { signatures: [{ party, signatures: [{ format, signature, signedBy, signingAlgorithmSpec }] }] }
+   * @param {string} params.hashingSchemeVersion - From prepare response (e.g. "HASHING_SCHEME_VERSION_V2")
+   * @param {string} params.submissionId - Unique submission ID
+   * @param {Object} params.deduplicationPeriod - Tagged union deduplication config
+   * @param {string} token - Bearer token
    */
-  async executeInteractiveSubmission({ preparedTransaction, signatures }, token) {
+  async executeInteractiveSubmission({
+    preparedTransaction,
+    partySignatures,
+    hashingSchemeVersion = "HASHING_SCHEME_VERSION_V2",
+    submissionId = null,
+    deduplicationPeriod = null
+  }, token) {
     const url = `${this.jsonApiBase}/v2/interactive-submission/execute`;
 
+    // Build FLAT request body per Canton OpenAPI spec (JsExecuteSubmissionRequest)
+    // deduplicationPeriod MUST use PascalCase tagged union format per OpenAPI spec:
+    //   { "DeduplicationDuration": { "value": { "seconds": N, "nanos": 0 } } }
     const body = {
       preparedTransaction,
-      signatures
+      submissionId: submissionId || `submit-exec-${crypto.randomUUID()}`,
+      hashingSchemeVersion: String(hashingSchemeVersion),
+      deduplicationPeriod: deduplicationPeriod || {
+        DeduplicationDuration: {
+          value: { seconds: 600, nanos: 0 }   // 10 minutes default
+        }
+      },
+      partySignatures
     };
 
     console.log(`[CantonService] POST ${url}`);
+    console.log(`[CantonService] Execute request body:`, JSON.stringify(body, null, 2));
 
     const res = await fetch(url, {
       method: "POST",
@@ -1527,10 +1598,13 @@ class CantonService {
 
     if (!res.ok) {
       const error = parseCantonError(text, res.status);
+      console.error(`[CantonService] ❌ Execute failed:`, error);
       throw new Error(`Execute failed: ${error.message}`);
     }
 
-    return JSON.parse(text);
+    const result = JSON.parse(text);
+    console.log(`[CantonService] ✅ Execute succeeded, updateId: ${result.transaction?.updateId || 'unknown'}`);
+    return result;
   }
 
   // ==========================================================================

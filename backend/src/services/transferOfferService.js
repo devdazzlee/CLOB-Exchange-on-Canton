@@ -182,18 +182,225 @@ class TransferOfferService {
   }
 
   /**
-   * Accept a transfer offer (Splice Token Standard TransferInstruction)
+   * STEP 1: Prepare transfer accept for interactive signing (external parties)
    * 
-   * Uses a cascading approach:
-   * 1. Canton SDK client (uses the Transfer Factory Registry via SDK)
-   * 2. Direct Scan Proxy API (local validator at http://65.108.40.104:8088)
-   * 3. Legacy external Registry Backend API (fallback)
+   * External parties with Confirmation permission require interactive submission:
+   * 1. Backend PREPARES the transaction → returns hash to sign
+   * 2. Frontend SIGNS the hash with user's Ed25519 private key
+   * 3. Backend EXECUTES with the user's signature
+   * 
+   * @param {string} offerContractId - The transfer offer contract ID
+   * @param {string} partyId - The external party accepting the offer
+   * @param {string} token - Admin/service token
+   * @param {string} templateId - Optional template ID hint
+   * @returns {Object} { preparedTransaction, preparedTransactionHash, choiceContextData, ... }
+   */
+  async prepareTransferAccept(offerContractId, partyId, token, templateId = null) {
+    await this.initialize();
+    
+    const TRANSFER_INSTRUCTION_INTERFACE = '#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction';
+    
+    try {
+      console.log(`[TransferOfferService] PREPARE transfer accept: ${offerContractId.substring(0, 30)}... for ${partyId.substring(0, 30)}...`);
+      
+      const operatorPartyId = config.canton.operatorPartyId;
+      const synchronizerId = config.canton.synchronizerId;
+      const adminToken = token || await tokenProvider.getServiceToken();
+      
+      // ─── Interactive submission: actAs must ONLY contain the external party ────
+      // In Canton's interactive submission flow, ALL actAs parties must provide
+      // external signatures. The operator is an internal party (participant-hosted)
+      // so it CANNOT provide an external signature.
+      //
+      // The operator's authorization comes from being a signatory on the
+      // TransferInstruction contract — it doesn't need to be in actAs.
+      // The TransferInstruction_Accept choice is controlled by the receiver only.
+      //
+      // readAs includes both parties so the command can read operator-visible contracts.
+      const actAsParties = [partyId];  // Only the external party (signer)
+      const readAsParties = [partyId];
+      if (operatorPartyId && operatorPartyId !== partyId) {
+        readAsParties.push(operatorPartyId);
+      }
+      
+      console.log(`[TransferOfferService] actAs: [${actAsParties.map(p => p.substring(0, 30) + '...').join(', ')}]`);
+      console.log(`[TransferOfferService] readAs: [${readAsParties.map(p => p.substring(0, 30) + '...').join(', ')}]`);
+      
+      // ─── Get choice context (disclosed contracts) ──────────────────────────────
+      const { disclosedContracts, choiceContextData } = await this._getAcceptChoiceContext(
+        offerContractId, adminToken, synchronizerId
+      );
+      
+      const utilitiesInterface = UTILITIES_CONFIG.TRANSFER_INSTRUCTION_INTERFACE || TRANSFER_INSTRUCTION_INTERFACE;
+      
+      // ─── Prepare interactive submission ─────────────────────────────────────────
+      console.log(`[TransferOfferService] Preparing interactive submission for external party...`);
+      
+      const prepareResult = await this.cantonService.prepareInteractiveSubmission({
+        token: adminToken,
+        actAsParty: actAsParties,
+        templateId: utilitiesInterface,
+        contractId: offerContractId,
+        choice: 'TransferInstruction_Accept',
+        choiceArgument: {
+          extraArgs: {
+            context: choiceContextData,
+            meta: { values: {} },
+          },
+        },
+        readAs: readAsParties,
+        disclosedContracts,
+        synchronizerId,
+        verboseHashing: false
+      });
+      
+      if (!prepareResult.preparedTransaction || !prepareResult.preparedTransactionHash) {
+        throw new Error('Prepare returned incomplete result: missing preparedTransaction or preparedTransactionHash');
+      }
+      
+      console.log(`[TransferOfferService] ✅ Transaction prepared. Hash to sign: ${prepareResult.preparedTransactionHash.substring(0, 40)}...`);
+      
+      return {
+        success: true,
+        step: 'PREPARED',
+        preparedTransaction: prepareResult.preparedTransaction,
+        preparedTransactionHash: prepareResult.preparedTransactionHash,
+        hashingSchemeVersion: prepareResult.hashingSchemeVersion,
+        hashingDetails: prepareResult.hashingDetails || null,
+        offerContractId,
+        partyId,
+        actAsParties,
+      };
+      
+    } catch (error) {
+      console.error('[TransferOfferService] Failed to prepare transfer accept:', error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * STEP 2: Execute prepared transfer accept with user's signature
+   * 
+   * @param {string} preparedTransaction - Opaque blob from prepare step
+   * @param {string} partyId - The external party that signed the hash
+   * @param {string} signatureBase64 - User's Ed25519 signature of preparedTransactionHash
+   * @param {string} signedBy - Public key fingerprint that signed
+   * @param {string} token - Admin/service token
+   * @param {string|number} hashingSchemeVersion - From prepare response
+   * @returns {Object} Transaction result
+   */
+  async executeTransferAccept(preparedTransaction, partyId, signatureBase64, signedBy, token, hashingSchemeVersion = 1) {
+    await this.initialize();
+    
+    try {
+      console.log(`[TransferOfferService] EXECUTE transfer accept for ${partyId.substring(0, 30)}...`);
+      
+      const adminToken = token || await tokenProvider.getServiceToken();
+      
+      // Build partySignatures in Canton's FLAT format:
+      // partySignatures.signatures is an ARRAY of { party, signatures: [...] }
+      const partySignatures = {
+        signatures: [
+          {
+            party: partyId,
+            signatures: [{
+              format: 'SIGNATURE_FORMAT_RAW',
+              signature: signatureBase64,
+              signedBy: signedBy,
+              signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519'
+            }]
+          }
+        ]
+      };
+      
+      console.log(`[TransferOfferService] Executing with signature from party: ${partyId.substring(0, 30)}...`);
+      
+      const result = await this.cantonService.executeInteractiveSubmission({
+        preparedTransaction,
+        partySignatures,
+        hashingSchemeVersion,
+      }, adminToken);
+      
+      console.log('[TransferOfferService] ✅ Transfer accepted via interactive submission!');
+      return { success: true, usedInteractiveSubmission: true, result };
+      
+    } catch (error) {
+      console.error('[TransferOfferService] Failed to execute transfer accept:', error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Helper: Get accept choice context (disclosed contracts + choice context data)
+   * Tries multiple URL patterns for the Registry/Utilities Backend API
+   */
+  async _getAcceptChoiceContext(offerContractId, adminToken, synchronizerId) {
+    const backendUrl = UTILITIES_CONFIG.BACKEND_URL;
+    const adminParty = UTILITIES_CONFIG.CBTC_ADMIN_PARTY;
+    const encodedCid = encodeURIComponent(offerContractId);
+    const scanProxyBase = SCAN_PROXY_API || 'http://65.108.40.104:8088';
+    
+    const urlPatterns = [
+      `${backendUrl}/v0/registrars/${encodeURIComponent(adminParty)}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`,
+      `${backendUrl}/v0/registrars/${adminParty}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`,
+      `${scanProxyBase}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`,
+    ];
+    
+    for (const acceptContextUrl of urlPatterns) {
+      try {
+        console.log(`[TransferOfferService] Getting choice context: ${acceptContextUrl.substring(0, 120)}...`);
+        
+        const contextResponse = await fetch(acceptContextUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${adminToken}`,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
+        });
+        
+        if (contextResponse.ok) {
+          const acceptContext = await contextResponse.json();
+          console.log(`[TransferOfferService] ✅ Got accept context (${acceptContext.disclosedContracts?.length || 0} disclosed contracts)`);
+          
+          const disclosedContracts = (acceptContext.disclosedContracts || []).map(dc => ({
+            templateId: dc.templateId,
+            contractId: dc.contractId,
+            createdEventBlob: dc.createdEventBlob,
+            synchronizerId: dc.synchronizerId || synchronizerId,
+          }));
+          
+          const choiceContextData = acceptContext.choiceContextData || acceptContext.choiceContext?.choiceContextData || { values: {} };
+          
+          return { disclosedContracts, choiceContextData };
+        } else {
+          const errorText = await contextResponse.text();
+          console.log(`[TransferOfferService] ${contextResponse.status}: ${errorText.substring(0, 150)}`);
+        }
+      } catch (err) {
+        console.log(`[TransferOfferService] Failed: ${(err?.message || String(err)).substring(0, 120)}`);
+      }
+    }
+    
+    throw new Error(
+      'Could not get accept choice context. The transfer offer may have expired or the registry is unavailable.'
+    );
+  }
+
+  /**
+   * Accept a transfer offer (legacy single-step for internal parties OR 2-step interactive for external)
+   * 
+   * For EXTERNAL parties: Uses interactive submission (prepare → sign → execute)
+   * For INTERNAL parties: Uses direct exerciseChoice (deprecated path)
+   * 
+   * This method now defaults to interactive submission flow.
    * 
    * @param {string} offerContractId - The transfer offer contract ID
    * @param {string} partyId - The party accepting the offer
    * @param {string} token - Admin token
    * @param {string} templateId - Optional template ID (if known)
-   * @returns {Object} Result of accepting the offer
+   * @returns {Object} For external parties: { requiresSignature, preparedTransaction, ... }
    */
   async acceptTransferOffer(offerContractId, partyId, token, templateId = null) {
     await this.initialize();
@@ -206,107 +413,63 @@ class TransferOfferService {
         console.log(`[TransferOfferService] Template hint: ${templateId.substring(0, 60)}...`);
       }
       
-      // ─── Resolve operator party ────────────────────────────────────────────────
-      // The operator party is needed in actAs because the service token has canActAs
-      // rights for the operator, and the operator hosts external parties.
       const operatorPartyId = config.canton.operatorPartyId;
       const synchronizerId = config.canton.synchronizerId;
       
-      // Build actAs list: receiver (user) + operator (validator/exchange)
+      // ─── External party detection ─────────────────────────────────────────────
+      // External parties (with Confirmation permission) require interactive submission.
+      // They typically start with "ext-" prefix (from onboarding-service.js generatePartyHint).
+      const isExternalParty = partyId.startsWith('ext-');
+      
+      if (isExternalParty) {
+        console.log(`[TransferOfferService] External party detected — using interactive submission (2-step flow)`);
+        console.log(`[TransferOfferService] Frontend must call /prepare-accept then /execute-accept with user signature`);
+        
+        // Return a marker telling the caller (route handler) that interactive submission is needed
+        // The route handler should respond with requiresSignature: true
+        const prepareResult = await this.prepareTransferAccept(offerContractId, partyId, token, templateId);
+        return {
+          ...prepareResult,
+          requiresSignature: true,
+        };
+      }
+      
+      // ─── Internal party path (legacy) ─────────────────────────────────────────
+      // For internal parties, the participant signs for ALL actAs parties automatically.
+      // So we include both the user and the operator in actAs.
+      console.log(`[TransferOfferService] Internal party — using direct exerciseChoice`);
+      
       const actAsParties = [partyId];
       if (operatorPartyId && operatorPartyId !== partyId) {
         actAsParties.push(operatorPartyId);
       }
       console.log(`[TransferOfferService] actAs parties: [${actAsParties.map(p => p.substring(0, 30) + '...').join(', ')}]`);
       
-      // ─── Detect token type from template ID ────────────────────────────────────
-      // Utility.Registry.App → CBTC (Utilities token)
-      // Splice.Amulet → CC (Amulet/Splice token)
-      let detectedSymbol = null;
-      const templateLower = (templateId || '').toLowerCase();
-      if (templateLower.includes('utility') || templateLower.includes('cbtc')) {
-        detectedSymbol = 'CBTC';
-        console.log(`[TransferOfferService] Detected: CBTC (Utilities token)`);
-      } else if (templateLower.includes('amulet') || templateLower.includes('splice.amulet')) {
-        detectedSymbol = 'CC';
-        console.log(`[TransferOfferService] Detected: CC (Amulet/Splice token)`);
-      } else {
-        console.log(`[TransferOfferService] Token type unknown from template, will try all approaches`);
-      }
+      const adminToken = token || await tokenProvider.getServiceToken();
       
-      // ─── Approach 1: Canton SDK client ─────────────────────────────────────────
+      // Try SDK first
       const sdkClient = getSDKClient();
       if (sdkClient && sdkClient.isReady()) {
         try {
-          console.log(`[TransferOfferService] Using Canton SDK to accept transfer (symbol: ${detectedSymbol || 'auto'})...`);
+          let detectedSymbol = null;
+          const templateLower = (templateId || '').toLowerCase();
+          if (templateLower.includes('utility') || templateLower.includes('cbtc')) detectedSymbol = 'CBTC';
+          else if (templateLower.includes('amulet')) detectedSymbol = 'CC';
+          
           const result = await sdkClient.acceptTransfer(offerContractId, partyId, detectedSymbol);
           console.log('[TransferOfferService] ✅ Transfer accepted via Canton SDK!');
           return { success: true, offerContractId, usedSdk: true, result };
         } catch (sdkError) {
-          console.log(`[TransferOfferService] SDK accept failed: ${(sdkError?.message || String(sdkError)).substring(0, 120)}`);
+          console.log(`[TransferOfferService] SDK failed: ${(sdkError?.message || String(sdkError)).substring(0, 120)}`);
         }
-      } else {
-        console.log('[TransferOfferService] SDK not ready, skipping SDK approach');
       }
       
-      const adminToken = token || await tokenProvider.getServiceToken();
-      
-      // ─── Approach 2: Utilities/Registry Backend API (for CBTC) ────────────────
-      // Tries multiple URL patterns for the accept choice context
-      if (detectedSymbol === 'CBTC' || !detectedSymbol) {
-        const backendUrl = UTILITIES_CONFIG.BACKEND_URL;
-        const adminParty = UTILITIES_CONFIG.CBTC_ADMIN_PARTY;
-        const encodedCid = encodeURIComponent(offerContractId);
-        const scanProxyBase = SCAN_PROXY_API || 'http://65.108.40.104:8088';
+      // Try direct exerciseChoice via choice context
+      try {
+        const { disclosedContracts, choiceContextData } = await this._getAcceptChoiceContext(
+          offerContractId, adminToken, synchronizerId
+        );
         
-        const utilitiesUrls = [
-          // Pattern 1: Token Standard API (client-provided URL)
-          `${backendUrl}/v0/registrars/${encodeURIComponent(adminParty)}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`,
-          // Pattern 2: Without encoding admin party
-          `${backendUrl}/v0/registrars/${adminParty}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`,
-          // Pattern 3: Scan Proxy registry endpoint (requires POST)
-          `${scanProxyBase}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`,
-          // Pattern 4: Validator API direct accept
-          `${scanProxyBase}/api/validator/v0/wallet/transfer-offers/${encodedCid}/accept`,
-        ];
-        
-        for (const acceptContextUrl of utilitiesUrls) {
-          try {
-            console.log(`[TransferOfferService] Trying: ${acceptContextUrl.substring(0, 120)}...`);
-            
-            // All choice-context endpoints use POST.
-            // Only validator wallet direct-accept uses POST with different body.
-            const fetchOpts = {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${adminToken}`,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-              },
-              body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
-            };
-            
-            const contextResponse = await fetch(acceptContextUrl, fetchOpts);
-            
-            if (contextResponse.ok) {
-              const acceptContext = await contextResponse.json();
-              
-              // If validator API direct accept (Pattern 4), it accepted directly
-              if (acceptContextUrl.includes('/wallet/transfer-offers/')) {
-                console.log('[TransferOfferService] ✅ Transfer accepted directly via Validator API!');
-                return { success: true, offerContractId, usedValidatorApi: true, result: acceptContext };
-              }
-              
-              console.log(`[TransferOfferService] ✅ Got accept context (${acceptContext.disclosedContracts?.length || 0} disclosed contracts)`);
-              
-              const disclosedContracts = (acceptContext.disclosedContracts || []).map(dc => ({
-                templateId: dc.templateId,
-                contractId: dc.contractId,
-                createdEventBlob: dc.createdEventBlob,
-                synchronizerId: dc.synchronizerId || synchronizerId,
-              }));
-              
-              const choiceContextData = acceptContext.choiceContextData || acceptContext.choiceContext?.choiceContextData || { values: {} };
               const utilitiesInterface = UTILITIES_CONFIG.TRANSFER_INSTRUCTION_INTERFACE || TRANSFER_INSTRUCTION_INTERFACE;
               
               const result = await this.cantonService.exerciseChoice({
@@ -326,83 +489,10 @@ class TransferOfferService {
                 synchronizerId,
               });
               
-              console.log('[TransferOfferService] ✅ Transfer accepted via Utilities Backend API!');
-              return { success: true, offerContractId, usedUtilitiesApi: true, result };
-            } else {
-              const errorText = await contextResponse.text();
-              console.log(`[TransferOfferService] ${contextResponse.status}: ${errorText.substring(0, 150)}`);
-            }
-          } catch (utilError) {
-            console.log(`[TransferOfferService] Failed: ${(utilError?.message || String(utilError)).substring(0, 120)}`);
-          }
-        }
-        console.log(`[TransferOfferService] All Utilities/Registry URL patterns failed for CBTC`);
-      }
-      
-      // ─── Approach 3: Scan Proxy API (for CC/Amulet) ────────────────────────────
-      if (detectedSymbol === 'CC' || !detectedSymbol) {
-        const scanProxyBase = SCAN_PROXY_API || 'http://65.108.40.104:8088';
-        
-        const urlPatterns = [
-          `${scanProxyBase}/registry/transfer-instruction/v1/${offerContractId}/choice-contexts/accept`,
-        ];
-        
-        for (const acceptUrl of urlPatterns) {
-          try {
-            console.log(`[TransferOfferService] Trying Scan Proxy: ${acceptUrl.substring(0, 80)}...`);
-            
-            // Registry choice-context endpoints require POST
-            const contextResponse = await fetch(acceptUrl, {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${adminToken}`,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-              },
-              body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
-            });
-            
-            if (!contextResponse.ok) {
-              const errorText = await contextResponse.text();
-              console.log(`[TransferOfferService] ${contextResponse.status}: ${errorText.substring(0, 100)}`);
-              continue;
-            }
-            
-            const contextData = await contextResponse.json();
-            console.log(`[TransferOfferService] ✅ Got choice context (${contextData.disclosedContracts?.length || 0} disclosed contracts)`);
-            
-            const disclosedContracts = (contextData.disclosedContracts || []).map(dc => ({
-              templateId: dc.templateId,
-              contractId: dc.contractId,
-              createdEventBlob: dc.createdEventBlob,
-              synchronizerId: dc.synchronizerId || synchronizerId,
-            }));
-            
-            const choiceContextData = contextData.choiceContextData || contextData.choiceContext?.choiceContextData || { values: {} };
-            
-            const result = await this.cantonService.exerciseChoice({
-              token: adminToken,
-              templateId: TRANSFER_INSTRUCTION_INTERFACE,
-              contractId: offerContractId,
-              choice: 'TransferInstruction_Accept',
-              choiceArgument: {
-                extraArgs: {
-                  context: choiceContextData,
-                  meta: { values: {} },
-                },
-              },
-              actAsParty: actAsParties,
-              readAs: actAsParties,
-              disclosedContracts,
-              synchronizerId,
-            });
-            
-            console.log('[TransferOfferService] ✅ Transfer accepted via Scan Proxy!');
-            return { success: true, offerContractId, usedScanProxy: true, result };
-          } catch (urlError) {
-            console.log(`[TransferOfferService] URL pattern failed: ${(urlError?.message || String(urlError)).substring(0, 100)}`);
-          }
-        }
+        console.log('[TransferOfferService] ✅ Transfer accepted via direct exerciseChoice!');
+        return { success: true, offerContractId, usedDirectExercise: true, result };
+      } catch (directError) {
+        console.log(`[TransferOfferService] Direct exercise failed: ${(directError?.message || String(directError)).substring(0, 120)}`);
       }
       
       // ─── All approaches failed ──────────────────────────────────────────────────

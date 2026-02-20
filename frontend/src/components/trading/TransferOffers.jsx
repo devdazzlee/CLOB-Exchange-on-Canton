@@ -18,12 +18,14 @@ import {
   Gift,
   ExternalLink,
   AlertCircle,
-  Inbox
+  Inbox,
+  KeyRound
 } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
 import { Button } from '../ui/button';
 import { useToast } from '../ui/toast';
 import { apiClient } from '../../config/config';
+import { loadWallet, decryptPrivateKey, signMessage } from '../../wallet/keyManager';
 
 export default function TransferOffers({ partyId, onTransferAccepted }) {
   const [offers, setOffers] = useState([]);
@@ -31,6 +33,11 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
   const [accepting, setAccepting] = useState(null); // contractId being accepted
   const [error, setError] = useState(null);
   const toast = useToast();
+
+  // Interactive signing state (for external parties)
+  const [signingState, setSigningState] = useState(null); // { offer, preparedTransaction, preparedTransactionHash }
+  const [walletPassword, setWalletPassword] = useState('');
+  const [signingError, setSigningError] = useState(null);
 
   // Fetch pending transfer offers (silent polling — only logs on changes)
   const prevCountRef = React.useRef(-1);
@@ -74,15 +81,17 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
     return () => clearInterval(interval);
   }, [fetchOffers]);
 
-  // Accept a transfer offer
+  // Accept a transfer offer (2-step interactive signing for external parties)
   const handleAccept = async (offer) => {
     if (accepting) return;
     
     setAccepting(offer.contractId);
+    setSigningError(null);
     
     try {
       console.log('[TransferOffers] Accepting offer:', offer.contractId.substring(0, 30));
       
+      // Step 1: Call backend to prepare or directly accept
       const response = await apiClient.post('/transfers/accept', {
         offerContractId: offer.contractId,
         partyId: partyId,
@@ -90,15 +99,28 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
       });
       
       if (response.success) {
-        toast.success(`Accepted ${offer.amount} ${offer.token} transfer!`);
+        const data = response.data;
         
-        // Remove from list
-        setOffers(prev => prev.filter(o => o.contractId !== offer.contractId));
-        
-        // Notify parent to refresh balances
-        if (onTransferAccepted) {
-          onTransferAccepted(offer);
+        // Check if this is an external party requiring interactive signing
+        if (data.requiresSignature) {
+          console.log('[TransferOffers] External party — interactive signing required');
+          console.log('[TransferOffers] Hash to sign:', data.preparedTransactionHash?.substring(0, 40) + '...');
+          
+          // Show signing dialog (include hashingSchemeVersion for execute step)
+          setSigningState({
+            offer,
+            preparedTransaction: data.preparedTransaction,
+            preparedTransactionHash: data.preparedTransactionHash,
+            hashingSchemeVersion: data.hashingSchemeVersion,
+          });
+          setAccepting(null); // Release accepting lock while waiting for password
+          return;
         }
+        
+        // Internal party: accepted directly
+        toast.success(`Accepted ${offer.amount} ${offer.token} transfer!`);
+        setOffers(prev => prev.filter(o => o.contractId !== offer.contractId));
+        if (onTransferAccepted) onTransferAccepted(offer);
       } else {
         throw new Error(response.error || 'Failed to accept transfer');
       }
@@ -108,6 +130,73 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
     } finally {
       setAccepting(null);
     }
+  };
+
+  // Step 2: Sign the prepared transaction hash and execute
+  const handleSignAndExecute = async () => {
+    if (!signingState || !walletPassword) return;
+    
+    const { offer, preparedTransaction, preparedTransactionHash, hashingSchemeVersion } = signingState;
+    setAccepting(offer.contractId);
+    setSigningError(null);
+    
+    try {
+      // 1. Load wallet and decrypt private key
+      const wallet = loadWallet();
+      if (!wallet) throw new Error('Wallet not found. Please create/import wallet again.');
+      
+      const privateKey = await decryptPrivateKey(wallet.encryptedPrivateKey, walletPassword);
+      console.log('[TransferOffers] Wallet unlocked, signing transaction hash...');
+      
+      // 2. Sign the prepared transaction hash (it's a base64-encoded hash from Canton)
+      const signatureBase64 = await signMessage(privateKey, preparedTransactionHash);
+      console.log('[TransferOffers] Transaction signed, executing...');
+      
+      // 3. Get the public key fingerprint
+      // Canton partyId format is "partyHint::publicKeyFingerprint"
+      // so we can extract it directly from the partyId — no localStorage needed
+      const signedBy = localStorage.getItem('canton_key_fingerprint')
+        || (partyId && partyId.includes('::') ? partyId.split('::')[1] : null);
+      if (!signedBy) {
+        throw new Error('Public key fingerprint not found. Please re-onboard your wallet.');
+      }
+      console.log('[TransferOffers] Using signedBy fingerprint:', signedBy.substring(0, 20) + '...');
+      
+      // 4. Call backend to execute the signed transaction
+      const response = await apiClient.post('/transfers/execute-accept', {
+        preparedTransaction,
+        partyId,
+        signatureBase64,
+        signedBy,
+        hashingSchemeVersion,
+      });
+      
+      if (response.success) {
+        toast.success(`Accepted ${offer.amount} ${offer.token} transfer!`);
+        setOffers(prev => prev.filter(o => o.contractId !== offer.contractId));
+        setSigningState(null);
+        setWalletPassword('');
+        if (onTransferAccepted) onTransferAccepted(offer);
+      } else {
+        throw new Error(response.error || 'Failed to execute transfer');
+      }
+    } catch (err) {
+      console.error('[TransferOffers] Sign & execute error:', err);
+      if (err.message.includes('decrypt') || err.message.includes('password')) {
+        setSigningError('Incorrect wallet password. Please try again.');
+      } else {
+        setSigningError(err.message?.substring(0, 150));
+      }
+    } finally {
+      setAccepting(null);
+    }
+  };
+
+  // Cancel interactive signing
+  const handleCancelSigning = () => {
+    setSigningState(null);
+    setWalletPassword('');
+    setSigningError(null);
   };
 
   // Token symbols and colors
@@ -263,6 +352,89 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
           <p>Canton uses 2-step transfers. Click Accept to receive tokens.</p>
         </div>
       </CardContent>
+
+      {/* Interactive Signing Dialog (for external parties) */}
+      {signingState && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="bg-card border-2 border-primary/30 rounded-2xl p-6 max-w-md w-full mx-4 shadow-2xl"
+          >
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-10 h-10 rounded-lg bg-primary/10 flex items-center justify-center">
+                <KeyRound className="w-5 h-5 text-primary" />
+              </div>
+              <div>
+                <h3 className="font-bold text-foreground">Sign Transaction</h3>
+                <p className="text-xs text-muted-foreground">
+                  Unlock your wallet to authorize this transfer
+                </p>
+              </div>
+            </div>
+
+            <div className="bg-primary/5 border border-primary/20 rounded-lg p-3 mb-4">
+              <p className="text-sm text-foreground">
+                Accept <span className="font-bold">
+                  {parseFloat(signingState.offer.amount).toLocaleString(undefined, {
+                    minimumFractionDigits: 0,
+                    maximumFractionDigits: 8
+                  })}
+                </span>{' '}
+                <span className="text-primary font-medium">{signingState.offer.token}</span>
+              </p>
+              <p className="text-xs text-muted-foreground mt-1">
+                From: {signingState.offer.sender?.substring(0, 25)}...
+              </p>
+            </div>
+
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-foreground mb-1.5">
+                Wallet Password
+              </label>
+              <input
+                type="password"
+                value={walletPassword}
+                onChange={(e) => setWalletPassword(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && handleSignAndExecute()}
+                placeholder="Enter your wallet password"
+                autoFocus
+                className="w-full px-3 py-2 rounded-lg bg-background border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50"
+              />
+            </div>
+
+            {signingError && (
+              <div className="flex items-center gap-2 p-3 mb-4 bg-destructive/10 border border-destructive/30 rounded-lg text-sm text-destructive">
+                <AlertCircle className="w-4 h-4 flex-shrink-0" />
+                <span>{signingError}</span>
+              </div>
+            )}
+
+            <div className="flex gap-3">
+              <Button
+                variant="ghost"
+                className="flex-1"
+                onClick={handleCancelSigning}
+                disabled={accepting === signingState.offer.contractId}
+              >
+                Cancel
+              </Button>
+              <Button
+                className="flex-1 bg-primary hover:bg-primary/90"
+                onClick={handleSignAndExecute}
+                disabled={!walletPassword || accepting === signingState.offer.contractId}
+              >
+                {accepting === signingState.offer.contractId ? (
+                  <Loader2 className="w-4 h-4 animate-spin mr-2" />
+                ) : (
+                  <Check className="w-4 h-4 mr-2" />
+                )}
+                Sign & Accept
+              </Button>
+            </div>
+          </motion.div>
+        </div>
+      )}
     </Card>
   );
 }

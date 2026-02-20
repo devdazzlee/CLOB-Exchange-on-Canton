@@ -50,8 +50,9 @@ router.get('/offers/:partyId', asyncHandler(async (req, res) => {
  * 
  * Body: { offerContractId, partyId, templateId? }
  * 
- * templateId is optional - if not provided, will be discovered automatically
- * For Splice offers, use: splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:TransferOffer
+ * For EXTERNAL parties: Returns { requiresSignature: true, preparedTransaction, preparedTransactionHash }
+ *   → Frontend signs the hash, then calls POST /api/transfers/execute-accept
+ * For INTERNAL parties: Accepts directly and returns { success: true }
  */
 router.post('/accept', asyncHandler(async (req, res) => {
   const { offerContractId, partyId, templateId } = req.body;
@@ -71,7 +72,86 @@ router.post('/accept', asyncHandler(async (req, res) => {
   
   const result = await transferService.acceptTransferOffer(offerContractId, partyId, adminToken, templateId);
   
+  // For external parties, the result includes requiresSignature: true
+  // The frontend must sign preparedTransactionHash and call /execute-accept
+  if (result.requiresSignature) {
+    return success(res, {
+      requiresSignature: true,
+      preparedTransaction: result.preparedTransaction,
+      preparedTransactionHash: result.preparedTransactionHash,
+      hashingSchemeVersion: result.hashingSchemeVersion,
+      hashingDetails: result.hashingDetails,
+      offerContractId: result.offerContractId,
+      partyId: result.partyId,
+    }, 'Transaction prepared. Sign the hash and call /execute-accept.');
+  }
+  
   return success(res, result, 'Transfer offer accepted successfully');
+}));
+
+/**
+ * POST /api/transfers/prepare-accept
+ * STEP 1: Prepare transfer accept for interactive signing
+ * 
+ * Body: { offerContractId, partyId, templateId? }
+ * Returns: { preparedTransaction, preparedTransactionHash, ... }
+ * 
+ * The frontend must sign preparedTransactionHash with the user's Ed25519 private key,
+ * then call /execute-accept with the signature.
+ */
+router.post('/prepare-accept', asyncHandler(async (req, res) => {
+  const { offerContractId, partyId, templateId } = req.body;
+  
+  if (!offerContractId || !partyId) {
+    throw new ValidationError('offerContractId and partyId are required');
+  }
+  
+  console.log(`[Transfers] PREPARE accept: ${offerContractId.substring(0, 20)}... for ${partyId.substring(0, 30)}...`);
+  
+  const adminToken = await tokenProvider.getServiceToken();
+  const transferService = getTransferOfferService();
+  await transferService.initialize();
+  
+  const result = await transferService.prepareTransferAccept(offerContractId, partyId, adminToken, templateId);
+  
+  return success(res, {
+    preparedTransaction: result.preparedTransaction,
+    preparedTransactionHash: result.preparedTransactionHash,
+    hashingSchemeVersion: result.hashingSchemeVersion,
+    hashingDetails: result.hashingDetails,
+    offerContractId: result.offerContractId,
+    partyId: result.partyId,
+  }, 'Transaction prepared for signing');
+}));
+
+/**
+ * POST /api/transfers/execute-accept
+ * STEP 2: Execute prepared transfer accept with user's signature
+ * 
+ * Body: { preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion? }
+ * 
+ * signatureBase64: User's Ed25519 signature of the preparedTransactionHash
+ * signedBy: The public key fingerprint (from onboarding) that signed
+ * hashingSchemeVersion: From the prepare response (echoed back)
+ */
+router.post('/execute-accept', asyncHandler(async (req, res) => {
+  const { preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion } = req.body;
+  
+  if (!preparedTransaction || !partyId || !signatureBase64 || !signedBy) {
+    throw new ValidationError('preparedTransaction, partyId, signatureBase64, and signedBy are required');
+  }
+  
+  console.log(`[Transfers] EXECUTE accept for ${partyId.substring(0, 30)}... signedBy: ${signedBy.substring(0, 20)}...`);
+  
+  const adminToken = await tokenProvider.getServiceToken();
+  const transferService = getTransferOfferService();
+  await transferService.initialize();
+  
+  const result = await transferService.executeTransferAccept(
+    preparedTransaction, partyId, signatureBase64, signedBy, adminToken, hashingSchemeVersion
+  );
+  
+  return success(res, result, 'Transfer accepted via interactive submission');
 }));
 
 /**

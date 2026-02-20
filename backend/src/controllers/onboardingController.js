@@ -108,10 +108,11 @@ class OnboardingController {
         // Increment quota only after successful allocation+onboarding
         const quotaStatus = quota.increment();
 
-        // Store mapping userId -> { partyId, publicKeyBase64 }
+        // Store mapping userId -> { partyId, publicKeyBase64, publicKeyFingerprint }
         userRegistry.upsertUser(userId, {
           partyId: result.partyId,
           publicKeyBase64,
+          ...(publicKeyFingerprint ? { publicKeyFingerprint } : {}),
         });
 
         return success(res, { ...result, quotaStatus }, 'Party onboarded successfully', 200);
