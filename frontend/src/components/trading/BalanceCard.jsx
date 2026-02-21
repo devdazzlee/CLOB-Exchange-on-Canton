@@ -46,10 +46,10 @@ export default function BalanceCard({ balance = {}, lockedBalance = {}, loading,
 
   return (
     <Card className="bg-gradient-to-br from-card to-background border-2 border-border shadow-xl">
-      <CardHeader className="pb-4">
+      <CardHeader className="pb-3 sm:pb-4 px-3 sm:px-6">
         <div className="flex items-center justify-between">
-          <CardTitle className="text-xl font-bold flex items-center space-x-2">
-            <Wallet className="w-5 h-5 text-primary" />
+          <CardTitle className="text-base sm:text-xl font-bold flex items-center space-x-2">
+            <Wallet className="w-4 h-4 sm:w-5 sm:h-5 text-primary" />
             <span>Your Balance</span>
           </CardTitle>
           <Button
@@ -57,14 +57,14 @@ export default function BalanceCard({ balance = {}, lockedBalance = {}, loading,
             size="icon"
             onClick={onRefresh}
             disabled={loading}
-            className="h-8 w-8 hover:bg-primary/10 transition-colors"
+            className="h-7 w-7 sm:h-8 sm:w-8 hover:bg-primary/10 transition-colors"
             title="Refresh balance"
           >
-            <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin text-primary' : 'text-muted-foreground hover:text-primary'} transition-colors`} />
+            <RefreshCw className={`h-3.5 w-3.5 sm:h-4 sm:w-4 ${loading ? 'animate-spin text-primary' : 'text-muted-foreground hover:text-primary'} transition-colors`} />
           </Button>
         </div>
       </CardHeader>
-      <CardContent className="space-y-4">
+      <CardContent className="space-y-3 sm:space-y-4 px-3 sm:px-6">
         {/* Dynamically render ALL tokens */}
         {tokens.map((token, index) => {
           const config = getTokenConfig(token);
@@ -78,26 +78,26 @@ export default function BalanceCard({ balance = {}, lockedBalance = {}, loading,
               initial={{ opacity: 0, x: -20 }}
               animate={{ opacity: 1, x: 0 }}
               transition={{ delay: index * 0.1 }}
-              className={`relative overflow-hidden bg-card border-2 border-border rounded-xl p-5 hover:${config.borderColor} hover:shadow-lg transition-all group`}
+              className={`relative overflow-hidden bg-card border-2 border-border rounded-xl p-3 sm:p-5 hover:${config.borderColor} hover:shadow-lg transition-all group`}
             >
-              <div className={`absolute top-0 right-0 w-20 h-20 ${config.bgColor} rounded-full blur-2xl`}></div>
+              <div className={`absolute top-0 right-0 w-16 h-16 sm:w-20 sm:h-20 ${config.bgColor} rounded-full blur-2xl`}></div>
               <div className="relative flex items-center justify-between">
-                <div className="flex items-center space-x-3">
-                  <div className={`w-12 h-12 ${config.bgColor} rounded-lg flex items-center justify-center border ${config.borderColor}`}>
-                    <span className={`text-2xl font-bold ${config.color}`}>{config.symbol}</span>
+                <div className="flex items-center space-x-2 sm:space-x-3">
+                  <div className={`w-9 h-9 sm:w-12 sm:h-12 ${config.bgColor} rounded-lg flex items-center justify-center border ${config.borderColor} flex-shrink-0`}>
+                    <span className={`text-lg sm:text-2xl font-bold ${config.color}`}>{config.symbol}</span>
                   </div>
                   <div>
-                    <div className="text-xs text-muted-foreground uppercase tracking-wide font-semibold">{config.name}</div>
-                    <div className="text-sm text-foreground font-medium">{token}</div>
+                    <div className="text-[10px] sm:text-xs text-muted-foreground uppercase tracking-wide font-semibold">{config.name}</div>
+                    <div className="text-xs sm:text-sm text-foreground font-medium">{token}</div>
                   </div>
                 </div>
-                <div className="text-right">
+                <div className="text-right min-w-0">
                   {loading ? (
-                    <div className="animate-pulse bg-muted h-6 w-24 rounded"></div>
+                    <div className="animate-pulse bg-muted h-5 sm:h-6 w-20 sm:w-24 rounded"></div>
                   ) : (
                     <>
                       {/* Available balance (main display) */}
-                      <div className={`text-2xl font-bold text-foreground group-hover:${config.color} transition-colors`}>
+                      <div className={`text-lg sm:text-2xl font-bold text-foreground group-hover:${config.color} transition-colors truncate`}>
                         {available.toLocaleString(undefined, { 
                           minimumFractionDigits: 2, 
                           maximumFractionDigits: config.decimals 
@@ -106,8 +106,8 @@ export default function BalanceCard({ balance = {}, lockedBalance = {}, loading,
                       {/* Show locked amount if any */}
                       {locked > 0 && (
                         <div className="flex items-center justify-end gap-1 mt-0.5">
-                          <Lock className="w-3 h-3 text-yellow-500" />
-                          <span className="text-xs text-yellow-500/80">
+                          <Lock className="w-2.5 h-2.5 sm:w-3 sm:h-3 text-yellow-500" />
+                          <span className="text-[10px] sm:text-xs text-yellow-500/80">
                             {locked.toLocaleString(undefined, { 
                               minimumFractionDigits: 2, 
                               maximumFractionDigits: config.decimals 

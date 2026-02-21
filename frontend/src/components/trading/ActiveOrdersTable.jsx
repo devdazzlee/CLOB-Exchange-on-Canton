@@ -168,14 +168,144 @@ export default function ActiveOrdersTable({ orders, onCancelOrder }) {
     }
   };
 
+  const activeOrders = orders.filter(o => o.status === 'OPEN' || o.status === 'PARTIALLY_FILLED' || o.status === 'PENDING_TRIGGER');
+
+  const formatOrderPrice = (order) => {
+    const price = order.price;
+    if (price?.Some) return parseFloat(price.Some).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 });
+    if (price !== null && price !== undefined && price !== '' && price !== 'None') {
+      const numPrice = parseFloat(price);
+      if (!isNaN(numPrice) && numPrice > 0) return numPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 });
+    }
+    if (order.mode === 'STOP_LOSS' && order.stopPrice) {
+      return `SL @ ${parseFloat(order.stopPrice).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 })}`;
+    }
+    return order.mode === 'MARKET' ? 'Market' : 'N/A';
+  };
+
   return (
     <>
       <Card>
-        <CardHeader>
-          <CardTitle>Your Active Orders</CardTitle>
+        <CardHeader className="px-3 sm:px-6">
+          <CardTitle className="text-sm sm:text-base">Your Active Orders</CardTitle>
         </CardHeader>
-        <CardContent>
-          <div className="overflow-x-auto">
+        <CardContent className="px-3 sm:px-6">
+
+          {/* Mobile: Card layout */}
+          <div className="md:hidden space-y-4">
+            <AnimatePresence>
+              {activeOrders.length > 0 ? (
+                activeOrders.map((order) => {
+                  const quantity = parseFloat(order.quantity || 0);
+                  const filled = parseFloat(order.filled || 0);
+                  const fillPercentage = quantity > 0 ? (filled / quantity) * 100 : 0;
+                  const remaining = Math.max(0, quantity - filled);
+                  const isPartiallyFilled = filled > 0 && remaining > 0;
+
+                  return (
+                    <motion.div
+                      key={order.id}
+                      initial={{ opacity: 0, y: 10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0 }}
+                      className={cn(
+                        "rounded-xl p-4 space-y-3 border-l-4",
+                        order.type === 'BUY' 
+                          ? 'border-l-success bg-success/5 border border-success/20' 
+                          : 'border-l-destructive bg-destructive/5 border border-destructive/20'
+                      )}
+                    >
+                      {/* Header: Type/Mode + Status Badge + Cancel */}
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <span className={cn(
+                            "text-base font-bold",
+                            order.type === 'BUY' ? 'text-success' : 'text-destructive'
+                          )}>
+                            {order.type}
+                          </span>
+                          <span className="text-sm text-muted-foreground font-medium">{order.mode}</span>
+                          <span className={cn(
+                            "px-2 py-0.5 rounded-full text-xs font-semibold inline-flex items-center gap-1",
+                            order.status === 'OPEN' ? 'bg-primary/15 text-primary border border-primary/40' :
+                            order.status === 'PENDING_TRIGGER' ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/40' :
+                            order.status === 'FILLED' ? 'bg-success/15 text-success border border-success/40' :
+                            'bg-destructive/15 text-destructive border border-destructive/40'
+                          )}>
+                            {order.status === 'PENDING_TRIGGER' && <ShieldAlert className="w-3 h-3" />}
+                            {order.status === 'PENDING_TRIGGER' ? 'Stop' : order.status}
+                          </span>
+                        </div>
+                        {(order.status === 'OPEN' || order.status === 'PENDING_TRIGGER') && (
+                          <Button
+                            onClick={() => handleCancelClick(order)}
+                            variant="destructive"
+                            size="sm"
+                            className="h-8 px-3 text-xs font-semibold"
+                          >
+                            Cancel
+                          </Button>
+                        )}
+                      </div>
+
+                      {/* Order ID */}
+                      <div className="text-xs text-muted-foreground font-mono">
+                        ID: {order.id?.substring(0, 16)}...
+                      </div>
+
+                      {/* Details Grid */}
+                      <div className="grid grid-cols-2 gap-3">
+                        <div className="bg-background/60 rounded-lg p-2.5">
+                          <div className="text-[11px] text-muted-foreground uppercase tracking-wide mb-0.5">Price</div>
+                          <div className="text-sm font-mono font-semibold text-foreground">{formatOrderPrice(order)}</div>
+                        </div>
+                        <div className="bg-background/60 rounded-lg p-2.5">
+                          <div className="text-[11px] text-muted-foreground uppercase tracking-wide mb-0.5">Quantity</div>
+                          <div className="text-sm font-mono font-semibold text-foreground">{quantity.toFixed(6)}</div>
+                        </div>
+                        <div className="bg-background/60 rounded-lg p-2.5">
+                          <div className="text-[11px] text-muted-foreground uppercase tracking-wide mb-0.5">Filled</div>
+                          <div className="text-sm font-mono font-semibold text-foreground">{filled.toFixed(6)}</div>
+                        </div>
+                        <div className="bg-background/60 rounded-lg p-2.5">
+                          <div className="text-[11px] text-muted-foreground uppercase tracking-wide mb-0.5">Remaining</div>
+                          <div className="text-sm font-mono font-semibold text-foreground">{remaining.toFixed(6)}</div>
+                        </div>
+                      </div>
+
+                      {/* Progress bar */}
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="text-muted-foreground">Fill Progress</span>
+                          <span className={cn(
+                            "font-semibold",
+                            fillPercentage >= 100 ? 'text-success' : isPartiallyFilled ? 'text-warning' : 'text-muted-foreground'
+                          )}>
+                            {fillPercentage.toFixed(1)}%
+                          </span>
+                        </div>
+                        <div className="w-full h-2 bg-muted rounded-full overflow-hidden">
+                          <div
+                            className={cn(
+                              "h-full rounded-full transition-all duration-300",
+                              isPartiallyFilled ? 'bg-warning' : 'bg-success',
+                              fillPercentage >= 100 ? 'bg-success' : ''
+                            )}
+                            style={{ width: `${Math.min(100, fillPercentage)}%` }}
+                          />
+                        </div>
+                      </div>
+                    </motion.div>
+                  );
+                })
+              ) : (
+                <div className="py-8 text-center text-muted-foreground text-sm">No active orders</div>
+              )}
+            </AnimatePresence>
+          </div>
+
+          {/* Desktop: Table layout */}
+          <div className="hidden md:block overflow-x-auto">
             <table className="w-full">
               <thead>
                 <tr className="border-b border-border">
@@ -193,8 +323,8 @@ export default function ActiveOrdersTable({ orders, onCancelOrder }) {
               </thead>
               <tbody>
                 <AnimatePresence>
-                  {orders.filter(o => o.status === 'OPEN' || o.status === 'PARTIALLY_FILLED' || o.status === 'PENDING_TRIGGER').length > 0 ? (
-                    orders.filter(o => o.status === 'OPEN' || o.status === 'PARTIALLY_FILLED' || o.status === 'PENDING_TRIGGER').map((order) => (
+                  {activeOrders.length > 0 ? (
+                    activeOrders.map((order) => (
                       <motion.tr
                         key={order.id}
                         initial={{ opacity: 0, y: 10 }}
@@ -216,20 +346,7 @@ export default function ActiveOrdersTable({ orders, onCancelOrder }) {
                           {order.type}
                         </td>
                         <td className="py-3 px-4 text-foreground">{order.mode}</td>
-                        <td className="py-3 px-4 text-foreground font-mono">
-                          {(() => {
-                            const price = order.price;
-                            if (price?.Some) return parseFloat(price.Some).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 });
-                            if (price !== null && price !== undefined && price !== '' && price !== 'None') {
-                              const numPrice = parseFloat(price);
-                              if (!isNaN(numPrice) && numPrice > 0) return numPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 });
-                            }
-                            if (order.mode === 'STOP_LOSS' && order.stopPrice) {
-                              return `SL @ ${parseFloat(order.stopPrice).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 })}`;
-                            }
-                            return order.mode === 'MARKET' ? 'Market' : 'N/A';
-                          })()}
-                        </td>
+                        <td className="py-3 px-4 text-foreground font-mono">{formatOrderPrice(order)}</td>
                         <td className="py-3 px-4 text-right text-foreground">{parseFloat(order.quantity || 0).toFixed(8)}</td>
                         <td className="py-3 px-4 text-right text-foreground">{parseFloat(order.filled || 0).toFixed(8)}</td>
                         <td className="py-3 px-4 text-right text-foreground">

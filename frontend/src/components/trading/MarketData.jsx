@@ -82,37 +82,37 @@ export default function MarketData({ tradingPair, orderBook, trades = [] }) {
 
   return (
     <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center justify-between">
+      <CardHeader className="px-3 sm:px-6">
+        <CardTitle className="flex items-center justify-between text-sm sm:text-base">
           <span>{tradingPair}</span>
           <div className="flex items-center gap-2">
             {isPositive ? (
-              <TrendingUp className="w-5 h-5 text-success" />
+              <TrendingUp className="w-4 h-4 sm:w-5 sm:h-5 text-success" />
             ) : (
-              <TrendingDown className="w-5 h-5 text-destructive" />
+              <TrendingDown className="w-4 h-4 sm:w-5 sm:h-5 text-destructive" />
             )}
           </div>
         </CardTitle>
       </CardHeader>
-      <CardContent>
-        <div className="space-y-4">
+      <CardContent className="px-3 sm:px-6">
+        <div className="space-y-3 sm:space-y-4">
           {/* Current Price */}
-          <div className="text-center py-4 border-b border-border">
-            <div className="text-sm text-muted-foreground uppercase tracking-wide mb-1">
+          <div className="text-center py-3 sm:py-4 border-b border-border">
+            <div className="text-xs sm:text-sm text-muted-foreground uppercase tracking-wide mb-1">
               Current Price
             </div>
             <motion.div
               key={currentPrice}
               initial={{ scale: 1.1, opacity: 0.5 }}
               animate={{ scale: 1, opacity: 1 }}
-              className={`text-3xl font-bold font-mono ${
+              className={`text-2xl sm:text-3xl font-bold font-mono ${
                 isPositive ? 'text-success' : 'text-destructive'
               }`}
             >
-              {formatPrice(currentPrice)} {quoteToken}
+              {formatPrice(currentPrice)} <span className="text-base sm:text-lg">{quoteToken}</span>
             </motion.div>
             {stats.change !== 0 && (
-              <div className={`text-sm font-medium mt-1 ${
+              <div className={`text-xs sm:text-sm font-medium mt-1 ${
                 isPositive ? 'text-success' : 'text-destructive'
               }`}>
                 {isPositive ? '+' : ''}{formatPrice(stats.change)} ({isPositive ? '+' : ''}{stats.changePercent.toFixed(2)}%)
@@ -122,33 +122,33 @@ export default function MarketData({ tradingPair, orderBook, trades = [] }) {
 
           {/* 24h Stats Grid */}
           <div className="grid grid-cols-2 gap-4">
-            <div className="space-y-1">
-              <div className="flex items-center gap-2 text-xs text-muted-foreground uppercase tracking-wide">
-                <TrendingUp className="w-3 h-3" />
+            <div className="space-y-1.5 bg-success/5 border border-success/20 rounded-lg p-3">
+              <div className="flex items-center gap-2 text-xs sm:text-sm text-muted-foreground uppercase tracking-wide font-medium">
+                <TrendingUp className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-success" />
                 24h High
               </div>
-              <div className="text-lg font-semibold font-mono text-success">
-                {formatPrice(stats.high)} {quoteToken}
+              <div className="text-base sm:text-xl lg:text-2xl font-bold font-mono text-success">
+                {formatPrice(stats.high)}
               </div>
             </div>
 
-            <div className="space-y-1">
-              <div className="flex items-center gap-2 text-xs text-muted-foreground uppercase tracking-wide">
-                <TrendingDown className="w-3 h-3" />
+            <div className="space-y-1.5 bg-destructive/5 border border-destructive/20 rounded-lg p-3">
+              <div className="flex items-center gap-2 text-xs sm:text-sm text-muted-foreground uppercase tracking-wide font-medium">
+                <TrendingDown className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-destructive" />
                 24h Low
               </div>
-              <div className="text-lg font-semibold font-mono text-destructive">
-                {formatPrice(stats.low)} {quoteToken}
+              <div className="text-base sm:text-xl lg:text-2xl font-bold font-mono text-destructive">
+                {formatPrice(stats.low)}
               </div>
             </div>
 
-            <div className="space-y-1 col-span-2">
-              <div className="flex items-center gap-2 text-xs text-muted-foreground uppercase tracking-wide">
-                <Volume2 className="w-3 h-3" />
+            <div className="space-y-1.5 col-span-2 bg-muted/30 border border-border/50 rounded-lg p-3">
+              <div className="flex items-center gap-2 text-xs sm:text-sm text-muted-foreground uppercase tracking-wide font-medium">
+                <Volume2 className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
                 24h Volume
               </div>
-              <div className="text-lg font-semibold font-mono">
-                {formatVolume(stats.volume)} {baseToken}
+              <div className="text-base sm:text-xl lg:text-2xl font-bold font-mono">
+                {formatVolume(stats.volume)} <span className="text-sm sm:text-base text-muted-foreground">{baseToken}</span>
               </div>
             </div>
           </div>

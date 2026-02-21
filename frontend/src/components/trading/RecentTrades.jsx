@@ -36,24 +36,24 @@ export default function RecentTrades({ trades, tradingPair, loading }) {
 
   return (
     <Card>
-      <CardHeader>
-        <CardTitle>Recent Trades - {tradingPair}</CardTitle>
+      <CardHeader className="px-3 sm:px-6">
+        <CardTitle className="text-sm sm:text-base">Recent Trades - {tradingPair}</CardTitle>
       </CardHeader>
-      <CardContent>
+      <CardContent className="px-3 sm:px-6">
         {loading ? (
-          <div className="flex items-center justify-center py-8">
-            <div className="animate-pulse text-muted-foreground text-sm">Loading trades...</div>
+          <div className="flex items-center justify-center py-6 sm:py-8">
+            <div className="animate-pulse text-muted-foreground text-xs sm:text-sm">Loading trades...</div>
           </div>
         ) : sortedTrades.length === 0 ? (
-          <div className="flex items-center justify-center py-8 text-muted-foreground text-sm">
+          <div className="flex items-center justify-center py-6 sm:py-8 text-muted-foreground text-xs sm:text-sm">
             No recent trades
           </div>
         ) : (
-          <div className="space-y-1 max-h-96 overflow-y-auto">
-            <div className="grid grid-cols-4 gap-4 pb-2 border-b border-border text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+          <div className="space-y-0.5 sm:space-y-1 max-h-72 sm:max-h-96 overflow-y-auto">
+            <div className="grid grid-cols-3 sm:grid-cols-4 gap-2 sm:gap-4 pb-2 border-b border-border text-[10px] sm:text-xs font-semibold text-muted-foreground uppercase tracking-wide">
               <div>Price</div>
               <div className="text-right">Amount</div>
-              <div className="text-right">Total</div>
+              <div className="text-right hidden sm:block">Total</div>
               <div className="text-right">Time</div>
             </div>
             <AnimatePresence>
@@ -61,7 +61,7 @@ export default function RecentTrades({ trades, tradingPair, loading }) {
                 const price = parseFloat(trade.price || 0);
                 const quantity = parseFloat(trade.quantity || 0);
                 const total = price * quantity;
-                const isBuy = trade.buyer === trade.partyId; // Assuming we have partyId in context
+                const isBuy = trade.buyer === trade.partyId;
                 
                 return (
                   <motion.div
@@ -70,28 +70,28 @@ export default function RecentTrades({ trades, tradingPair, loading }) {
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0 }}
                     className={cn(
-                      "grid grid-cols-4 gap-4 py-2 px-2 rounded hover:bg-card transition-colors",
+                      "grid grid-cols-3 sm:grid-cols-4 gap-2 sm:gap-4 py-1.5 sm:py-2 px-1 sm:px-2 rounded hover:bg-card transition-colors",
                       idx % 2 === 0 && "bg-background/50"
                     )}
                   >
                     <div className={cn(
-                      "font-mono font-semibold flex items-center space-x-1",
+                      "font-mono font-semibold flex items-center space-x-0.5 sm:space-x-1 text-[11px] sm:text-sm",
                       isBuy ? "text-success" : "text-destructive"
                     )}>
                       {isBuy ? (
-                        <TrendingUp className="w-3 h-3" />
+                        <TrendingUp className="w-2.5 h-2.5 sm:w-3 sm:h-3 flex-shrink-0" />
                       ) : (
-                        <TrendingDown className="w-3 h-3" />
+                        <TrendingDown className="w-2.5 h-2.5 sm:w-3 sm:h-3 flex-shrink-0" />
                       )}
-                      <span>{price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 })}</span>
+                      <span className="truncate">{price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}</span>
                     </div>
-                    <div className="text-right text-foreground font-mono text-sm">
-                      {quantity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 })}
+                    <div className="text-right text-foreground font-mono text-[11px] sm:text-sm truncate">
+                      {quantity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
                     </div>
-                    <div className="text-right text-muted-foreground font-mono text-sm">
+                    <div className="text-right text-muted-foreground font-mono text-[11px] sm:text-sm hidden sm:block">
                       {total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                     </div>
-                    <div className="text-right text-muted-foreground text-xs">
+                    <div className="text-right text-muted-foreground text-[10px] sm:text-xs">
                       {formatTime(trade.timestamp || trade.createdAt)}
                     </div>
                   </motion.div>

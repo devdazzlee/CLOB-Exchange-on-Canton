@@ -168,20 +168,20 @@ export default function OrderForm({
 
   return (
     <Card className="lg:col-span-2">
-      <CardHeader>
-        <div className="flex items-center justify-between">
-          <CardTitle>Place Order</CardTitle>
+      <CardHeader className="px-3 sm:px-6">
+        <div className="flex items-center justify-between gap-2">
+          <CardTitle className="text-sm sm:text-base">Place Order</CardTitle>
           {marketPrice && (
             <div className="text-right">
-              <div className="text-xs text-muted-foreground uppercase tracking-wide">Market Price</div>
-              <div className="text-lg font-bold font-mono">
-                {formatNumber(marketPrice, 2)} {quoteToken}
+              <div className="text-[10px] sm:text-xs text-muted-foreground uppercase tracking-wide">Market Price</div>
+              <div className="text-base sm:text-lg font-bold font-mono">
+                {formatNumber(marketPrice, 2)} <span className="text-xs sm:text-sm">{quoteToken}</span>
               </div>
             </div>
           )}
         </div>
       </CardHeader>
-      <CardContent>
+      <CardContent className="px-3 sm:px-6">
         <form onSubmit={(e) => {
           e.preventDefault();
           if (validation.isValid) {

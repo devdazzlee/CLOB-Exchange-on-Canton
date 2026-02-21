@@ -1161,12 +1161,12 @@ export default function TradingInterface({ partyId }) {
         </div>
       )}
       
-    <div className="space-y-6">
+    <div className="space-y-4 sm:space-y-6">
       <div className="flex items-center justify-between">
-          <h2 className="text-3xl font-bold text-foreground">Trading Interface</h2>
+          <h2 className="text-xl sm:text-2xl md:text-3xl font-bold text-foreground">Trading</h2>
         <div className="flex items-center space-x-2">
           <div className="w-2 h-2 bg-success rounded-full animate-pulse"></div>
-          <span className="text-sm text-muted-foreground">Connected</span>
+          <span className="text-xs sm:text-sm text-muted-foreground">Connected</span>
         </div>
       </div>
       
@@ -1180,7 +1180,7 @@ export default function TradingInterface({ partyId }) {
           </motion.div>
         )}
 
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6">
             <OrderForm
               tradingPair={tradingPair}
               availablePairs={availablePairs}
@@ -1235,9 +1235,9 @@ export default function TradingInterface({ partyId }) {
           volume24h={trades.reduce((sum, t) => sum + (parseFloat(t.quantity) || 0), 0)}
         />
 
-        {/* Order Book and Active Orders */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <div className="lg:col-span-2 space-y-6">
+        {/* Order Book, Market Data & Recent Trades */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 sm:gap-6">
+          <div className="lg:col-span-2">
             {/* Order Book */}
             <OrderBookCard 
               orderBook={orderBook}
@@ -1245,18 +1245,10 @@ export default function TradingInterface({ partyId }) {
               tradingPair={tradingPair}
               userOrders={orders}
             />
-
-            {/* Active Orders */}
-            <ActiveOrdersTable
-              orders={orders}
-              loading={loading}
-              onCancelOrder={handleCancelOrder}
-              partyId={partyId}
-            />
           </div>
 
           {/* Market Data and Recent Trades */}
-          <div className="space-y-6">
+          <div className="space-y-4 sm:space-y-6">
             <MarketData 
               tradingPair={tradingPair}
               orderBook={orderBook}
@@ -1271,8 +1263,16 @@ export default function TradingInterface({ partyId }) {
           </div>
         </div>
 
+        {/* Active Orders - Full Width */}
+        <ActiveOrdersTable
+          orders={orders}
+          loading={loading}
+          onCancelOrder={handleCancelOrder}
+          partyId={partyId}
+        />
+
         {/* Depth Chart and History */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6">
           <DepthChart 
             orderBook={{
               bids: orderBook.buys || [],

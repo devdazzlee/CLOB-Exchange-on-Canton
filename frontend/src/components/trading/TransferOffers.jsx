@@ -247,10 +247,10 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
 
   return (
     <Card className="bg-gradient-to-br from-card to-background border-2 border-border shadow-xl">
-      <CardHeader className="pb-3">
+      <CardHeader className="pb-3 px-3 sm:px-6">
         <div className="flex items-center justify-between">
-          <CardTitle className="text-lg font-bold flex items-center space-x-2">
-            <Gift className="w-5 h-5 text-primary" />
+          <CardTitle className="text-sm sm:text-lg font-bold flex items-center space-x-2">
+            <Gift className="w-4 h-4 sm:w-5 sm:h-5 text-primary" />
             <span>Incoming Transfers</span>
             {offers.length > 0 && (
               <span className="ml-2 px-2 py-0.5 text-xs bg-primary/20 text-primary rounded-full">
@@ -277,7 +277,7 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
         </p>
       </CardHeader>
       
-      <CardContent className="space-y-3">
+      <CardContent className="space-y-3 px-3 sm:px-6">
         {error && (
           <div className="flex items-center gap-2 p-3 bg-destructive/10 border border-destructive/30 rounded-lg text-sm text-destructive">
             <AlertCircle className="w-4 h-4 flex-shrink-0" />

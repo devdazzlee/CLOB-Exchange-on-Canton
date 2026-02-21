@@ -167,22 +167,22 @@ function DepthChart({
 
   return (
     <Card className={cn("bg-card/50 backdrop-blur-sm border-border/50", className)}>
-      <CardHeader className="pb-2">
-        <div className="flex items-center justify-between">
-          <CardTitle className="text-sm font-medium text-foreground flex items-center gap-2">
-            <Layers className="w-4 h-4 text-primary" />
+      <CardHeader className="pb-2 px-3 sm:px-6">
+        <div className="flex items-center justify-between gap-2">
+          <CardTitle className="text-xs sm:text-sm font-medium text-foreground flex items-center gap-1.5 sm:gap-2">
+            <Layers className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-primary" />
             Market Depth
           </CardTitle>
-          <div className="flex items-center gap-4 text-xs">
+          <div className="flex items-center gap-2 sm:gap-4 text-[10px] sm:text-xs">
             <div className="flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-success"></span>
+              <span className="w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full bg-success"></span>
               <span className="text-success font-medium">{bidPercent.toFixed(1)}%</span>
-              <span className="text-muted-foreground">Bids</span>
+              <span className="text-muted-foreground hidden sm:inline">Bids</span>
             </div>
             <div className="flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-destructive"></span>
+              <span className="w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full bg-destructive"></span>
               <span className="text-destructive font-medium">{askPercent.toFixed(1)}%</span>
-              <span className="text-muted-foreground">Asks</span>
+              <span className="text-muted-foreground hidden sm:inline">Asks</span>
             </div>
           </div>
         </div>
@@ -207,16 +207,16 @@ function DepthChart({
         />
         
         {/* Volume Stats */}
-        <div className="px-4 py-2 border-t border-border/50 flex items-center justify-between text-xs">
+        <div className="px-3 sm:px-4 py-2 border-t border-border/50 flex items-center justify-between text-[10px] sm:text-xs">
           <div className="flex items-center gap-1">
-            <span className="text-muted-foreground">Bid Depth:</span>
+            <span className="text-muted-foreground">Bid:</span>
             <span className="text-success font-mono font-medium">
               {totalBidVolume.toLocaleString(undefined, { maximumFractionDigits: 4 })}
             </span>
           </div>
           <div className="text-muted-foreground">|</div>
           <div className="flex items-center gap-1">
-            <span className="text-muted-foreground">Ask Depth:</span>
+            <span className="text-muted-foreground">Ask:</span>
             <span className="text-destructive font-mono font-medium">
               {totalAskVolume.toLocaleString(undefined, { maximumFractionDigits: 4 })}
             </span>
