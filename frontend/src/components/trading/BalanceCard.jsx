@@ -127,7 +127,7 @@ export default function BalanceCard({ balance = {}, lockedBalance = {}, loading,
         {tokens.length === 0 && (
           <div className="text-center py-8 text-muted-foreground">
             <p className="text-sm">No tokens found</p>
-            <p className="text-xs mt-2">Use "Get Test Funds" to mint tokens</p>
+            <p className="text-xs mt-2">No tokens available</p>
           </div>
         )}
         

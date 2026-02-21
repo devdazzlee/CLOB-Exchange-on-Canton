@@ -1199,8 +1199,6 @@ export default function TradingInterface({ partyId }) {
               balance={balance}
               lockedBalance={lockedBalance}
               orderBook={orderBook}
-            onMintTokens={handleMintTokens}
-            mintingLoading={mintingLoading}
               lastTradePrice={trades.length > 0 ? trades[0]?.price : null}
             />
 

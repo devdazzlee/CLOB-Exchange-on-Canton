@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
-import { AlertTriangle, Loader2, Info, Calculator, TrendingUp, TrendingDown, Coins, ShieldAlert } from 'lucide-react';
+import { AlertTriangle, Loader2, Info, Calculator, TrendingUp, TrendingDown, ShieldAlert } from 'lucide-react';
 import { Button } from '../ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
 import { Input } from '../ui/input';
@@ -26,8 +26,6 @@ export default function OrderForm({
   balance = { BTC: '0.0', USDT: '0.0' },
   lockedBalance = {},
   orderBook = { buys: [], sells: [] },
-  onMintTokens = null,
-  mintingLoading = false,
   lastTradePrice = null
 }) {
   const [timeInForce, setTimeInForce] = useState('GTC'); // GTC, IOC, FOK
@@ -400,25 +398,6 @@ export default function OrderForm({
                 <span className="text-xs text-muted-foreground">
                   Available: {formatNumber(orderType === 'BUY' ? quoteBalance : baseBalance, 8)} {orderType === 'BUY' ? quoteToken : baseToken}
                 </span>
-                {onMintTokens && (
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="h-6 text-xs px-2 bg-gradient-to-r from-yellow-500/10 to-orange-500/10 border-yellow-500/30 hover:border-yellow-500/50 text-yellow-600 dark:text-yellow-400"
-                    onClick={onMintTokens}
-                    disabled={mintingLoading}
-                  >
-                    {mintingLoading ? (
-                      <Loader2 className="w-3 h-3 animate-spin" />
-                    ) : (
-                      <>
-                        <Coins className="w-3 h-3 mr-1" />
-                        Get Test Funds
-                      </>
-                    )}
-                  </Button>
-                )}
               </div>
             </div>
             <Input
