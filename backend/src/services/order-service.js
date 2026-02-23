@@ -28,7 +28,6 @@ const tokenProvider = require('./tokenProvider');
 const { ValidationError, NotFoundError } = require('../utils/errors');
 const { v4: uuidv4 } = require('uuid');
 const { getReadModelService } = require('./readModelService');
-const { getUpdateStream } = require('./cantonUpdateStream');
 const { getCantonSDKClient } = require('./canton-sdk-client');
 
 // Configure Decimal for financial precision
@@ -584,7 +583,6 @@ class OrderService {
 
     console.log(`[OrderService] ✅ Order placed: ${orderId} (${contractId.substring(0, 20)}...) [status: ${initialStatus}]`);
 
-    // Add to UpdateStream for persistent storage and real-time updates
     const orderRecord = {
       contractId,
       orderId,
@@ -613,12 +611,7 @@ class OrderService {
       console.log(`[OrderService] Registered order ${orderId} in global registry`);
     }
     
-    const updateStream = getUpdateStream();
-    if (updateStream) {
-      updateStream.addOrder(orderRecord);
-    }
-
-    // Also add to ReadModel for backward compatibility
+    // Add to ReadModel
     const readModel = getReadModelService();
     if (readModel) {
       readModel.addOrder({
@@ -845,11 +838,6 @@ class OrderService {
       // Register in global open orders registry
       if (orderRecord.status === 'OPEN') {
         registerOpenOrders([orderRecord]);
-      }
-      
-      const updateStream = getUpdateStream();
-      if (updateStream) {
-        updateStream.addOrder(orderRecord);
       }
       
       const readModel = getReadModelService();
@@ -1089,14 +1077,7 @@ class OrderService {
       releaseReservation(orderId_cancel);
     }
 
-    // Remove from UpdateStream (persistent storage)
-    const updateStream = getUpdateStream();
-    if (updateStream) {
-      updateStream.removeOrder(orderContractId);
-      console.log(`[OrderService] Order removed from UpdateStream`);
-    }
-
-    // Remove from ReadModel cache
+    // Remove from ReadModel
     const readModel = getReadModelService();
     if (readModel) {
       readModel.removeOrder(orderContractId);
@@ -1212,12 +1193,7 @@ class OrderService {
         releaseReservation(cancelMeta.orderId);
       }
       
-      // Remove from tracking systems
-      const updateStream = getUpdateStream();
-      if (updateStream) {
-        updateStream.removeOrder(cancelMeta.orderContractId);
-      }
-      
+      // Remove from tracking
       const readModel = getReadModelService();
       if (readModel) {
         readModel.removeOrder(cancelMeta.orderContractId);
@@ -1297,8 +1273,6 @@ class OrderService {
         .map(c => {
           const payload = c.payload || c.createArgument || {};
           const contractId = c.contractId;
-          
-          console.log(`[OrderService] DEBUG RAW PRICE for ${payload.orderId}:`, JSON.stringify(payload.price));
           
           let extractedPrice = null;
           if (payload.price) {

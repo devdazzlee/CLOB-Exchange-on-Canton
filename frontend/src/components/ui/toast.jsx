@@ -77,7 +77,7 @@ function ToastContainer({ toasts, onRemove }) {
   );
 }
 
-function Toast({ toast, onRemove }) {
+const Toast = React.forwardRef(function Toast({ toast, onRemove }, ref) {
   const icons = {
     success: <CheckCircle className="w-5 h-5" />,
     error: <AlertCircle className="w-5 h-5" />,
@@ -109,6 +109,7 @@ function Toast({ toast, onRemove }) {
   if (toast.type === 'trade' && toast.tradeData) {
     return (
       <motion.div
+        ref={ref}
         initial={{ opacity: 0, x: 100, scale: 0.9 }}
         animate={{ opacity: 1, x: 0, scale: 1 }}
         exit={{ opacity: 0, x: 50, scale: 0.9 }}
@@ -155,6 +156,7 @@ function Toast({ toast, onRemove }) {
   if (toast.type === 'orderFilled' && toast.orderData) {
     return (
       <motion.div
+        ref={ref}
         initial={{ opacity: 0, y: 50, scale: 0.9 }}
         animate={{ opacity: 1, y: 0, scale: 1 }}
         exit={{ opacity: 0, y: 20, scale: 0.9 }}
@@ -188,6 +190,7 @@ function Toast({ toast, onRemove }) {
 
   return (
     <motion.div
+      ref={ref}
       initial={{ opacity: 0, y: 50, scale: 0.9 }}
       animate={{ opacity: 1, y: 0, scale: 1 }}
       exit={{ opacity: 0, y: 20, scale: 0.9 }}
@@ -227,7 +230,9 @@ function Toast({ toast, onRemove }) {
       />
     </motion.div>
   );
-}
+});
+
+Toast.displayName = 'Toast';
 
 // Order success modal component - Matching Cancel Modal Style
 export function OrderSuccessModal({ isOpen, onClose, orderData }) {

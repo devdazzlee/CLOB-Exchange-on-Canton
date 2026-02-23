@@ -8,13 +8,12 @@
  *   - CANCELLED orders → exercise ArchiveOrder
  *   - EXECUTED allocations → exercise ArchiveAllocation
  *   - CANCELLED allocations → exercise ArchiveAllocation
- *   - Old trade records → exercise ArchiveTrade (after persisting to file cache)
+ *   - Old trade records → exercise ArchiveTrade
  * 
  * All archive choices are consuming — the contract is removed from the ACS
  * on exercise, freeing space and improving query performance.
  * 
  * Safety:
- *   - Trade records are persisted to cantonUpdateStream before archival
  *   - Only contracts older than TRADE_RETENTION_MS are archived
  *   - Runs at CLEANUP_INTERVAL_MS intervals (default: 5 minutes)
  *   - Non-critical: if archival fails, the contract stays in ACS (no data loss)
@@ -216,32 +215,6 @@ class ACSCleanupService {
       });
 
       if (archivable.length > 0) {
-        // Persist to file cache BEFORE archiving
-        try {
-          const { getUpdateStream } = require('./cantonUpdateStream');
-          const updateStream = getUpdateStream();
-          for (const contract of archivable) {
-            const payload = contract.payload || contract.createArgument || {};
-            updateStream.addTrade({
-              contractId: contract.contractId,
-              tradeId: payload.tradeId,
-              tradingPair: payload.tradingPair || '',
-              buyer: payload.buyer,
-              seller: payload.seller,
-              price: payload.price,
-              quantity: payload.baseAmount || payload.quantity,
-              quoteAmount: payload.quoteAmount,
-              buyOrderId: payload.buyOrderId,
-              sellOrderId: payload.sellOrderId,
-              timestamp: payload.timestamp,
-              archivedAt: new Date().toISOString(),
-            });
-          }
-        } catch (_) {
-          // Non-critical but log
-          console.warn('[ACSCleanup] Could not persist trades to file cache before archival');
-        }
-
         const batch = archivable.slice(0, BATCH_SIZE);
         for (const contract of batch) {
           try {

@@ -22,4 +22,7 @@ router.get('/:pair', (req, res, next) => {
 // GET /api/trades/user/:partyId?limit=200
 router.get('/user/:partyId', tradeController.getForParty);
 
+// GET /api/trades/party/:partyId?limit=200 — alias for /user/:partyId (frontend compatibility)
+router.get('/party/:partyId', tradeController.getForParty);
+
 module.exports = router;

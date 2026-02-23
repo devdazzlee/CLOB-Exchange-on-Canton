@@ -154,27 +154,15 @@ class ReadModelService extends EventEmitter {
     }
 
     /**
-     * Get recent trades — streaming first, then file cache, then REST
+     * Get recent trades from WebSocket streaming read model
      */
     getRecentTrades(tradingPair = null, limit = 50) {
-        // PRIMARY: Streaming read model
         if (this.streamingModel?.isReady()) {
             return tradingPair
                 ? this.streamingModel.getTradesForPair(tradingPair, limit)
                 : this.streamingModel.getAllTrades(limit);
         }
-
-        // FALLBACK: File-backed cache
-        try {
-            const { getUpdateStream } = require('./cantonUpdateStream');
-            const updateStream = getUpdateStream();
-            const trades = tradingPair
-                ? updateStream.getTradesForPair(tradingPair, limit)
-                : updateStream.getAllTrades(limit);
-            return trades;
-        } catch (e) {
-            return [];
-        }
+        return [];
     }
 
     /**

@@ -729,6 +729,17 @@ class CantonSDKClient {
   }
 
   /**
+   * Backward-compatible alias used by balance routes.
+   * Executes a full token transfer sender -> receiver.
+   */
+  async executeFullTransfer(senderPartyId, receiverPartyId, amount, symbol, transferId = '') {
+    if (transferId) {
+      console.log(`[CantonSDK] executeFullTransfer transferId=${String(transferId).substring(0, 40)}...`);
+    }
+    return this.performTransfer(senderPartyId, receiverPartyId, amount, symbol);
+  }
+
+  /**
    * Accept a TransferInstruction (transfer offer) — used by TransferOfferService.
    * 
    * This exercises `TransferInstruction_Accept` on the Canton ledger directly.
@@ -959,9 +970,12 @@ class CantonSDKClient {
       choiceContextData,
     } = params;
 
-      const now = new Date().toISOString();
-      const settleBefore = new Date(Date.now() + 86400000).toISOString(); // 24 hours
-      const allocateBefore = new Date(Date.now() + 3600000).toISOString(); // 1 hour
+      const nowMs = Date.now();
+      const now = new Date(nowMs).toISOString();
+      // Keep allocation windows short for Amulet to satisfy on-ledger lock-expiry assertions.
+      // allocateBefore must be earlier than settleBefore.
+      const allocateBefore = new Date(nowMs + 2 * 60 * 1000).toISOString(); // +2m
+      const settleBefore = new Date(nowMs + 5 * 60 * 1000).toISOString();   // +5m
 
     return {
       expectedAdmin: adminParty,
@@ -990,6 +1004,14 @@ class CantonSDKClient {
         meta: { values: {} },
       },
     };
+  }
+
+  _pickSynchronizerIdFromDisclosed(disclosedContracts, fallbackSynchronizerId) {
+    if (Array.isArray(disclosedContracts)) {
+      const found = disclosedContracts.find(dc => typeof dc?.synchronizerId === 'string' && dc.synchronizerId.length > 0);
+      if (found?.synchronizerId) return found.synchronizerId;
+    }
+    return fallbackSynchronizerId;
   }
 
   /**
@@ -1050,16 +1072,20 @@ class CantonSDKClient {
 
       const adminToken = await tokenProvider.getServiceToken();
       const configModule = require('../config');
-      const synchronizerId = configModule.canton.synchronizerId;
+      const synchronizerId = this._pickSynchronizerIdFromDisclosed(
+        factory.choiceContext?.disclosedContracts || [],
+        configModule.canton.synchronizerId
+      );
 
         const result = await cantonService.exerciseChoice({
           token: adminToken,
+          // AllocationFactory_Allocate authorizes sender; submit as sender.
           actAsParty: [senderPartyId],
         templateId: UTILITIES_CONFIG.ALLOCATION_INSTRUCTION_FACTORY_INTERFACE,
         contractId: factory.factoryId,
         choice: 'AllocationFactory_Allocate',
         choiceArgument: exerciseArgs,
-          readAs: [senderPartyId, executorPartyId],
+          readAs: [senderPartyId, receiverPartyId || executorPartyId, executorPartyId],
         synchronizerId,
         disclosedContracts: (factory.choiceContext?.disclosedContracts || []).map(dc => ({
             templateId: dc.templateId,
@@ -1139,16 +1165,20 @@ class CantonSDKClient {
 
     const adminToken = await tokenProvider.getServiceToken();
     const configModule = require('../config');
-    const synchronizerId = configModule.canton.synchronizerId;
+    const synchronizerId = this._pickSynchronizerIdFromDisclosed(
+      factory.choiceContext?.disclosedContracts || [],
+      configModule.canton.synchronizerId
+    );
 
     const result = await cantonService.exerciseChoice({
       token: adminToken,
+      // AllocationFactory_Allocate authorizes sender; submit as sender.
       actAsParty: [senderPartyId],
       templateId: UTILITIES_CONFIG.ALLOCATION_INSTRUCTION_FACTORY_INTERFACE,
       contractId: factory.factoryId,
         choice: 'AllocationFactory_Allocate',
       choiceArgument: exerciseArgs,
-        readAs: [senderPartyId, executorPartyId],
+        readAs: [senderPartyId, receiverPartyId || executorPartyId, executorPartyId],
       synchronizerId,
       disclosedContracts: (factory.choiceContext?.disclosedContracts || []).map(dc => ({
         templateId: dc.templateId,
@@ -1281,22 +1311,10 @@ class CantonSDKClient {
       return null;
     }
 
-    // Build the actAs list: MUST include ALL THREE parties:
-    //   1. executorPartyId  — the exchange (settlement executor)
-    //   2. ownerPartyId     — the sender (allocation owner, whose funds are locked)
-    //   3. receiverPartyId  — the receiver (who will receive the funds)
-    //
-    // The AmuletAllocation / DvpLegAllocation contract requires ALL THREE as
-    // authorizers for Allocation_ExecuteTransfer. Missing ANY party causes:
-    //   DAML_AUTHORIZATION_ERROR: requires authorizers [executor, sender, receiver]
+    // Client-required model: settlement executes with exchange as executor.
+    // Keep sender/receiver in readAs for visibility/context, but do not submit as them.
     const actAsParties = [executorPartyId];
-    if (ownerPartyId && ownerPartyId !== executorPartyId) {
-      actAsParties.push(ownerPartyId);
-    }
-    if (receiverPartyId && !actAsParties.includes(receiverPartyId)) {
-      actAsParties.push(receiverPartyId);
-    }
-    const readAsParties = [...actAsParties];
+    const readAsParties = [...new Set([executorPartyId, ownerPartyId, receiverPartyId].filter(Boolean))];
 
     // Get synchronizerId from config — REQUIRED for all Canton command submissions
     const configModule = require('../config');
@@ -1429,16 +1447,10 @@ class CantonSDKClient {
     const encodedCid = encodeURIComponent(allocationContractId);
     const executeContextUrl = `${backendUrl}/v0/registrars/${encodeURIComponent(adminParty)}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
 
-    // Build actAs: ALL THREE parties required — executor, sender (owner), AND receiver
-    // The DvpLegAllocation contract requires all three as authorizers for ExecuteTransfer
+    // Client-required model: settlement executes with exchange as executor.
+    // Keep sender/receiver in readAs for visibility/context, but do not submit as them.
     const actAsParties = [executorPartyId];
-    if (ownerPartyId && ownerPartyId !== executorPartyId) {
-      actAsParties.push(ownerPartyId);
-    }
-    if (receiverPartyId && !actAsParties.includes(receiverPartyId)) {
-      actAsParties.push(receiverPartyId);
-    }
-    const readAsParties = [...actAsParties];
+    const readAsParties = [...new Set([executorPartyId, ownerPartyId, receiverPartyId].filter(Boolean))];
 
     // Get synchronizerId — REQUIRED for Canton command submission
     const configModule = require('../config');

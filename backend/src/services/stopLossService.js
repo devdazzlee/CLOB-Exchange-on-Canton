@@ -27,6 +27,7 @@ const Decimal = require('decimal.js');
 const cantonService = require('./cantonService');
 const config = require('../config');
 const tokenProvider = require('./tokenProvider');
+// NOTE: cantonService and tokenProvider are still needed for triggerOrder() — do NOT remove
 
 // Configure decimal precision
 Decimal.set({ precision: 20, rounding: Decimal.ROUND_DOWN });
@@ -358,14 +359,40 @@ class StopLossService extends EventEmitter {
 
   /**
    * Get current market price for a trading pair.
-   * Tries: order book midpoint → last trade price → best bid/ask
+   * Uses ONLY in-memory data from the streaming read model — NO Canton queries.
+   * Tries: order book midpoint → last trade price from streaming model
    */
   async _getMarketPrice(tradingPair) {
+    // 1. Try order book midpoint from streaming model
+    try {
+      const { getStreamingReadModel } = require('./streamingReadModel');
+      const streaming = getStreamingReadModel();
+      if (streaming?.isReady()) {
+        const book = streaming.getOrderBook(tradingPair);
+        if (book.buyOrders?.length > 0 && book.sellOrders?.length > 0) {
+          const bestBid = parseFloat(book.buyOrders[0]?.price || 0);
+          const bestAsk = parseFloat(book.sellOrders[0]?.price || 0);
+          if (bestBid > 0 && bestAsk > 0) return (bestBid + bestAsk) / 2;
+          if (bestBid > 0) return bestBid;
+          if (bestAsk > 0) return bestAsk;
+        }
+
+        // 2. Try last trade price from streaming model trades (in-memory)
+        const trades = streaming.getTradesForPair(tradingPair, 1);
+        if (trades.length > 0 && trades[0].price) {
+          return parseFloat(trades[0].price);
+        }
+      }
+    } catch (err) {
+      // Suppress
+    }
+
+    // 3. Try order book service as last resort (still in-memory, no Canton query)
     try {
       const { getOrderBookService } = require('./orderBookService');
       const orderBookService = getOrderBookService();
       const orderBook = await orderBookService.getOrderBook(tradingPair);
-      
+
       if (orderBook.buyOrders?.length > 0 && orderBook.sellOrders?.length > 0) {
         const bestBid = parseFloat(orderBook.buyOrders[0]?.price || 0);
         const bestAsk = parseFloat(orderBook.sellOrders[0]?.price || 0);
@@ -379,35 +406,9 @@ class StopLossService extends EventEmitter {
       // Suppress
     }
 
-    // Fallback: query trades from Canton
-    try {
-      const token = await tokenProvider.getServiceToken();
-      const packageId = config.canton.packageIds.clobExchange;
-      const operatorPartyId = config.canton.operatorPartyId;
-      const templateId = `${packageId}:Settlement:Trade`;
-      
-      const contracts = await cantonService.queryActiveContracts({
-        party: operatorPartyId,
-        templateIds: [templateId],
-        pageSize: 10,
-      }, token);
-
-      let latestPrice = null;
-      let latestTs = 0;
-      for (const c of (Array.isArray(contracts) ? contracts : [])) {
-        const p = c.payload || c.createArgument || {};
-        if (p.tradingPair === tradingPair && p.price) {
-          const ts = new Date(p.timestamp || 0).getTime();
-          if (ts > latestTs) {
-            latestTs = ts;
-            latestPrice = parseFloat(p.price);
-          }
-        }
-      }
-      return latestPrice;
-    } catch (err) {
-      return null;
-    }
+    // No Canton query fallback — the streaming model IS the source of truth.
+    // If it has no data, we simply don't have a market price.
+    return null;
   }
 
   /**

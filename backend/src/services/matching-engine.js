@@ -37,7 +37,6 @@ const cantonService = require('./cantonService');
 const config = require('../config');
 const tokenProvider = require('./tokenProvider');
 const { getCantonSDKClient } = require('./canton-sdk-client');
-const { getGlobalOpenOrders } = require('./order-service');
 
 // Configure decimal.js for financial precision
 Decimal.set({ precision: 20, rounding: Decimal.ROUND_DOWN });
@@ -238,68 +237,18 @@ class MatchingEngine {
     if (!packageId || !operatorPartyId) return false;
 
     try {
-      // ═══ PRIMARY: Streaming Read Model (no 200 limit) ═══
+      // WebSocket streaming read model is the only source of order data.
       const streaming = this._getStreamingModel();
       let rawOrders = null;
       
       if (streaming) {
-        // Instant in-memory lookup — ALL orders, no REST call, no 200 limit
+        // Instant lookup from WebSocket-synced read model.
         rawOrders = streaming.getOpenOrdersForPair(tradingPair);
       }
-      
-      // ═══ FALLBACK: REST API (200 limit applies) ═══
-      if (!rawOrders) {
-        const legacyPackageId = config.canton.packageIds?.legacy;
-        const templateIdsToQuery = [`${packageId}:Order:Order`];
-        if (legacyPackageId && legacyPackageId !== packageId) {
-          templateIdsToQuery.push(`${legacyPackageId}:Order:Order`);
-        }
 
-        let contracts = await cantonService.queryActiveContracts({
-          party: operatorPartyId,
-          templateIds: templateIdsToQuery,
-          pageSize: 200
-        }, token);
-        
-        // Merge with global open orders registry (catches orders behind 200 limit)
-        try {
-          const globalOrders = getGlobalOpenOrders();
-          if (Array.isArray(globalOrders) && globalOrders.length > 0) {
-            const existingIds = new Set((Array.isArray(contracts) ? contracts : []).map(c => c.contractId));
-            const extra = globalOrders
-              .filter(o => o.status === 'OPEN' && !existingIds.has(o.contractId))
-              .map(o => ({
-                contractId: o.contractId,
-                templateId: `${packageId}:Order:Order`,
-                payload: o,
-                createArgument: o,
-              }));
-            if (extra.length > 0) {
-              contracts = [...(Array.isArray(contracts) ? contracts : []), ...extra];
-            }
-          }
-        } catch (_) { /* non-critical */ }
-        
-        // Convert REST contracts to normalized rawOrders format
-        rawOrders = (Array.isArray(contracts) ? contracts : []).map(c => {
-          const payload = c.payload || c.createArgument || {};
-          return {
-            contractId: c.contractId,
-            templateId: c.templateId || `${packageId}:Order:Order`,
-            orderId: payload.orderId,
-            owner: payload.owner,
-            orderType: payload.orderType,
-            orderMode: payload.orderMode || 'LIMIT',
-            tradingPair: payload.tradingPair,
-            price: payload.price,
-            quantity: payload.quantity,
-            filled: payload.filled || '0',
-            status: payload.status,
-            timestamp: payload.timestamp,
-            allocationCid: payload.allocationCid,
-          };
-        }).filter(o => o.tradingPair === tradingPair && o.status === 'OPEN');
-      }
+      // No fallback to REST/patched registries by client requirement.
+      // If streaming is unavailable or not bootstrapped yet, skip this cycle.
+      if (!streaming || !streaming.isReady()) return false;
       
       if (!rawOrders || rawOrders.length === 0) return false;
       
@@ -472,11 +421,22 @@ class MatchingEngine {
           return true;
         } catch (error) {
           console.error(`[MatchingEngine] ❌ Match execution failed:`, error.message);
+          // If auth/token expired, refresh immediately and allow instant retry
+          // instead of waiting for the 30s recentlyMatched cooldown.
+          if (error.message?.includes('401') || error.message?.includes('security-sensitive')) {
+            this.invalidateToken();
+            this.recentlyMatchedOrders.delete(matchKey);
+            console.warn('[MatchingEngine] 🔄 Invalidated admin token after auth failure; retrying on next cycle');
+          }
           
           if (error.message?.includes('already filled') || 
               error.message?.includes('could not be found') ||
               error.message?.includes('CONTRACT_NOT_FOUND')) {
             console.log(`[MatchingEngine] ℹ️ Order already processed — skipping`);
+            // If BUY side contract is gone, no point trying this buy against more sells.
+            if (error.message?.includes('Buy FillOrder failed')) {
+              break;
+            }
             continue;
           }
           
@@ -651,7 +611,7 @@ class MatchingEngine {
         releasePartialReservation(sellOrder.orderId, matchQtyStr);
         releasePartialReservation(buyOrder.orderId, quoteAmountStr);
       } catch (_) { /* non-critical */ }
-      return; // Abort settlement — FillOrder already happened but no tokens move
+      throw new Error(`Settlement aborted: cannot create ${baseSymbol} allocation`);
     }
 
     // Leg B allocation: buyer sends quote asset to seller
@@ -687,7 +647,7 @@ class MatchingEngine {
         releasePartialReservation(sellOrder.orderId, matchQtyStr);
         releasePartialReservation(buyOrder.orderId, quoteAmountStr);
       } catch (_) { /* non-critical */ }
-      return;
+      throw new Error(`Settlement aborted: cannot create ${quoteSymbol} allocation`);
     }
 
     // ── PHASE 2: EXECUTE both allocations (both CIDs are fresh & valid) ──
@@ -724,7 +684,7 @@ class MatchingEngine {
         releasePartialReservation(sellOrder.orderId, matchQtyStr);
         releasePartialReservation(buyOrder.orderId, quoteAmountStr);
       } catch (_) { /* non-critical */ }
-      return;
+      throw new Error(`Settlement aborted: ${baseSymbol} allocation execution failed`);
     }
 
     // Execute Leg B: quote asset (buyer → seller)
@@ -746,6 +706,12 @@ class MatchingEngine {
       console.error(`[MatchingEngine]    ❌ Leg B execution FAILED: ${execErr.message}`);
       console.error(`[MatchingEngine]    🚨 CRITICAL: Partial settlement — ${baseSymbol} moved but ${quoteSymbol} FAILED`);
       // Leg A already executed — this is a partial settlement that needs manual resolution
+      try {
+        const { releasePartialReservation } = require('./order-service');
+        releasePartialReservation(sellOrder.orderId, matchQtyStr);
+        releasePartialReservation(buyOrder.orderId, quoteAmountStr);
+      } catch (_) { /* non-critical */ }
+      throw new Error(`Settlement partial failure: ${quoteSymbol} allocation execution failed after ${baseSymbol} moved`);
     }
 
     // Settlement summary
@@ -753,6 +719,9 @@ class MatchingEngine {
       console.log(`[MatchingEngine]    ✅ Settlement COMPLETE — BOTH legs settled via match-time Allocations!`);
     } else if (!baseTransferResult && !quoteTransferResult) {
       console.error(`[MatchingEngine]    ❌ Settlement FAILED — no tokens transferred.`);
+      throw new Error('Settlement failed: no transfer leg completed');
+    } else {
+      throw new Error('Settlement incomplete: one transfer leg did not complete');
     }
 
     // Release balance reservations for filled quantities
@@ -841,17 +810,6 @@ class MatchingEngine {
       instrumentAllocationId: sellOrder.allocationContractId || null,
       paymentAllocationId: buyOrder.allocationContractId || null,
     };
-
-    // Add to UpdateStream for persistence
-    try {
-      const { getUpdateStream } = require('./cantonUpdateStream');
-      const updateStream = getUpdateStream();
-      if (updateStream && typeof updateStream.addTrade === 'function') {
-        updateStream.addTrade(tradeRecord);
-      }
-    } catch (e) {
-      // Non-critical
-    }
 
     // Broadcast via WebSocket
     if (global.broadcastWebSocket) {

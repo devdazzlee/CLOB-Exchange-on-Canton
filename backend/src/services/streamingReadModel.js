@@ -164,6 +164,23 @@ class StreamingReadModel extends EventEmitter {
     }
 
     console.log(`[StreamingReadModel] 📦 Bootstrapped ${totalContracts} total contracts`);
+
+    // Diagnostic: count orders by status
+    const statusCounts = {};
+    for (const order of this.orders.values()) {
+      statusCounts[order.status] = (statusCounts[order.status] || 0) + 1;
+    }
+    if (Object.keys(statusCounts).length > 0) {
+      console.log(`[StreamingReadModel]   Order statuses: ${JSON.stringify(statusCounts)}`);
+    }
+    const pairCounts = {};
+    for (const [pair, ids] of this.ordersByPair) {
+      pairCounts[pair] = ids.size;
+    }
+    if (Object.keys(pairCounts).length > 0) {
+      console.log(`[StreamingReadModel]   Orders by pair: ${JSON.stringify(pairCounts)}`);
+    }
+
     this.bootstrapComplete = true;
   }
 
@@ -227,6 +244,10 @@ class StreamingReadModel extends EventEmitter {
           if (contract && contract.contractId) {
             this._processContract(contract);
             count++;
+          } else if (count === 0 && !msg.offset) {
+            // Log first unrecognized message for diagnostics
+            const keys = Object.keys(msg).join(', ');
+            console.warn(`[StreamingReadModel] ⚠️ Unrecognized message format (keys: ${keys})`);
           }
         } catch (e) {
           // Ignore parse errors on individual messages
@@ -381,6 +402,10 @@ class StreamingReadModel extends EventEmitter {
     }
 
     if (newEvents > 0) {
+      // Log significant updates (orders/trades, not just offsets)
+      if (newEvents <= 10) {
+        console.log(`[StreamingReadModel] 📡 ${newEvents} event(s) at offset ${this.lastOffset} — orders: ${this.orders.size}, trades: ${this.trades.size}`);
+      }
       this.emit('update', { type: 'websocket', events: newEvents, offset: this.lastOffset });
     }
   }
@@ -574,13 +599,6 @@ class StreamingReadModel extends EventEmitter {
       this.tradesByPair.get(tradingPair).add(contractId);
     }
 
-    // Push to file-backed cache for persistence across restarts
-    try {
-      const { getUpdateStream } = require('./cantonUpdateStream');
-      const updateStream = getUpdateStream();
-      updateStream.addTrade(trade);
-    } catch (_) { /* non-critical */ }
-
     this.emit('tradeCreated', trade);
   }
 
@@ -667,7 +685,7 @@ class StreamingReadModel extends EventEmitter {
         ...o,
         remaining: parseFloat(o.quantity || 0) - parseFloat(o.filled || 0),
       }))
-      .filter(o => o.remaining > 0)
+      .filter(o => o.remaining > 0.0000001) // Filter fully-filled orders still marked OPEN
       .sort((a, b) => parseFloat(b.price || 0) - parseFloat(a.price || 0));
 
     const sellOrders = openOrders
@@ -676,7 +694,7 @@ class StreamingReadModel extends EventEmitter {
         ...o,
         remaining: parseFloat(o.quantity || 0) - parseFloat(o.filled || 0),
       }))
-      .filter(o => o.remaining > 0)
+      .filter(o => o.remaining > 0.0000001) // Filter fully-filled orders still marked OPEN
       .sort((a, b) => parseFloat(a.price || Infinity) - parseFloat(b.price || Infinity));
 
     return {

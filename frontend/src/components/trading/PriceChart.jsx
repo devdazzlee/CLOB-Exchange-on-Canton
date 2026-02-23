@@ -43,6 +43,22 @@ function PriceChart({
   volume24h = 0,
   className
 }) {
+  const isFiniteNumber = (v) => typeof v === 'number' && Number.isFinite(v);
+
+  const normalizeCandle = useCallback((candle) => {
+    if (!candle) return null;
+    const time = Number(candle.time);
+    const open = Number(candle.open);
+    const high = Number(candle.high);
+    const low = Number(candle.low);
+    const close = Number(candle.close);
+    const volume = Number(candle.volume ?? 0);
+    if (!isFiniteNumber(time) || !isFiniteNumber(open) || !isFiniteNumber(high) || !isFiniteNumber(low) || !isFiniteNumber(close)) {
+      return null;
+    }
+    return { time, open, high, low, close, volume: isFiniteNumber(volume) ? volume : 0 };
+  }, []);
+
   const chartContainerRef = useRef(null);
   const chartRef = useRef(null);
   const seriesRef = useRef(null);
@@ -120,7 +136,8 @@ function PriceChart({
       return filled;
     }
     
-    return candleArray.length > 0 ? candleArray : generateSampleData(intervalMs);
+    const normalized = candleArray.map(normalizeCandle).filter(Boolean);
+    return normalized.length > 0 ? normalized : generateSampleData(intervalMs);
   }, []);
 
   // Generate sample data for demonstration
@@ -144,8 +161,8 @@ function PriceChart({
       price = close;
     }
     
-    return candles;
-  }, [currentPrice]);
+    return candles.map(normalizeCandle).filter(Boolean);
+  }, [currentPrice, normalizeCandle]);
 
   // Initialize chart
   useEffect(() => {
@@ -284,16 +301,20 @@ function PriceChart({
     });
 
     // Set data
-    if (chartData.length > 0 && seriesRef.current) {
+    const safeChartData = chartData.map(normalizeCandle).filter(Boolean);
+    if (safeChartData.length > 0 && seriesRef.current) {
       try {
         if (chartType === 'candlestick') {
-          seriesRef.current.setData(chartData);
+          seriesRef.current.setData(safeChartData);
         } else {
-          seriesRef.current.setData(chartData.map(d => ({ time: d.time, value: d.close })));
+          const lineData = safeChartData
+            .map(d => ({ time: d.time, value: Number(d.close) }))
+            .filter(d => isFiniteNumber(d.value));
+          if (lineData.length > 0) seriesRef.current.setData(lineData);
         }
 
         if (volumeSeriesRef.current) {
-          volumeSeriesRef.current.setData(chartData.map((d) => ({
+          volumeSeriesRef.current.setData(safeChartData.map((d) => ({
             time: d.time,
             value: d.volume,
             color: d.close >= d.open ? 'rgba(34, 197, 94, 0.3)' : 'rgba(239, 68, 68, 0.3)'
@@ -308,7 +329,7 @@ function PriceChart({
 
     setLastUpdate(new Date());
     setIsLoading(false);
-  }, [chartType, chartData]);
+  }, [chartType, chartData, normalizeCandle]);
 
   // Generate chart data when trades or interval changes
   useEffect(() => {
@@ -320,32 +341,34 @@ function PriceChart({
   // Update current candle in real-time
   useEffect(() => {
     if (!seriesRef.current || !chartData.length || !currentPrice) return;
+    const parsedCurrentPrice = Number(currentPrice);
+    if (!isFiniteNumber(parsedCurrentPrice) || parsedCurrentPrice <= 0) return;
 
     try {
       const now = Math.floor(Date.now() / 1000);
       const intervalSec = selectedInterval.value / 1000;
       const currentCandleTime = Math.floor(now / intervalSec) * intervalSec;
       
-      const lastCandle = chartData[chartData.length - 1];
+      const lastCandle = normalizeCandle(chartData[chartData.length - 1]);
       
       if (lastCandle && lastCandle.time === currentCandleTime) {
         const updatedCandle = {
           ...lastCandle,
-          high: Math.max(lastCandle.high, currentPrice),
-          low: Math.min(lastCandle.low, currentPrice),
-          close: currentPrice
+          high: Math.max(lastCandle.high, parsedCurrentPrice),
+          low: Math.min(lastCandle.low, parsedCurrentPrice),
+          close: parsedCurrentPrice
         };
         
         if (chartType === 'candlestick') {
           seriesRef.current.update(updatedCandle);
         } else {
-          seriesRef.current.update({ time: updatedCandle.time, value: currentPrice });
+          seriesRef.current.update({ time: updatedCandle.time, value: parsedCurrentPrice });
         }
       }
     } catch (e) {
       console.warn('[PriceChart] Error updating candle:', e.message);
     }
-  }, [currentPrice, chartData, selectedInterval, chartType]);
+  }, [currentPrice, chartData, selectedInterval, chartType, normalizeCandle]);
 
   const formatPrice = (price) => {
     if (!price || isNaN(price)) return '--';
