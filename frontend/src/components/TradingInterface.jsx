@@ -82,8 +82,8 @@ export default function TradingInterface({ partyId }) {
   const [signingError, setSigningError] = useState(null);
 
   // === PHASE 3: ALL USECALLBACK HOOKS - NO CONDITIONALS ===
-  // TOKEN STANDARD V2: Mint creates Holding contracts (real tokens)
-  const handleMintTokens = useCallback(async () => {
+  // TOKEN STANDARD V2: Mint creates transfer offers/holdings through backend mint API
+  const handleMintTokens = useCallback(async (tokensToMint = null) => {
     console.log('[Mint V2] Manual mint button clicked for party:', partyId);
     
     if (mintingLoading || isMintingRef.current) {
@@ -96,20 +96,30 @@ export default function TradingInterface({ partyId }) {
     
     try {
       // TOKEN STANDARD V2: Create Holding contracts (real tokens, not text balances)
-      const mintResult = await balanceService.mintTokens(partyId, [
-        { symbol: 'BTC', amount: 10 },
-        { symbol: 'USDT', amount: 100000 },
-        { symbol: 'ETH', amount: 100 },
-        { symbol: 'SOL', amount: 1000 },
-        { symbol: 'CC', amount: 50 },
-        { symbol: 'CBTC', amount: 5 }
-      ]);
+      const mintPayload = Array.isArray(tokensToMint) && tokensToMint.length > 0
+        ? tokensToMint
+        : [
+            { symbol: 'BTC', amount: 10 },
+            { symbol: 'USDT', amount: 100000 },
+            { symbol: 'ETH', amount: 100 },
+            { symbol: 'SOL', amount: 1000 },
+            { symbol: 'CC', amount: 50 },
+            { symbol: 'CBTC', amount: 5 }
+          ];
+
+      // Force V2 mint endpoint so UI matches the exact manual API flow:
+      // POST /api/balance/v2/mint
+      const mintResult = await balanceService.mintTokens(partyId, mintPayload, true);
       
       if (mintResult.success) {
         console.log('[Mint V2] Holdings created:', mintResult);
-        toast.success('Test tokens minted as Holdings!', {
+        const mintedSummary = mintPayload
+          .map((t) => `${t.symbol}: ${t.amount}`)
+          .join(' | ');
+
+        toast.success('Mint request submitted successfully', {
           title: '🪙 Holdings Created',
-          details: 'BTC: 10 | USDT: 100,000 | ETH: 100 | SOL: 1,000 | CC: 50 | CBTC: 5'
+          details: mintedSummary
         });
         
         // Refresh balance from V2 Holdings (includes CBTC)
@@ -1204,10 +1214,15 @@ export default function TradingInterface({ partyId }) {
 
           {/* Balance Card - Shows all token holdings including CBTC */}
           <BalanceCard
+            partyId={partyId}
             balance={balance}
             lockedBalance={lockedBalance}
             loading={balanceLoading}
             onRefresh={() => loadBalance(true)}
+            mintingLoading={mintingLoading}
+            onMintToken={async (symbol, amount) => {
+              await handleMintTokens([{ symbol, amount }]);
+            }}
           />
           
           {/* Transfer Offers - Accept incoming tokens (CBTC from faucet, etc.) */}

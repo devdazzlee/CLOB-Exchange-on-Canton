@@ -507,56 +507,17 @@ class MatchingEngine {
     const sdkClient = getCantonSDKClient();
 
     // ═══════════════════════════════════════════════════════════════════
-    // STEP 1: FillOrder on BOTH Canton orders FIRST
-    // This prevents the re-matching loop: once filled, the matching
-    // engine won't pick them up again even if settlement takes time.
+    // STEP 1: REAL Token Settlement via Allocation API
+    //
+    // IMPORTANT:
+    // We settle token movement BEFORE filling order contracts.
+    // If FillOrder is done first and settlement fails, orders become FILLED
+    // with no token transfer (client-critical inconsistency).
     // ═══════════════════════════════════════════════════════════════════
     console.log(`[MatchingEngine] 🔄 Settlement: ${matchQtyStr} ${baseSymbol} @ ${matchPrice} ${quoteSymbol}`);
-    console.log(`[MatchingEngine] 📝 Step 1: Filling orders on-chain (prevents re-matching)...`);
+    console.log(`[MatchingEngine] 💰 Step 1: Creating & executing match-time Allocations...`);
 
-    try {
-      const buyFillArg = { fillQuantity: matchQtyStr };
-      if (buyOrder.isNewPackage) buyFillArg.newAllocationCid = null;
-        await cantonService.exerciseChoice({
-        token, actAsParty: [operatorPartyId],
-          templateId: buyOrder.templateId || `${packageId}:Order:Order`,
-        contractId: buyOrder.contractId, choice: 'FillOrder',
-          choiceArgument: buyFillArg,
-          readAs: [operatorPartyId, buyOrder.owner],
-        });
-      console.log(`[MatchingEngine] ✅ Buy order filled: ${buyOrder.orderId}${buyIsPartial ? ' (partial)' : ' (complete)'}`);
-      } catch (fillError) {
-      console.error(`[MatchingEngine] ❌ Buy FillOrder FAILED: ${fillError.message}`);
-      if (fillError.message?.includes('already filled') || fillError.message?.includes('CONTRACT_NOT_FOUND')) {
-        throw fillError;
-      }
-      throw new Error(`Buy FillOrder failed: ${fillError.message}`);
-    }
-
-    try {
-      const sellFillArg = { fillQuantity: matchQtyStr };
-      if (sellOrder.isNewPackage) sellFillArg.newAllocationCid = null;
-        await cantonService.exerciseChoice({
-        token, actAsParty: [operatorPartyId],
-          templateId: sellOrder.templateId || `${packageId}:Order:Order`,
-        contractId: sellOrder.contractId, choice: 'FillOrder',
-          choiceArgument: sellFillArg,
-          readAs: [operatorPartyId, sellOrder.owner],
-        });
-      console.log(`[MatchingEngine] ✅ Sell order filled: ${sellOrder.orderId}${sellIsPartial ? ' (partial)' : ' (complete)'}`);
-      } catch (fillError) {
-      console.error(`[MatchingEngine] ❌ Sell FillOrder FAILED: ${fillError.message}`);
-      if (!fillError.message?.includes('already filled') && !fillError.message?.includes('CONTRACT_NOT_FOUND')) {
-        console.warn(`[MatchingEngine] ⚠️ Sell FillOrder failed but buy succeeded — will still attempt settlement`);
-      }
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // STEP 2: REAL Token Settlement via Allocation API
-    //
     // Per client requirement: Settlement MUST use Allocations, NOT TransferInstruction.
-    // Exchange acts as EXECUTOR — settles with its own key, no user key needed.
-    //
     // ARCHITECTURE: Allocations are created HERE at MATCH TIME with the EXACT
     // match amount, NOT at order placement time. This is critical because:
     //   - Allocation contracts are SINGLE-USE on Canton (consumed on execute)
@@ -572,8 +533,6 @@ class MatchingEngine {
     //   4. EXECUTE allocation B — if fails, log critical (A already executed)
     //
     // @see https://docs.sync.global/app_dev/api/splice-api-token-allocation-v1/
-    // ═══════════════════════════════════════════════════════════════════
-    console.log(`[MatchingEngine] 💰 Step 2: Creating & executing match-time Allocations...`);
     console.log(`[MatchingEngine]    Leg A: ${matchQtyStr} ${baseSymbol} (seller → buyer)`);
     console.log(`[MatchingEngine]    Leg B: ${quoteAmountStr} ${quoteSymbol} (buyer → seller)`);
 
@@ -722,6 +681,51 @@ class MatchingEngine {
       throw new Error('Settlement failed: no transfer leg completed');
     } else {
       throw new Error('Settlement incomplete: one transfer leg did not complete');
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // STEP 2: FillOrder on BOTH Canton order contracts AFTER settlement
+    // ═══════════════════════════════════════════════════════════════════
+    console.log(`[MatchingEngine] 📝 Step 2: Filling orders on-chain (post-settlement)...`);
+
+    try {
+      const buyFillArg = { fillQuantity: matchQtyStr };
+      if (buyOrder.isNewPackage) buyFillArg.newAllocationCid = null;
+      await cantonService.exerciseChoice({
+        token,
+        actAsParty: [operatorPartyId],
+        templateId: buyOrder.templateId || `${packageId}:Order:Order`,
+        contractId: buyOrder.contractId,
+        choice: 'FillOrder',
+        choiceArgument: buyFillArg,
+        readAs: [operatorPartyId, buyOrder.owner],
+      });
+      console.log(`[MatchingEngine] ✅ Buy order filled: ${buyOrder.orderId}${buyIsPartial ? ' (partial)' : ' (complete)'}`);
+    } catch (fillError) {
+      console.error(`[MatchingEngine] ❌ Buy FillOrder FAILED after settlement: ${fillError.message}`);
+      if (!fillError.message?.includes('already filled') && !fillError.message?.includes('CONTRACT_NOT_FOUND')) {
+        throw new Error(`Post-settlement Buy FillOrder failed: ${fillError.message}`);
+      }
+    }
+
+    try {
+      const sellFillArg = { fillQuantity: matchQtyStr };
+      if (sellOrder.isNewPackage) sellFillArg.newAllocationCid = null;
+      await cantonService.exerciseChoice({
+        token,
+        actAsParty: [operatorPartyId],
+        templateId: sellOrder.templateId || `${packageId}:Order:Order`,
+        contractId: sellOrder.contractId,
+        choice: 'FillOrder',
+        choiceArgument: sellFillArg,
+        readAs: [operatorPartyId, sellOrder.owner],
+      });
+      console.log(`[MatchingEngine] ✅ Sell order filled: ${sellOrder.orderId}${sellIsPartial ? ' (partial)' : ' (complete)'}`);
+    } catch (fillError) {
+      console.error(`[MatchingEngine] ❌ Sell FillOrder FAILED after settlement: ${fillError.message}`);
+      if (!fillError.message?.includes('already filled') && !fillError.message?.includes('CONTRACT_NOT_FOUND')) {
+        throw new Error(`Post-settlement Sell FillOrder failed: ${fillError.message}`);
+      }
     }
 
     // Release balance reservations for filled quantities

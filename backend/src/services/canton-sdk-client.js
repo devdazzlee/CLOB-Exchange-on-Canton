@@ -930,6 +930,17 @@ class CantonSDKClient {
       throw new Error('Canton SDK not initialized');
     }
 
+    // AllocationFactory_Allocate is controlled by the transfer-leg sender.
+    // External parties cannot be backend submitters on this participant.
+    // Attempting match-time creation for ext-* sender causes:
+    // NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT.
+    const isExternalSender = typeof senderPartyId === 'string' && senderPartyId.startsWith('ext-');
+    if (isExternalSender) {
+      throw new Error(
+        'Allocation creation requires sender authorization. External sender cannot be submitted by backend at match-time; create/authorize allocations at order placement via interactive signing.'
+      );
+    }
+
     const instrumentId = toCantonInstrument(symbol);
     const tokenSystemType = getTokenSystemType(symbol);
     const adminParty = this.getInstrumentAdminForSymbol(symbol);
@@ -1309,6 +1320,15 @@ class CantonSDKClient {
     if (!allocationContractId) {
       console.warn('[CantonSDK] No allocationContractId — skipping execution');
       return null;
+    }
+
+    // Splice/Utilities allocation execution requires all allocation authorizers.
+    // For external owners, backend cannot submit on their behalf at match-time.
+    const isExternalOwner = typeof ownerPartyId === 'string' && ownerPartyId.startsWith('ext-');
+    if (isExternalOwner) {
+      throw new Error(
+        'Allocation execution requires external owner authorization. Backend cannot execute external-owner allocation at match-time without interactive signing.'
+      );
     }
 
     // Client-required model: settlement executes with exchange as executor.

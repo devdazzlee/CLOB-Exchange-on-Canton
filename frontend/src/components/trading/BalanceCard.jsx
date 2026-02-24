@@ -1,7 +1,9 @@
+import { useState } from 'react';
 import { motion } from 'framer-motion';
-import { Wallet, RefreshCw, Lock } from 'lucide-react';
+import { Wallet, RefreshCw, Lock, Sparkles } from 'lucide-react';
 import { Button } from '../ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '../ui/select';
 
 // Token configuration - add new tokens here
 const TOKEN_CONFIG = {
@@ -25,7 +27,18 @@ function getTokenConfig(symbol) {
   };
 }
 
-export default function BalanceCard({ balance = {}, lockedBalance = {}, loading, onRefresh }) {
+export default function BalanceCard({
+  partyId,
+  balance = {},
+  lockedBalance = {},
+  loading,
+  onRefresh,
+  mintingLoading = false,
+  onMintToken,
+}) {
+  const [mintToken, setMintToken] = useState('CC');
+  const [mintAmount, setMintAmount] = useState('1');
+
   // Get all tokens from balance (dynamic - includes CBTC, CC, etc.)
   // Combine available + locked to get full token list
   const allTokens = new Set([
@@ -43,6 +56,15 @@ export default function BalanceCard({ balance = {}, lockedBalance = {}, loading,
   if (tokens.length === 0) {
     tokens.push('USDT', 'BTC');
   }
+
+  const handleMintClick = async () => {
+    if (!partyId || !onMintToken) return;
+
+    const amountNum = Number(mintAmount);
+    if (!Number.isFinite(amountNum) || amountNum <= 0) return;
+
+    await onMintToken(mintToken, amountNum);
+  };
 
   return (
     <Card className="bg-gradient-to-br from-card to-background border-2 border-border shadow-xl">
@@ -142,6 +164,78 @@ export default function BalanceCard({ balance = {}, lockedBalance = {}, loading,
             </div>
           </div>
         )}
+
+        {/* UI mint helper for quick manual test minting */}
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.35, ease: 'easeOut' }}
+          className="mt-4 pt-4 border-t border-border"
+        >
+          <div className="relative rounded-xl border border-primary/30 bg-gradient-to-br from-primary/10 via-card to-card p-3 sm:p-4 shadow-lg">
+            <motion.div
+              aria-hidden
+              className="pointer-events-none absolute -top-10 -right-10 h-28 w-28 rounded-full bg-primary/20 blur-3xl"
+              animate={{ scale: [1, 1.08, 1], opacity: [0.35, 0.6, 0.35] }}
+              transition={{ duration: 3, repeat: Infinity, ease: 'easeInOut' }}
+            />
+
+            <div className="relative space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <div className="rounded-md bg-primary/20 p-1.5">
+                    <Sparkles className="h-3.5 w-3.5 text-primary" />
+                  </div>
+                  <span className="text-xs text-foreground uppercase tracking-wide font-semibold">
+                    Mint Test Token
+                  </span>
+                </div>
+                <span className="text-[10px] text-muted-foreground truncate max-w-[140px]" title={partyId}>
+                  {partyId ? `${partyId.slice(0, 16)}...` : 'No party'}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <Select value={mintToken} onValueChange={setMintToken}>
+                  <SelectTrigger
+                    className="relative z-20 h-10 rounded-lg border-border/80 bg-background/90 px-3 text-sm shadow-sm"
+                    disabled={mintingLoading}
+                  >
+                    <SelectValue placeholder="Token" />
+                  </SelectTrigger>
+                  <SelectContent className="z-[70]">
+                    <SelectItem value="CC">CC</SelectItem>
+                    <SelectItem value="CBTC">CBTC</SelectItem>
+                    <SelectItem value="BTC">BTC</SelectItem>
+                    <SelectItem value="USDT">USDT</SelectItem>
+                    <SelectItem value="ETH">ETH</SelectItem>
+                    <SelectItem value="SOL">SOL</SelectItem>
+                  </SelectContent>
+                </Select>
+
+                <input
+                  type="number"
+                  min="0.00000001"
+                  step="0.00000001"
+                  value={mintAmount}
+                  onChange={(e) => setMintAmount(e.target.value)}
+                  placeholder="Amount"
+                  className="h-10 rounded-lg border border-border/80 bg-background/90 px-3 text-sm text-foreground shadow-sm transition-all focus:border-primary/70 focus:outline-none focus:ring-2 focus:ring-primary/20"
+                  disabled={mintingLoading}
+                />
+              </div>
+
+              <Button
+                onClick={handleMintClick}
+                disabled={mintingLoading || !partyId || !onMintToken || Number(mintAmount) <= 0}
+                className="h-10 w-full border-primary/50 bg-gradient-to-r from-primary/20 to-primary/10 text-foreground hover:from-primary/30 hover:to-primary/20"
+                variant="outline"
+              >
+                {mintingLoading ? 'Minting...' : `Mint ${mintToken}`}
+              </Button>
+            </div>
+          </div>
+        </motion.div>
       </CardContent>
     </Card>
   );
