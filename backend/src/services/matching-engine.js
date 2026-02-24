@@ -63,6 +63,8 @@ class MatchingEngine {
 
     // ═══ Pending pairs queue ═══
     this.pendingPairs = new Set();
+    this.invalidSettlementContracts = new Map();
+    this.INVALID_SETTLEMENT_TTL = 10 * 60 * 1000;
 
     // ═══ Adaptive polling ═══
     this._consecutiveIdleCycles = 0;
@@ -177,6 +179,42 @@ class MatchingEngine {
     }
   }
 
+  _markInvalidSettlementOrder(order, reason) {
+    if (!order?.contractId) return;
+    this.invalidSettlementContracts.set(order.contractId, { at: Date.now(), reason: String(reason || 'unknown') });
+    console.warn(`[MatchingEngine] 🚫 Quarantined order ${order.orderId || order.contractId.substring(0, 24)} for settlement: ${reason}`);
+  }
+
+  async _tryCancelStaleOrder(order, token) {
+    if (!order?.contractId) return;
+    const packageId = config.canton.packageIds?.clobExchange;
+    const operatorPartyId = config.canton.operatorPartyId;
+    if (!packageId || !operatorPartyId) return;
+
+    try {
+      await cantonService.exerciseChoice({
+        token,
+        actAsParty: [operatorPartyId],
+        templateId: order.templateId || `${packageId}:Order:Order`,
+        contractId: order.contractId,
+        choice: 'CancelOrder',
+        choiceArgument: {},
+        readAs: [operatorPartyId, order.owner].filter(Boolean),
+      });
+      console.warn(`[MatchingEngine] 🧹 Auto-cancelled stale order ${order.orderId || order.contractId.substring(0, 24)} after settlement failure`);
+    } catch (cancelErr) {
+      // Best-effort cleanup: order may already be archived/filled by concurrent flow.
+      if (
+        cancelErr.message?.includes('CONTRACT_NOT_FOUND') ||
+        cancelErr.message?.includes('could not be found') ||
+        cancelErr.message?.includes('already')
+      ) {
+        return;
+      }
+      console.warn(`[MatchingEngine] ⚠️ Failed to auto-cancel stale order ${order.orderId || order.contractId.substring(0, 24)}: ${cancelErr.message}`);
+    }
+  }
+
   async runMatchingCycle() {
     if (this.matchingInProgress) {
       if (Date.now() - this.matchingStartTime > 25000) {
@@ -255,6 +293,13 @@ class MatchingEngine {
       const buyOrders = [];
       const sellOrders = [];
       
+      const now = Date.now();
+      for (const [cid, meta] of this.invalidSettlementContracts) {
+        if (now - meta.at > this.INVALID_SETTLEMENT_TTL) {
+          this.invalidSettlementContracts.delete(cid);
+        }
+      }
+
       for (const payload of rawOrders) {
         // Only match OPEN orders (not PENDING_TRIGGER stop-loss orders)
         if (payload.status !== 'OPEN') continue;
@@ -277,6 +322,7 @@ class MatchingEngine {
         if (remaining.lte(0)) continue;
 
         const contractTemplateId = payload.templateId || `${packageId}:Order:Order`;
+        if (this.invalidSettlementContracts.has(payload.contractId)) continue;
         const isNewPackage = contractTemplateId.startsWith(packageId);
 
         // Extract allocationCid (Allocation contract ID for settlement)
@@ -290,6 +336,9 @@ class MatchingEngine {
             allocationCid = getAllocationContractIdForOrder(payload.orderId);
           } catch (_) { /* best effort */ }
         }
+        // Orders without a persisted allocation lock are not settlement-safe.
+        // Skip them to avoid matching contracts that cannot complete token transfer.
+        if (!allocationCid) continue;
         
         const order = {
           contractId: payload.contractId,
@@ -445,6 +494,18 @@ class MatchingEngine {
             }
             continue;
           }
+
+          // Root-cause handling: stale/invalid allocation locks should not block the entire pair.
+          if (error.message?.includes('STALE_ALLOCATION_LOCK_MISSING') ||
+              error.message?.includes('STALE_ALLOCATION_EXPIRED') ||
+              error.message?.includes('UNSUBMITTABLE_EXTERNAL_ACTAS')) {
+            this._markInvalidSettlementOrder(buyOrder, error.message);
+            this._markInvalidSettlementOrder(sellOrder, error.message);
+            await this._tryCancelStaleOrder(buyOrder, token);
+            await this._tryCancelStaleOrder(sellOrder, token);
+            this.recentlyMatchedOrders.delete(matchKey);
+            continue;
+          }
           
           return false;
         }
@@ -509,12 +570,12 @@ class MatchingEngine {
     let tradeContractId = null;
     const buyIsPartial = new Decimal(buyOrder.remaining).gt(matchQty);
     const sellIsPartial = new Decimal(sellOrder.remaining).gt(matchQty);
+    const remainingBuyBase = new Decimal(buyOrder.remaining).minus(matchQty);
+    const remainingSellBase = new Decimal(sellOrder.remaining).minus(matchQty);
+    const buyLockPrice = new Decimal(buyOrder.price ?? matchPrice);
+    const remainingBuyQuote = remainingBuyBase.times(buyLockPrice);
     
     const sdkClient = getCantonSDKClient();
-
-    if (buyIsPartial || sellIsPartial) {
-      throw new Error('Pre-authorized allocation settlement currently requires full-fill matches on both sides');
-    }
 
     // ═══════════════════════════════════════════════════════════════════
     // STEP 1: Execute pre-authorized order allocations + operator payouts
@@ -530,6 +591,8 @@ class MatchingEngine {
 
     let baseTransferResult = null;
     let quoteTransferResult = null;
+    let replacementBuyAllocationCid = null;
+    let replacementSellAllocationCid = null;
 
     // Execute inbound allocation locks (user -> operator escrow)
     baseTransferResult = await sdkClient.executeAllocation(
@@ -591,6 +654,38 @@ class MatchingEngine {
       throw new Error('Settlement aborted: operator payout allocation execution failed');
     }
 
+    // For partial fills, re-lock the remaining collateral under operator-owned allocations.
+    // The new allocation CIDs are persisted back into the updated Order via FillOrder(newAllocationCid).
+    if (buyIsPartial) {
+      const buyReplacement = await sdkClient.createAllocation(
+        operatorPartyId,
+        operatorPartyId,
+        remainingBuyQuote.toFixed(10),
+        quoteSymbol,
+        operatorPartyId,
+        `relock-buy-${buyOrder.orderId}-${Date.now()}`
+      );
+      replacementBuyAllocationCid = buyReplacement?.allocationContractId || null;
+      if (!replacementBuyAllocationCid) {
+        throw new Error(`Settlement aborted: failed to create replacement quote allocation for partial BUY ${buyOrder.orderId}`);
+      }
+    }
+
+    if (sellIsPartial) {
+      const sellReplacement = await sdkClient.createAllocation(
+        operatorPartyId,
+        operatorPartyId,
+        remainingSellBase.toFixed(10),
+        baseSymbol,
+        operatorPartyId,
+        `relock-sell-${sellOrder.orderId}-${Date.now()}`
+      );
+      replacementSellAllocationCid = sellReplacement?.allocationContractId || null;
+      if (!replacementSellAllocationCid) {
+        throw new Error(`Settlement aborted: failed to create replacement base allocation for partial SELL ${sellOrder.orderId}`);
+      }
+    }
+
     console.log(`[MatchingEngine]    ✅ Settlement COMPLETE via pre-authorized allocations + operator payout allocations`);
 
     // ═══════════════════════════════════════════════════════════════════
@@ -600,7 +695,7 @@ class MatchingEngine {
 
     try {
       const buyFillArg = { fillQuantity: matchQtyStr };
-      if (buyOrder.isNewPackage) buyFillArg.newAllocationCid = null;
+      if (buyOrder.isNewPackage) buyFillArg.newAllocationCid = buyIsPartial ? replacementBuyAllocationCid : null;
       await cantonService.exerciseChoice({
         token,
         actAsParty: [operatorPartyId],
@@ -620,7 +715,7 @@ class MatchingEngine {
 
     try {
       const sellFillArg = { fillQuantity: matchQtyStr };
-      if (sellOrder.isNewPackage) sellFillArg.newAllocationCid = null;
+      if (sellOrder.isNewPackage) sellFillArg.newAllocationCid = sellIsPartial ? replacementSellAllocationCid : null;
       await cantonService.exerciseChoice({
         token,
         actAsParty: [operatorPartyId],

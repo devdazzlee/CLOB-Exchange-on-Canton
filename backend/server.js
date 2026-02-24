@@ -10,6 +10,13 @@
 // Initialize logger FIRST — overrides console.log/warn/error to write to files
 const logger = require('./src/utils/logger');
 
+// Enforce secure TLS verification for all outbound HTTPS calls.
+// Always normalize this at process start (parent shells may export insecure values).
+if (process.env.NODE_TLS_REJECT_UNAUTHORIZED !== '1') {
+  logger.warn(`[Server] Normalizing NODE_TLS_REJECT_UNAUTHORIZED from "${process.env.NODE_TLS_REJECT_UNAUTHORIZED || ''}" -> "1"`);
+}
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '1';
+
 const { createApp, startServer } = require('./src/app');
 
 // Check if running on Vercel (serverless)
@@ -18,9 +25,6 @@ const isVercel = process.env.VERCEL === '1' || process.env.VERCEL_ENV;
 if (isVercel) {
   // Vercel serverless mode - export Express app as default
   console.log('[Server] Running in Vercel serverless mode');
-  
-  // Ensure TLS bypass for DevNet Keycloak (self-signed cert)
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
   
   const { app } = createApp();
 

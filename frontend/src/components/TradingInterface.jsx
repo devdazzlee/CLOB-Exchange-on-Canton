@@ -99,12 +99,12 @@ export default function TradingInterface({ partyId }) {
       const mintPayload = Array.isArray(tokensToMint) && tokensToMint.length > 0
         ? tokensToMint
         : [
-            { symbol: 'BTC', amount: 10 },
-            { symbol: 'USDT', amount: 100000 },
-            { symbol: 'ETH', amount: 100 },
-            { symbol: 'SOL', amount: 1000 },
-            { symbol: 'CC', amount: 50 },
-            { symbol: 'CBTC', amount: 5 }
+        { symbol: 'BTC', amount: 10 },
+        { symbol: 'USDT', amount: 100000 },
+        { symbol: 'ETH', amount: 100 },
+        { symbol: 'SOL', amount: 1000 },
+        { symbol: 'CC', amount: 50 },
+        { symbol: 'CBTC', amount: 5 }
           ];
 
       // Force V2 mint endpoint so UI matches the exact manual API flow:
@@ -273,6 +273,7 @@ export default function TradingInterface({ partyId }) {
             quantity: data.quantity,
             stopPrice: data.stopPrice,
             lockInfo: data.lockInfo,
+            stage: data.stage || 'ALLOCATION_PREPARED',
           },
           orderData, // original form data for success toast
         });
@@ -476,7 +477,24 @@ export default function TradingInterface({ partyId }) {
           hashingSchemeVersion,
           orderMeta: signingState.orderMeta,
         });
-        
+
+        if (response?.data?.requiresSignature) {
+          // Participant requires sequential interactive submissions for external parties:
+          // sign allocation first, then sign order create.
+          setSigningState((prev) => ({
+            ...prev,
+            action: 'PLACE',
+            preparedTransaction: response.data.preparedTransaction,
+            preparedTransactionHash: response.data.preparedTransactionHash,
+            hashingSchemeVersion: response.data.hashingSchemeVersion,
+            orderMeta: response.data.orderMeta || prev?.orderMeta,
+          }));
+          setWalletPassword('');
+          toast.success('Step 1 complete. Please sign once more to finalize order.');
+          setOrderPlacing(false);
+          return;
+        }
+
         if (response.success) {
           const od = signingState.orderData;
           setPrice('');
@@ -1074,7 +1092,7 @@ export default function TradingInterface({ partyId }) {
         onClose={() => setShowOrderSuccess(false)}
         orderData={lastOrderData}
       />
-
+      
       {/* Interactive Signing Dialog (External Party) */}
       {signingState && (
         <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">

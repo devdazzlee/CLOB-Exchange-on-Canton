@@ -167,6 +167,126 @@ class OrderService {
     console.log('[OrderService] Initialized with Canton JSON API v2 + Allocation-based settlement');
   }
 
+  _templateIdToString(templateId) {
+    if (typeof templateId === 'string') return templateId;
+    if (templateId && typeof templateId === 'object' && templateId.packageId && templateId.moduleName && templateId.entityName) {
+      return `${templateId.packageId}:${templateId.moduleName}:${templateId.entityName}`;
+    }
+    return '';
+  }
+
+  _extractAllocationCidFromExecuteResult(result) {
+    const isCidLike = (value) => typeof value === 'string' && value.length > 20;
+    const visited = new Set();
+    const stack = [result];
+
+    while (stack.length > 0) {
+      const current = stack.pop();
+      if (!current || typeof current !== 'object') continue;
+      if (visited.has(current)) continue;
+      visited.add(current);
+
+      if (isCidLike(current.allocationCid)) return current.allocationCid;
+      if (isCidLike(current.allocationContractId)) return current.allocationContractId;
+
+      if (Array.isArray(current)) {
+        for (const item of current) stack.push(item);
+      } else {
+        for (const key of Object.keys(current)) {
+          stack.push(current[key]);
+        }
+      }
+    }
+    return null;
+  }
+
+  _extractOrderRefFromAllocationPayload(payload) {
+    if (!payload || typeof payload !== 'object') return null;
+    return (
+      payload?.settlement?.settlementRef?.id ||
+      payload?.allocation?.settlement?.settlementRef?.id ||
+      payload?.settlementRef?.id ||
+      payload?.allocation?.settlementRef?.id ||
+      payload?.transferLegId ||
+      payload?.allocation?.transferLegId ||
+      payload?.output?.allocation?.settlement?.settlementRef?.id ||
+      payload?.output?.allocation?.transferLegId ||
+      null
+    );
+  }
+
+  async _findAllocationCidForOrder(orderId, partyId, token) {
+    if (!orderId) return null;
+    const operatorPartyId = config.canton.operatorPartyId;
+    const parties = [...new Set([partyId, operatorPartyId].filter(Boolean))];
+
+    // 1) First attempt: use SDK pending-allocation view (narrow, deterministic, and fast).
+    try {
+      const sdkClient = getCantonSDKClient();
+      if (sdkClient?.isReady?.()) {
+        for (const party of parties) {
+          const pending = await sdkClient.fetchPendingAllocations(party);
+          for (const row of Array.isArray(pending) ? pending : []) {
+            const contractId = row?.contractId || row?.activeContract?.createdEvent?.contractId || null;
+            const payload =
+              row?.activeContract?.createdEvent?.createArgument ||
+              row?.payload ||
+              row?.createArgument ||
+              {};
+            const ref = this._extractOrderRefFromAllocationPayload(payload);
+            if (ref === orderId && contractId) {
+              console.log(`[OrderService] ✅ Found allocation via SDK pending view for ${orderId}: ${contractId.substring(0, 30)}...`);
+              return contractId;
+            }
+          }
+        }
+      }
+    } catch (sdkErr) {
+      console.warn(`[OrderService] SDK pending-allocation lookup failed: ${sdkErr.message}`);
+    }
+
+    // 2) Fallback: raw ACS query. Retry briefly for eventual-consistency lag after execute.
+    const attempts = 4;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+    for (const party of parties) {
+      try {
+        const contracts = await cantonService.queryActiveContracts({
+          party,
+          templateIds: [],
+          verbose: true,
+        }, token);
+
+        for (const contract of Array.isArray(contracts) ? contracts : []) {
+          const templateId = this._templateIdToString(contract.templateId || contract.identifier);
+          if (!templateId.includes('Allocation')) continue;
+
+          const payload = contract.payload || contract.createArgument || {};
+          const settlementRefId = this._extractOrderRefFromAllocationPayload(payload);
+
+          if (settlementRefId === orderId && contract.contractId) {
+            console.log(`[OrderService] ✅ Found allocation for order ${orderId}: ${contract.contractId.substring(0, 30)}...`);
+            return contract.contractId;
+          }
+
+          // Defensive fallback: token-standard payloads can vary across package versions.
+          // If the payload references the orderId anywhere, treat this as the matching allocation.
+          if (contract.contractId && JSON.stringify(payload).includes(orderId)) {
+            console.log(`[OrderService] ✅ Found allocation via payload scan for order ${orderId}: ${contract.contractId.substring(0, 30)}...`);
+            return contract.contractId;
+          }
+        }
+      } catch (err) {
+        console.warn(`[OrderService] Allocation lookup failed for party ${party.substring(0, 20)}...: ${err.message}`);
+      }
+    }
+      if (attempt < attempts) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    }
+
+    return null;
+  }
+
   /**
    * Calculate amount to lock for an order (uses Decimal for precision).
    * BUY order: lock quote currency (e.g., CBTC for CC/CBTC pair)
@@ -492,19 +612,19 @@ class OrderService {
     const isExternalParty = partyId.startsWith('ext-') || partyId.includes('external');
     
     const createArgs = {
-      orderId: orderId,
-      owner: partyId,
-      orderType: orderType.toUpperCase(),
-      orderMode: orderMode.toUpperCase(),
-      tradingPair: tradingPair,
-      price: orderMode.toUpperCase() === 'LIMIT' && price ? price.toString() : (stopPrice ? stopPrice.toString() : null),
-      quantity: quantity.toString(),
-      filled: '0.0',
-      status: initialStatus,
-      timestamp: timestamp,
-      operator: operatorPartyId,
-      allocationCid: allocationContractId || '',
-      stopPrice: stopPrice ? stopPrice.toString() : null
+        orderId: orderId,
+        owner: partyId,
+        orderType: orderType.toUpperCase(),
+        orderMode: orderMode.toUpperCase(),
+        tradingPair: tradingPair,
+        price: orderMode.toUpperCase() === 'LIMIT' && price ? price.toString() : (stopPrice ? stopPrice.toString() : null),
+        quantity: quantity.toString(),
+        filled: '0.0',
+        status: initialStatus,
+        timestamp: timestamp,
+        operator: operatorPartyId,
+        allocationCid: allocationContractId || '',
+        stopPrice: stopPrice ? stopPrice.toString() : null
     };
 
     let result;
@@ -518,7 +638,7 @@ class OrderService {
       // For Order creation: signatory is "owner" (the external party).
       // We only include the external party in actAs — the operator is an observer,
       // not a signatory, so it doesn't need to sign.
-      console.log(`[OrderService] External party detected — preparing allocation + order via interactive submission`);
+      console.log(`[OrderService] External party detected — preparing allocation via interactive submission (step 1/2)`);
 
       // Build pre-authorized allocation command (sender=party, receiver=operator escrow).
       // This is signed by the external user in the same interactive flow.
@@ -532,13 +652,6 @@ class OrderService {
         orderId
       );
 
-      const orderCreateCommand = {
-        CreateCommand: {
-          templateId: `${packageId}:Order:Order`,
-          createArguments: createArgs,
-        },
-      };
-
       const readAs = [...new Set([operatorPartyId, partyId, ...(allocationPrep.readAs || [])])];
       const disclosedContracts = allocationPrep.disclosedContracts || [];
       const synchronizerId = allocationPrep.synchronizerId || config.canton.synchronizerId;
@@ -546,7 +659,7 @@ class OrderService {
       const prepareResult = await cantonService.prepareInteractiveSubmission({
         token,
         actAsParty: [partyId],
-        commands: [allocationPrep.command, orderCreateCommand],
+        commands: [allocationPrep.command],
         readAs,
         synchronizerId,
         disclosedContracts,
@@ -556,12 +669,12 @@ class OrderService {
         throw new Error('Prepare returned incomplete result: missing preparedTransaction or preparedTransactionHash');
       }
       
-      console.log(`[OrderService] ✅ Allocation + order prepared. Hash to sign: ${prepareResult.preparedTransactionHash.substring(0, 40)}...`);
+      console.log(`[OrderService] ✅ Allocation prepared (step 1/2). Hash to sign: ${prepareResult.preparedTransactionHash.substring(0, 40)}...`);
       
       // Return the prepared transaction for the frontend to sign
       return {
         requiresSignature: true,
-        step: 'PREPARED',
+        step: 'ALLOCATION_PREPARED',
         orderId,
         tradingPair,
         orderType: orderType.toUpperCase(),
@@ -574,6 +687,7 @@ class OrderService {
         hashingSchemeVersion: prepareResult.hashingSchemeVersion,
         partyId,
         lockInfo,
+        stage: 'ALLOCATION_PREPARED',
       };
     }
 
@@ -817,13 +931,15 @@ class OrderService {
         hashingSchemeVersion,
       }, token);
       
-      // Extract created contract IDs from result
+      const stage = orderMeta?.stage || 'ALLOCATION_PREPARED';
+
+      // Extract created contract IDs from executed transaction
       let contractId = null;
       let allocationContractId = null;
       if (result.transaction?.events) {
         for (const event of result.transaction.events) {
           const created = event.created || event.CreatedEvent;
-          const templateId = typeof created?.templateId === 'string' ? created.templateId : '';
+          const templateId = this._templateIdToString(created?.templateId);
           if (!created?.contractId) continue;
           if (!contractId && templateId.includes(':Order:Order')) {
             contractId = created.contractId;
@@ -833,19 +949,91 @@ class OrderService {
           }
         }
       }
-      
-      if (!contractId) {
-        contractId = result.transaction?.updateId || result.updateId || `${orderMeta.orderId}-pending`;
+
+      // Some allocation factory executions return allocationCid only in exercise-result payload,
+      // not as a top-level CreatedEvent. Extract it from the full execute response shape.
+      if (!allocationContractId) {
+        allocationContractId = this._extractAllocationCidFromExecuteResult(result);
       }
       
-      console.log(`[OrderService] ✅ Order placed via interactive submission: ${orderMeta.orderId} (${contractId?.substring(0, 20)}...)`);
-
       if (orderMeta.orderId && allocationContractId) {
         setAllocationContractIdForOrder(orderMeta.orderId, allocationContractId);
         console.log(`[OrderService] ✅ Allocation linked to order ${orderMeta.orderId}: ${allocationContractId.substring(0, 30)}...`);
       }
+
+      // Step 1: allocation executed. Prepare Step 2: order create.
+      if (stage === 'ALLOCATION_PREPARED') {
+        const packageId = config.canton.packageIds.clobExchange;
+        let effectiveAllocationCid = orderMeta.allocationContractId || allocationContractId;
+        if (!effectiveAllocationCid) {
+          effectiveAllocationCid = await this._findAllocationCidForOrder(orderMeta.orderId, partyId, token);
+        }
+        if (!packageId) {
+          throw new Error('CLOB_EXCHANGE_PACKAGE_ID is not configured');
+        }
+        if (!effectiveAllocationCid) {
+          throw new Error('Allocation execute succeeded but allocationContractId is missing for order create step');
+        }
+
+        const orderStatus = orderMeta.orderMode === 'STOP_LOSS' ? 'PENDING_TRIGGER' : 'OPEN';
+        const orderCreateArgs = {
+          orderId: orderMeta.orderId,
+          owner: partyId,
+          orderType: orderMeta.orderType,
+          orderMode: orderMeta.orderMode,
+          tradingPair: orderMeta.tradingPair,
+          price: orderMeta.price ? String(orderMeta.price) : null,
+          quantity: String(orderMeta.quantity),
+          filled: '0.0',
+          status: orderStatus,
+          timestamp: new Date().toISOString(),
+          operator: operatorPartyId,
+          allocationCid: effectiveAllocationCid,
+          stopPrice: orderMeta.stopPrice || null,
+        };
+
+        const orderPrepareResult = await cantonService.prepareInteractiveSubmission({
+          token,
+          actAsParty: [partyId],
+          commands: [{
+            CreateCommand: {
+              templateId: `${packageId}:Order:Order`,
+              createArguments: orderCreateArgs,
+            },
+          }],
+          readAs: [operatorPartyId, partyId],
+          synchronizerId: config.canton.synchronizerId,
+        });
+
+        if (!orderPrepareResult.preparedTransaction || !orderPrepareResult.preparedTransactionHash) {
+          throw new Error('Order create prepare returned incomplete result');
+        }
+
+        console.log(`[OrderService] ✅ Order create prepared (step 2/2) for ${orderMeta.orderId}`);
+        return {
+          requiresSignature: true,
+          step: 'ORDER_CREATE_PREPARED',
+          orderId: orderMeta.orderId,
+          preparedTransaction: orderPrepareResult.preparedTransaction,
+          preparedTransactionHash: orderPrepareResult.preparedTransactionHash,
+          hashingSchemeVersion: orderPrepareResult.hashingSchemeVersion,
+          partyId,
+          orderMeta: {
+            ...orderMeta,
+            stage: 'ORDER_CREATE_PREPARED',
+            allocationContractId: effectiveAllocationCid,
+          },
+        };
+      }
+
+      if (!contractId) {
+        contractId = result.transaction?.updateId || result.updateId || `${orderMeta.orderId}-pending`;
+      }
+
+      console.log(`[OrderService] ✅ Order placed via interactive submission: ${orderMeta.orderId} (${contractId?.substring(0, 20)}...)`);
       
       // Register in tracking systems
+      const finalAllocationCid = orderMeta.allocationContractId || allocationContractId || null;
       const orderRecord = {
         contractId,
         orderId: orderMeta.orderId,
@@ -862,7 +1050,7 @@ class OrderService {
         lockId: null,
         lockedAmount: orderMeta.lockInfo?.amount || '0',
         lockedAsset: orderMeta.lockInfo?.asset || '',
-        allocationContractId: allocationContractId || null,
+        allocationContractId: finalAllocationCid,
       };
       
       // Register in global open orders registry
@@ -927,7 +1115,7 @@ class OrderService {
         quantity: orderMeta.quantity,
         filled: '0',
         remaining: orderMeta.quantity,
-        allocationContractId: allocationContractId || null,
+        allocationContractId: finalAllocationCid,
         timestamp: new Date().toISOString()
       };
       
@@ -935,7 +1123,7 @@ class OrderService {
       console.error('[OrderService] Failed to execute order placement:', error.message);
       
       // Release reservation on failure
-      if (orderMeta.orderId) {
+      if (orderMeta.orderId && orderMeta.stage !== 'ORDER_CREATE_PREPARED') {
         releaseReservation(orderMeta.orderId);
       }
       throw error;

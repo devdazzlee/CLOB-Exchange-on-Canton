@@ -31,6 +31,18 @@ const Decimal = require('decimal.js');
 // Configure decimal precision
 Decimal.set({ precision: 20, rounding: Decimal.ROUND_DOWN });
 
+/**
+ * Canton JSON API expects Numeric values as plain decimal strings
+ * (scientific notation like "1e-7" is rejected).
+ */
+function toDamlNumericString(value) {
+  try {
+    return new Decimal(value).toFixed();
+  } catch (error) {
+    throw new Error(`Invalid numeric value for DAML payload: ${value}`);
+  }
+}
+
 // ─── Lazy-load SDK — loaded via dynamic import() in _doInitialize ───────────
 // The SDK's CJS bundle require()s `jose` which is ESM-only (v5+).
 // Static require() fails on Vercel's Node runtime with ERR_REQUIRE_ESM.
@@ -561,7 +573,7 @@ class CantonSDKClient {
           transfer: {
             sender: senderPartyId,
             receiver: receiverPartyId,
-            amount: amount.toString(),
+            amount: toDamlNumericString(amount),
             instrumentId: { id: instrumentId, admin: adminParty },
             requestedAt: now,
             executeBefore,
@@ -604,7 +616,7 @@ class CantonSDKClient {
         transfer: {
           sender: senderPartyId,
           receiver: receiverPartyId,
-          amount: amount.toString(),
+          amount: toDamlNumericString(amount),
           instrumentId: { id: instrumentId, admin: adminParty },
           requestedAt: now,
           executeBefore,
@@ -994,6 +1006,7 @@ class CantonSDKClient {
       orderId,
       holdingCids,
       choiceContextData: null,
+      tokenSystemType,
     });
 
     const allocationFactoryUrl = tokenSystemType === 'utilities'
@@ -1026,6 +1039,7 @@ class CantonSDKClient {
       orderId,
       holdingCids,
       choiceContextData: factory.choiceContext?.choiceContextData,
+      tokenSystemType,
     });
 
     const configModule = require('../config');
@@ -1075,15 +1089,26 @@ class CantonSDKClient {
     const {
       adminParty, senderPartyId, receiverPartyId, executorPartyId,
       amount, instrumentId, orderId, holdingCids,
-      choiceContextData,
+      choiceContextData, tokenSystemType = 'splice',
     } = params;
 
       const nowMs = Date.now();
       const now = new Date(nowMs).toISOString();
-      // Keep allocation windows short for Amulet to satisfy on-ledger lock-expiry assertions.
-      // allocateBefore must be earlier than settleBefore.
-      const allocateBefore = new Date(nowMs + 2 * 60 * 1000).toISOString(); // +2m
-      const settleBefore = new Date(nowMs + 5 * 60 * 1000).toISOString();   // +5m
+      // Root-cause timing policy:
+      // - Splice (Amulet/CC) enforces lock-expiry invariants during allocation prepare.
+      //   Overly long settle windows can fail with: "lock expires before amulet".
+      // - Utilities tokens can use a longer window safely.
+      const defaultSettleWindowMs =
+        tokenSystemType === 'utilities'
+          ? 24 * 60 * 60 * 1000   // 24h
+          : 5 * 60 * 1000;        // 5m (known-safe for Splice assertions)
+      const configuredSettleWindowMs = Number(process.env.ALLOCATION_SETTLE_WINDOW_MS || defaultSettleWindowMs);
+      const settleWindowMs = Number.isFinite(configuredSettleWindowMs) && configuredSettleWindowMs > 60_000
+        ? configuredSettleWindowMs
+        : defaultSettleWindowMs;
+      const allocateWindowMs = Math.max(60_000, Math.min(2 * 60 * 1000, Math.floor(settleWindowMs / 2)));
+      const allocateBefore = new Date(nowMs + allocateWindowMs).toISOString();
+      const settleBefore = new Date(nowMs + settleWindowMs).toISOString();
 
     return {
       expectedAdmin: adminParty,
@@ -1100,7 +1125,7 @@ class CantonSDKClient {
         transferLeg: {
           sender: senderPartyId,
           receiver: receiverPartyId || executorPartyId,
-          amount: amount.toString(),
+          amount: toDamlNumericString(amount),
           instrumentId: { id: instrumentId, admin: adminParty },
           meta: { values: {} },
           },
@@ -1150,6 +1175,7 @@ class CantonSDKClient {
         adminParty, senderPartyId, receiverPartyId, executorPartyId,
         amount, instrumentId, orderId, holdingCids,
         choiceContextData: null,
+        tokenSystemType: 'splice',
       });
 
       console.log(`[CantonSDK]    Calling Splice allocation-factory: ${allocationFactoryUrl}`);
@@ -1176,6 +1202,7 @@ class CantonSDKClient {
         adminParty, senderPartyId, receiverPartyId, executorPartyId,
         amount, instrumentId, orderId, holdingCids,
         choiceContextData: factory.choiceContext?.choiceContextData,
+        tokenSystemType: 'splice',
       });
 
       const adminToken = await tokenProvider.getServiceToken();
@@ -1243,6 +1270,7 @@ class CantonSDKClient {
       adminParty, senderPartyId, receiverPartyId, executorPartyId,
       amount, instrumentId, orderId, holdingCids,
       choiceContextData: null,
+      tokenSystemType: 'utilities',
     });
 
     console.log(`[CantonSDK]    Calling Utilities allocation-factory: ${allocationFactoryUrl}`);
@@ -1269,6 +1297,7 @@ class CantonSDKClient {
       adminParty, senderPartyId, receiverPartyId, executorPartyId,
       amount, instrumentId, orderId, holdingCids,
       choiceContextData: factory.choiceContext?.choiceContextData,
+      tokenSystemType: 'utilities',
     });
 
     const adminToken = await tokenProvider.getServiceToken();
@@ -1419,9 +1448,6 @@ class CantonSDKClient {
       return null;
     }
 
-    // Client-required model: settlement executes with exchange as executor.
-    // Keep sender/receiver in readAs for visibility/context, but do not submit as them.
-    const actAsParties = [executorPartyId];
     const readAsParties = [...new Set([executorPartyId, ownerPartyId, receiverPartyId].filter(Boolean))];
 
     // Get synchronizerId from config — REQUIRED for all Canton command submissions
@@ -1432,7 +1458,16 @@ class CantonSDKClient {
     console.log(`[CantonSDK]    Executor: ${executorPartyId.substring(0, 30)}...`);
     console.log(`[CantonSDK]    Owner/Sender: ${ownerPartyId ? ownerPartyId.substring(0, 30) + '...' : 'N/A'}`);
     console.log(`[CantonSDK]    Receiver: ${receiverPartyId ? receiverPartyId.substring(0, 30) + '...' : 'N/A'}`);
-    console.log(`[CantonSDK]    actAs (${actAsParties.length} parties): [${actAsParties.map(p => p.substring(0, 20) + '...').join(', ')}]`);
+    const summarize = (parties) => `[${parties.map(p => p.substring(0, 20) + '...').join(', ')}]`;
+    const isAuthError = (err) => {
+      const msg = String(err?.message || err || '');
+      return msg.includes('DAML_AUTHORIZATION_ERROR') || msg.includes('requires authorizers');
+    };
+    const isNoSynchronizerError = (err) => {
+      const msg = String(err?.message || err || '');
+      return msg.includes('NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT') ||
+             msg.includes('Not connected to a synchronizer on which this participant can submit for all submitters');
+    };
 
     const tokenSystemType = symbol ? getTokenSystemType(symbol) : null;
     const adminToken = await tokenProvider.getServiceToken();
@@ -1447,99 +1482,137 @@ class CantonSDKClient {
       return this._executeUtilitiesAllocation(allocationContractId, executorPartyId, symbol, adminToken, ownerPartyId, receiverPartyId);
     }
 
-    // ── Splice tokens (CC/Amulet): Try SDK method first ──────────────────
-    if (this.isReady()) {
-      try {
-        if (this.sdk.tokenStandard && typeof this.sdk.tokenStandard.exerciseAllocationChoice === 'function') {
-          return await this._withPartyContext(executorPartyId, async () => {
-            const [executeCmd, disclosed] = await this.sdk.tokenStandard.exerciseAllocationChoice(
-              allocationContractId,
-              'ExecuteTransfer'
-            );
+    const tryExecuteForActAs = async (actAsParties) => {
+      console.log(`[CantonSDK]    Trying actAs (${actAsParties.length}): ${summarize(actAsParties)}`);
 
-            const commands = Array.isArray(executeCmd) ? executeCmd : [executeCmd];
-            let result = null;
-            for (const rawCmd of commands) {
-              const cmd = rawCmd.ExerciseCommand || rawCmd;
-              result = await cantonService.exerciseChoice({
-                token: adminToken,
-                actAsParty: actAsParties,
-                templateId: cmd.templateId,
-                contractId: cmd.contractId,
-                choice: cmd.choice,
-                choiceArgument: cmd.choiceArgument,
-                readAs: readAsParties,
-                synchronizerId,
-                disclosedContracts: (disclosed || []).map(dc => ({
-                  templateId: dc.templateId,
-                  contractId: dc.contractId,
-                  createdEventBlob: dc.createdEventBlob,
-                  synchronizerId: dc.synchronizerId || synchronizerId,
-                })),
-              });
-            }
-
-            console.log(`[CantonSDK]    ✅ Allocation executed via SDK — updateId: ${result?.transaction?.updateId || 'N/A'}`);
-            return result;
-          });
+      // Attempt 1: SDK-generated command + disclosed contracts.
+      if (this.isReady()) {
+        try {
+          if (this.sdk.tokenStandard && typeof this.sdk.tokenStandard.exerciseAllocationChoice === 'function') {
+            // Root-cause fix:
+            // Build the execute command in a party context that can definitely read the
+            // allocation contract. For external-user allocations this is the owner party.
+            // Using executor-only context can fail command generation and force flaky
+            // registry fallback timeouts.
+            const commandBuilderPartyId = ownerPartyId || executorPartyId;
+            console.log(`[CantonSDK]    Building execute command in context: ${commandBuilderPartyId.substring(0, 30)}...`);
+            return await this._withPartyContext(commandBuilderPartyId, async () => {
+              const [executeCmd, disclosed] = await this.sdk.tokenStandard.exerciseAllocationChoice(
+                allocationContractId,
+                'ExecuteTransfer'
+              );
+              const commands = Array.isArray(executeCmd) ? executeCmd : [executeCmd];
+              let result = null;
+              for (const rawCmd of commands) {
+                const cmd = rawCmd.ExerciseCommand || rawCmd;
+                result = await cantonService.exerciseChoice({
+                  token: adminToken,
+                  actAsParty: actAsParties,
+                  templateId: cmd.templateId,
+                  contractId: cmd.contractId,
+                  choice: cmd.choice,
+                  choiceArgument: cmd.choiceArgument,
+                  readAs: readAsParties,
+                  synchronizerId,
+                  disclosedContracts: (disclosed || []).map(dc => ({
+                    templateId: dc.templateId,
+                    contractId: dc.contractId,
+                    createdEventBlob: dc.createdEventBlob,
+                    synchronizerId: dc.synchronizerId || synchronizerId,
+                  })),
+                });
+              }
+              return result;
+            });
+          }
+        } catch (sdkErr) {
+          console.warn(`[CantonSDK]    SDK exerciseAllocationChoice failed: ${sdkErr.message} — trying registry API`);
         }
-      } catch (sdkErr) {
-        console.warn(`[CantonSDK]    SDK exerciseAllocationChoice failed: ${sdkErr.message} — trying registry API`);
+      } else {
+        console.warn(`[CantonSDK]    SDK not ready — trying registry API`);
       }
-    } else {
-      console.warn(`[CantonSDK]    SDK not ready — attempting registry API execution for allocation`);
-    }
 
-    // Fallback for Splice: Try the Scan Proxy execute-transfer endpoint directly
-    try {
+      // Attempt 2: Registry choice-context API.
       const registryUrl = CANTON_SDK_CONFIG.REGISTRY_API_URL;
       const encodedCid = encodeURIComponent(allocationContractId);
       const executeContextUrl = `${registryUrl}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
-
-      console.log(`[CantonSDK]    Trying Splice registry execute-transfer API...`);
       const resp = await fetch(executeContextUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ excludeDebugFields: true }),
       });
-
-      if (resp.ok) {
-        const context = await resp.json();
-        const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
-        const result = await cantonService.exerciseChoice({
-          token: adminToken,
-          actAsParty: actAsParties,
-          templateId: ALLOCATION_INTERFACE,
-          contractId: allocationContractId,
-          choice: 'Allocation_ExecuteTransfer',
-          choiceArgument: {
-            extraArgs: {
-              context: context.choiceContextData || { values: {} },
-              meta: { values: {} },
-            },
-          },
-          readAs: readAsParties,
-          synchronizerId,
-          disclosedContracts: (context.disclosedContracts || []).map(dc => ({
-            templateId: dc.templateId,
-            contractId: dc.contractId,
-            createdEventBlob: dc.createdEventBlob,
-            synchronizerId: dc.synchronizerId || synchronizerId,
-          })),
-        });
-
-        console.log(`[CantonSDK]    ✅ Splice allocation executed via registry API — updateId: ${result?.transaction?.updateId || 'N/A'}`);
-        return result;
-      } else {
+      if (!resp.ok) {
         const errText = await resp.text();
-        console.warn(`[CantonSDK]    ⚠️ Registry execute-transfer returned ${resp.status}: ${errText.substring(0, 200)}`);
+        throw new Error(`Registry execute-transfer returned ${resp.status}: ${errText.substring(0, 300)}`);
       }
-    } catch (registryErr) {
-      console.warn(`[CantonSDK]    ⚠️ Splice registry execute-transfer failed: ${registryErr.message}`);
+
+      const context = await resp.json();
+      const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
+      return cantonService.exerciseChoice({
+        token: adminToken,
+        actAsParty: actAsParties,
+        templateId: ALLOCATION_INTERFACE,
+        contractId: allocationContractId,
+        choice: 'Allocation_ExecuteTransfer',
+        choiceArgument: {
+          extraArgs: {
+            context: context.choiceContextData || { values: {} },
+            meta: { values: {} },
+          },
+        },
+        readAs: readAsParties,
+        synchronizerId,
+        disclosedContracts: (context.disclosedContracts || []).map(dc => ({
+          templateId: dc.templateId,
+          contractId: dc.contractId,
+          createdEventBlob: dc.createdEventBlob,
+          synchronizerId: dc.synchronizerId || synchronizerId,
+        })),
+      });
+    };
+
+    // Strategy A (preferred): executor-only submit. Strategy B: executor + owner.
+    // Some allocations require both authorizers; others can execute via app-right context.
+    const strategies = [[executorPartyId]];
+    if (ownerPartyId && ownerPartyId !== executorPartyId) {
+      strategies.push([executorPartyId, ownerPartyId]);
     }
 
-    // Allocation execution failed
+    let lastError = null;
+    for (const actAsParties of strategies) {
+      try {
+        const result = await tryExecuteForActAs(actAsParties);
+        console.log(`[CantonSDK]    ✅ Splice allocation executed — updateId: ${result?.transaction?.updateId || 'N/A'}`);
+        return result;
+      } catch (err) {
+        lastError = err;
+        console.warn(`[CantonSDK]    Attempt failed for actAs ${summarize(actAsParties)}: ${err.message}`);
+
+        // If executor+owner cannot be submitted on any synchronizer, no further backend strategy exists.
+        if (isNoSynchronizerError(err) && actAsParties.length > 1) {
+          break;
+        }
+        // If executor-only auth fails and owner strategy exists, continue to next strategy.
+        if (isAuthError(err) && actAsParties.length === 1 && strategies.length > 1) {
+          continue;
+        }
+      }
+    }
+
     console.error(`[CantonSDK]    ❌ Splice allocation execution failed — all methods exhausted`);
+    if (lastError) {
+      const lastMessage = String(lastError.message || lastError);
+      console.error(`[CantonSDK]    Last execute error: ${lastMessage}`);
+      if (lastMessage.includes('LockedAmulet') && lastMessage.includes('not found')) {
+        throw new Error(`STALE_ALLOCATION_LOCK_MISSING: ${lastMessage}`);
+      }
+      if (lastMessage.includes('deadline-exceeded') || lastMessage.includes('settleBefore')) {
+        throw new Error(`STALE_ALLOCATION_EXPIRED: ${lastMessage}`);
+      }
+      if (lastMessage.includes('NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT')) {
+        throw new Error(`UNSUBMITTABLE_EXTERNAL_ACTAS: ${lastMessage}`);
+      }
+    }
     return null;
   }
 
@@ -1555,9 +1628,8 @@ class CantonSDKClient {
     const encodedCid = encodeURIComponent(allocationContractId);
     const executeContextUrl = `${backendUrl}/v0/registrars/${encodeURIComponent(adminParty)}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
 
-    // Client-required model: settlement executes with exchange as executor.
-    // Keep sender/receiver in readAs for visibility/context, but do not submit as them.
-    const actAsParties = [executorPartyId];
+    // Keep the same authorizer strategy as Splice allocations.
+    const actAsParties = [...new Set([executorPartyId, ownerPartyId].filter(Boolean))];
     const readAsParties = [...new Set([executorPartyId, ownerPartyId, receiverPartyId].filter(Boolean))];
 
     // Get synchronizerId — REQUIRED for Canton command submission

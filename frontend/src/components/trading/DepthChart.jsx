@@ -1,5 +1,5 @@
 import { useEffect, useRef, memo } from 'react';
-import { createChart, AreaSeries, ColorType } from 'lightweight-charts';
+import { createChart, LineSeries, ColorType } from 'lightweight-charts';
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
 import { cn } from '@/lib/utils';
 import { Layers } from 'lucide-react';
@@ -19,40 +19,70 @@ function DepthChart({
   const askSeriesRef = useRef(null);
   const resizeObserverRef = useRef(null);
 
-  // Process order book into cumulative depth data
+  // Process order book into cumulative depth data.
+  // Lightweight Charts will crash if it receives null/NaN points,
+  // so we normalize all incoming values to finite numbers here.
   const processDepthData = (bids, asks) => {
-    const sortedBids = [...bids]
-      .filter(b => parseFloat(b.price) > 0 && parseFloat(b.quantity || b.amount || b.remaining) > 0)
-      .sort((a, b) => parseFloat(b.price) - parseFloat(a.price));
-    
-    let bidCumulative = 0;
-    const bidData = sortedBids.map(bid => {
-      bidCumulative += parseFloat(bid.quantity || bid.amount || bid.remaining || 0);
-      return {
-        price: parseFloat(bid.price),
-        cumulative: bidCumulative
-      };
-    });
+    const toFiniteNumber = (value) => {
+      if (value === null || value === undefined) return null;
+      if (typeof value === 'object') {
+        if (value.Some !== undefined) return toFiniteNumber(value.Some);
+        if (value.value !== undefined) return toFiniteNumber(value.value);
+        return null;
+      }
+      const n = Number(value);
+      return Number.isFinite(n) ? n : null;
+    };
 
-    const sortedAsks = [...asks]
-      .filter(a => parseFloat(a.price) > 0 && parseFloat(a.quantity || a.amount || a.remaining) > 0)
-      .sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
-    
-    let askCumulative = 0;
-    const askData = sortedAsks.map(ask => {
-      askCumulative += parseFloat(ask.quantity || ask.amount || ask.remaining || 0);
-      return {
-        price: parseFloat(ask.price),
-        cumulative: askCumulative
-      };
-    });
+    const getQuantity = (entry) => {
+      if (!entry || typeof entry !== 'object') return null;
+      return toFiniteNumber(
+        entry.quantity ??
+        entry.amount ??
+        entry.remaining ??
+        entry.depth ??
+        null
+      );
+    };
 
-    return { bidData, askData };
+    const normalizeSide = (levels, side) => {
+      const source = Array.isArray(levels) ? levels : [];
+      const valid = source
+        .map((level) => {
+          const price = toFiniteNumber(level?.price);
+          const quantity = getQuantity(level);
+          if (price === null || quantity === null || price <= 0 || quantity <= 0) {
+            return null;
+          }
+          return { price, quantity };
+        })
+        .filter(Boolean)
+        .sort((a, b) => side === 'bids' ? b.price - a.price : a.price - b.price);
+
+      let cumulative = 0;
+      return valid.map((level) => {
+        cumulative += level.quantity;
+        return { price: level.price, cumulative };
+      });
+    };
+
+    return {
+      bidData: normalizeSide(bids, 'bids'),
+      askData: normalizeSide(asks, 'asks'),
+    };
   };
 
   // Initialize chart
   useEffect(() => {
     if (!chartContainerRef.current) return;
+
+    // Defensive cleanup for dev StrictMode / remount races.
+    if (chartRef.current) {
+      chartRef.current.remove();
+      chartRef.current = null;
+      bidSeriesRef.current = null;
+      askSeriesRef.current = null;
+    }
 
     const chart = createChart(chartContainerRef.current, {
       layout: {
@@ -81,20 +111,17 @@ function DepthChart({
 
     chartRef.current = chart;
 
-    // Create bid area series (green) - v5 API
-    bidSeriesRef.current = chart.addSeries(AreaSeries, {
-      topColor: 'rgba(34, 197, 94, 0.4)',
-      bottomColor: 'rgba(34, 197, 94, 0.0)',
+    // Use LineSeries for depth to avoid AreaSeries null-style crashes
+    // observed under rapid real-time order book updates.
+    bidSeriesRef.current = chart.addSeries(LineSeries, {
       lineColor: '#22C55E',
       lineWidth: 2,
       priceLineVisible: false,
       lastValueVisible: false,
     });
 
-    // Create ask area series (red) - v5 API
-    askSeriesRef.current = chart.addSeries(AreaSeries, {
-      topColor: 'rgba(239, 68, 68, 0.4)',
-      bottomColor: 'rgba(239, 68, 68, 0.0)',
+    // Create ask depth line (red)
+    askSeriesRef.current = chart.addSeries(LineSeries, {
       lineColor: '#EF4444',
       lineWidth: 2,
       priceLineVisible: false,
@@ -121,21 +148,29 @@ function DepthChart({
         chartRef.current.remove();
         chartRef.current = null;
       }
+      bidSeriesRef.current = null;
+      askSeriesRef.current = null;
     };
   }, []);
 
   // Update data when orderBook changes
   useEffect(() => {
-    if (!bidSeriesRef.current || !askSeriesRef.current) return;
+    if (!chartRef.current || !bidSeriesRef.current || !askSeriesRef.current) return;
 
     const { bidData, askData } = processDepthData(orderBook.bids || [], orderBook.asks || []);
 
+    const totalPoints = bidData.length + askData.length;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const startTime = nowSec - Math.max(totalPoints, 1);
+
     if (bidData.length > 0) {
       const reversedBids = [...bidData].reverse();
-      const bidChartData = reversedBids.map((d, i) => ({
-        time: i,
-        value: d.cumulative
-      }));
+      const bidChartData = reversedBids
+        .map((d, i) => ({
+          time: startTime + i,
+          value: Number.isFinite(d.cumulative) ? d.cumulative : null,
+        }))
+        .filter((p) => p.value !== null);
       bidSeriesRef.current.setData(bidChartData);
     } else {
       bidSeriesRef.current.setData([]);
@@ -143,10 +178,12 @@ function DepthChart({
 
     if (askData.length > 0) {
       const offset = bidData.length;
-      const askChartData = askData.map((d, i) => ({
-        time: offset + i,
-        value: d.cumulative
-      }));
+      const askChartData = askData
+        .map((d, i) => ({
+          time: startTime + offset + i,
+          value: Number.isFinite(d.cumulative) ? d.cumulative : null,
+        }))
+        .filter((p) => p.value !== null);
       askSeriesRef.current.setData(askChartData);
     } else {
       askSeriesRef.current.setData([]);

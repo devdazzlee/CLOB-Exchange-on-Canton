@@ -332,7 +332,6 @@ class CantonService {
       throw new Error("exerciseChoice: choice is required");
     }
 
-    // Convert templateId to string format (required by JSON Ledger API v2)
     const templateIdString = templateIdToString(templateId);
 
     // Resolve synchronizerId — use passed value, or fall back to config default
@@ -1441,9 +1440,6 @@ class CantonService {
     const url = `${this.jsonApiBase}/v2/interactive-submission/prepare`;
     const actAs = Array.isArray(actAsParty) ? actAsParty : [actAsParty];
 
-    // Convert templateId to string format (required by JSON Ledger API v2)
-    const templateIdString = templateIdToString(templateId);
-
     // Resolve synchronizerId — use passed value, or fall back to config default
     const effectiveSyncId = synchronizerId || this.synchronizerId;
 
@@ -1465,6 +1461,11 @@ class CantonService {
       commandList = commands;
       console.log(`[CantonService] Preparing ${commands.length} command(s) for interactive submission`);
     } else {
+      if (!templateId) {
+        throw new Error("prepareInteractiveSubmission requires either commands[] or templateId");
+      }
+      // Convert templateId to string format (required by JSON Ledger API v2)
+      const templateIdString = templateIdToString(templateId);
       let command;
       if (createArguments && !contractId) {
         command = {
@@ -1581,24 +1582,41 @@ class CantonService {
     console.log(`[CantonService] POST ${url}`);
     console.log(`[CantonService] Execute request body:`, JSON.stringify(body, null, 2));
 
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${token}`
-      },
-      body: JSON.stringify(body)
-    });
+    const executeOnce = async () => {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify(body)
+      });
+      const text = await res.text();
+      return { res, text };
+    };
 
-    const text = await res.text();
+    let attempt = await executeOnce();
 
-    if (!res.ok) {
-      const error = parseCantonError(text, res.status);
-      console.error(`[CantonService] ❌ Execute failed:`, error);
-      throw new Error(`Execute failed: ${error.message}`);
+    if (!attempt.res.ok) {
+      let error = parseCantonError(attempt.text, attempt.res.status);
+
+      // Sequencer timeout can be transient; retry once with same prepared transaction/signature.
+      if (error.code === 'NOT_SEQUENCED_TIMEOUT') {
+        console.warn('[CantonService] Execute timed out at sequencer. Retrying once...');
+        await new Promise((resolve) => setTimeout(resolve, 800));
+        attempt = await executeOnce();
+        if (!attempt.res.ok) {
+          error = parseCantonError(attempt.text, attempt.res.status);
+          console.error(`[CantonService] ❌ Execute retry failed:`, error);
+          throw new Error(`Execute failed: ${error.message}`);
+        }
+      } else {
+        console.error(`[CantonService] ❌ Execute failed:`, error);
+        throw new Error(`Execute failed: ${error.message}`);
+      }
     }
 
-    const result = JSON.parse(text);
+    const result = JSON.parse(attempt.text);
     console.log(`[CantonService] ✅ Execute succeeded, updateId: ${result.transaction?.updateId || 'unknown'}`);
     return result;
   }

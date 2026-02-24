@@ -7,11 +7,9 @@
  * NO STATIC JWTS IN CODE. NO USER TOKEN EXCHANGE.
  */
 
-// Ensure TLS bypass for self-signed Keycloak cert (DevNet)
-// This MUST be set before any HTTPS fetch to Keycloak
-if (!process.env.NODE_TLS_REJECT_UNAUTHORIZED) {
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-}
+// Keep TLS verification enabled by default. If an environment explicitly
+// sets NODE_TLS_REJECT_UNAUTHORIZED=0, Node will still allow insecure TLS
+// and emit its own warning.
 
 const config = require('../config');
 

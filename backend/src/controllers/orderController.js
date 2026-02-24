@@ -221,6 +221,11 @@ class OrderController {
       preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, orderMeta || {}
     );
 
+    if (result?.requiresSignature) {
+      console.log(`[OrderController] External party — returning next prepared step for signing (${result.step})`);
+      return success(res, result, 'Step prepared. Sign the next hash and call /execute-place again.');
+    }
+
     console.log(`[OrderController] ✅ Order placed via interactive submission: ${result.orderId}`);
 
     // Fire-and-forget matching
