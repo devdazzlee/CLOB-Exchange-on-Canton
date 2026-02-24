@@ -958,6 +958,103 @@ class CantonSDKClient {
   }
 
   /**
+   * Build an AllocationFactory_Allocate interactive command payload for an external signer.
+   * This does NOT submit the command; caller includes the returned command in
+   * /v2/interactive-submission/prepare so the external party signs it.
+   */
+  async buildAllocationInteractiveCommand(senderPartyId, receiverPartyId, amount, symbol, executorPartyId, orderId = '') {
+    if (!this.isReady()) {
+      throw new Error('Canton SDK not initialized');
+    }
+
+    const tokenSystemType = getTokenSystemType(symbol);
+    const instrumentId = toCantonInstrument(symbol);
+    const adminParty = this.getInstrumentAdminForSymbol(symbol);
+
+    const holdings = await this._withPartyContext(senderPartyId, async () => {
+      return await this.sdk.tokenStandard?.listHoldingUtxos(false) || [];
+    });
+
+    const holdingCids = holdings
+      .filter(h => extractInstrumentId(h.interfaceViewValue?.instrumentId) === instrumentId)
+      .map(h => h.contractId);
+
+    if (holdingCids.length === 0) {
+      throw new Error(`No ${symbol} holdings found for allocation sender ${senderPartyId.substring(0, 30)}...`);
+    }
+
+    const effectiveReceiver = receiverPartyId || executorPartyId;
+    const choiceArgs = this._buildAllocationChoiceArgs({
+      adminParty,
+      senderPartyId,
+      receiverPartyId: effectiveReceiver,
+      executorPartyId,
+      amount,
+      instrumentId,
+      orderId,
+      holdingCids,
+      choiceContextData: null,
+    });
+
+    const allocationFactoryUrl = tokenSystemType === 'utilities'
+      ? `${UTILITIES_CONFIG.BACKEND_URL}/v0/registrars/${encodeURIComponent(adminParty)}/registry/allocation-instruction/v1/allocation-factory`
+      : `${CANTON_SDK_CONFIG.REGISTRY_API_URL}/registry/allocation-instruction/v1/allocation-factory`;
+
+    const factoryResponse = await fetch(allocationFactoryUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        choiceArguments: choiceArgs,
+        excludeDebugFields: true,
+      }),
+    });
+
+    if (!factoryResponse.ok) {
+      const errorText = await factoryResponse.text();
+      throw new Error(`Allocation factory API failed (${factoryResponse.status}): ${errorText.substring(0, 300)}`);
+    }
+
+    const factory = await factoryResponse.json();
+
+    const exerciseArgs = this._buildAllocationChoiceArgs({
+      adminParty,
+      senderPartyId,
+      receiverPartyId: effectiveReceiver,
+      executorPartyId,
+      amount,
+      instrumentId,
+      orderId,
+      holdingCids,
+      choiceContextData: factory.choiceContext?.choiceContextData,
+    });
+
+    const configModule = require('../config');
+    const synchronizerId = this._pickSynchronizerIdFromDisclosed(
+      factory.choiceContext?.disclosedContracts || [],
+      configModule.canton.synchronizerId
+    );
+
+    return {
+      command: {
+        ExerciseCommand: {
+          templateId: UTILITIES_CONFIG.ALLOCATION_INSTRUCTION_FACTORY_INTERFACE,
+          contractId: factory.factoryId,
+          choice: 'AllocationFactory_Allocate',
+          choiceArgument: exerciseArgs,
+        },
+      },
+      readAs: [senderPartyId, effectiveReceiver, executorPartyId],
+      disclosedContracts: (factory.choiceContext?.disclosedContracts || []).map(dc => ({
+        templateId: dc.templateId,
+        contractId: dc.contractId,
+        createdEventBlob: dc.createdEventBlob,
+        synchronizerId: dc.synchronizerId || synchronizerId,
+      })),
+      synchronizerId,
+    };
+  }
+
+  /**
    * Build the correct allocation choiceArguments structure.
    * 
    * VERIFIED against live Splice & Utilities endpoints (2026-02-17):
@@ -1320,15 +1417,6 @@ class CantonSDKClient {
     if (!allocationContractId) {
       console.warn('[CantonSDK] No allocationContractId — skipping execution');
       return null;
-    }
-
-    // Splice/Utilities allocation execution requires all allocation authorizers.
-    // For external owners, backend cannot submit on their behalf at match-time.
-    const isExternalOwner = typeof ownerPartyId === 'string' && ownerPartyId.startsWith('ext-');
-    if (isExternalOwner) {
-      throw new Error(
-        'Allocation execution requires external owner authorization. Backend cannot execute external-owner allocation at match-time without interactive signing.'
-      );
     }
 
     // Client-required model: settlement executes with exchange as executor.

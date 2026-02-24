@@ -156,6 +156,12 @@ function getAllocationContractIdForOrder(orderId) {
   return reservation?.allocationContractId || null;
 }
 
+function setAllocationContractIdForOrder(orderId, allocationContractId) {
+  const reservation = _orderReservations.get(orderId);
+  if (!reservation) return;
+  reservation.allocationContractId = allocationContractId || null;
+}
+
 class OrderService {
   constructor() {
     console.log('[OrderService] Initialized with Canton JSON API v2 + Allocation-based settlement');
@@ -468,20 +474,9 @@ class OrderService {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // STEP A: Balance verified — Allocations are created at MATCH TIME
-    //
-    // Per client requirement: Settlement MUST use Allocations, NOT TransferInstruction.
-    // The exchange (executor) settles at match time with its own key.
-    //
-    // WHY allocations are created at match time, NOT order placement:
-    //   - Allocation contracts are SINGLE-USE on Canton (consumed on execute)
-    //   - Allocation_ExecuteTransfer transfers the FULL locked amount
-    //   - For partial fills, a full-order allocation would over-transfer
-    //   - Creating per-match allocations with exact amounts prevents this
-    //   - The receiver is also known at match time (counterparty)
-    //
-    // Fund safety: In-memory balance reservation prevents double-spending.
-    // At match time: createAllocation(exact_match_amount) → executeAllocation()
+    // STEP A: Balance verified — reserve locked amount in memory
+    // For external parties, the actual Allocation authorization is done
+    // in the interactive order-placement transaction prepared below.
     // ═══════════════════════════════════════════════════════════════════
     let allocationContractId = null;
 
@@ -523,21 +518,45 @@ class OrderService {
       // For Order creation: signatory is "owner" (the external party).
       // We only include the external party in actAs — the operator is an observer,
       // not a signatory, so it doesn't need to sign.
-      console.log(`[OrderService] External party detected — using interactive submission for order creation`);
-      
+      console.log(`[OrderService] External party detected — preparing allocation + order via interactive submission`);
+
+      // Build pre-authorized allocation command (sender=party, receiver=operator escrow).
+      // This is signed by the external user in the same interactive flow.
+      const sdkClient = getCantonSDKClient();
+      const allocationPrep = await sdkClient.buildAllocationInteractiveCommand(
+        partyId,
+        operatorPartyId,
+        String(lockInfo.amount),
+        lockInfo.asset,
+        operatorPartyId,
+        orderId
+      );
+
+      const orderCreateCommand = {
+        CreateCommand: {
+          templateId: `${packageId}:Order:Order`,
+          createArguments: createArgs,
+        },
+      };
+
+      const readAs = [...new Set([operatorPartyId, partyId, ...(allocationPrep.readAs || [])])];
+      const disclosedContracts = allocationPrep.disclosedContracts || [];
+      const synchronizerId = allocationPrep.synchronizerId || config.canton.synchronizerId;
+
       const prepareResult = await cantonService.prepareInteractiveSubmission({
         token,
         actAsParty: [partyId],
-        templateId: `${packageId}:Order:Order`,
-        createArguments: createArgs,
-        readAs: [operatorPartyId, partyId],
+        commands: [allocationPrep.command, orderCreateCommand],
+        readAs,
+        synchronizerId,
+        disclosedContracts,
       });
       
       if (!prepareResult.preparedTransaction || !prepareResult.preparedTransactionHash) {
         throw new Error('Prepare returned incomplete result: missing preparedTransaction or preparedTransactionHash');
       }
       
-      console.log(`[OrderService] ✅ Order creation prepared. Hash to sign: ${prepareResult.preparedTransactionHash.substring(0, 40)}...`);
+      console.log(`[OrderService] ✅ Allocation + order prepared. Hash to sign: ${prepareResult.preparedTransactionHash.substring(0, 40)}...`);
       
       // Return the prepared transaction for the frontend to sign
       return {
@@ -798,15 +817,21 @@ class OrderService {
         hashingSchemeVersion,
       }, token);
       
-      // Extract created contract ID from result
+      // Extract created contract IDs from result
       let contractId = null;
+      let allocationContractId = null;
       if (result.transaction?.events) {
-        const createdEvent = result.transaction.events.find(e => 
-          e.created?.templateId?.includes('Order') || 
-          e.CreatedEvent?.templateId?.includes('Order')
-        );
-        contractId = createdEvent?.created?.contractId || 
-                     createdEvent?.CreatedEvent?.contractId;
+        for (const event of result.transaction.events) {
+          const created = event.created || event.CreatedEvent;
+          const templateId = typeof created?.templateId === 'string' ? created.templateId : '';
+          if (!created?.contractId) continue;
+          if (!contractId && templateId.includes(':Order:Order')) {
+            contractId = created.contractId;
+          }
+          if (!allocationContractId && templateId.includes('Allocation')) {
+            allocationContractId = created.contractId;
+          }
+        }
       }
       
       if (!contractId) {
@@ -814,6 +839,11 @@ class OrderService {
       }
       
       console.log(`[OrderService] ✅ Order placed via interactive submission: ${orderMeta.orderId} (${contractId?.substring(0, 20)}...)`);
+
+      if (orderMeta.orderId && allocationContractId) {
+        setAllocationContractIdForOrder(orderMeta.orderId, allocationContractId);
+        console.log(`[OrderService] ✅ Allocation linked to order ${orderMeta.orderId}: ${allocationContractId.substring(0, 30)}...`);
+      }
       
       // Register in tracking systems
       const orderRecord = {
@@ -832,7 +862,7 @@ class OrderService {
         lockId: null,
         lockedAmount: orderMeta.lockInfo?.amount || '0',
         lockedAsset: orderMeta.lockInfo?.asset || '',
-        allocationContractId: null,
+        allocationContractId: allocationContractId || null,
       };
       
       // Register in global open orders registry
@@ -897,6 +927,7 @@ class OrderService {
         quantity: orderMeta.quantity,
         filled: '0',
         remaining: orderMeta.quantity,
+        allocationContractId: allocationContractId || null,
         timestamp: new Date().toISOString()
       };
       
@@ -905,7 +936,7 @@ class OrderService {
       
       // Release reservation on failure
       if (orderMeta.orderId) {
-        removeReservation(orderMeta.orderId);
+        releaseReservation(orderMeta.orderId);
       }
       throw error;
     }
@@ -1484,4 +1515,5 @@ module.exports.releaseReservation = releaseReservation;
 module.exports.releasePartialReservation = releasePartialReservation;
 module.exports.getReservedBalance = getReservedBalance;
 module.exports.getAllocationContractIdForOrder = getAllocationContractIdForOrder;
+module.exports.setAllocationContractIdForOrder = setAllocationContractIdForOrder;
 module.exports.getGlobalOpenOrders = getGlobalOpenOrders;

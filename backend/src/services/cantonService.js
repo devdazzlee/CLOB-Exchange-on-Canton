@@ -255,8 +255,9 @@ class CantonService {
       throw new Error("createContract: createArguments is required");
     }
 
-    // Convert templateId to string format (required by JSON Ledger API v2)
-    const templateIdString = templateIdToString(templateId);
+    // Convert templateId to string format for legacy single-command mode.
+    // In multi-command mode (`commands` provided), template IDs are already embedded.
+    const templateIdString = templateId ? templateIdToString(templateId) : null;
 
     // Resolve synchronizerId — use passed value, or fall back to config default
     const effectiveSyncId = synchronizerId || this.synchronizerId;
@@ -1426,6 +1427,7 @@ class CantonService {
   async prepareInteractiveSubmission({
     token,
     actAsParty,
+    commands = null,
     templateId,
     contractId = null,
     choice = null,
@@ -1454,34 +1456,36 @@ class CantonService {
       }));
     }
 
-    // Build FLAT request body for /v2/interactive-submission/prepare
-    // IMPORTANT: This endpoint uses a FLAT structure (NOT the nested "commands" wrapper
-    // that submit-and-wait-for-transaction uses). All fields are at the root level.
-    //
-    // Determine command type:
-    //   - CreateCommand for contract creation (when createArguments is provided)
-    //   - ExerciseCommand for exercising choices (when contractId + choice are provided)
-    let command;
-    if (createArguments && !contractId) {
-      // CreateCommand
-      command = {
-        CreateCommand: {
-          templateId: templateIdString,
-          createArguments
-        }
-      };
-      console.log(`[CantonService] Preparing CreateCommand for template: ${templateIdString}`);
+    // Build FLAT request body for /v2/interactive-submission/prepare.
+    // Supports either:
+    //  - explicit `commands` array (already normalized by caller), or
+    //  - legacy single-command inputs (templateId + create/exercise args).
+    let commandList = null;
+    if (Array.isArray(commands) && commands.length > 0) {
+      commandList = commands;
+      console.log(`[CantonService] Preparing ${commands.length} command(s) for interactive submission`);
     } else {
-      // ExerciseCommand
-      command = {
-        ExerciseCommand: {
-          templateId: templateIdString,
-          contractId,
-          choice,
-          choiceArgument
-        }
-      };
-      console.log(`[CantonService] Preparing ExerciseCommand: ${choice} on ${contractId?.substring(0, 20)}...`);
+      let command;
+      if (createArguments && !contractId) {
+        command = {
+          CreateCommand: {
+            templateId: templateIdString,
+            createArguments
+          }
+        };
+        console.log(`[CantonService] Preparing CreateCommand for template: ${templateIdString}`);
+      } else {
+        command = {
+          ExerciseCommand: {
+            templateId: templateIdString,
+            contractId,
+            choice,
+            choiceArgument
+          }
+        };
+        console.log(`[CantonService] Preparing ExerciseCommand: ${choice} on ${contractId?.substring(0, 20)}...`);
+      }
+      commandList = [command];
     }
 
     const readAsList = Array.isArray(readAs) ? readAs : (readAs ? [readAs] : []);
@@ -1490,7 +1494,7 @@ class CantonService {
       actAs,
       ...(readAsList.length > 0 && { readAs: readAsList }),
       synchronizerId: effectiveSyncId,
-      commands: [command],
+      commands: commandList,
       ...(normalizedDisclosed && { disclosedContracts: normalizedDisclosed }),
       packageIdSelectionPreference: [],
       verboseHashing

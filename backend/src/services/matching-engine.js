@@ -281,9 +281,15 @@ class MatchingEngine {
 
         // Extract allocationCid (Allocation contract ID for settlement)
         const rawAllocationCid = payload.allocationCid || '';
-        const allocationCid = (rawAllocationCid && rawAllocationCid !== 'FILL_ONLY' && rawAllocationCid !== 'NONE' && rawAllocationCid.length >= 10)
+        let allocationCid = (rawAllocationCid && rawAllocationCid !== 'FILL_ONLY' && rawAllocationCid !== 'NONE' && rawAllocationCid.length >= 10)
           ? rawAllocationCid
           : null;
+        if (!allocationCid && payload.orderId) {
+          try {
+            const { getAllocationContractIdForOrder } = require('./order-service');
+            allocationCid = getAllocationContractIdForOrder(payload.orderId);
+          } catch (_) { /* best effort */ }
+        }
         
         const order = {
           contractId: payload.contractId,
@@ -506,182 +512,86 @@ class MatchingEngine {
     
     const sdkClient = getCantonSDKClient();
 
+    if (buyIsPartial || sellIsPartial) {
+      throw new Error('Pre-authorized allocation settlement currently requires full-fill matches on both sides');
+    }
+
     // ═══════════════════════════════════════════════════════════════════
-    // STEP 1: REAL Token Settlement via Allocation API
-    //
-    // IMPORTANT:
-    // We settle token movement BEFORE filling order contracts.
-    // If FillOrder is done first and settlement fails, orders become FILLED
-    // with no token transfer (client-critical inconsistency).
+    // STEP 1: Execute pre-authorized order allocations + operator payouts
     // ═══════════════════════════════════════════════════════════════════
     console.log(`[MatchingEngine] 🔄 Settlement: ${matchQtyStr} ${baseSymbol} @ ${matchPrice} ${quoteSymbol}`);
-    console.log(`[MatchingEngine] 💰 Step 1: Creating & executing match-time Allocations...`);
+    console.log(`[MatchingEngine] 💰 Step 1: Executing pre-authorized allocations...`);
+    console.log(`[MatchingEngine]    Leg A lock: ${sellOrder.allocationContractId ? sellOrder.allocationContractId.substring(0, 24) + '...' : 'missing'} (${baseSymbol})`);
+    console.log(`[MatchingEngine]    Leg B lock: ${buyOrder.allocationContractId ? buyOrder.allocationContractId.substring(0, 24) + '...' : 'missing'} (${quoteSymbol})`);
 
-    // Per client requirement: Settlement MUST use Allocations, NOT TransferInstruction.
-    // ARCHITECTURE: Allocations are created HERE at MATCH TIME with the EXACT
-    // match amount, NOT at order placement time. This is critical because:
-    //   - Allocation contracts are SINGLE-USE on Canton (consumed on execute)
-    //   - Allocation_ExecuteTransfer transfers the FULL locked amount
-    //   - For partial fills, a full-order allocation would OVER-TRANSFER
-    //   - Creating per-match allocations with exact amounts prevents this
-    //   - The receiver (counterparty) is known here, not at order placement
-    //
-    // Flow:
-    //   1. CREATE allocation A: exact match qty of base asset, seller → buyer
-    //   2. CREATE allocation B: exact match qty of quote asset, buyer → seller
-    //   3. EXECUTE allocation A — if fails, cancel B, abort
-    //   4. EXECUTE allocation B — if fails, log critical (A already executed)
-    //
-    // @see https://docs.sync.global/app_dev/api/splice-api-token-allocation-v1/
-    console.log(`[MatchingEngine]    Leg A: ${matchQtyStr} ${baseSymbol} (seller → buyer)`);
-    console.log(`[MatchingEngine]    Leg B: ${quoteAmountStr} ${quoteSymbol} (buyer → seller)`);
+    if (!sellOrder.allocationContractId || !buyOrder.allocationContractId) {
+      throw new Error('Settlement aborted: missing pre-authorized allocation on one or both orders');
+    }
 
     let baseTransferResult = null;
     let quoteTransferResult = null;
-    let legAAllocationCid = null;
-    let legBAllocationCid = null;
 
-    // ── PHASE 1: CREATE both allocations with EXACT match amounts ──
-    // Both must succeed before we execute either one (atomic guarantee).
-
-    // Leg A allocation: seller sends base asset to buyer
-    try {
-      console.log(`[MatchingEngine]    📋 Creating Leg A allocation: ${matchQtyStr} ${baseSymbol} (seller → buyer)...`);
-      const legAResult = await sdkClient.createAllocation(
-        sellOrder.owner,      // sender — the seller
-        buyOrder.owner,       // receiver — the buyer (known at match time!)
-        matchQtyStr,          // EXACT match amount, not full order amount
-        baseSymbol,           // instrument symbol
-        operatorPartyId,      // executor — the exchange
-        `match-${sellOrder.orderId}-${Date.now()}`  // unique per match
-      );
-      legAAllocationCid = legAResult?.allocationContractId;
-      if (legAAllocationCid) {
-        console.log(`[MatchingEngine]    ✅ Leg A allocation created: ${legAAllocationCid.substring(0, 30)}...`);
-      } else {
-        throw new Error('Allocation factory returned no contract ID for Leg A');
-      }
-    } catch (allocErr) {
-      console.error(`[MatchingEngine]    ❌ Leg A allocation creation FAILED: ${allocErr.message}`);
-      console.error(`[MatchingEngine]    ❌ Settlement ABORTED — cannot create ${baseSymbol} allocation`);
-      // Release balance reservations since settlement won't happen
-      try {
-        const { releasePartialReservation } = require('./order-service');
-        releasePartialReservation(sellOrder.orderId, matchQtyStr);
-        releasePartialReservation(buyOrder.orderId, quoteAmountStr);
-      } catch (_) { /* non-critical */ }
-      throw new Error(`Settlement aborted: cannot create ${baseSymbol} allocation`);
+    // Execute inbound allocation locks (user -> operator escrow)
+    baseTransferResult = await sdkClient.executeAllocation(
+      sellOrder.allocationContractId,
+      operatorPartyId,
+      baseSymbol,
+      sellOrder.owner,
+      operatorPartyId
+    );
+    if (!baseTransferResult) {
+      throw new Error(`${baseSymbol} inbound allocation execution returned null`);
     }
 
-    // Leg B allocation: buyer sends quote asset to seller
-    try {
-      console.log(`[MatchingEngine]    📋 Creating Leg B allocation: ${quoteAmountStr} ${quoteSymbol} (buyer → seller)...`);
-      const legBResult = await sdkClient.createAllocation(
-        buyOrder.owner,       // sender — the buyer
-        sellOrder.owner,      // receiver — the seller (known at match time!)
-        quoteAmountStr,       // EXACT match amount
-        quoteSymbol,          // instrument symbol
-        operatorPartyId,      // executor — the exchange
-        `match-${buyOrder.orderId}-${Date.now()}`  // unique per match
-      );
-      legBAllocationCid = legBResult?.allocationContractId;
-      if (legBAllocationCid) {
-        console.log(`[MatchingEngine]    ✅ Leg B allocation created: ${legBAllocationCid.substring(0, 30)}...`);
-      } else {
-        throw new Error('Allocation factory returned no contract ID for Leg B');
-      }
-    } catch (allocErr) {
-      console.error(`[MatchingEngine]    ❌ Leg B allocation creation FAILED: ${allocErr.message}`);
-      // Cancel Leg A allocation since we can't complete the trade
-      try {
-        console.log(`[MatchingEngine]    🔓 Cancelling Leg A allocation (Leg B failed)...`);
-        await sdkClient.cancelAllocation(legAAllocationCid, sellOrder.owner, operatorPartyId, baseSymbol);
-        console.log(`[MatchingEngine]    ✅ Leg A allocation cancelled`);
-      } catch (cancelErr) {
-        console.warn(`[MatchingEngine]    ⚠️ Could not cancel Leg A allocation: ${cancelErr.message}`);
-      }
-      console.error(`[MatchingEngine]    ❌ Settlement ABORTED — cannot create ${quoteSymbol} allocation`);
-      try {
-        const { releasePartialReservation } = require('./order-service');
-        releasePartialReservation(sellOrder.orderId, matchQtyStr);
-        releasePartialReservation(buyOrder.orderId, quoteAmountStr);
-      } catch (_) { /* non-critical */ }
-      throw new Error(`Settlement aborted: cannot create ${quoteSymbol} allocation`);
+    quoteTransferResult = await sdkClient.executeAllocation(
+      buyOrder.allocationContractId,
+      operatorPartyId,
+      quoteSymbol,
+      buyOrder.owner,
+      operatorPartyId
+    );
+    if (!quoteTransferResult) {
+      throw new Error(`${quoteSymbol} inbound allocation execution returned null`);
     }
 
-    // ── PHASE 2: EXECUTE both allocations (both CIDs are fresh & valid) ──
-    console.log(`[MatchingEngine]    🔄 Both allocations created — executing settlements...`);
+    // Create and execute payout allocations from operator to counterparties.
+    const payoutBase = await sdkClient.createAllocation(
+      operatorPartyId,
+      buyOrder.owner,
+      matchQtyStr,
+      baseSymbol,
+      operatorPartyId,
+      `payout-${sellOrder.orderId}-${Date.now()}`
+    );
+    const payoutQuote = await sdkClient.createAllocation(
+      operatorPartyId,
+      sellOrder.owner,
+      quoteAmountStr,
+      quoteSymbol,
+      operatorPartyId,
+      `payout-${buyOrder.orderId}-${Date.now()}`
+    );
 
-    // Execute Leg A: base asset (seller → buyer)
-    try {
-      console.log(`[MatchingEngine]    📤 Executing Leg A: ${matchQtyStr} ${baseSymbol} (seller → buyer)`);
-      baseTransferResult = await sdkClient.executeAllocation(
-        legAAllocationCid,
-        operatorPartyId,
-        baseSymbol,
-        sellOrder.owner,  // ownerPartyId (sender)
-        buyOrder.owner    // receiverPartyId — REQUIRED: AmuletAllocation needs ALL THREE authorizers
-      );
-      if (baseTransferResult) {
-        console.log(`[MatchingEngine]    ✅ ${baseSymbol} settled via Allocation (seller → buyer)`);
-      } else {
-        throw new Error(`${baseSymbol} allocation execution returned null`);
-      }
-    } catch (execErr) {
-      console.error(`[MatchingEngine]    ❌ Leg A execution FAILED: ${execErr.message}`);
-      // Cancel Leg B allocation since Leg A failed
-      try {
-        console.log(`[MatchingEngine]    🔓 Cancelling Leg B allocation (Leg A execution failed)...`);
-        await sdkClient.cancelAllocation(legBAllocationCid, buyOrder.owner, operatorPartyId, quoteSymbol);
-        console.log(`[MatchingEngine]    ✅ Leg B allocation cancelled`);
-      } catch (cancelErr) {
-        console.warn(`[MatchingEngine]    ⚠️ Could not cancel Leg B allocation: ${cancelErr.message}`);
-      }
-      console.error(`[MatchingEngine]    ❌ Settlement ABORTED — ${baseSymbol} execution failed, ${quoteSymbol} allocation cancelled`);
-      try {
-        const { releasePartialReservation } = require('./order-service');
-        releasePartialReservation(sellOrder.orderId, matchQtyStr);
-        releasePartialReservation(buyOrder.orderId, quoteAmountStr);
-      } catch (_) { /* non-critical */ }
-      throw new Error(`Settlement aborted: ${baseSymbol} allocation execution failed`);
+    const payoutBaseResult = await sdkClient.executeAllocation(
+      payoutBase?.allocationContractId,
+      operatorPartyId,
+      baseSymbol,
+      operatorPartyId,
+      buyOrder.owner
+    );
+    const payoutQuoteResult = await sdkClient.executeAllocation(
+      payoutQuote?.allocationContractId,
+      operatorPartyId,
+      quoteSymbol,
+      operatorPartyId,
+      sellOrder.owner
+    );
+
+    if (!payoutBaseResult || !payoutQuoteResult) {
+      throw new Error('Settlement aborted: operator payout allocation execution failed');
     }
 
-    // Execute Leg B: quote asset (buyer → seller)
-    try {
-      console.log(`[MatchingEngine]    📤 Executing Leg B: ${quoteAmountStr} ${quoteSymbol} (buyer → seller)`);
-      quoteTransferResult = await sdkClient.executeAllocation(
-        legBAllocationCid,
-        operatorPartyId,
-        quoteSymbol,
-        buyOrder.owner,   // ownerPartyId (sender)
-        sellOrder.owner   // receiverPartyId — REQUIRED: AmuletAllocation needs ALL THREE authorizers
-      );
-      if (quoteTransferResult) {
-        console.log(`[MatchingEngine]    ✅ ${quoteSymbol} settled via Allocation (buyer → seller)`);
-      } else {
-        throw new Error(`${quoteSymbol} allocation execution returned null`);
-      }
-    } catch (execErr) {
-      console.error(`[MatchingEngine]    ❌ Leg B execution FAILED: ${execErr.message}`);
-      console.error(`[MatchingEngine]    🚨 CRITICAL: Partial settlement — ${baseSymbol} moved but ${quoteSymbol} FAILED`);
-      // Leg A already executed — this is a partial settlement that needs manual resolution
-      try {
-        const { releasePartialReservation } = require('./order-service');
-        releasePartialReservation(sellOrder.orderId, matchQtyStr);
-        releasePartialReservation(buyOrder.orderId, quoteAmountStr);
-      } catch (_) { /* non-critical */ }
-      throw new Error(`Settlement partial failure: ${quoteSymbol} allocation execution failed after ${baseSymbol} moved`);
-    }
-
-    // Settlement summary
-    if (baseTransferResult && quoteTransferResult) {
-      console.log(`[MatchingEngine]    ✅ Settlement COMPLETE — BOTH legs settled via match-time Allocations!`);
-    } else if (!baseTransferResult && !quoteTransferResult) {
-      console.error(`[MatchingEngine]    ❌ Settlement FAILED — no tokens transferred.`);
-      throw new Error('Settlement failed: no transfer leg completed');
-    } else {
-      throw new Error('Settlement incomplete: one transfer leg did not complete');
-    }
+    console.log(`[MatchingEngine]    ✅ Settlement COMPLETE via pre-authorized allocations + operator payout allocations`);
 
     // ═══════════════════════════════════════════════════════════════════
     // STEP 2: FillOrder on BOTH Canton order contracts AFTER settlement
