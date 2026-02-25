@@ -298,3 +298,28 @@ Yes
 Ok
 [10:46 PM, 2/20/2026] AHMED: I have switch from internal to external party
 [10:47 PM, 2/20/2026] AHMED: Just few changes remain I'm working then I'll push my changes
+
+
+[5:03 PM, 2/25/2026] AHMED: Hey, we're stuck on one thing right now. The Canton participant node (65.108.40.104) keeps dropping its connection to the global domain synchronizer. When it disconnects, no write operations go through orders can't settle, tokens can't transfer. Everything else is ready matching engine, allocations, external parties, order book all working. We just need a stable connection on the participant. Can you check if something is up with the server or restart the Canton participant process?
+[5:04 PM, 2/25/2026] AHMED: @~Mohak @~huz
+[5:05 PM, 2/25/2026] +91 79903 24401: Hey, we're stuck on one thing right now. The Canton participant node (65.108.40.104) keeps dropping its connection to the global domain synchronizer. When it disconnects, no write operations go through orders can't settle, tokens can't transfer. Everything else is ready matching engine, allocations, external parties, order book all working. We just need a stable connection on the participant. Can you check if something is up with the server or restart the Canton participant process?
+Let me try restarting the participant node
+[5:09 PM, 2/25/2026] AHMED: Let me try restarting the participant node
+Thanks.
+Yes, please restart the participant node. Once it's back up, we’ll test and confirm everything is working.
+[5:14 PM, 2/25/2026] +91 79903 24401: Please check now
+[5:14 PM, 2/25/2026] AHMED: Please check now
+I'll check
+
+
+@42121079853221 the participant logs are filled with submit commands generating from your partyId 
+
+
+
+```
+{"@timestamp":"2026-02-25T16:01:21.805Z","message":"Request com.daml.ledger.api.v2.CommandService/SubmitAndWaitForTransaction by inprocess-grpc-5001: failed with NOT_FOUND/CONTRACT_NOT_FOUND(11,1b53657f): Contract could not be found with id 00b0c2587f37a0387f9a0d8be9b1bd8de97bf6d2cd30c7a1f5db44fa7e14ec3375ca121220bbdfa3c57b792ca8181d71d4889936b09f52dc6f514b04c26882f54c50824257","logger_name":"c.d.c.n.g.ApiRequestLogger:participant=participant","thread_name":"canton-env-ec-79","level":"INFO","span-id":"ab3bc99ddce522a8","span-parent-id":"400f127839bf1c5c","trace-id":"a1cb78df399174b26a927d2324863717","span-name":"logger"}
+{"@timestamp":"2026-02-25T16:01:21.979Z","message":"Phase 1 started: Submitting 1 command(s) for interpretation on behalf of 8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c....","logger_name":"c.d.c.p.a.s.c.CommandSubmissionServiceImpl:participant=participant","thread_name":"canton-env-ec-795","level":"INFO","span-id":"3a9928e5dc03e385","span-parent-id":"f176f68142c7f5c1","trace-id":"35dbea24a85c6741e470d33739fe7232","span-name":"StreamTracker.track"}
+{"@timestamp":"2026-02-25T16:01:21.983Z","message":"CONTRACT_NOT_FOUND(11,65a07c89): Contract could not be found with id 00b0c2587f37a0387f9a0d8be9b1bd8de97bf6d2cd30c7a1f5db44fa7e14ec3375ca121220bbdfa3c57b792ca8181d71d4889936b09f52dc6f514b04c26882f54c50824257","logger_name":"c.d.c.p.a.s.c.CommandSubmissionServiceImpl:participant=participant","thread_name":"canton-env-ec-795","level":"INFO","trace-id":"35dbea24a85c6741e470d33739fe7232","location":"RejectionGenerators.scala:100","span-id":"3a9928e5dc03e385","error-code":"CONTRACT_NOT_FOUND(11,65a07c89)","span-parent-id":"f176f68142c7f5c1","participant":"'participant'","commands":"{readAs: ['ext-99495cb33b51::1220c98aeed243fe29dfc7d6fda2917e7423388a8cbf8d4946c98be167035c9a00cb'], deduplicationPeriod: {duration: 'PT30S'}, submittedAt: '2026-02-25T16:01:21.979415Z', submissionId: '65a07c89-5181-4ef6-93fb-3870ad76c530', actAs: ['8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292'], commandId: 'cmd-exercise-8684cef2-ca0b-4bbc-ab41-d9cfb932829f', userId: '652db10c-71a6-458b-baf3-906418723859', workflowId: }","span-name":"StreamTracker.track"}
+```
+
+This contract is archived this might be the reason for your error

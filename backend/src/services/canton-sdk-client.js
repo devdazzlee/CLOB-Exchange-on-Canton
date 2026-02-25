@@ -1094,19 +1094,21 @@ class CantonSDKClient {
 
       const nowMs = Date.now();
       const now = new Date(nowMs).toISOString();
-      // Root-cause timing policy:
-      // - Splice (Amulet/CC) enforces lock-expiry invariants during allocation prepare.
-      //   Overly long settle windows can fail with: "lock expires before amulet".
-      // - Utilities tokens can use a longer window safely.
+      // Splice (Amulet/CC) enforces lock-expiry invariants during allocation prepare.
+      // The settle window must be shorter than the LockedAmulet's lock expiry
+      // (tied to the current Splice round, typically 10-60 min on devnet).
+      // 5 min was too aggressive for a CLOB exchange — orders may wait several
+      // minutes for a counterparty.  15 min balances safety with usability.
+      // Utilities tokens (CBTC) are not round-bound, so 24h is safe.
       const defaultSettleWindowMs =
         tokenSystemType === 'utilities'
           ? 24 * 60 * 60 * 1000   // 24h
-          : 5 * 60 * 1000;        // 5m (known-safe for Splice assertions)
+          : 15 * 60 * 1000;       // 15m — safe within Splice round bounds
       const configuredSettleWindowMs = Number(process.env.ALLOCATION_SETTLE_WINDOW_MS || defaultSettleWindowMs);
       const settleWindowMs = Number.isFinite(configuredSettleWindowMs) && configuredSettleWindowMs > 60_000
         ? configuredSettleWindowMs
         : defaultSettleWindowMs;
-      const allocateWindowMs = Math.max(60_000, Math.min(2 * 60 * 1000, Math.floor(settleWindowMs / 2)));
+      const allocateWindowMs = Math.max(60_000, Math.min(5 * 60 * 1000, Math.floor(settleWindowMs / 2)));
       const allocateBefore = new Date(nowMs + allocateWindowMs).toISOString();
       const settleBefore = new Date(nowMs + settleWindowMs).toISOString();
 
@@ -1526,7 +1528,13 @@ class CantonSDKClient {
             });
           }
         } catch (sdkErr) {
-          console.warn(`[CantonSDK]    SDK exerciseAllocationChoice failed: ${sdkErr.message} — trying registry API`);
+          const sdkMsg = String(sdkErr?.message || sdkErr?.error || JSON.stringify(sdkErr) || '');
+          // If the SDK already determined the allocation is stale, don't waste time on registry fallback.
+          if (sdkMsg.includes('LockedAmulet') || sdkMsg.includes('not found') ||
+              sdkMsg.includes('deadline-exceeded') || sdkMsg.includes('settleBefore')) {
+            throw new Error(`STALE_ALLOCATION_LOCK_MISSING: ${sdkMsg}`);
+          }
+          console.warn(`[CantonSDK]    SDK exerciseAllocationChoice failed: ${sdkMsg} — trying registry API`);
         }
       } else {
         console.warn(`[CantonSDK]    SDK not ready — trying registry API`);
@@ -1571,14 +1579,23 @@ class CantonSDKClient {
       });
     };
 
-    // Strategy A (preferred): executor-only submit. Strategy B: executor + owner.
-    // Some allocations require both authorizers; others can execute via app-right context.
-    const strategies = [[executorPartyId]];
-    if (ownerPartyId && ownerPartyId !== executorPartyId) {
-      strategies.push([executorPartyId, ownerPartyId]);
-    }
+    // Allocation_ExecuteTransfer requires allocationControllers = union(sender, receiver, executor).
+    // ALL parties must be in actAs — there is no valid fallback to a smaller set.
+    const allParties = [...new Set([executorPartyId, ownerPartyId, receiverPartyId].filter(Boolean))];
+    const strategies = [allParties];
+
+    const isDeadlineError = (err) => {
+      const msg = String(err?.message || err || '');
+      return msg.includes('deadline-exceeded') || msg.includes('settleBefore');
+    };
+    const isLockMissingError = (err) => {
+      const msg = String(err?.message || err || '');
+      return msg.includes('LockedAmulet') && msg.includes('not found');
+    };
 
     let lastError = null;
+    let sawDeadlineError = false;
+    let sawLockMissingError = false;
     for (const actAsParties of strategies) {
       try {
         const result = await tryExecuteForActAs(actAsParties);
@@ -1588,30 +1605,27 @@ class CantonSDKClient {
         lastError = err;
         console.warn(`[CantonSDK]    Attempt failed for actAs ${summarize(actAsParties)}: ${err.message}`);
 
-        // If executor+owner cannot be submitted on any synchronizer, no further backend strategy exists.
-        if (isNoSynchronizerError(err) && actAsParties.length > 1) {
-          break;
-        }
-        // If executor-only auth fails and owner strategy exists, continue to next strategy.
-        if (isAuthError(err) && actAsParties.length === 1 && strategies.length > 1) {
-          continue;
-        }
+        if (isDeadlineError(err)) sawDeadlineError = true;
+        if (isLockMissingError(err)) sawLockMissingError = true;
+
+        // All errors are terminal — there is only one valid actAs set for Allocation_ExecuteTransfer.
+        break;
       }
     }
 
     console.error(`[CantonSDK]    ❌ Splice allocation execution failed — all methods exhausted`);
+    const anyMsg = String(lastError?.message || lastError || '');
+    if (sawLockMissingError) {
+      throw new Error(`STALE_ALLOCATION_LOCK_MISSING: ${anyMsg}`);
+    }
+    if (sawDeadlineError) {
+      throw new Error(`STALE_ALLOCATION_EXPIRED: ${anyMsg}`);
+    }
+    if (isNoSynchronizerError(lastError)) {
+      throw new Error(`TRANSIENT_SYNCHRONIZER_ERROR: ${anyMsg}`);
+    }
     if (lastError) {
-      const lastMessage = String(lastError.message || lastError);
-      console.error(`[CantonSDK]    Last execute error: ${lastMessage}`);
-      if (lastMessage.includes('LockedAmulet') && lastMessage.includes('not found')) {
-        throw new Error(`STALE_ALLOCATION_LOCK_MISSING: ${lastMessage}`);
-      }
-      if (lastMessage.includes('deadline-exceeded') || lastMessage.includes('settleBefore')) {
-        throw new Error(`STALE_ALLOCATION_EXPIRED: ${lastMessage}`);
-      }
-      if (lastMessage.includes('NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT')) {
-        throw new Error(`UNSUBMITTABLE_EXTERNAL_ACTAS: ${lastMessage}`);
-      }
+      throw lastError;
     }
     return null;
   }
@@ -1628,8 +1642,8 @@ class CantonSDKClient {
     const encodedCid = encodeURIComponent(allocationContractId);
     const executeContextUrl = `${backendUrl}/v0/registrars/${encodeURIComponent(adminParty)}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
 
-    // Keep the same authorizer strategy as Splice allocations.
-    const actAsParties = [...new Set([executorPartyId, ownerPartyId].filter(Boolean))];
+    // allocationControllers = union(sender, receiver, executor) — include all distinct parties.
+    const actAsParties = [...new Set([executorPartyId, ownerPartyId, receiverPartyId].filter(Boolean))];
     const readAsParties = [...new Set([executorPartyId, ownerPartyId, receiverPartyId].filter(Boolean))];
 
     // Get synchronizerId — REQUIRED for Canton command submission
@@ -1680,12 +1694,19 @@ class CantonSDKClient {
       console.log(`[CantonSDK]    ✅ Utilities allocation executed — updateId: ${result?.transaction?.updateId || 'N/A'}`);
       return result;
     } catch (err) {
-      console.warn(`[CantonSDK]    ⚠️ Utilities allocation execution failed: ${err.message}`);
+      const msg = String(err.message || err);
+      console.error(`[CantonSDK]    ❌ Utilities allocation execution failed: ${msg}`);
+      if (msg.includes('deadline-exceeded') || msg.includes('settleBefore')) {
+        throw new Error(`STALE_ALLOCATION_EXPIRED: ${msg}`);
+      }
+      if (msg.includes('LockedAmulet') && msg.includes('not found')) {
+        throw new Error(`STALE_ALLOCATION_LOCK_MISSING: ${msg}`);
+      }
+      if (msg.includes('NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT') || msg.includes('Not connected to a synchronizer')) {
+        throw new Error(`TRANSIENT_SYNCHRONIZER_ERROR: ${msg}`);
+      }
+      throw err;
     }
-
-    // Utilities allocation execution failed
-    console.error(`[CantonSDK]    ❌ Utilities allocation execution failed — all methods exhausted`);
-    return null;
   }
 
   // NOTE: _executeDirectAllocation (AllocationRecord fallback) has been REMOVED.

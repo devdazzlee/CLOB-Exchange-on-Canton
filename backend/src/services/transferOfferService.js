@@ -416,90 +416,15 @@ class TransferOfferService {
       const operatorPartyId = config.canton.operatorPartyId;
       const synchronizerId = config.canton.synchronizerId;
       
-      // ─── External party detection ─────────────────────────────────────────────
-      // External parties (with Confirmation permission) require interactive submission.
-      // They typically start with "ext-" prefix (from onboarding-service.js generatePartyHint).
-      const isExternalParty = partyId.startsWith('ext-');
+      // All parties are external (Confirmation permission) — use interactive submission.
+      console.log(`[TransferOfferService] Using interactive submission (2-step flow)`);
+      console.log(`[TransferOfferService] Frontend must call /prepare-accept then /execute-accept with user signature`);
       
-      if (isExternalParty) {
-        console.log(`[TransferOfferService] External party detected — using interactive submission (2-step flow)`);
-        console.log(`[TransferOfferService] Frontend must call /prepare-accept then /execute-accept with user signature`);
-        
-        // Return a marker telling the caller (route handler) that interactive submission is needed
-        // The route handler should respond with requiresSignature: true
-        const prepareResult = await this.prepareTransferAccept(offerContractId, partyId, token, templateId);
-        return {
-          ...prepareResult,
-          requiresSignature: true,
-        };
-      }
-      
-      // ─── Internal party path (legacy) ─────────────────────────────────────────
-      // For internal parties, the participant signs for ALL actAs parties automatically.
-      // So we include both the user and the operator in actAs.
-      console.log(`[TransferOfferService] Internal party — using direct exerciseChoice`);
-      
-      const actAsParties = [partyId];
-      if (operatorPartyId && operatorPartyId !== partyId) {
-        actAsParties.push(operatorPartyId);
-      }
-      console.log(`[TransferOfferService] actAs parties: [${actAsParties.map(p => p.substring(0, 30) + '...').join(', ')}]`);
-      
-      const adminToken = token || await tokenProvider.getServiceToken();
-      
-      // Try SDK first
-      const sdkClient = getSDKClient();
-      if (sdkClient && sdkClient.isReady()) {
-        try {
-          let detectedSymbol = null;
-          const templateLower = (templateId || '').toLowerCase();
-          if (templateLower.includes('utility') || templateLower.includes('cbtc')) detectedSymbol = 'CBTC';
-          else if (templateLower.includes('amulet')) detectedSymbol = 'CC';
-          
-          const result = await sdkClient.acceptTransfer(offerContractId, partyId, detectedSymbol);
-          console.log('[TransferOfferService] ✅ Transfer accepted via Canton SDK!');
-          return { success: true, offerContractId, usedSdk: true, result };
-        } catch (sdkError) {
-          console.log(`[TransferOfferService] SDK failed: ${(sdkError?.message || String(sdkError)).substring(0, 120)}`);
-        }
-      }
-      
-      // Try direct exerciseChoice via choice context
-      try {
-        const { disclosedContracts, choiceContextData } = await this._getAcceptChoiceContext(
-          offerContractId, adminToken, synchronizerId
-        );
-        
-              const utilitiesInterface = UTILITIES_CONFIG.TRANSFER_INSTRUCTION_INTERFACE || TRANSFER_INSTRUCTION_INTERFACE;
-              
-              const result = await this.cantonService.exerciseChoice({
-                token: adminToken,
-                templateId: utilitiesInterface,
-                contractId: offerContractId,
-                choice: 'TransferInstruction_Accept',
-                choiceArgument: {
-                  extraArgs: {
-                    context: choiceContextData,
-                    meta: { values: {} },
-                  },
-                },
-                actAsParty: actAsParties,
-                readAs: actAsParties,
-                disclosedContracts,
-                synchronizerId,
-              });
-              
-        console.log('[TransferOfferService] ✅ Transfer accepted via direct exerciseChoice!');
-        return { success: true, offerContractId, usedDirectExercise: true, result };
-      } catch (directError) {
-        console.log(`[TransferOfferService] Direct exercise failed: ${(directError?.message || String(directError)).substring(0, 120)}`);
-      }
-      
-      // ─── All approaches failed ──────────────────────────────────────────────────
-      throw new Error(
-        'Transfer accept failed. The transfer offer may have expired, already been accepted, or the contract ID may be invalid. ' +
-        'Please refresh the page and try again.'
-      );
+      const prepareResult = await this.prepareTransferAccept(offerContractId, partyId, token, templateId);
+      return {
+        ...prepareResult,
+        requiresSignature: true,
+      };
       
     } catch (error) {
       console.error('[TransferOfferService] Failed to accept transfer:', error.message);

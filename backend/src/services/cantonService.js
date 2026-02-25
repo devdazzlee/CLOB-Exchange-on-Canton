@@ -173,10 +173,14 @@ class CantonService {
         if (!res.ok) {
           const error = parseCantonError(text, res.status);
 
-          // Retry on 503 (server overloaded / timeout) and 429 (rate limited)
-          if ((res.status === 503 || res.status === 429) && attempt < maxRetries) {
-            const delay = Math.min(2000 * attempt, 8000); // 2s, 4s, 8s
-            console.warn(`[CantonService] ⚠️ ${res.status} on attempt ${attempt}/${maxRetries} for ${commandId} — retrying in ${delay}ms...`);
+          // Retry on 503 (server overloaded / timeout), 429 (rate limited),
+          // and transient NO_SYNCHRONIZER (participant temporarily disconnected).
+          const isTransientSync = res.status === 404 &&
+              error.code === 'NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT' &&
+              (error.context?.unknownSubmitters || '').includes(',');
+          if ((res.status === 503 || res.status === 429 || isTransientSync) && attempt < maxRetries) {
+            const delay = Math.min(2000 * attempt, 8000);
+            console.warn(`[CantonService] ⚠️ ${isTransientSync ? 'TRANSIENT_SYNC' : res.status} on attempt ${attempt}/${maxRetries} for ${commandId} — retrying in ${delay}ms...`);
             await new Promise(r => setTimeout(r, delay));
             lastError = error;
             continue;
@@ -187,6 +191,7 @@ class CantonService {
           err.code = error.code;
           err.correlationId = error.correlationId;
           err.traceId = error.traceId;
+          err.context = error.context;
           err.httpStatus = error.httpStatus;
           throw err;
         }

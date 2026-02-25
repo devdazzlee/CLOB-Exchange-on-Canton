@@ -64,7 +64,7 @@ class MatchingEngine {
     // ═══ Pending pairs queue ═══
     this.pendingPairs = new Set();
     this.invalidSettlementContracts = new Map();
-    this.INVALID_SETTLEMENT_TTL = 10 * 60 * 1000;
+    this.INVALID_SETTLEMENT_TTL = 7 * 24 * 60 * 60 * 1000; // permanent for practical purposes
 
     // ═══ Adaptive polling ═══
     this._consecutiveIdleCycles = 0;
@@ -183,6 +183,10 @@ class MatchingEngine {
     if (!order?.contractId) return;
     this.invalidSettlementContracts.set(order.contractId, { at: Date.now(), reason: String(reason || 'unknown') });
     console.warn(`[MatchingEngine] 🚫 Quarantined order ${order.orderId || order.contractId.substring(0, 24)} for settlement: ${reason}`);
+
+    // Evict from streaming read model so it never appears again this session
+    const streaming = this._getStreamingModel();
+    if (streaming) streaming.evictOrder(order.contractId);
   }
 
   async _tryCancelStaleOrder(order, token) {
@@ -191,27 +195,33 @@ class MatchingEngine {
     const operatorPartyId = config.canton.operatorPartyId;
     if (!packageId || !operatorPartyId) return;
 
+    const orderId = order.orderId || order.contractId.substring(0, 24);
+    const templateId = order.templateId || `${packageId}:Order:Order`;
+
+    // Only try operator-only — avoids NO_SYNCHRONIZER for external parties
     try {
       await cantonService.exerciseChoice({
         token,
         actAsParty: [operatorPartyId],
-        templateId: order.templateId || `${packageId}:Order:Order`,
+        templateId,
         contractId: order.contractId,
         choice: 'CancelOrder',
         choiceArgument: {},
         readAs: [operatorPartyId, order.owner].filter(Boolean),
       });
-      console.warn(`[MatchingEngine] 🧹 Auto-cancelled stale order ${order.orderId || order.contractId.substring(0, 24)} after settlement failure`);
+      console.warn(`[MatchingEngine] 🧹 Auto-cancelled stale order ${orderId}`);
     } catch (cancelErr) {
-      // Best-effort cleanup: order may already be archived/filled by concurrent flow.
-      if (
-        cancelErr.message?.includes('CONTRACT_NOT_FOUND') ||
-        cancelErr.message?.includes('could not be found') ||
-        cancelErr.message?.includes('already')
-      ) {
+      const msg = cancelErr.message || '';
+      if (msg.includes('CONTRACT_NOT_FOUND') || msg.includes('could not be found') || msg.includes('already')) {
+        // Order is already archived on the ledger — evict from read model
+        const streaming = this._getStreamingModel();
+        if (streaming) streaming.evictOrder(order.contractId);
         return;
       }
-      console.warn(`[MatchingEngine] ⚠️ Failed to auto-cancel stale order ${order.orderId || order.contractId.substring(0, 24)}: ${cancelErr.message}`);
+      // Any other error: don't retry — the order is already quarantined/evicted
+      if (!msg.includes('NO_SYNCHRONIZER') && !msg.includes('Not connected')) {
+        console.warn(`[MatchingEngine] ⚠️ CancelOrder failed for ${orderId}: ${msg.substring(0, 120)}`);
+      }
     }
   }
 
@@ -294,15 +304,23 @@ class MatchingEngine {
       const sellOrders = [];
       
       const now = Date.now();
-      for (const [cid, meta] of this.invalidSettlementContracts) {
-        if (now - meta.at > this.INVALID_SETTLEMENT_TTL) {
-          this.invalidSettlementContracts.delete(cid);
-        }
-      }
+      // Max allocation lifetime: 24h for utility tokens, 15m for Splice.
+      // Orders older than 24h definitely have expired allocations — evict them.
+      const MAX_ALLOCATION_AGE_MS = 24 * 60 * 60 * 1000;
 
       for (const payload of rawOrders) {
-        // Only match OPEN orders (not PENDING_TRIGGER stop-loss orders)
         if (payload.status !== 'OPEN') continue;
+        if (this.invalidSettlementContracts.has(payload.contractId)) continue;
+
+        // Pre-filter: evict orders whose allocations are guaranteed to be expired
+        const orderAge = payload.timestamp ? (now - new Date(payload.timestamp).getTime()) : Infinity;
+        if (orderAge > MAX_ALLOCATION_AGE_MS) {
+          this._markInvalidSettlementOrder(
+            { contractId: payload.contractId, orderId: payload.orderId, owner: payload.owner },
+            `Allocation expired (order age: ${Math.round(orderAge / 3600000)}h)`
+          );
+          continue;
+        }
 
         const rawPrice = payload.price;
         let parsedPrice = null;
@@ -322,7 +340,6 @@ class MatchingEngine {
         if (remaining.lte(0)) continue;
 
         const contractTemplateId = payload.templateId || `${packageId}:Order:Order`;
-        if (this.invalidSettlementContracts.has(payload.contractId)) continue;
         const isNewPackage = contractTemplateId.startsWith(packageId);
 
         // Extract allocationCid (Allocation contract ID for settlement)
@@ -336,8 +353,6 @@ class MatchingEngine {
             allocationCid = getAllocationContractIdForOrder(payload.orderId);
           } catch (_) { /* best effort */ }
         }
-        // Orders without a persisted allocation lock are not settlement-safe.
-        // Skip them to avoid matching contracts that cannot complete token transfer.
         if (!allocationCid) continue;
         
         const order = {
@@ -487,22 +502,49 @@ class MatchingEngine {
           if (error.message?.includes('already filled') || 
               error.message?.includes('could not be found') ||
               error.message?.includes('CONTRACT_NOT_FOUND')) {
-            console.log(`[MatchingEngine] ℹ️ Order already processed — skipping`);
-            // If BUY side contract is gone, no point trying this buy against more sells.
+            // Contract is archived on the ledger — evict from read model permanently
+            const streaming = this._getStreamingModel();
+            if (streaming) {
+              streaming.evictOrder(buyOrder.contractId);
+              streaming.evictOrder(sellOrder.contractId);
+            }
+            this.recentlyMatchedOrders.delete(matchKey);
             if (error.message?.includes('Buy FillOrder failed')) {
               break;
             }
             continue;
           }
 
-          // Root-cause handling: stale/invalid allocation locks should not block the entire pair.
-          if (error.message?.includes('STALE_ALLOCATION_LOCK_MISSING') ||
+          // Transient synchronizer errors — skip this match, retry on next cycle.
+          const isTransient = error.message?.includes('TRANSIENT_SYNCHRONIZER_ERROR') ||
+              error.message?.includes('NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT') ||
+              error.message?.includes('Not connected to a synchronizer');
+          if (isTransient) {
+            console.warn(`[MatchingEngine] ⏳ Transient synchronizer error — will retry on next cycle`);
+            this.recentlyMatchedOrders.delete(matchKey);
+            continue;
+          }
+
+          // Permanent allocation failures — quarantine the affected order and try to cancel it.
+          const isPermanent = error.message?.includes('STALE_ALLOCATION_LOCK_MISSING') ||
               error.message?.includes('STALE_ALLOCATION_EXPIRED') ||
-              error.message?.includes('UNSUBMITTABLE_EXTERNAL_ACTAS')) {
-            this._markInvalidSettlementOrder(buyOrder, error.message);
-            this._markInvalidSettlementOrder(sellOrder, error.message);
-            await this._tryCancelStaleOrder(buyOrder, token);
-            await this._tryCancelStaleOrder(sellOrder, token);
+              error.message?.includes('SELLER_ALLOCATION_FAILED') ||
+              error.message?.includes('BUYER_ALLOCATION_FAILED');
+          if (isPermanent) {
+            const isSeller = error.message?.includes('SELLER_ALLOCATION_FAILED');
+            const isBuyer = error.message?.includes('BUYER_ALLOCATION_FAILED');
+            if (isSeller) {
+              this._markInvalidSettlementOrder(sellOrder, error.message);
+              await this._tryCancelStaleOrder(sellOrder, token);
+            } else if (isBuyer) {
+              this._markInvalidSettlementOrder(buyOrder, error.message);
+              await this._tryCancelStaleOrder(buyOrder, token);
+            } else {
+              this._markInvalidSettlementOrder(buyOrder, error.message);
+              this._markInvalidSettlementOrder(sellOrder, error.message);
+              await this._tryCancelStaleOrder(buyOrder, token);
+              await this._tryCancelStaleOrder(sellOrder, token);
+            }
             this.recentlyMatchedOrders.delete(matchKey);
             continue;
           }
@@ -594,27 +636,38 @@ class MatchingEngine {
     let replacementBuyAllocationCid = null;
     let replacementSellAllocationCid = null;
 
-    // Execute inbound allocation locks (user -> operator escrow)
-    baseTransferResult = await sdkClient.executeAllocation(
-      sellOrder.allocationContractId,
-      operatorPartyId,
-      baseSymbol,
-      sellOrder.owner,
-      operatorPartyId
-    );
-    if (!baseTransferResult) {
-      throw new Error(`${baseSymbol} inbound allocation execution returned null`);
+    // Execute inbound allocation locks (user -> operator escrow).
+    // Wrap each leg separately so the error identifies which order's allocation failed.
+    try {
+      baseTransferResult = await sdkClient.executeAllocation(
+        sellOrder.allocationContractId,
+        operatorPartyId,
+        baseSymbol,
+        sellOrder.owner,
+        operatorPartyId
+      );
+      if (!baseTransferResult) {
+        throw new Error(`${baseSymbol} inbound allocation execution returned null`);
+      }
+    } catch (sellAllocErr) {
+      const msg = sellAllocErr.message || String(sellAllocErr);
+      throw new Error(`SELLER_ALLOCATION_FAILED: ${msg}`);
     }
 
-    quoteTransferResult = await sdkClient.executeAllocation(
-      buyOrder.allocationContractId,
-      operatorPartyId,
-      quoteSymbol,
-      buyOrder.owner,
-      operatorPartyId
-    );
-    if (!quoteTransferResult) {
-      throw new Error(`${quoteSymbol} inbound allocation execution returned null`);
+    try {
+      quoteTransferResult = await sdkClient.executeAllocation(
+        buyOrder.allocationContractId,
+        operatorPartyId,
+        quoteSymbol,
+        buyOrder.owner,
+        operatorPartyId
+      );
+      if (!quoteTransferResult) {
+        throw new Error(`${quoteSymbol} inbound allocation execution returned null`);
+      }
+    } catch (buyAllocErr) {
+      const msg = buyAllocErr.message || String(buyAllocErr);
+      throw new Error(`BUYER_ALLOCATION_FAILED: ${msg}`);
     }
 
     // Create and execute payout allocations from operator to counterparties.
@@ -698,7 +751,7 @@ class MatchingEngine {
       if (buyOrder.isNewPackage) buyFillArg.newAllocationCid = buyIsPartial ? replacementBuyAllocationCid : null;
       await cantonService.exerciseChoice({
         token,
-        actAsParty: [operatorPartyId],
+        actAsParty: [operatorPartyId, buyOrder.owner],
         templateId: buyOrder.templateId || `${packageId}:Order:Order`,
         contractId: buyOrder.contractId,
         choice: 'FillOrder',
@@ -718,7 +771,7 @@ class MatchingEngine {
       if (sellOrder.isNewPackage) sellFillArg.newAllocationCid = sellIsPartial ? replacementSellAllocationCid : null;
       await cantonService.exerciseChoice({
         token,
-        actAsParty: [operatorPartyId],
+        actAsParty: [operatorPartyId, sellOrder.owner],
         templateId: sellOrder.templateId || `${packageId}:Order:Order`,
         contractId: sellOrder.contractId,
         choice: 'FillOrder',

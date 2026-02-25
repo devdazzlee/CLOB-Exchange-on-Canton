@@ -609,239 +609,56 @@ class OrderService {
 
     // Create Order contract on Canton
     const timestamp = new Date().toISOString();
-    const isExternalParty = partyId.startsWith('ext-') || partyId.includes('external');
-    
-    const createArgs = {
-        orderId: orderId,
-        owner: partyId,
-        orderType: orderType.toUpperCase(),
-        orderMode: orderMode.toUpperCase(),
-        tradingPair: tradingPair,
-        price: orderMode.toUpperCase() === 'LIMIT' && price ? price.toString() : (stopPrice ? stopPrice.toString() : null),
-        quantity: quantity.toString(),
-        filled: '0.0',
-        status: initialStatus,
-        timestamp: timestamp,
-        operator: operatorPartyId,
-        allocationCid: allocationContractId || '',
-        stopPrice: stopPrice ? stopPrice.toString() : null
-    };
 
-    let result;
-    let contractId = null;
+    // All parties are external (Confirmation permission).
+    // Use interactive submission: prepare → user signs in browser → execute.
+    console.log(`[OrderService] Preparing allocation via interactive submission (step 1/2)`);
 
-    if (isExternalParty) {
-      // ═══ EXTERNAL PARTY: Use interactive submission (prepare → sign → execute) ═══
-      // External parties have Confirmation permission — the participant cannot sign
-      // on their behalf. The user must sign the transaction with their private key.
-      //
-      // For Order creation: signatory is "owner" (the external party).
-      // We only include the external party in actAs — the operator is an observer,
-      // not a signatory, so it doesn't need to sign.
-      console.log(`[OrderService] External party detected — preparing allocation via interactive submission (step 1/2)`);
+    const sdkClient = getCantonSDKClient();
+    const allocationPrep = await sdkClient.buildAllocationInteractiveCommand(
+      partyId,
+      operatorPartyId,
+      String(lockInfo.amount),
+      lockInfo.asset,
+      operatorPartyId,
+      orderId
+    );
 
-      // Build pre-authorized allocation command (sender=party, receiver=operator escrow).
-      // This is signed by the external user in the same interactive flow.
-      const sdkClient = getCantonSDKClient();
-      const allocationPrep = await sdkClient.buildAllocationInteractiveCommand(
-        partyId,
-        operatorPartyId,
-        String(lockInfo.amount),
-        lockInfo.asset,
-        operatorPartyId,
-        orderId
-      );
+    const readAs = [...new Set([operatorPartyId, partyId, ...(allocationPrep.readAs || [])])];
+    const disclosedContracts = allocationPrep.disclosedContracts || [];
+    const synchronizerId = allocationPrep.synchronizerId || config.canton.synchronizerId;
 
-      const readAs = [...new Set([operatorPartyId, partyId, ...(allocationPrep.readAs || [])])];
-      const disclosedContracts = allocationPrep.disclosedContracts || [];
-      const synchronizerId = allocationPrep.synchronizerId || config.canton.synchronizerId;
-
-      const prepareResult = await cantonService.prepareInteractiveSubmission({
-        token,
-        actAsParty: [partyId],
-        commands: [allocationPrep.command],
-        readAs,
-        synchronizerId,
-        disclosedContracts,
-      });
-      
-      if (!prepareResult.preparedTransaction || !prepareResult.preparedTransactionHash) {
-        throw new Error('Prepare returned incomplete result: missing preparedTransaction or preparedTransactionHash');
-      }
-      
-      console.log(`[OrderService] ✅ Allocation prepared (step 1/2). Hash to sign: ${prepareResult.preparedTransactionHash.substring(0, 40)}...`);
-      
-      // Return the prepared transaction for the frontend to sign
-      return {
-        requiresSignature: true,
-        step: 'ALLOCATION_PREPARED',
-        orderId,
-        tradingPair,
-        orderType: orderType.toUpperCase(),
-        orderMode: orderMode.toUpperCase(),
-        price: createArgs.price,
-        quantity: createArgs.quantity,
-        stopPrice: stopPrice || null,
-        preparedTransaction: prepareResult.preparedTransaction,
-        preparedTransactionHash: prepareResult.preparedTransactionHash,
-        hashingSchemeVersion: prepareResult.hashingSchemeVersion,
-        partyId,
-        lockInfo,
-        stage: 'ALLOCATION_PREPARED',
-      };
-    }
-
-    // ═══ INTERNAL PARTY: Direct submission ═══
-    result = await cantonService.createContractWithTransaction({
+    const prepareResult = await cantonService.prepareInteractiveSubmission({
       token,
-      actAsParty: [partyId, operatorPartyId],
-      templateId: `${packageId}:Order:Order`,
-      createArguments: createArgs,
-      readAs: [operatorPartyId, partyId]
+      actAsParty: [partyId],
+      commands: [allocationPrep.command],
+      readAs,
+      synchronizerId,
+      disclosedContracts,
     });
-
-    // Extract created contract ID from result
-    if (result.transaction?.events) {
-      const createdEvent = result.transaction.events.find(e => 
-        e.created?.templateId?.includes('Order') || 
-        e.CreatedEvent?.templateId?.includes('Order')
-      );
-      contractId = createdEvent?.created?.contractId || 
-                   createdEvent?.CreatedEvent?.contractId;
+    
+    if (!prepareResult.preparedTransaction || !prepareResult.preparedTransactionHash) {
+      throw new Error('Prepare returned incomplete result: missing preparedTransaction or preparedTransactionHash');
     }
     
-    if (!contractId) {
-      contractId = result.updateId || `${orderId}-pending`;
-    }
-
-    console.log(`[OrderService] ✅ Order placed: ${orderId} (${contractId.substring(0, 20)}...) [status: ${initialStatus}]`);
-
-    const orderRecord = {
-      contractId,
-      orderId,
-      owner: partyId,
-      tradingPair,
-      orderType: orderType.toUpperCase(),
-      orderMode: orderMode.toUpperCase(),
-      price: orderMode.toUpperCase() === 'LIMIT' && price ? price.toString() : null,
-      stopPrice: stopPrice ? stopPrice.toString() : null,
-      quantity: quantity.toString(),
-      filled: '0',
-      status: initialStatus,
-      timestamp: timestamp,
-      lockId: null,
-      lockedAmount: lockInfo.amount,
-      lockedAsset: lockInfo.asset,
-      allocationContractId: allocationContractId || null,
-    };
-
-    // ═══ IMMEDIATELY register in global open orders registry ═══
-    // This ensures the orderbook and matching engine can see this order
-    // even if Canton queries hit the 200-element limit (which blocks
-    // operator-level and anyParty queries for templates with 200+ contracts).
-    if (initialStatus === 'OPEN') {
-      registerOpenOrders([orderRecord]);
-      console.log(`[OrderService] Registered order ${orderId} in global registry`);
-    }
+    console.log(`[OrderService] ✅ Allocation prepared (step 1/2). Hash to sign: ${prepareResult.preparedTransactionHash.substring(0, 40)}...`);
     
-    // Add to ReadModel
-    const readModel = getReadModelService();
-    if (readModel) {
-      readModel.addOrder({
-        contractId,
-        orderId,
-        owner: partyId,
-        tradingPair,
-        orderType: orderType.toUpperCase(),
-        orderMode: orderMode.toUpperCase(),
-        price: orderMode.toUpperCase() === 'LIMIT' && price ? price.toString() : null,
-        stopPrice: stopPrice ? stopPrice.toString() : null,
-        quantity: parseFloat(quantity),
-        filled: 0,
-        status: initialStatus,
-        timestamp: timestamp,
-        operator: operatorPartyId,
-        allocationContractId: allocationContractId || null,
-      });
-      console.log(`[OrderService] Order added to ReadModel cache`);
-    }
-
-    // Emit WebSocket event for real-time updates to Global Order Book
-    // STOP_LOSS orders are NOT broadcast to the order book (invisible until triggered)
-    if (global.broadcastWebSocket && initialStatus === 'OPEN') {
-      global.broadcastWebSocket(`orderbook:${tradingPair}`, {
-        type: 'NEW_ORDER',
-        orderId: orderId,
-        contractId: contractId,
-        owner: partyId,
-        orderType: orderType.toUpperCase(),
-        orderMode: orderMode.toUpperCase(),
-        price: price,
-        quantity: quantity,
-        remaining: quantity,
-        tradingPair,
-        timestamp: new Date().toISOString()
-      });
-    }
-
-    // Register stop-loss with the StopLossService if applicable
-    if (orderMode === 'STOP_LOSS') {
-      try {
-        const { getStopLossService } = require('./stopLossService');
-        const stopLossService = getStopLossService();
-        stopLossService.registerStopLoss({
-          orderContractId: contractId,
-          orderId,
-          tradingPair,
-          orderType: orderType.toUpperCase(),
-          stopPrice: stopPrice,
-          partyId,
-          quantity: quantity.toString(),
-          allocationContractId: allocationContractId || null,
-        });
-        console.log(`[OrderService] ✅ Stop-loss registered: triggers at ${stopPrice}`);
-      } catch (slErr) {
-        console.warn(`[OrderService] ⚠️ Failed to register stop-loss: ${slErr.message}`);
-      }
-    }
-
-    // ═══ IMMEDIATE MATCHING: Trigger matching engine (only for OPEN orders) ═══
-    if (initialStatus === 'OPEN') {
-    try {
-      const { getMatchingEngine } = require('./matching-engine');
-      const matchingEngine = getMatchingEngine();
-        if (matchingEngine) {
-        console.log(`[OrderService] Triggering immediate matching for ${tradingPair}`);
-          const triggerResult = await matchingEngine.triggerMatchingCycle(tradingPair);
-          if (triggerResult.success) {
-            console.log(`[OrderService] ✅ Matching cycle completed for ${tradingPair} in ${triggerResult.elapsed}ms`);
-          } else {
-            console.log(`[OrderService] ⏳ Matching trigger result: ${triggerResult.reason}`);
-          }
-      }
-    } catch (matchErr) {
-      console.error('[OrderService] Could not trigger immediate matching:', matchErr.message);
-      }
-    }
-
     return {
-      success: true,
-      orderId: orderId,
-      contractId: contractId,
-      status: initialStatus,
+      requiresSignature: true,
+      step: 'ALLOCATION_PREPARED',
+      orderId,
       tradingPair,
       orderType: orderType.toUpperCase(),
       orderMode: orderMode.toUpperCase(),
-      price,
+      price: orderMode.toUpperCase() === 'LIMIT' && price ? price.toString() : (stopPrice ? stopPrice.toString() : null),
+      quantity: quantity.toString(),
       stopPrice: stopPrice || null,
-      quantity,
-      filled: '0',
-      remaining: quantity,
-      lockedAsset: lockInfo.asset,
-      lockedAmount: lockInfo.amount,
-      allocationContractId: allocationContractId || null,
-      tokenStandard: true,
-      timestamp: new Date().toISOString()
+      preparedTransaction: prepareResult.preparedTransaction,
+      preparedTransactionHash: prepareResult.preparedTransactionHash,
+      hashingSchemeVersion: prepareResult.hashingSchemeVersion,
+      partyId,
+      lockInfo,
+      stage: 'ALLOCATION_PREPARED',
     };
   }
 
@@ -1219,135 +1036,37 @@ class OrderService {
       }
     }
 
-    // Exercise CancelOrder choice on the Order contract
-    // CancelOrder is controlled by "owner" — external parties need interactive submission
-    const isExternalParty = partyId.startsWith('ext-') || partyId.includes('external');
-    let result;
+    // CancelOrder is controlled by "owner" — external parties need interactive submission.
+    console.log(`[OrderService] Preparing CancelOrder for interactive signing`);
     
-    if (isExternalParty) {
-      // ═══ EXTERNAL PARTY: Prepare for interactive signing ═══
-      console.log(`[OrderService] External party detected — preparing CancelOrder for interactive signing`);
-      
-      const prepareResult = await cantonService.prepareInteractiveSubmission({
-        token,
-        actAsParty: [partyId],
-        templateId: `${packageId}:Order:Order`,
-        contractId: orderContractId,
-        choice: 'CancelOrder',
-        choiceArgument: {},
-        readAs: [operatorPartyId, partyId],
-      });
-      
-      if (!prepareResult.preparedTransaction || !prepareResult.preparedTransactionHash) {
-        throw new Error('Prepare returned incomplete result for CancelOrder');
-      }
-      
-      console.log(`[OrderService] ✅ CancelOrder prepared. Hash to sign: ${prepareResult.preparedTransactionHash.substring(0, 40)}...`);
-      
-      // Return the prepared transaction for the frontend to sign
-      return {
-        requiresSignature: true,
-        step: 'PREPARED',
-        action: 'CANCEL',
-        orderContractId,
-        orderId: orderDetails?.orderId,
-        tradingPair: orderDetails?.tradingPair || tradingPair,
-        preparedTransaction: prepareResult.preparedTransaction,
-        preparedTransactionHash: prepareResult.preparedTransactionHash,
-        hashingSchemeVersion: prepareResult.hashingSchemeVersion,
-        partyId,
-        orderDetails,
-      };
-    }
-    
-    // ═══ INTERNAL PARTY: Direct submission ═══
-    try {
-      result = await cantonService.exerciseChoice({
-        token,
-        actAsParty: partyId,
-        templateId: `${packageId}:Order:Order`,
-        contractId: orderContractId,
-        choice: 'CancelOrder',
-        choiceArgument: {},
-        readAs: [operatorPartyId, partyId]
-      });
-    } catch (cancelErr) {
-      const legacyPackageId = config.canton.packageIds?.legacy;
-      if (legacyPackageId && legacyPackageId !== packageId) {
-        console.log(`[OrderService] Retrying cancel with legacy package...`);
-        result = await cantonService.exerciseChoice({
-          token,
-          actAsParty: partyId,
-          templateId: `${legacyPackageId}:Order:Order`,
-          contractId: orderContractId,
-          choice: 'CancelOrder',
-          choiceArgument: {},
-          readAs: [operatorPartyId, partyId]
-        });
-      } else {
-        throw cancelErr;
-      }
-    }
-
-    console.log(`[OrderService] ✅ Order cancelled: ${orderContractId}`);
-
-    // Release balance reservation so other orders can use the freed funds
-    if (orderId_cancel) {
-      releaseReservation(orderId_cancel);
-    }
-
-    // Remove from ReadModel
-    const readModel = getReadModelService();
-    if (readModel) {
-      readModel.removeOrder(orderContractId);
-      console.log(`[OrderService] Order removed from ReadModel cache`);
-    }
-
-    // Calculate refund amount (unfilled portion)
-    let refundInfo = null;
-    if (orderDetails) {
-      const filled = parseFloat(orderDetails.filled || 0);
-      const quantity = parseFloat(orderDetails.quantity || 0);
-      const remaining = quantity - filled;
-      
-      if (remaining > 0) {
-        const lockInfo = this.calculateLockAmount(
-          orderDetails.tradingPair,
-          orderDetails.orderType,
-          orderDetails.price,
-          remaining
-        );
-        refundInfo = {
-          asset: lockInfo.asset,
-          amount: lockInfo.amount,
-          message: `${lockInfo.amount} ${lockInfo.asset} returned to available balance (Allocation cancelled)`
-        };
-        console.log(`[OrderService] Refund: ${refundInfo.amount} ${refundInfo.asset}`);
-      }
-    }
-
-    // Emit WebSocket event for order book update
-    const pair = tradingPair || orderDetails?.tradingPair || 'BTC/USDT';
-    if (global.broadcastWebSocket) {
-      global.broadcastWebSocket(`orderbook:${pair}`, {
-        type: 'ORDER_CANCELLED',
-        contractId: orderContractId,
-        orderId: orderDetails?.orderId,
-        owner: partyId,
-        tradingPair: pair,
-        refund: refundInfo,
-        timestamp: new Date().toISOString()
-      });
-    }
-
-    return {
-      success: true,
-      orderId: orderDetails?.orderId || orderContractId,
+    const prepareResult = await cantonService.prepareInteractiveSubmission({
+      token,
+      actAsParty: [partyId],
+      templateId: `${packageId}:Order:Order`,
       contractId: orderContractId,
-      status: 'CANCELLED',
-      tradingPair: pair,
-      refund: refundInfo,
-      timestamp: new Date().toISOString()
+      choice: 'CancelOrder',
+      choiceArgument: {},
+      readAs: [operatorPartyId, partyId],
+    });
+    
+    if (!prepareResult.preparedTransaction || !prepareResult.preparedTransactionHash) {
+      throw new Error('Prepare returned incomplete result for CancelOrder');
+    }
+    
+    console.log(`[OrderService] ✅ CancelOrder prepared. Hash to sign: ${prepareResult.preparedTransactionHash.substring(0, 40)}...`);
+    
+    return {
+      requiresSignature: true,
+      step: 'PREPARED',
+      action: 'CANCEL',
+      orderContractId,
+      orderId: orderDetails?.orderId,
+      tradingPair: orderDetails?.tradingPair || tradingPair,
+      preparedTransaction: prepareResult.preparedTransaction,
+      preparedTransactionHash: prepareResult.preparedTransactionHash,
+      hashingSchemeVersion: prepareResult.hashingSchemeVersion,
+      partyId,
+      orderDetails,
     };
   }
 

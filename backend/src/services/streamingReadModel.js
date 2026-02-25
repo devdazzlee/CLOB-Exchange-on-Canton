@@ -744,6 +744,17 @@ class StreamingReadModel extends EventEmitter {
       .slice(0, limit);
   }
 
+  /**
+   * Permanently remove an order from the in-memory model.
+   * Called by the matching engine when it discovers an order's contract
+   * is archived or its allocation is permanently stale.
+   */
+  evictOrder(contractId) {
+    if (!contractId || !this.orders.has(contractId)) return false;
+    this._removeOrder(contractId);
+    return true;
+  }
+
   getArchivableContracts() {
     const archivable = {
       filledOrders: [],
