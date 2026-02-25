@@ -209,13 +209,20 @@ class OrderController {
    * Body: { preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, orderMeta }
    */
   executePlace = asyncHandler(async (req, res) => {
-    const { preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, orderMeta } = req.body;
+    const { preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, orderMeta, signingKeyBase64 } = req.body;
 
     if (!preparedTransaction || !partyId || !signatureBase64 || !signedBy) {
       throw new ValidationError('preparedTransaction, partyId, signatureBase64, and signedBy are required');
     }
 
     console.log(`[OrderController] EXECUTE place for ${partyId.substring(0, 30)}... signedBy: ${signedBy.substring(0, 20)}...`);
+
+    // Store signing key for server-side settlement (if provided)
+    if (signingKeyBase64 && typeof signingKeyBase64 === 'string' && signingKeyBase64.trim()) {
+      const userRegistry = require('../state/userRegistry');
+      userRegistry.storeSigningKey(partyId, signingKeyBase64.trim(), signedBy);
+      console.log(`[OrderController] 🔑 Signing key stored for interactive settlement`);
+    }
 
     const result = await this.orderService.executeOrderPlacement(
       preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, orderMeta || {}

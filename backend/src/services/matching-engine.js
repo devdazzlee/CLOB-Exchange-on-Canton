@@ -37,6 +37,7 @@ const cantonService = require('./cantonService');
 const config = require('../config');
 const tokenProvider = require('./tokenProvider');
 const { getCantonSDKClient } = require('./canton-sdk-client');
+const { getTokenSystemType } = require('../config/canton-sdk.config');
 
 // Configure decimal.js for financial precision
 Decimal.set({ precision: 20, rounding: Decimal.ROUND_DOWN });
@@ -198,17 +199,58 @@ class MatchingEngine {
     const orderId = order.orderId || order.contractId.substring(0, 24);
     const templateId = order.templateId || `${packageId}:Order:Order`;
 
-    // Only try operator-only — avoids NO_SYNCHRONIZER for external parties
+    // CancelOrder usually requires both operator + owner authorizers.
+    // Try that first, then fall back to operator-only for edge cases.
+    const strategyActAs = [];
+    const fullAuth = [operatorPartyId, order.owner].filter(Boolean);
+    if (fullAuth.length > 0) strategyActAs.push(fullAuth);
+    strategyActAs.push([operatorPartyId]);
+
     try {
-      await cantonService.exerciseChoice({
+      let cancelled = false;
+      const synchronizerId = await cantonService.resolveSubmissionSynchronizerId(
         token,
-        actAsParty: [operatorPartyId],
-        templateId,
-        contractId: order.contractId,
-        choice: 'CancelOrder',
-        choiceArgument: {},
-        readAs: [operatorPartyId, order.owner].filter(Boolean),
-      });
+        config.canton.synchronizerId
+      );
+
+      for (const actAsParties of strategyActAs) {
+        try {
+          await cantonService.exerciseChoice({
+            token,
+            actAsParty: actAsParties,
+            templateId,
+            contractId: order.contractId,
+            choice: 'CancelOrder',
+            choiceArgument: {},
+            readAs: [operatorPartyId, order.owner].filter(Boolean),
+            synchronizerId,
+          });
+          cancelled = true;
+          break;
+        } catch (attemptErr) {
+          const msg = String(attemptErr?.message || attemptErr || '');
+          // CONTRACT_NOT_FOUND: The order contract is already archived.
+          // Stop immediately — no point trying other actAs strategies.
+          if (msg.includes('CONTRACT_NOT_FOUND') || msg.includes('could not be found') ||
+              msg.includes('Contract could not be found')) {
+            throw attemptErr; // Will be caught by outer catch which handles this
+          }
+          const isAuthorizerError =
+            msg.includes('DAML_AUTHORIZATION_ERROR') || msg.includes('requires authorizers');
+          const isNoSynchronizerError =
+            msg.includes('NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT') ||
+            msg.includes('Not connected to a synchronizer') ||
+            msg.includes('cannot submit as the given submitter on any connected synchronizer');
+          if (isAuthorizerError || isNoSynchronizerError) {
+            continue;
+          }
+          throw attemptErr;
+        }
+      }
+
+      if (!cancelled) {
+        throw new Error('CancelOrder attempts exhausted');
+      }
       console.warn(`[MatchingEngine] 🧹 Auto-cancelled stale order ${orderId}`);
     } catch (cancelErr) {
       const msg = cancelErr.message || '';
@@ -239,6 +281,41 @@ class MatchingEngine {
       this.matchingInProgress = true;
       this.matchingStartTime = Date.now();
       const token = await this.getAdminToken();
+
+      // ── PRE-FLIGHT: Verify synchronizer connectivity BEFORE doing anything ──
+      // If the participant is disconnected, skip the ENTIRE cycle to avoid
+      // flooding the Canton participant with commands that will all fail.
+      // This is CRITICAL — Huz reported the participant logs are filled with
+      // submit commands from our partyId, which may be causing instability.
+      try {
+        const syncResult = await cantonService.resolveSubmissionSynchronizerId(
+          token, config.canton.synchronizerId
+        );
+        if (!syncResult) {
+          // Synchronizer is down — increase polling interval to reduce load
+          this._consecutiveSyncFailures = (this._consecutiveSyncFailures || 0) + 1;
+          const backoffMs = Math.min(60000, 5000 * this._consecutiveSyncFailures);
+          if (this._consecutiveSyncFailures <= 3 || this._consecutiveSyncFailures % 10 === 0) {
+            console.warn(`[MatchingEngine] ⏳ Synchronizer disconnected (${this._consecutiveSyncFailures}x) — skipping entire cycle, next attempt in ${backoffMs / 1000}s`);
+          }
+          this.pollingInterval = backoffMs;
+          return;
+        }
+        // Synchronizer is back — reset failure counter and polling
+        if (this._consecutiveSyncFailures > 0) {
+          console.log(`[MatchingEngine] ✅ Synchronizer reconnected after ${this._consecutiveSyncFailures} failures — resuming normal operation`);
+          this._consecutiveSyncFailures = 0;
+          this.pollingInterval = this.basePollingInterval;
+        }
+      } catch (syncErr) {
+        this._consecutiveSyncFailures = (this._consecutiveSyncFailures || 0) + 1;
+        const backoffMs = Math.min(60000, 5000 * this._consecutiveSyncFailures);
+        if (this._consecutiveSyncFailures <= 3 || this._consecutiveSyncFailures % 10 === 0) {
+          console.warn(`[MatchingEngine] ⏳ Synchronizer health check failed (${this._consecutiveSyncFailures}x): ${syncErr.message?.substring(0, 80)} — skipping cycle`);
+        }
+        this.pollingInterval = backoffMs;
+        return;
+      }
 
       let matchFoundThisCycle = false;
 
@@ -304,20 +381,28 @@ class MatchingEngine {
       const sellOrders = [];
       
       const now = Date.now();
-      // Max allocation lifetime: 24h for utility tokens, 15m for Splice.
-      // Orders older than 24h definitely have expired allocations — evict them.
-      const MAX_ALLOCATION_AGE_MS = 24 * 60 * 60 * 1000;
+      const MAX_UTILITY_ALLOCATION_AGE_MS = 24 * 60 * 60 * 1000;
+      const MAX_SPLICE_ALLOCATION_AGE_MS = 15 * 60 * 1000;
 
       for (const payload of rawOrders) {
         if (payload.status !== 'OPEN') continue;
         if (this.invalidSettlementContracts.has(payload.contractId)) continue;
 
-        // Pre-filter: evict orders whose allocations are guaranteed to be expired
+        // Pre-filter: evict orders whose allocations are guaranteed to be expired.
+        // BUY locks quote asset; SELL locks base asset.
+        const [baseAsset, quoteAsset] = String(payload.tradingPair || tradingPair || '').split('/');
+        const side = String(payload.orderType || '').toUpperCase();
+        const lockedAsset = side === 'BUY' ? quoteAsset : baseAsset;
+        const lockedAssetType = lockedAsset ? getTokenSystemType(lockedAsset) : null;
+        const maxAllocationAgeMs = lockedAssetType === 'splice'
+          ? MAX_SPLICE_ALLOCATION_AGE_MS
+          : MAX_UTILITY_ALLOCATION_AGE_MS;
+
         const orderAge = payload.timestamp ? (now - new Date(payload.timestamp).getTime()) : Infinity;
-        if (orderAge > MAX_ALLOCATION_AGE_MS) {
+        if (orderAge > maxAllocationAgeMs) {
           this._markInvalidSettlementOrder(
             { contractId: payload.contractId, orderId: payload.orderId, owner: payload.owner },
-            `Allocation expired (order age: ${Math.round(orderAge / 3600000)}h)`
+            `Allocation expired for ${lockedAsset || 'unknown'} (${Math.round(orderAge / 60000)}m)`
           );
           continue;
         }
@@ -516,16 +601,34 @@ class MatchingEngine {
           }
 
           // Transient synchronizer errors — skip this match, retry on next cycle.
+          // IMPORTANT: Check the FULL error message (including inner cause) because the
+          // outer error may be wrapped as SELLER_ALLOCATION_FAILED or BUYER_ALLOCATION_FAILED
+          // but the underlying cause is a transient synchronizer disconnection.
+          // NOTE: FAILED_TO_EXECUTE_TRANSACTION is NOT transient — it means the operator's
+          // key is not hosted on the participant (a permanent config issue, not a network glitch).
           const isTransient = error.message?.includes('TRANSIENT_SYNCHRONIZER_ERROR') ||
               error.message?.includes('NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT') ||
-              error.message?.includes('Not connected to a synchronizer');
+              error.message?.includes('Not connected to a synchronizer') ||
+              error.message?.includes('cannot submit as the given submitter on any connected synchronizer');
           if (isTransient) {
             console.warn(`[MatchingEngine] ⏳ Transient synchronizer error — will retry on next cycle`);
             this.recentlyMatchedOrders.delete(matchKey);
             continue;
           }
 
+          // Signing key missing — the external party hasn't stored their key yet.
+          // Don't quarantine — the key may arrive when they re-login or place an order.
+          if (error.message?.includes('SIGNING_KEY_MISSING')) {
+            console.warn(`[MatchingEngine] ⚠️ Signing key not available for external party — skipping match (will retry when key is stored)`);
+            // Don't delete from recentlyMatchedOrders — keep the cooldown to avoid log spam
+            continue;
+          }
+
           // Permanent allocation failures — quarantine the affected order and try to cancel it.
+          // IMPORTANT: SELLER_ALLOCATION_FAILED / BUYER_ALLOCATION_FAILED are only permanent
+          // if the cause is NOT a transient synchronizer error. The transient check above
+          // already catches those cases, so if we reach here, the cause is truly permanent
+          // (e.g., stale allocation, deadline expired, authorization mismatch).
           const isPermanent = error.message?.includes('STALE_ALLOCATION_LOCK_MISSING') ||
               error.message?.includes('STALE_ALLOCATION_EXPIRED') ||
               error.message?.includes('SELLER_ALLOCATION_FAILED') ||
@@ -604,6 +707,18 @@ class MatchingEngine {
         const operatorPartyId = config.canton.operatorPartyId;
     const synchronizerId = config.canton.synchronizerId;
     const [baseSymbol, quoteSymbol] = tradingPair.split('/');
+
+    // ── Pre-flight: verify synchronizer connectivity ──────────────
+    // Fail fast if the participant is disconnected — saves time and log noise.
+    try {
+      const syncResult = await cantonService.resolveSubmissionSynchronizerId(token, synchronizerId);
+      if (!syncResult) {
+        throw new Error('TRANSIENT_SYNCHRONIZER_ERROR: Participant has no connected synchronizer — settlement postponed');
+      }
+    } catch (syncCheckErr) {
+      if (syncCheckErr.message?.includes('TRANSIENT_SYNCHRONIZER_ERROR')) throw syncCheckErr;
+      console.warn(`[MatchingEngine] ⚠️ Synchronizer health check failed: ${syncCheckErr.message} — proceeding anyway`);
+    }
 
     const quoteAmount = matchQty.times(new Decimal(matchPrice));
     const matchQtyStr = matchQty.toFixed(10);

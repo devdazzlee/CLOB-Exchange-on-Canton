@@ -1,51 +1,105 @@
 /**
- * Order Book Service — WebSocket Streaming Only
- * 
- * Source of truth: WebSocket streaming read model (bypasses the 200-element limit).
- * 
- * The streaming read model (streamingReadModel.js) bootstraps via WebSocket from
- * /v2/state/active-contracts and subscribes to /v2/updates for real-time state.
- * This eliminates the 200-element REST API limit and provides instant queries.
- * 
- * Documentation: https://docs.digitalasset.com/build/3.4/reference/json-api/asyncapi.html
+ * Order Book Service — Live Canton Queries
+ *
+ * Source of truth: Canton ledger (no in-memory orderbook cache).
+ * Every request queries active Order contracts and builds a fresh book.
  */
+
+const config = require('../config');
+const tokenProvider = require('./tokenProvider');
+const cantonService = require('./cantonService');
+const { TEMPLATE_IDS } = require('../config/constants');
+const { getTokenSystemType } = require('../config/canton-sdk.config');
 
 class OrderBookService {
     constructor() {
-        this.streamingModel = null;
-        console.log('[OrderBookService] Initialized — WebSocket streaming only');
-    }
-
-    /**
-     * Get the streaming read model (lazy init)
-     */
-    _getStreamingModel() {
-        if (!this.streamingModel) {
-            try {
-                const { getStreamingReadModel } = require('./streamingReadModel');
-                this.streamingModel = getStreamingReadModel();
-            } catch (_) { /* streaming not available */ }
-        }
-        return this.streamingModel?.isReady() ? this.streamingModel : null;
+        console.log('[OrderBookService] Initialized — live Canton query mode');
     }
 
     /**
      * Get order book for a trading pair
-     * 
-     * Instant in-memory lookup from the WebSocket-synced read model.
      */
     async getOrderBook(tradingPair, userPartyId = null) {
-        const streaming = this._getStreamingModel();
-        if (streaming) {
-            const book = streaming.getOrderBook(tradingPair);
-            return book;
+        const token = await tokenProvider.getServiceToken();
+        const operatorPartyId = config.canton.operatorPartyId;
+        if (!operatorPartyId) {
+            return this.emptyOrderBook(tradingPair, 'missing-operator-party');
         }
-        if (userPartyId) {
-            console.warn(`[OrderBookService] Streaming model not ready yet for ${tradingPair} (user: ${userPartyId.substring(0, 30)}...)`);
-        } else {
-            console.warn(`[OrderBookService] Streaming model not ready yet for ${tradingPair}`);
-        }
-        return this.emptyOrderBook(tradingPair, 'websocket-not-ready');
+
+        const templateIds = [
+            TEMPLATE_IDS.orderNew,
+            TEMPLATE_IDS.order,
+        ];
+
+        const contracts = await cantonService.queryActiveContracts({
+            party: operatorPartyId,
+            templateIds,
+            pageSize: 500,
+        }, token);
+
+        const now = Date.now();
+        const MAX_UTILITY_ALLOCATION_AGE_MS = 24 * 60 * 60 * 1000;
+        const MAX_SPLICE_ALLOCATION_AGE_MS = 15 * 60 * 1000;
+
+        const openOrders = (Array.isArray(contracts) ? contracts : [])
+            .map((c) => {
+                const payload = c.payload || c.createArgument || {};
+                const qty = parseFloat(payload.quantity || '0');
+                const filled = parseFloat(payload.filled || '0');
+                const remaining = qty - filled;
+                const rawPrice = payload.price?.Some ?? payload.price ?? null;
+                return {
+                    contractId: c.contractId,
+                    owner: payload.owner,
+                    orderId: payload.orderId,
+                    tradingPair: payload.tradingPair,
+                    orderType: payload.orderType,
+                    orderMode: payload.orderMode,
+                    status: payload.status,
+                    price: rawPrice,
+                    quantity: payload.quantity,
+                    filled: payload.filled,
+                    remaining,
+                    timestamp: payload.timestamp,
+                };
+            })
+            .filter((o) =>
+                o.tradingPair === tradingPair &&
+                o.status === 'OPEN' &&
+                Number.isFinite(o.remaining) &&
+                o.remaining > 0.0000001
+            )
+            .filter((o) => {
+                // Keep orderbook aligned with matcher: exclude orders whose locked allocation
+                // is guaranteed expired and therefore cannot settle.
+                const [baseAsset, quoteAsset] = String(o.tradingPair || '').split('/');
+                const side = String(o.orderType || '').toUpperCase();
+                const lockedAsset = side === 'BUY' ? quoteAsset : baseAsset;
+                const lockedAssetType = lockedAsset ? getTokenSystemType(lockedAsset) : null;
+                const maxAgeMs = lockedAssetType === 'splice'
+                    ? MAX_SPLICE_ALLOCATION_AGE_MS
+                    : MAX_UTILITY_ALLOCATION_AGE_MS;
+                const orderAgeMs = o.timestamp ? (now - new Date(o.timestamp).getTime()) : Infinity;
+                return Number.isFinite(orderAgeMs) && orderAgeMs <= maxAgeMs;
+            });
+
+        const buyOrders = openOrders
+            .filter((o) => o.orderType === 'BUY')
+            .sort((a, b) => parseFloat(b.price || 0) - parseFloat(a.price || 0));
+
+        const sellOrders = openOrders
+            .filter((o) => o.orderType === 'SELL')
+            .sort((a, b) => parseFloat(a.price || Infinity) - parseFloat(b.price || Infinity));
+
+        return {
+            tradingPair,
+            buyOrders,
+            sellOrders,
+            lastPrice: null,
+            timestamp: new Date().toISOString(),
+            source: 'canton-live-query',
+            ...(userPartyId ? { userPartyId } : {}),
+        };
     }
 
     /**
@@ -86,15 +140,39 @@ class OrderBookService {
         return orderBooks;
     }
 
-    /**
-     * Get trades from WebSocket streaming read model
-     */
     async getTrades(tradingPair, limit = 50) {
-        const streaming = this._getStreamingModel();
-        if (streaming) {
-            return streaming.getTradesForPair(tradingPair, limit);
-        }
-        return [];
+        const token = await tokenProvider.getServiceToken();
+        const operatorPartyId = config.canton.operatorPartyId;
+        if (!operatorPartyId) return [];
+
+        const tradeTemplateIds = [
+            TEMPLATE_IDS.trade,
+            TEMPLATE_IDS.legacyTrade,
+        ];
+        const contracts = await cantonService.queryActiveContracts({
+            party: operatorPartyId,
+            templateIds: tradeTemplateIds,
+            pageSize: 500,
+        }, token);
+
+        return (Array.isArray(contracts) ? contracts : [])
+            .map((c) => {
+                const p = c.payload || c.createArgument || {};
+                return {
+                    contractId: c.contractId,
+                    tradeId: p.tradeId,
+                    tradingPair: p.tradingPair || p.pair,
+                    buyer: p.buyer,
+                    seller: p.seller,
+                    price: p.price,
+                    amount: p.amount || p.quantity,
+                    quantity: p.quantity || p.amount,
+                    timestamp: p.timestamp,
+                };
+            })
+            .filter((t) => t.tradingPair === tradingPair)
+            .sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0))
+            .slice(0, limit);
     }
 
     /**

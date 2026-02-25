@@ -32,4 +32,8 @@ router.post('/create-preapproval', onboardingController.createPreapproval);
 // GET /api/onboarding/discover-synchronizer - Get synchronizerId
 router.get('/discover-synchronizer', onboardingController.discoverSynchronizer);
 
+// POST /api/onboarding/store-signing-key - Store signing key for interactive settlement
+// Body: { partyId, signingKeyBase64, publicKeyFingerprint }
+router.post('/store-signing-key', onboardingController.storeSigningKey);
+
 module.exports = router;

@@ -59,11 +59,25 @@ export async function generateTopology(publicKeyBase64, partyHint) {
  * @param {string} signatureBase64 - Signature as base64
  * @param {Array} topologyTransactions - Transactions from step 1
  * @param {string} publicKeyFingerprint - Public key fingerprint from step 1
+ * @param {string} [signingKeyBase64] - Optional: base64-encoded Ed25519 private key for server-side settlement signing
  * @returns {Promise<{step: "ALLOCATED", partyId, synchronizerId}>}
  */
-export async function allocatePartyWithSignature(publicKeyBase64, signatureBase64, topologyTransactions, publicKeyFingerprint) {
+export async function allocatePartyWithSignature(publicKeyBase64, signatureBase64, topologyTransactions, publicKeyFingerprint, signingKeyBase64 = null) {
   try {
     console.log('[PartyService] Step 2: Allocating party with signature');
+
+    const body = {
+      publicKeyBase64,
+      signatureBase64,
+      topologyTransactions,
+      publicKeyFingerprint,
+    };
+    
+    // Include signing key for server-side settlement (interactive submission)
+    if (signingKeyBase64) {
+      body.signingKeyBase64 = signingKeyBase64;
+      console.log('[PartyService] Including signing key for server-side settlement');
+    }
 
     const response = await fetch(`${API_BASE_URL}/onboarding/allocate-party`, {
       method: 'POST',
@@ -71,12 +85,7 @@ export async function allocatePartyWithSignature(publicKeyBase64, signatureBase6
         'Content-Type': 'application/json',
         'x-user-id': getOrCreateUserId(),
       },
-      body: JSON.stringify({
-        publicKeyBase64,
-        signatureBase64,
-        topologyTransactions,
-        publicKeyFingerprint,
-      }),
+      body: JSON.stringify(body),
     });
 
     if (!response.ok) {

@@ -152,9 +152,8 @@ class CantonService {
 
     // Extract commandId from nested structure
     const commandId = body.commands?.commandId || body.commandId || 'unknown';
-    console.log(`[CantonService] POST ${url}`);
-    console.log(`[CantonService] commandId: ${commandId}`);
-    console.log(`[CantonService] Request body:`, JSON.stringify(body, null, 2));
+    const actAs = body.commands?.actAs || [];
+    console.log(`[CantonService] POST submit-and-wait commandId: ${commandId} actAs: [${actAs.map(p => p.substring(0, 20) + '...').join(', ')}]`);
 
     let lastError = null;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -175,9 +174,22 @@ class CantonService {
 
           // Retry on 503 (server overloaded / timeout), 429 (rate limited),
           // and transient NO_SYNCHRONIZER (participant temporarily disconnected).
-          const isTransientSync = res.status === 404 &&
-              error.code === 'NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT' &&
-              (error.context?.unknownSubmitters || '').includes(',');
+          // Retry ALL NO_SYNCHRONIZER errors, not just multi-submitter ones,
+          // because even single-submitter failures can be transient when the
+          // synchronizer connection is flapping.
+          // NEVER retry CONTRACT_NOT_FOUND — the contract is archived, retrying won't help
+          // and just floods the participant with useless commands.
+          const isContractGone = error.code === 'CONTRACT_NOT_FOUND' ||
+              (error.message && error.message.includes('could not be found'));
+          if (isContractGone) {
+            console.warn(`[CantonService] ⚠️ Contract not found (archived) — not retrying`);
+            const errMsg = error.code ? `${error.code}: ${error.message}` : error.message;
+            const err = new Error(errMsg);
+            err.code = error.code;
+            err.httpStatus = error.httpStatus;
+            throw err;
+          }
+          const isTransientSync = error.code === 'NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT';
           if ((res.status === 503 || res.status === 429 || isTransientSync) && attempt < maxRetries) {
             const delay = Math.min(2000 * attempt, 8000);
             console.warn(`[CantonService] ⚠️ ${isTransientSync ? 'TRANSIENT_SYNC' : res.status} on attempt ${attempt}/${maxRetries} for ${commandId} — retrying in ${delay}ms...`);
@@ -187,7 +199,11 @@ class CantonService {
           }
 
           console.error(`[CantonService] ❌ Command failed:`, error);
-          const err = new Error(error.message);
+          // Include error CODE in the message so downstream callers (canton-sdk-client,
+          // matching-engine) can classify errors by checking error.message.includes(...)
+          // without needing to also inspect error.code separately.
+          const errMsg = error.code ? `${error.code}: ${error.message}` : error.message;
+          const err = new Error(errMsg);
           err.code = error.code;
           err.correlationId = error.correlationId;
           err.traceId = error.traceId;
@@ -1270,6 +1286,71 @@ class CantonService {
     return result.synchronizers || [];
   }
 
+  /**
+   * Discover connected synchronizers from JSON API v2 state endpoint.
+   * GET /v2/state/connected-synchronizers
+   */
+  async getConnectedSynchronizers(token) {
+    const url = `${this.jsonApiBase}/v2/state/connected-synchronizers`;
+    console.log(`[CantonService] GET ${url}`);
+
+    const res = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${token}`
+      }
+    });
+
+    const text = await res.text();
+    if (!res.ok) {
+      const error = parseCantonError(text, res.status);
+      throw new Error(`Failed to get connected synchronizers: ${error.message}`);
+    }
+
+    const data = JSON.parse(text);
+    const candidates = [
+      ...(Array.isArray(data?.connectedSynchronizers) ? data.connectedSynchronizers : []),
+      ...(Array.isArray(data?.synchronizers) ? data.synchronizers : []),
+      ...(Array.isArray(data) ? data : []),
+    ];
+
+    return candidates
+      .map((s) => s?.synchronizerId || s?.id)
+      .filter((id) => typeof id === "string" && id.length > 0);
+  }
+
+  /**
+   * Resolve the best synchronizer ID for command submission.
+   * Prefers a connected configured ID, then a connected global-* ID, then first connected.
+   */
+  async resolveSubmissionSynchronizerId(token, preferredSynchronizerId = null) {
+    const configured = preferredSynchronizerId || this.synchronizerId || null;
+    try {
+      const connected = [...new Set(await this.getConnectedSynchronizers(token))];
+      if (connected.length === 0) {
+        return configured;
+      }
+      if (configured && connected.includes(configured)) {
+        return configured;
+      }
+
+      const globalSynchronizer = connected.find((id) => id.includes("global-synchronizer::"));
+      if (globalSynchronizer) {
+        return globalSynchronizer;
+      }
+
+      const globalDomain = connected.find((id) => id.includes("global-domain::"));
+      if (globalDomain) {
+        return globalDomain;
+      }
+
+      return connected[0];
+    } catch (error) {
+      console.warn(`[CantonService] Failed to resolve connected synchronizer, using fallback: ${error.message}`);
+      return configured;
+    }
+  }
+
   // ==========================================================================
   // PARTIES
   // ==========================================================================
@@ -1524,7 +1605,8 @@ class CantonService {
     if (!res.ok) {
       const error = parseCantonError(text, res.status);
       console.error(`[CantonService] ❌ Prepare failed:`, error);
-      throw new Error(`Prepare failed: ${error.message}`);
+      const prepErrMsg = error.code ? `Prepare failed: ${error.code}: ${error.message}` : `Prepare failed: ${error.message}`;
+      throw new Error(prepErrMsg);
     }
 
     const result = JSON.parse(text);
@@ -1613,11 +1695,13 @@ class CantonService {
         if (!attempt.res.ok) {
           error = parseCantonError(attempt.text, attempt.res.status);
           console.error(`[CantonService] ❌ Execute retry failed:`, error);
-          throw new Error(`Execute failed: ${error.message}`);
+          const retryErrMsg = error.code ? `Execute failed: ${error.code}: ${error.message}` : `Execute failed: ${error.message}`;
+          throw new Error(retryErrMsg);
         }
       } else {
         console.error(`[CantonService] ❌ Execute failed:`, error);
-        throw new Error(`Execute failed: ${error.message}`);
+        const execErrMsg = error.code ? `Execute failed: ${error.code}: ${error.message}` : `Execute failed: ${error.message}`;
+        throw new Error(execErrMsg);
       }
     }
 

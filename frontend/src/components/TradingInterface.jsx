@@ -31,7 +31,7 @@ import websocketService from '../services/websocketService';
 import * as balanceService from '../services/balanceService';
 import * as orderService from '../services/orderService';
 // Wallet signing (for external party interactive submission)
-import { loadWallet, decryptPrivateKey, signMessage } from '../wallet/keyManager';
+import { loadWallet, decryptPrivateKey, signMessage, bytesToBase64 } from '../wallet/keyManager';
 
 export default function TradingInterface({ partyId }) {
   // === PHASE 1: ALL HOOKS MUST BE DECLARED FIRST - NO EXCEPTIONS ===
@@ -468,7 +468,8 @@ export default function TradingInterface({ partyId }) {
       let response;
       
       if (action === 'PLACE') {
-        // 4a. Execute order placement
+        // 4a. Execute order placement (include signing key for server-side settlement)
+        const privateKeyBase64 = bytesToBase64(privateKey);
         response = await apiClient.post('/orders/execute-place', {
           preparedTransaction,
           partyId,
@@ -476,6 +477,7 @@ export default function TradingInterface({ partyId }) {
           signedBy,
           hashingSchemeVersion,
           orderMeta: signingState.orderMeta,
+          signingKeyBase64: privateKeyBase64,
         });
 
         if (response?.data?.requiresSignature) {

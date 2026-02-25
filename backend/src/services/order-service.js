@@ -393,11 +393,19 @@ class OrderService {
 
     try {
       // cancelAllocation now works with or without SDK (has direct API fallback)
-      await sdkClient.cancelAllocation(allocationContractId, partyId, executorPartyId);
-      console.log(`[OrderService] ✅ Allocation cancelled for order ${orderId} — funds released`);
+      const cancelResult = await sdkClient.cancelAllocation(allocationContractId, partyId, executorPartyId);
+      if (cancelResult?.cancelled) {
+        console.log(`[OrderService] ✅ Allocation cancelled for order ${orderId} — funds released`);
+      } else if (cancelResult?.skipped) {
+        console.log(`[OrderService] ⏭️ Allocation cancel skipped for order ${orderId}: ${cancelResult.reason}`);
+      } else {
+        console.warn(`[OrderService] ⚠️ Allocation cancel not confirmed for order ${orderId}`);
+      }
+      return cancelResult;
     } catch (cancelErr) {
       console.warn(`[OrderService] ⚠️ Could not cancel Allocation: ${cancelErr.message}`);
       // Don't throw — order cancellation should still proceed
+      return { cancelled: false, skipped: false, reason: cancelErr.message };
     }
   }
 
@@ -1013,8 +1021,14 @@ class OrderService {
       const allocationCid = orderDetails?.allocationCid || getAllocationContractIdForOrder(orderId_cancel);
       if (allocationCid) {
         try {
-          await this.cancelAllocationForOrder(orderId_cancel, allocationCid, partyId);
-          console.log(`[OrderService] ✅ Allocation cancelled — funds released`);
+          const allocationCancelResult = await this.cancelAllocationForOrder(orderId_cancel, allocationCid, partyId);
+          if (allocationCancelResult?.cancelled) {
+            console.log(`[OrderService] ✅ Allocation cancelled — funds released`);
+          } else if (allocationCancelResult?.skipped) {
+            console.log(`[OrderService] ⏭️ Allocation cancel skipped: ${allocationCancelResult.reason}`);
+          } else {
+            console.warn('[OrderService] ⚠️ Allocation cancel not confirmed; continuing with interactive order cancel');
+          }
         } catch (allocCancelErr) {
           console.warn('[OrderService] Could not cancel Allocation:', allocCancelErr.message);
           // Continue with cancellation even if allocation cancel fails

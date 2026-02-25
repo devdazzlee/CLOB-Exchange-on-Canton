@@ -115,6 +115,17 @@ class OnboardingController {
           ...(publicKeyFingerprint ? { publicKeyFingerprint } : {}),
         });
 
+        // ── Store signing key for server-side interactive settlement ──
+        // The frontend sends the Ed25519 private key (base64) during onboarding
+        // so the backend can sign Allocation_ExecuteTransfer at match time.
+        const signingKeyBase64 = req.body.signingKeyBase64;
+        if (signingKeyBase64 && typeof signingKeyBase64 === 'string' && signingKeyBase64.trim()) {
+          userRegistry.storeSigningKey(result.partyId, signingKeyBase64.trim(), publicKeyFingerprint || '');
+          console.log(`[OnboardingController] 🔑 Signing key stored for party ${result.partyId.substring(0, 30)}...`);
+        } else {
+          console.warn(`[OnboardingController] ⚠️ No signingKeyBase64 provided — interactive settlement will not work until key is stored`);
+        }
+
         return success(res, { ...result, quotaStatus }, 'Party onboarded successfully', 200);
       } catch (err) {
         const statusCode = err.statusCode || 500;
@@ -148,7 +159,7 @@ class OnboardingController {
    */
   rehydrate = asyncHandler(async (req, res) => {
     const userId = req.userId;
-    const { partyId, publicKeyBase64 } = req.body || {};
+    const { partyId, publicKeyBase64, signingKeyBase64, publicKeyFingerprint } = req.body || {};
 
     if (!partyId || typeof partyId !== 'string' || partyId.trim() === '') {
       return error(res, 'partyId is required', 400);
@@ -162,6 +173,13 @@ class OnboardingController {
       partyId: partyId.trim(),
       ...(publicKeyBase64 ? { publicKeyBase64: publicKeyBase64.trim() } : {}),
     });
+
+    // Also store signing key if provided (for interactive settlement)
+    if (signingKeyBase64 && typeof signingKeyBase64 === 'string' && signingKeyBase64.trim()) {
+      const fingerprint = publicKeyFingerprint || '';
+      userRegistry.storeSigningKey(partyId.trim(), signingKeyBase64.trim(), fingerprint);
+      console.log(`[OnboardingController] 🔑 Signing key restored during rehydrate for ${partyId.substring(0, 30)}...`);
+    }
 
     return success(res, { partyId: partyId.trim() }, 'User mapping restored', 200);
   });
@@ -203,6 +221,32 @@ class OnboardingController {
   discoverSynchronizer = asyncHandler(async (req, res) => {
     const synchronizerId = await this.onboardingService.discoverSynchronizerId();
     return success(res, { synchronizerId }, 'Synchronizer discovered successfully', 200);
+  });
+
+  /**
+   * Store signing key for interactive settlement
+   * 
+   * This allows the backend to sign Allocation_ExecuteTransfer on behalf
+   * of the external party at match time (no user interaction needed).
+   * 
+   * Request: { partyId, signingKeyBase64, publicKeyFingerprint }
+   * Response: { stored: true }
+   */
+  storeSigningKey = asyncHandler(async (req, res) => {
+    const { partyId, signingKeyBase64, publicKeyFingerprint } = req.body || {};
+
+    if (!partyId || typeof partyId !== 'string' || partyId.trim() === '') {
+      return error(res, 'partyId is required', 400);
+    }
+    if (!signingKeyBase64 || typeof signingKeyBase64 !== 'string' || signingKeyBase64.trim() === '') {
+      return error(res, 'signingKeyBase64 is required (base64-encoded Ed25519 private key)', 400);
+    }
+
+    const fingerprint = publicKeyFingerprint || '';
+    userRegistry.storeSigningKey(partyId.trim(), signingKeyBase64.trim(), fingerprint);
+
+    console.log(`[OnboardingController] 🔑 Signing key stored via /store-signing-key for ${partyId.substring(0, 30)}...`);
+    return success(res, { stored: true, partyId: partyId.trim() }, 'Signing key stored successfully', 200);
   });
 }
 

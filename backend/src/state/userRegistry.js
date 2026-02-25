@@ -2,9 +2,11 @@
  * In-memory user registry (MVP)
  * Stores mapping: userId -> { partyId, publicKeyBase64, createdAt }
  *
- * IMPORTANT:
- * - This is volatile (resets on server restart).
- * - Do NOT store private keys here (never sent to backend).
+ * Also stores signing keys for external parties in a SEPARATE in-memory map
+ * (NOT persisted to disk) for allocation execution at match time.
+ * Canton external parties require interactive submission (user signs every tx).
+ * Storing the signing key lets the backend sign on behalf of the user
+ * for pre-authorized operations (allocation execution during settlement).
  */
 
 const fs = require('fs');
@@ -12,6 +14,12 @@ const path = require('path');
 
 const registry = new Map();
 const REGISTRY_PATH = path.join(__dirname, '..', '..', '.user-registry.json');
+
+// ─── Signing Keys (in-memory only, NOT persisted to disk) ─────────────
+// Maps partyId -> { keyBase64, fingerprint }
+// Used by the matching engine to sign Allocation_ExecuteTransfer
+// for external parties at match-time.
+const signingKeys = new Map();
 
 function loadRegistry() {
   try {
@@ -96,6 +104,36 @@ function getAllPartyIds() {
   return [...new Set(partyIds)]; // deduplicate
 }
 
+// ─── Signing Key helpers ──────────────────────────────────────────────
+
+/**
+ * Store an external party's Ed25519 signing key (base64) for server-side signing.
+ * @param {string} partyId - Canton party ID (e.g. "ext-abc123::1220...")
+ * @param {string} keyBase64 - Base64-encoded 32-byte Ed25519 private key
+ * @param {string} fingerprint - Public key fingerprint (signedBy in Canton)
+ */
+function storeSigningKey(partyId, keyBase64, fingerprint) {
+  if (!partyId || !keyBase64) return;
+  signingKeys.set(partyId, { keyBase64, fingerprint });
+  console.log(`[UserRegistry] 🔑 Stored signing key for ${partyId.substring(0, 30)}...`);
+}
+
+/**
+ * Retrieve an external party's signing key.
+ * @param {string} partyId
+ * @returns {{ keyBase64: string, fingerprint: string } | null}
+ */
+function getSigningKey(partyId) {
+  return signingKeys.get(partyId) || null;
+}
+
+/**
+ * Check if a signing key is available for a party.
+ */
+function hasSigningKey(partyId) {
+  return signingKeys.has(partyId);
+}
+
 module.exports = {
   upsertUser,
   getUser,
@@ -103,6 +141,9 @@ module.exports = {
   requirePartyId,
   requirePublicKey,
   getAllPartyIds,
+  storeSigningKey,
+  getSigningKey,
+  hasSigningKey,
 };
 
 
