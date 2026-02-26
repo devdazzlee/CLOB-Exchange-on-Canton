@@ -220,7 +220,7 @@ class OrderController {
     // Store signing key for server-side settlement (if provided)
     if (signingKeyBase64 && typeof signingKeyBase64 === 'string' && signingKeyBase64.trim()) {
       const userRegistry = require('../state/userRegistry');
-      userRegistry.storeSigningKey(partyId, signingKeyBase64.trim(), signedBy);
+      await userRegistry.storeSigningKey(partyId, signingKeyBase64.trim(), signedBy);
       console.log(`[OrderController] 🔑 Signing key stored for interactive settlement`);
     }
 

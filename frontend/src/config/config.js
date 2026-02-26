@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { getOrCreateUserId } from '../services/userId';
 
 // Base API URL
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 
@@ -162,6 +163,9 @@ apiClient.interceptors.request.use(
         : `Bearer ${token}`;
     }
     
+    // Add user ID header (required by /api/onboarding and /api/ledger routes)
+    config.headers['x-user-id'] = getOrCreateUserId();
+
     // Add party ID header if available
     const partyId = localStorage.getItem('partyId') || 
                     localStorage.getItem('canton_party_id');

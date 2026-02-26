@@ -2023,31 +2023,43 @@ class CantonSDKClient {
 
     console.log(`[CantonSDK]    ✅ Prepared — hash: ${prepareResult.preparedTransactionHash.substring(0, 40)}...`);
 
-        // ── 4. SIGN hash with each external party's stored key that is in actAs ──
-        const extInActAs = currentActAs.filter(p => isExt(p));
+        // ── 4. SIGN hash with ALL actAs parties that have signing keys ──
+        // Canton interactive mode requires explicit external signatures for ALL
+        // actAs parties — including the operator if its key is managed externally.
     const partySignatureEntries = [];
-        for (const extPartyId of extInActAs) {
-      const keyInfo = await userRegistry.getSigningKey(extPartyId);
-      if (!keyInfo) {
-        throw new Error(`SIGNING_KEY_MISSING: Key disappeared for ${extPartyId.substring(0, 25)}...`);
+        const unsignedParties = [];
+        for (const partyId of currentActAs) {
+      const hasKey = await userRegistry.hasSigningKey(partyId);
+      if (hasKey) {
+        const keyInfo = await userRegistry.getSigningKey(partyId);
+        if (!keyInfo) continue;
+        console.log(`[CantonSDK]    🔑 Signing hash for ${partyId.substring(0, 30)}... (fingerprint: ${keyInfo.fingerprint?.substring(0, 20)}...)`);
+        const signatureBase64 = await signHashWithKey(keyInfo.keyBase64, prepareResult.preparedTransactionHash);
+        partySignatureEntries.push({
+          party: partyId,
+          signatures: [{
+            format: 'SIGNATURE_FORMAT_RAW',
+            signature: signatureBase64,
+            signedBy: keyInfo.fingerprint,
+            signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
+          }],
+        });
+      } else {
+        unsignedParties.push(partyId);
       }
-
-      console.log(`[CantonSDK]    🔑 Signing hash for ${extPartyId.substring(0, 25)}... (fingerprint: ${keyInfo.fingerprint?.substring(0, 20)}...)`);
-      const signatureBase64 = await signHashWithKey(keyInfo.keyBase64, prepareResult.preparedTransactionHash);
-      
-      partySignatureEntries.push({
-        party: extPartyId,
-        signatures: [{
-          format: 'SIGNATURE_FORMAT_RAW',
-          signature: signatureBase64,
-          signedBy: keyInfo.fingerprint,
-          signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
-        }],
-      });
     }
 
+        if (partySignatureEntries.length === 0) {
+          throw new Error('SIGNING_KEY_MISSING: No signing keys available for any actAs party');
+        }
+
+        if (unsignedParties.length > 0) {
+          console.warn(`[CantonSDK]    ⚠️ Missing signing keys for: ${unsignedParties.map(p => p.substring(0, 30) + '...').join(', ')}`);
+          console.warn(`[CantonSDK]    💡 To fix: store the operator's signing key via POST /api/onboarding/store-signing-key`);
+        }
+
     const partySignatures = { signatures: partySignatureEntries };
-        console.log(`[CantonSDK]    Collected ${partySignatureEntries.length} party signature(s) for ${currentActAs.length} actAs parties`);
+        console.log(`[CantonSDK]    Collected ${partySignatureEntries.length} signature(s) for ${currentActAs.length} actAs parties (${unsignedParties.length} unsigned)`);
 
         // ── 5. EXECUTE interactive submission ────────────────────────
     const executeResult = await cantonService.executeInteractiveSubmission({
@@ -2211,25 +2223,44 @@ class CantonSDKClient {
               });
 
               if (prepareResult.preparedTransaction && prepareResult.preparedTransactionHash) {
-                // Sign for each EXTERNAL party in actAs
-                const extInActAs = strategyActAs.filter(p => isExtParty(p));
+                // Sign for ALL actAs parties that have signing keys in the database.
+                // Canton interactive mode requires explicit external signatures for ALL
+                // actAs parties — including the operator if its key is managed externally
+                // (e.g. Keycloak KMS). The participant does NOT auto-sign in interactive mode.
                 const partySignatureEntries = [];
-                for (const extPartyId of extInActAs) {
-                  const keyInfo = await userRegistry.getSigningKey(extPartyId);
-                  if (!keyInfo) throw new Error(`SIGNING_KEY_MISSING: ${extPartyId.substring(0, 25)}...`);
-                  const signatureBase64 = await signHashWithKey(keyInfo.keyBase64, prepareResult.preparedTransactionHash);
-                  partySignatureEntries.push({
-                    party: extPartyId,
-                    signatures: [{
-                      format: 'SIGNATURE_FORMAT_RAW',
-                      signature: signatureBase64,
-                      signedBy: keyInfo.fingerprint,
-                      signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
-                    }],
-                  });
+                const unsignedParties = [];
+                for (const partyId of strategyActAs) {
+                  const hasKey = await userRegistry.hasSigningKey(partyId);
+                  if (hasKey) {
+                    const keyInfo = await userRegistry.getSigningKey(partyId);
+                    if (!keyInfo) continue;
+                    console.log(`[CantonSDK]    🔑 Signing hash for ${partyId.substring(0, 30)}... (fingerprint: ${keyInfo.fingerprint?.substring(0, 20)}...)`);
+                    const signatureBase64 = await signHashWithKey(keyInfo.keyBase64, prepareResult.preparedTransactionHash);
+                    partySignatureEntries.push({
+                      party: partyId,
+                      signatures: [{
+                        format: 'SIGNATURE_FORMAT_RAW',
+                        signature: signatureBase64,
+                        signedBy: keyInfo.fingerprint,
+                        signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
+                      }],
+                    });
+                  } else {
+                    unsignedParties.push(partyId);
+                  }
                 }
 
-                console.log(`[CantonSDK]    Collected ${partySignatureEntries.length} external signature(s) for ${strategyActAs.length} actAs parties`);
+                if (partySignatureEntries.length === 0) {
+                  throw new Error('SIGNING_KEY_MISSING: No signing keys available for any actAs party');
+                }
+
+                if (unsignedParties.length > 0) {
+                  console.warn(`[CantonSDK]    ⚠️ Missing signing keys for: ${unsignedParties.map(p => p.substring(0, 30) + '...').join(', ')}`);
+                  console.warn(`[CantonSDK]    ⚠️ Participant must auto-sign for these parties, or execute will fail`);
+                  console.warn(`[CantonSDK]    💡 To fix: store the operator's signing key via POST /api/onboarding/store-signing-key`);
+                }
+
+                console.log(`[CantonSDK]    Collected ${partySignatureEntries.length} signature(s) for ${strategyActAs.length} actAs parties (${unsignedParties.length} unsigned)`);
 
                 const executeResult = await cantonService.executeInteractiveSubmission({
                   preparedTransaction: prepareResult.preparedTransaction,

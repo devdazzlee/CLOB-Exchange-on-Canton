@@ -19,6 +19,13 @@ async function rehydrateUserMapping(partyId, wallet) {
 
   const publicKeyBase64 = bytesToBase64(wallet.publicKey);
 
+  // Include signing key if cached in sessionStorage (set after PIN entry).
+  // This ensures the backend has the key for interactive settlement
+  // even if the user just refreshed the page within the same session.
+  let signingKeyBase64 = null;
+  try { signingKeyBase64 = sessionStorage.getItem('canton_signing_key_b64'); } catch (_) {}
+  const publicKeyFingerprint = localStorage.getItem('canton_key_fingerprint') || '';
+
   try {
     await fetch(`${API_BASE_URL}/onboarding/rehydrate`, {
       method: 'POST',
@@ -29,6 +36,7 @@ async function rehydrateUserMapping(partyId, wallet) {
       body: JSON.stringify({
         partyId,
         publicKeyBase64,
+        ...(signingKeyBase64 ? { signingKeyBase64, publicKeyFingerprint } : {}),
       }),
     });
   } catch (error) {

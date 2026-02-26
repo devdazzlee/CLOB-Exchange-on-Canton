@@ -172,6 +172,8 @@ export default function WalletSetup({ onWalletReady }) {
       if (topology.publicKeyFingerprint) {
         localStorage.setItem('canton_key_fingerprint', topology.publicKeyFingerprint);
       }
+      // Cache signing key in sessionStorage for rehydration after page refresh
+      try { sessionStorage.setItem('canton_signing_key_b64', privateKeyBase64); } catch (_) {}
 
       setStep('ready');
       if (onWalletReady) {
@@ -249,6 +251,8 @@ export default function WalletSetup({ onWalletReady }) {
       if (topology.publicKeyFingerprint) {
         localStorage.setItem('canton_key_fingerprint', topology.publicKeyFingerprint);
       }
+      // Cache signing key in sessionStorage for rehydration after page refresh
+      try { sessionStorage.setItem('canton_signing_key_b64', privateKeyBase64); } catch (_) {}
 
       setStep('ready');
       if (onWalletReady) {
@@ -320,6 +324,8 @@ export default function WalletSetup({ onWalletReady }) {
       if (topologyData.publicKeyFingerprint) {
         localStorage.setItem('canton_key_fingerprint', topologyData.publicKeyFingerprint);
       }
+      // Cache signing key in sessionStorage for rehydration after page refresh
+      try { sessionStorage.setItem('canton_signing_key_b64', privateKeyBase64); } catch (_) {}
 
       setShowUnlockModal(false);
       setStep('ready');

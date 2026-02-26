@@ -453,14 +453,34 @@ export default function TradingInterface({ partyId }) {
       
       const privateKey = await decryptPrivateKey(wallet.encryptedPrivateKey, walletPassword);
       console.log(`[SignOrder] Wallet unlocked, signing ${action} transaction hash...`);
+
+      // 1b. Immediately sync signing key to backend for server-side settlement.
+      //     This ensures the matching engine can use interactive settlement (Strategy 2)
+      //     even if the user hasn't placed a new order since their last page refresh.
+      const privateKeyBase64ForSync = bytesToBase64(privateKey);
+      const fingerprint = localStorage.getItem('canton_key_fingerprint')
+        || (partyId && partyId.includes('::') ? partyId.split('::')[1] : null);
+      if (fingerprint && partyId) {
+        // Fire-and-forget: don't block order signing on key sync
+        apiClient.post('/onboarding/store-signing-key', {
+          partyId,
+          signingKeyBase64: privateKeyBase64ForSync,
+          publicKeyFingerprint: fingerprint,
+        }).then(() => {
+          console.log(`[SignOrder] 🔑 Signing key synced to backend for settlement`);
+          // Cache in sessionStorage for rehydration on page refresh
+          try { sessionStorage.setItem('canton_signing_key_b64', privateKeyBase64ForSync); } catch (_) {}
+        }).catch((syncErr) => {
+          console.warn(`[SignOrder] ⚠️ Signing key sync failed (non-fatal):`, syncErr?.message || syncErr);
+        });
+      }
       
       // 2. Sign the prepared transaction hash
       const signatureBase64 = await signMessage(privateKey, preparedTransactionHash);
       console.log(`[SignOrder] Transaction signed, executing ${action}...`);
       
       // 3. Get public key fingerprint
-      const signedBy = localStorage.getItem('canton_key_fingerprint')
-        || (partyId && partyId.includes('::') ? partyId.split('::')[1] : null);
+      const signedBy = fingerprint;
       if (!signedBy) {
         throw new Error('Public key fingerprint not found. Please re-onboard your wallet.');
       }
