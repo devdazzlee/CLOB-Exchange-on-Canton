@@ -8,6 +8,8 @@
  * 
  * NO KEYCLOAK LOGIN FOR END-USERS.
  * Private keys NEVER sent to backend.
+ * 
+ * All wallet data stored directly in PostgreSQL via Prisma (no in-memory cache).
  */
 
 const config = require('../config');
@@ -16,13 +18,11 @@ const tokenProvider = require('./tokenProvider');
 const onboardingService = require('./onboarding-service');
 const crypto = require('crypto');
 const { ValidationError, LedgerError } = require('../utils/ledgerError');
+const { getDb } = require('./db');
 
 class WalletService {
   constructor() {
     this.jsonApiBase = config.canton.jsonApiBase;
-    // In production, use database. For now, in-memory storage.
-    // Maps walletId (partyId) -> { publicKeyBase64Der, partyId, allocatedAt }
-    this.walletStore = new Map();
   }
 
   /**
@@ -40,7 +40,6 @@ class WalletService {
     }
 
     try {
-      // Get service token for backend
       const token = await tokenProvider.getServiceToken();
 
       // Step 1: Get connected synchronizers
@@ -53,10 +52,6 @@ class WalletService {
       // Step 2: Generate topology transactions
       const generateUrl = `${this.jsonApiBase}/v2/parties/external/generate-topology`;
       
-      // Permission "Confirmation" ensures the external party can confirm (sign) transactions
-      // but does not need to directly submit commands — the participant/validator does that.
-      // This is required for external parties: the exchange submits commands,
-      // the user's key is used for confirmation, ensuring all transactions have user authority.
       const generatePayload = {
         synchronizer: synchronizerId,
         partyHint: partyHint || `wallet-${Date.now()}`,
@@ -65,7 +60,7 @@ class WalletService {
           keyData: publicKeyBase64Der,
           keySpec: "SIGNING_KEY_SPEC_EC_CURVE25519"
         },
-        permission: 'Confirmation', // External party: user controls key, confirms transactions
+        permission: 'Confirmation',
         otherConfirmingParticipantUids: []
       };
 
@@ -89,22 +84,32 @@ class WalletService {
 
       console.log(`[WalletService] ✅ Topology generated: ${result.partyId}`);
 
-      // Store public key for later signature verification
-      this.walletStore.set(result.partyId, {
-        publicKeyBase64Der,
-        partyId: result.partyId,
-        publicKeyFingerprint: result.publicKeyFingerprint,
-        displayName,
-        status: 'PENDING_ALLOCATION'
+      // Store in PostgreSQL
+      const db = getDb();
+      await db.wallet.upsert({
+        where: { partyId: result.partyId },
+        create: {
+          partyId: result.partyId,
+          publicKeyBase64Der: publicKeyBase64Der,
+          publicKeyFingerprint: result.publicKeyFingerprint || null,
+          displayName,
+          status: 'PENDING_ALLOCATION',
+        },
+        update: {
+          publicKeyBase64Der: publicKeyBase64Der,
+          publicKeyFingerprint: result.publicKeyFingerprint || undefined,
+          displayName,
+          status: 'PENDING_ALLOCATION',
+        },
       });
 
       return {
-        walletId: result.partyId, // This is the authoritative walletId
+        walletId: result.partyId,
         partyId: result.partyId,
         publicKeyFingerprint: result.publicKeyFingerprint,
         multiHash: result.multiHash,
         topologyTransactions: result.topologyTransactions,
-        onboardingTransactions: result.topologyTransactions, // Alias for compatibility
+        onboardingTransactions: result.topologyTransactions,
         synchronizerId,
         displayName
       };
@@ -117,8 +122,6 @@ class WalletService {
 
   /**
    * Step 2: Allocate external party with user's signature
-   * This completes the full onboarding: allocate party + create UserAccount + mint tokens
-   * POST /v2/parties/external/allocate
    */
   async allocateExternalParty({
     partyId,
@@ -135,20 +138,19 @@ class WalletService {
     }
 
     try {
-      // Get wallet info to retrieve public key if not provided
-      const walletInfo = this.walletStore.get(partyId);
-      const effectivePublicKey = publicKeyBase64 || (walletInfo?.publicKeyBase64Der);
+      // Look up wallet from DB
+      const db = getDb();
+      const walletInfo = await db.wallet.findUnique({ where: { partyId } });
+      const effectivePublicKey = publicKeyBase64 || walletInfo?.publicKeyBase64Der;
       
       if (!effectivePublicKey) {
         throw new ValidationError('Public key required for allocation');
       }
 
-      // Extract signature from multiHashSignature object
       const signatureBase64 = typeof multiHashSignature === 'string' 
         ? multiHashSignature 
         : multiHashSignature.signature;
 
-      // Use onboarding service to complete full flow (allocate + create UserAccount + mint)
       const result = await onboardingService.completeOnboarding(
         effectivePublicKey,
         signatureBase64,
@@ -158,13 +160,25 @@ class WalletService {
         publicKeyFingerprint || walletInfo?.publicKeyFingerprint
       );
 
-      // Update wallet store
-      if (walletInfo) {
-        walletInfo.status = 'ACTIVE';
-        walletInfo.allocatedAt = new Date().toISOString();
-        walletInfo.userAccountCreated = result.userAccountCreated;
-        walletInfo.usdtMinted = result.usdtMinted;
-      }
+      // Update DB
+      await db.wallet.upsert({
+        where: { partyId },
+        create: {
+          partyId,
+          publicKeyBase64Der: effectivePublicKey,
+          status: 'ACTIVE',
+          allocatedAt: new Date(),
+          userAccountCreated: result.userAccountCreated || false,
+          usdtMinted: result.usdtMinted || false,
+        },
+        update: {
+          publicKeyBase64Der: effectivePublicKey,
+          status: 'ACTIVE',
+          allocatedAt: new Date(),
+          userAccountCreated: result.userAccountCreated || false,
+          usdtMinted: result.usdtMinted || false,
+        },
+      });
 
       console.log(`[WalletService] ✅ Party allocated and onboarded: ${partyId}`);
 
@@ -207,7 +221,6 @@ class WalletService {
 
   /**
    * Get party information
-   * Returns both Canton party info and stored wallet metadata
    */
   async getPartyInfo(partyId) {
     try {
@@ -227,8 +240,9 @@ class WalletService {
 
       const cantonInfo = await response.json();
       
-      // Merge with stored wallet info
-      const walletInfo = this.walletStore.get(partyId);
+      // Merge with stored wallet info from DB
+      const db = getDb();
+      const walletInfo = await db.wallet.findUnique({ where: { partyId } });
       
       return {
         ...cantonInfo,
@@ -236,7 +250,7 @@ class WalletService {
         publicKeyFingerprint: walletInfo?.publicKeyFingerprint,
         displayName: walletInfo?.displayName,
         status: walletInfo?.status,
-        allocatedAt: walletInfo?.allocatedAt
+        allocatedAt: walletInfo?.allocatedAt?.toISOString(),
       };
     } catch (error) {
       console.error(`[WalletService] Party info failed:`, error.message);

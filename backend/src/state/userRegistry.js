@@ -1,68 +1,60 @@
 /**
- * In-memory user registry (MVP)
- * Stores mapping: userId -> { partyId, publicKeyBase64, createdAt }
- *
- * Also stores signing keys for external parties in a SEPARATE in-memory map
- * (NOT persisted to disk) for allocation execution at match time.
- * Canton external parties require interactive submission (user signs every tx).
- * Storing the signing key lets the backend sign on behalf of the user
- * for pre-authorized operations (allocation execution during settlement).
+ * User Registry — PostgreSQL-backed via Prisma (Neon)
+ * 
+ * Stores:
+ *   userId -> { partyId, publicKeyBase64, createdAt }
+ *   partyId -> { keyBase64, fingerprint }  (signing keys)
+ * 
+ * ALL reads and writes go DIRECTLY to PostgreSQL.
+ * No in-memory cache. Database is the single source of truth.
  */
 
-const fs = require('fs');
-const path = require('path');
+const { getDb } = require('../services/db');
 
-const registry = new Map();
-const REGISTRY_PATH = path.join(__dirname, '..', '..', '.user-registry.json');
+// ─── User helpers ─────────────────────────────────────────────────────────
 
-// ─── Signing Keys (in-memory only, NOT persisted to disk) ─────────────
-// Maps partyId -> { keyBase64, fingerprint }
-// Used by the matching engine to sign Allocation_ExecuteTransfer
-// for external parties at match-time.
-const signingKeys = new Map();
-
-function loadRegistry() {
-  try {
-    if (!fs.existsSync(REGISTRY_PATH)) return;
-    const raw = fs.readFileSync(REGISTRY_PATH, 'utf8');
-    if (!raw.trim()) return;
-    const data = JSON.parse(raw);
-    if (data && typeof data === 'object') {
-      Object.entries(data).forEach(([userId, entry]) => {
-        registry.set(userId, entry);
-      });
-    }
-  } catch (error) {
-    console.warn('[UserRegistry] Failed to load registry:', error.message);
-  }
-}
-
-function persistRegistry() {
-  try {
-    const data = Object.fromEntries(registry);
-    fs.writeFileSync(REGISTRY_PATH, JSON.stringify(data, null, 2));
-  } catch (error) {
-    console.warn('[UserRegistry] Failed to persist registry:', error.message);
-  }
-}
-
-loadRegistry();
-
-function upsertUser(userId, updates) {
+async function upsertUser(userId, updates) {
   if (!userId) throw new Error('userId is required');
-  const existing = registry.get(userId) || { createdAt: Date.now() };
-  const next = { ...existing, ...updates, updatedAt: Date.now() };
-  registry.set(userId, next);
-  persistRegistry();
-  return next;
+  const db = getDb();
+  const result = await db.user.upsert({
+    where: { id: userId },
+    create: {
+      id: userId,
+      partyId: updates.partyId || null,
+      publicKeyBase64: updates.publicKeyBase64 || null,
+      displayName: updates.displayName || null,
+    },
+    update: {
+      ...(updates.partyId !== undefined ? { partyId: updates.partyId } : {}),
+      ...(updates.publicKeyBase64 !== undefined ? { publicKeyBase64: updates.publicKeyBase64 } : {}),
+      ...(updates.displayName !== undefined ? { displayName: updates.displayName } : {}),
+    },
+  });
+  return {
+    partyId: result.partyId,
+    publicKeyBase64: result.publicKeyBase64,
+    displayName: result.displayName,
+    createdAt: result.createdAt?.getTime() || Date.now(),
+    updatedAt: result.updatedAt?.getTime() || Date.now(),
+  };
 }
 
-function getUser(userId) {
-  return registry.get(userId) || null;
+async function getUser(userId) {
+  if (!userId) return null;
+  const db = getDb();
+  const u = await db.user.findUnique({ where: { id: userId } });
+  if (!u) return null;
+  return {
+    partyId: u.partyId,
+    publicKeyBase64: u.publicKeyBase64,
+    displayName: u.displayName,
+    createdAt: u.createdAt?.getTime() || Date.now(),
+    updatedAt: u.updatedAt?.getTime() || Date.now(),
+  };
 }
 
-function requireUser(userId) {
-  const u = getUser(userId);
+async function requireUser(userId) {
+  const u = await getUser(userId);
   if (!u) {
     const err = new Error('User not found. Please onboard/create wallet again.');
     err.statusCode = 401;
@@ -71,8 +63,8 @@ function requireUser(userId) {
   return u;
 }
 
-function requirePartyId(userId) {
-  const u = requireUser(userId);
+async function requirePartyId(userId) {
+  const u = await requireUser(userId);
   if (!u.partyId) {
     const err = new Error('No partyId mapped for this user. Please complete onboarding.');
     err.statusCode = 401;
@@ -81,8 +73,8 @@ function requirePartyId(userId) {
   return u.partyId;
 }
 
-function requirePublicKey(userId) {
-  const u = requireUser(userId);
+async function requirePublicKey(userId) {
+  const u = await requireUser(userId);
   if (!u.publicKeyBase64) {
     const err = new Error('No public key registered for this user. Please onboard/create wallet again.');
     err.statusCode = 401;
@@ -91,47 +83,41 @@ function requirePublicKey(userId) {
   return u.publicKeyBase64;
 }
 
-/**
- * Get all registered party IDs (for sharded queries)
- */
-function getAllPartyIds() {
-  const partyIds = [];
-  for (const [, entry] of registry) {
-    if (entry.partyId) {
-      partyIds.push(entry.partyId);
-    }
-  }
-  return [...new Set(partyIds)]; // deduplicate
+async function getAllPartyIds() {
+  const db = getDb();
+  const users = await db.user.findMany({
+    where: { partyId: { not: null } },
+    select: { partyId: true },
+  });
+  return [...new Set(users.map(u => u.partyId).filter(Boolean))];
 }
 
-// ─── Signing Key helpers ──────────────────────────────────────────────
+// ─── Signing Key helpers ──────────────────────────────────────────────────
 
-/**
- * Store an external party's Ed25519 signing key (base64) for server-side signing.
- * @param {string} partyId - Canton party ID (e.g. "ext-abc123::1220...")
- * @param {string} keyBase64 - Base64-encoded 32-byte Ed25519 private key
- * @param {string} fingerprint - Public key fingerprint (signedBy in Canton)
- */
-function storeSigningKey(partyId, keyBase64, fingerprint) {
+async function storeSigningKey(partyId, keyBase64, fingerprint) {
   if (!partyId || !keyBase64) return;
-  signingKeys.set(partyId, { keyBase64, fingerprint });
-  console.log(`[UserRegistry] 🔑 Stored signing key for ${partyId.substring(0, 30)}...`);
+  const db = getDb();
+  await db.signingKey.upsert({
+    where: { partyId },
+    create: { partyId, keyBase64, fingerprint: fingerprint || null },
+    update: { keyBase64, fingerprint: fingerprint || null },
+  });
+  console.log(`[UserRegistry] 🔑 Stored signing key for ${partyId.substring(0, 30)}... (PostgreSQL)`);
 }
 
-/**
- * Retrieve an external party's signing key.
- * @param {string} partyId
- * @returns {{ keyBase64: string, fingerprint: string } | null}
- */
-function getSigningKey(partyId) {
-  return signingKeys.get(partyId) || null;
+async function getSigningKey(partyId) {
+  if (!partyId) return null;
+  const db = getDb();
+  const k = await db.signingKey.findUnique({ where: { partyId } });
+  if (!k) return null;
+  return { keyBase64: k.keyBase64, fingerprint: k.fingerprint };
 }
 
-/**
- * Check if a signing key is available for a party.
- */
-function hasSigningKey(partyId) {
-  return signingKeys.has(partyId);
+async function hasSigningKey(partyId) {
+  if (!partyId) return false;
+  const db = getDb();
+  const count = await db.signingKey.count({ where: { partyId } });
+  return count > 0;
 }
 
 module.exports = {
@@ -145,6 +131,3 @@ module.exports = {
   getSigningKey,
   hasSigningKey,
 };
-
-
-

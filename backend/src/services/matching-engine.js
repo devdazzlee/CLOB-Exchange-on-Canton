@@ -435,7 +435,7 @@ class MatchingEngine {
         if (!allocationCid && payload.orderId) {
           try {
             const { getAllocationContractIdForOrder } = require('./order-service');
-            allocationCid = getAllocationContractIdForOrder(payload.orderId);
+            allocationCid = await getAllocationContractIdForOrder(payload.orderId);
           } catch (_) { /* best effort */ }
         }
         if (!allocationCid) continue;
@@ -904,8 +904,8 @@ class MatchingEngine {
     // Release balance reservations for filled quantities
     try {
       const { releasePartialReservation } = require('./order-service');
-      releasePartialReservation(sellOrder.orderId, matchQtyStr);
-      releasePartialReservation(buyOrder.orderId, quoteAmountStr);
+      await releasePartialReservation(sellOrder.orderId, matchQtyStr);
+      await releasePartialReservation(buyOrder.orderId, quoteAmountStr);
     } catch (_) { /* non-critical */ }
 
     // ═══════════════════════════════════════════════════════════════════

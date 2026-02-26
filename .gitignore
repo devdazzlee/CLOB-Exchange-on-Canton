@@ -41,6 +41,7 @@ frontend/build/
 # Temporary files
 *.tmp
 *.temp
-# Local user registry
+# Local user registry (legacy — now in PostgreSQL)
 .user-registry.json
+.signing-keys.json
 

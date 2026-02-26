@@ -323,3 +323,38 @@ I'll check
 ```
 
 This contract is archived this might be the reason for your error
+
+[5:05 PM, 2/25/2026] +91 79903 24401: Hey, we're stuck on one thing right now. The Canton participant node (65.108.40.104) keeps dropping its connection to the global domain synchronizer. When it disconnects, no write operations go through orders can't settle, tokens can't transfer. Everything else is ready matching engine, allocations, external parties, order book all working. We just need a stable connection on the participant. Can you check if something is up with the server or restart the Canton participant process?
+Let me try restarting the participant node
+[5:09 PM, 2/25/2026] AHMED: Let me try restarting the participant node
+Thanks.
+Yes, please restart the participant node. Once it's back up, we’ll test and confirm everything is working.
+[5:14 PM, 2/25/2026] +91 79903 24401: Please check now
+[5:14 PM, 2/25/2026] AHMED: Please check now
+I'll check
+[6:32 PM, 2/25/2026] AHMED: Hey @~huz , the participant is still dropping its synchronizer connection. We placed fresh orders, the matching engine detected the match and created the allocation, but settlement fails because the participant is disconnected again. The error shows both the operator AND the external party as "unknownSubmitters" meaning the participant has no active synchronizer connection at all. Can you check why it keeps disconnecting? We need a stable connection for any write operations to go through.
+[9:04 PM, 2/25/2026] +91 79903 24401: @AHMED the participant logs are filled with submit commands generating from your partyId 
+
+
+
+
+{"@timestamp":"2026-02-25T16:01:21.805Z","message":"Request com.daml.ledger.api.v2.CommandService/SubmitAndWaitForTransaction by inprocess-grpc-5001: failed with NOT_FOUND/CONTRACT_NOT_FOUND(11,1b53657f): Contract could not be found with id 00b0c2587f37a0387f9a0d8be9b1bd8de97bf6d2cd30c7a1f5db44fa7e14ec3375ca121220bbdfa3c57b792ca8181d71d4889936b09f52dc6f514b04c26882f54c50824257","logger_name":"c.d.c.n.g.ApiRequestLogger:participant=participant","thread_name":"canton-env-ec-79","level":"INFO","span-id":"ab3bc99ddce522a8","span-parent-id":"400f127839bf1c5c","trace-id":"a1cb78df399174b26a927d2324863717","span-name":"logger"}
+{"@timestamp":"2026-02-25T16:01:21.9…
+[5:45 AM, 2/26/2026] AHMED: Hey Huz, we’re stuck on one Canton issue that’s holding up all our settlements and could really use your help.
+
+Here’s what’s happening: when we do an interactive submission for Allocation_ExecuteTransfer, we include both the operator party (8100b2db-86cf-40a1-8351-55483c151cdc::122087fa…) and the external party (ext-edded1b16c64::1220de80…) in actAs, and we provide the external party’s Ed25519 signature. But Canton keeps rejecting it with this error:
+
+FAILED_TO_EXECUTE_TRANSACTION: The following actAs parties did not provide an external signature: 8100b2db-86cf-40a1-8351-55483c151cdc::122087fa…
+
+What’s confusing us is why isn’t the operator party auto-signing here? Its key should be hosted on the participant, and in interactive mode Canton is supposed to au…
+[11:35 AM, 2/26/2026] +91 79903 24401: Hey Huz, we’re stuck on one Canton issue that’s holding up all our settlements and could really use your help.
+
+Here’s what’s happening: when we do an interactive submission for Allocation_ExecuteTransfer, we include both the operator party (8100b2db-86cf-40a1-8351-55483c151cdc::122087fa…) and the external party (ext-edded1b16c64::1220de80…) in actAs, and we provide the external party’s Ed25519 signature. But Canton keeps rejecting it with this error:
+
+FAILED_TO_EXECUTE_TRANSACTION: The following actAs parties did not provide an external signature: 8100b2db-86cf-40a1-8351-55483c151cdc::122087fa…
+
+What’s confusing us is why isn’t the operator party auto-signing here? Its key should be hosted on the participant, and in interactive mode Canton is supposed to au
+@AHMED 
+As the actAs parameter have 2 different parties it needs to have 2 different signature while submitting the transaction, I havent created a multi-sign tx before so dont have much idea on it , check out requestBody in /v2/interactive-submission/execute route, in partySignatures.signatures we can add multiple signatures (can find similar in ledger-api).
+
+But, we can run the choice Allocation_ExecuteTransfer with just the executor if all the other parties in transferleg have already sign the allocation. Also, just want to know in which scenario we would be needing both parties signature?

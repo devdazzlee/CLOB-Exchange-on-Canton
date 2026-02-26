@@ -1,0 +1,167 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// CLOB Exchange — Prisma Schema (Neon PostgreSQL)
+// 
+// Replaces all in-memory Maps with persistent database tables.
+// Source of truth for APPLICATION state (Canton is truth for TRADING state).
+// ═══════════════════════════════════════════════════════════════════════════
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── 1. User Registry ────────────────────────────────────────────────────
+// Previously: userRegistry.js → registry = new Map()
+// Maps userId -> { partyId, publicKeyBase64, createdAt }
+model User {
+  id             String   @id // userId (from frontend)
+  partyId        String?  @unique
+  publicKeyBase64 String?
+  displayName    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  // Relations
+  signingKey     SigningKey?
+  walletInfo     Wallet?
+  stopLossOrders StopLossOrder[]
+  sessions       Session[]
+
+  @@index([partyId])
+}
+
+// ─── 2. Signing Keys ─────────────────────────────────────────────────────
+// Previously: userRegistry.js → signingKeys = new Map()
+// Maps partyId -> { keyBase64, fingerprint }
+// Used for server-side signing of Allocation_ExecuteTransfer
+model SigningKey {
+  partyId     String   @id // Canton party ID (e.g. "ext-abc123::1220...")
+  keyBase64   String   // Base64-encoded 32-byte Ed25519 private key
+  fingerprint String?  // Public key fingerprint (signedBy in Canton)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relation to user (optional — keys can exist without userId mapping)
+  user        User?    @relation(fields: [userId], references: [id])
+  userId      String?  @unique
+}
+
+// ─── 3. Wallet Store ─────────────────────────────────────────────────────
+// Previously: walletService.js → walletStore = new Map()
+// Maps walletId (partyId) -> { publicKeyBase64Der, partyId, allocatedAt }
+model Wallet {
+  partyId              String   @id // Canton party ID = walletId
+  publicKeyBase64Der   String?
+  publicKeyFingerprint String?
+  displayName          String?
+  status               String   @default("PENDING_ALLOCATION") // PENDING_ALLOCATION | ACTIVE
+  allocatedAt          DateTime?
+  userAccountCreated   Boolean  @default(false)
+  usdtMinted           Boolean  @default(false)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  // Relation to user
+  user                 User?    @relation(fields: [userId], references: [id])
+  userId               String?  @unique
+}
+
+// ─── 4. Order Reservations ───────────────────────────────────────────────
+// Previously: order-service.js → _orderReservations = new Map()
+// Maps orderId -> { partyId, asset, amount, allocationContractId }
+// Tracks locked balances to prevent double-spend
+model OrderReservation {
+  orderId              String   @id // Unique order ID
+  partyId              String
+  asset                String   // e.g. "CC", "CBTC"
+  amount               String   // Decimal string
+  allocationContractId String?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  @@index([partyId, asset])
+}
+
+// ─── 5. Stop-Loss Orders ─────────────────────────────────────────────────
+// Previously: stopLossService.js → pendingStopOrders = new Map()
+// User's money depends on these surviving restarts!
+model StopLossOrder {
+  orderId              String   @id
+  orderContractId      String?
+  tradingPair          String   // e.g. "CC/CBTC"
+  orderType            String   // "BUY" or "SELL"
+  stopPrice            String   // Decimal string
+  quantity             String   @default("0")
+  allocationContractId String?
+  status               String   @default("PENDING_TRIGGER") // PENDING_TRIGGER | TRIGGERED
+  triggeredAt          DateTime?
+  triggerPrice          String?
+  registeredAt         DateTime @default(now())
+
+  // Relation to user
+  user                 User?    @relation(fields: [partyId], references: [partyId])
+  partyId              String?
+
+  @@index([tradingPair])
+  @@index([partyId])
+  @@index([status])
+}
+
+// ─── 6. Auth Sessions ────────────────────────────────────────────────────
+// Previously: authService.js → sessions = new Map()
+// App-level JWT sessions
+model Session {
+  id        String   @id @default(uuid())
+  walletId  String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user      User?    @relation(fields: [walletId], references: [id])
+
+  @@index([walletId])
+  @@index([expiresAt])
+}
+
+// ─── 7. Auth Challenges ──────────────────────────────────────────────────
+// Previously: authService.js → challenges = new Map()
+// and ledgerProxyController.js → challengeStore = new Map()
+// Short-lived nonces for signature-based auth
+model AuthChallenge {
+  nonce     String   @id
+  walletId  String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([expiresAt])
+}
+
+// ─── 8. Refresh Tokens ──────────────────────────────────────────────────
+// Previously: authRoutes.js → refreshTokenStore = new Map()
+model RefreshToken {
+  token     String   @id
+  partyId   String
+  publicKey String?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([partyId])
+  @@index([expiresAt])
+}
+
+// ─── 9. Quota Counters ──────────────────────────────────────────────────
+// Previously: quota.js → counters = { daily: new Map(), weekly: new Map() }
+// Rate limiting for party allocations
+model QuotaCounter {
+  id        String   @id // Format: "daily:YYYY-MM-DD" or "weekly:YYYY-Www"
+  period    String   // "daily" or "weekly"
+  periodKey String   // "2026-02-26" or "2026-W09"
+  count     Int      @default(0)
+  updatedAt DateTime @updatedAt
+
+  @@unique([period, periodKey])
+  @@index([period, periodKey])
+}

@@ -54,13 +54,13 @@ class WalletController {
 
     try {
       // Check quota
-      quota.assertAvailable();
+      await quota.assertAvailable();
 
       // Generate wallet ID from public key (deterministic)
       const walletId = this.generateWalletId(publicKey);
 
       // Check if wallet already exists
-      const existingUser = userRegistry.getUser(walletId);
+      const existingUser = await userRegistry.getUser(walletId);
       if (existingUser && existingUser.partyId) {
         console.log(`[WalletController] Wallet already exists: ${walletId}`);
         
@@ -151,7 +151,7 @@ class WalletController {
 
     try {
       // Check quota
-      quota.assertAvailable();
+      await quota.assertAvailable();
 
       const walletId = this.generateWalletId(publicKey);
 
@@ -167,10 +167,10 @@ class WalletController {
       );
 
       // Increment quota
-      quota.increment();
+      await quota.increment();
 
       // Store wallet mapping
-      userRegistry.upsertUser(walletId, {
+      await userRegistry.upsertUser(walletId, {
         partyId: result.partyId,
         publicKeyBase64: publicKey,
         createdAt: Date.now()
@@ -221,7 +221,7 @@ class WalletController {
       return error(res, 'Invalid or expired session token', 401);
     }
 
-    const user = userRegistry.getUser(session.walletId);
+    const user = await userRegistry.getUser(session.walletId);
     if (!user) {
       return error(res, 'Wallet not found', 404);
     }
@@ -245,7 +245,7 @@ class WalletController {
       return error(res, 'walletId is required', 400);
     }
 
-    const user = userRegistry.getUser(walletId);
+    const user = await userRegistry.getUser(walletId);
     if (!user) {
       return error(res, 'Wallet not found', 404);
     }

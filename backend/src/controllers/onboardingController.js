@@ -91,7 +91,7 @@ class OnboardingController {
 
       try {
         // Quota enforcement BEFORE completing allocation
-        quota.assertAvailable();
+        await quota.assertAvailable();
 
         // Extract partyHint from topology transaction if available (for deduplication)
         // The partyHint helps prevent duplicate allocations
@@ -106,10 +106,10 @@ class OnboardingController {
         );
 
         // Increment quota only after successful allocation+onboarding
-        const quotaStatus = quota.increment();
+        const quotaStatus = await quota.increment();
 
         // Store mapping userId -> { partyId, publicKeyBase64, publicKeyFingerprint }
-        userRegistry.upsertUser(userId, {
+        await userRegistry.upsertUser(userId, {
           partyId: result.partyId,
           publicKeyBase64,
           ...(publicKeyFingerprint ? { publicKeyFingerprint } : {}),
@@ -120,7 +120,7 @@ class OnboardingController {
         // so the backend can sign Allocation_ExecuteTransfer at match time.
         const signingKeyBase64 = req.body.signingKeyBase64;
         if (signingKeyBase64 && typeof signingKeyBase64 === 'string' && signingKeyBase64.trim()) {
-          userRegistry.storeSigningKey(result.partyId, signingKeyBase64.trim(), publicKeyFingerprint || '');
+          await userRegistry.storeSigningKey(result.partyId, signingKeyBase64.trim(), publicKeyFingerprint || '');
           console.log(`[OnboardingController] 🔑 Signing key stored for party ${result.partyId.substring(0, 30)}...`);
         } else {
           console.warn(`[OnboardingController] ⚠️ No signingKeyBase64 provided — interactive settlement will not work until key is stored`);
@@ -141,8 +141,8 @@ class OnboardingController {
           partyHint
         );
 
-        // Store public key early for signature verification later (MVP)
-        userRegistry.upsertUser(userId, { publicKeyBase64 });
+        // Store public key early for signature verification later
+        await userRegistry.upsertUser(userId, { publicKeyBase64 });
 
         return success(res, result, 'Topology generated successfully', 200);
       } catch (err) {
@@ -169,7 +169,7 @@ class OnboardingController {
       return error(res, 'publicKeyBase64 must be a non-empty string if provided', 400);
     }
 
-    userRegistry.upsertUser(userId, {
+    await userRegistry.upsertUser(userId, {
       partyId: partyId.trim(),
       ...(publicKeyBase64 ? { publicKeyBase64: publicKeyBase64.trim() } : {}),
     });
@@ -177,7 +177,7 @@ class OnboardingController {
     // Also store signing key if provided (for interactive settlement)
     if (signingKeyBase64 && typeof signingKeyBase64 === 'string' && signingKeyBase64.trim()) {
       const fingerprint = publicKeyFingerprint || '';
-      userRegistry.storeSigningKey(partyId.trim(), signingKeyBase64.trim(), fingerprint);
+      await userRegistry.storeSigningKey(partyId.trim(), signingKeyBase64.trim(), fingerprint);
       console.log(`[OnboardingController] 🔑 Signing key restored during rehydrate for ${partyId.substring(0, 30)}...`);
     }
 
@@ -243,7 +243,7 @@ class OnboardingController {
     }
 
     const fingerprint = publicKeyFingerprint || '';
-    userRegistry.storeSigningKey(partyId.trim(), signingKeyBase64.trim(), fingerprint);
+    await userRegistry.storeSigningKey(partyId.trim(), signingKeyBase64.trim(), fingerprint);
 
     console.log(`[OnboardingController] 🔑 Signing key stored via /store-signing-key for ${partyId.substring(0, 30)}...`);
     return success(res, { stored: true, partyId: partyId.trim() }, 'Signing key stored successfully', 200);

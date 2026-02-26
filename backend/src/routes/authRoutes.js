@@ -1,5 +1,7 @@
 /**
  * Auth Routes - Session Management
+ * PostgreSQL via Prisma (Neon) — ALL reads/writes go directly to DB.
+ * No in-memory cache.
  * 
  * Implements:
  * - POST /auth/session - Create session for wallet
@@ -12,19 +14,17 @@ const express = require('express');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const router = express.Router();
-
-// In-memory refresh token store (use Redis in production)
-const refreshTokenStore = new Map();
+const { getDb } = require('../services/db');
 
 // Configuration
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
-const ACCESS_TOKEN_EXPIRY = '15m';  // Short-lived access token
+const ACCESS_TOKEN_EXPIRY = '15m';
 const REFRESH_TOKEN_EXPIRY = 7 * 24 * 60 * 60 * 1000; // 7 days in ms
 
 /**
- * Generate tokens for a user
+ * Generate tokens for a user (async — writes to DB)
  */
-function generateTokens(user) {
+async function generateTokens(user) {
   const accessToken = jwt.sign(
     {
       sub: user.partyId,
@@ -39,11 +39,14 @@ function generateTokens(user) {
   const refreshToken = crypto.randomBytes(64).toString('hex');
   const refreshExpiry = Date.now() + REFRESH_TOKEN_EXPIRY;
 
-  refreshTokenStore.set(refreshToken, {
-    partyId: user.partyId,
-    publicKey: user.publicKey,
-    expiresAt: refreshExpiry,
-    createdAt: Date.now()
+  const db = getDb();
+  await db.refreshToken.create({
+    data: {
+      token: refreshToken,
+      partyId: user.partyId,
+      publicKey: user.publicKey || null,
+      expiresAt: new Date(refreshExpiry),
+    },
   });
 
   const decoded = jwt.decode(accessToken);
@@ -60,7 +63,7 @@ router.post('/session', async (req, res) => {
       return res.status(400).json({ success: false, error: 'partyId is required' });
     }
     console.log('[Auth] Creating session for party:', partyId.substring(0, 20) + '...');
-    const tokens = generateTokens({ partyId, publicKey });
+    const tokens = await generateTokens({ partyId, publicKey });
     res.json({ success: true, ...tokens, user: { partyId, publicKey } });
   } catch (error) {
     console.error('[Auth] Session creation failed:', error);
@@ -75,17 +78,24 @@ router.post('/refresh', async (req, res) => {
     if (!refreshToken) {
       return res.status(400).json({ success: false, error: 'refreshToken is required' });
     }
-    const tokenData = refreshTokenStore.get(refreshToken);
+
+    const db = getDb();
+    const tokenData = await db.refreshToken.findUnique({ where: { token: refreshToken } });
+
     if (!tokenData) {
       return res.status(401).json({ success: false, error: 'Invalid refresh token' });
     }
-    if (Date.now() >= tokenData.expiresAt) {
-      refreshTokenStore.delete(refreshToken);
+    if (Date.now() >= tokenData.expiresAt.getTime()) {
+      await db.refreshToken.delete({ where: { token: refreshToken } }).catch(() => {});
       return res.status(401).json({ success: false, error: 'Refresh token expired' });
     }
+
     console.log('[Auth] Refreshing token for party:', tokenData.partyId.substring(0, 20) + '...');
-    refreshTokenStore.delete(refreshToken); // Token rotation
-    const tokens = generateTokens({ partyId: tokenData.partyId, publicKey: tokenData.publicKey });
+
+    // Token rotation: delete old, create new
+    await db.refreshToken.delete({ where: { token: refreshToken } }).catch(() => {});
+
+    const tokens = await generateTokens({ partyId: tokenData.partyId, publicKey: tokenData.publicKey });
     res.json({ success: true, ...tokens, user: { partyId: tokenData.partyId, publicKey: tokenData.publicKey } });
   } catch (error) {
     console.error('[Auth] Token refresh failed:', error);
@@ -98,7 +108,8 @@ router.post('/logout', async (req, res) => {
   try {
     const { refreshToken } = req.body;
     if (refreshToken) {
-      refreshTokenStore.delete(refreshToken);
+      const db = getDb();
+      await db.refreshToken.delete({ where: { token: refreshToken } }).catch(() => {});
       console.log('[Auth] Refresh token invalidated');
     }
     res.json({ success: true, message: 'Logged out successfully' });
@@ -144,17 +155,19 @@ function verifyToken(req, res, next) {
   }
 }
 
-// Cleanup expired tokens every hour
-setInterval(() => {
-  const now = Date.now();
-  let cleaned = 0;
-  for (const [token, data] of refreshTokenStore.entries()) {
-    if (now >= data.expiresAt) {
-      refreshTokenStore.delete(token);
-      cleaned++;
+// Cleanup expired tokens every hour (DB only)
+setInterval(async () => {
+  try {
+    const db = getDb();
+    const result = await db.refreshToken.deleteMany({
+      where: { expiresAt: { lt: new Date() } },
+    });
+    if (result.count > 0) {
+      console.log(`[Auth] Cleaned up ${result.count} expired refresh token(s)`);
     }
+  } catch (err) {
+    // Suppress
   }
-  if (cleaned > 0) console.log('[Auth] Cleaned up', cleaned, 'expired refresh tokens');
 }, 60 * 60 * 1000);
 
 module.exports = router;

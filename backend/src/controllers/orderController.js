@@ -103,7 +103,7 @@ class OrderController {
       try {
         const { getStopLossService } = require('../services/stopLossService');
         const stopLossService = getStopLossService();
-        stopLossService.registerStopLoss({
+        await stopLossService.registerStopLoss({
           orderContractId: result.contractId,
           orderId: result.orderId,
           tradingPair: decodedTradingPair,

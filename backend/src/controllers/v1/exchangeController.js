@@ -259,7 +259,7 @@ class ExchangeController {
           const { getStopLossService } = require('../../services/stopLossService');
           const stopLossService = getStopLossService();
           
-          stopLossService.registerStopLoss({
+          await stopLossService.registerStopLoss({
             orderContractId: contractId,
             orderId,
             tradingPair: pair,

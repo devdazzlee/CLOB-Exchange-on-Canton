@@ -1,5 +1,7 @@
 /**
  * Auth Service - App-Level Sessions
+ * PostgreSQL via Prisma (Neon) — ALL reads/writes go directly to DB.
+ * No in-memory cache.
  * 
  * End-users authenticate with cryptographic signatures, NOT Keycloak.
  * Backend issues app-level JWTs for session management.
@@ -13,46 +15,40 @@ const config = require('../config');
 const walletService = require('./walletService');
 const crypto = require('crypto');
 const { ValidationError, NotFoundError } = require('../utils/ledgerError');
+const { getDb } = require('./db');
 
 class AuthService {
   constructor() {
-    // In production, use Redis or database for sessions
-    this.challenges = new Map(); // nonce -> { walletId, expiresAt }
-    this.sessions = new Map();    // sessionId -> { walletId, expiresAt }
-    
-    // JWT secret for app sessions (NOT Keycloak)
     this.jwtSecret = process.env.APP_JWT_SECRET || crypto.randomBytes(64).toString('hex');
     
-    // Cleanup intervals
-    setInterval(() => this.cleanupChallenges(), 5 * 60 * 1000); // 5 minutes
-    setInterval(() => this.cleanupSessions(), 60 * 60 * 1000); // 1 hour
+    // Cleanup intervals (DB only)
+    setInterval(() => this.cleanupChallenges().catch(() => {}), 5 * 60 * 1000);
+    setInterval(() => this.cleanupSessions().catch(() => {}), 60 * 60 * 1000);
   }
 
   /**
    * Generate authentication challenge for wallet
    */
   async generateChallenge(walletId) {
-    const requestId = crypto.randomUUID();
-    
     if (!walletId) {
       throw new ValidationError('walletId is required');
     }
 
-    // Verify wallet exists
     const partyInfo = await walletService.getPartyInfo(walletId);
     if (!partyInfo) {
       throw new NotFoundError('Wallet', walletId);
     }
 
-    // Generate nonce
     const nonce = crypto.randomBytes(32).toString('hex');
-    const expiresAt = Date.now() + (5 * 60 * 1000); // 5 minutes
+    const expiresAt = Date.now() + (5 * 60 * 1000);
 
-    // Store challenge
-    this.challenges.set(nonce, {
-      walletId,
-      expiresAt,
-      requestId
+    const db = getDb();
+    await db.authChallenge.create({
+      data: {
+        nonce,
+        walletId,
+        expiresAt: new Date(expiresAt),
+      },
     });
 
     console.log(`[AuthService] Generated challenge for ${walletId}: ${nonce.slice(0, 16)}...`);
@@ -68,40 +64,36 @@ class AuthService {
    * Verify signature and issue app session token
    */
   async unlockWallet({ walletId, nonce, signatureBase64 }) {
-    const requestId = crypto.randomUUID();
-    
     if (!walletId || !nonce || !signatureBase64) {
       throw new ValidationError('walletId, nonce, and signatureBase64 are required');
     }
 
-    // Verify challenge exists and is not expired
-    const challenge = this.challenges.get(nonce);
+    const db = getDb();
+    const challenge = await db.authChallenge.findUnique({ where: { nonce } });
+
     if (!challenge) {
       throw new ValidationError('Invalid or expired challenge');
     }
     if (challenge.walletId !== walletId) {
       throw new ValidationError('Challenge walletId mismatch');
     }
-    if (Date.now() > challenge.expiresAt) {
-      this.challenges.delete(nonce);
+    if (Date.now() > challenge.expiresAt.getTime()) {
+      await db.authChallenge.delete({ where: { nonce } }).catch(() => {});
       throw new ValidationError('Challenge expired');
     }
 
     try {
-      // Get wallet's public key (stored during onboarding)
       const partyInfo = await walletService.getPartyInfo(walletId);
       if (!partyInfo) {
         throw new NotFoundError('Wallet', walletId);
       }
 
-      // Public key is now stored during onboarding
       const publicKeyBase64 = partyInfo.publicKeyBase64Der;
       
       if (!publicKeyBase64) {
         throw new Error('Public key not found for wallet. Wallet may not be fully onboarded.');
       }
 
-      // Verify signature over nonce
       const isValid = walletService.verifySignature(
         nonce,
         signatureBase64,
@@ -112,17 +104,20 @@ class AuthService {
         throw new ValidationError('Invalid signature');
       }
 
-      // Clean up challenge
-      this.challenges.delete(nonce);
+      // Clean up challenge from DB (one-time use)
+      await db.authChallenge.delete({ where: { nonce } }).catch(() => {});
 
       // Issue app JWT
       const sessionId = crypto.randomUUID();
-      const expiresAt = Date.now() + (24 * 60 * 60 * 1000); // 24 hours
+      const expiresAt = Date.now() + (24 * 60 * 60 * 1000);
 
-      this.sessions.set(sessionId, {
-        walletId,
-        expiresAt,
-        requestId
+      // Persist session to DB
+      await db.session.create({
+        data: {
+          id: sessionId,
+          walletId,
+          expiresAt: new Date(expiresAt),
+        },
       });
 
       const appToken = this.generateAppJWT({
@@ -148,7 +143,9 @@ class AuthService {
   }
 
   /**
-   * Verify app session token
+   * Verify app session token.
+   * JWT signature + expiry is the source of truth.
+   * No in-memory session cache — we trust the JWT itself.
    */
   verifySessionToken(token) {
     try {
@@ -157,11 +154,9 @@ class AuthService {
         return null;
       }
 
-      const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString());
       const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
       const signature = parts[2];
 
-      // Verify signature (simplified - in production use proper JWT library)
       const expectedSignature = crypto
         .createHmac('sha256', this.jwtSecret)
         .update(`${parts[0]}.${parts[1]}`)
@@ -171,14 +166,7 @@ class AuthService {
         return null;
       }
 
-      // Check expiry
       if (payload.exp && Date.now() > payload.exp * 1000) {
-        return null;
-      }
-
-      // Check session exists
-      const session = this.sessions.get(payload.sessionId);
-      if (!session || Date.now() > session.expiresAt) {
         return null;
       }
 
@@ -216,31 +204,34 @@ class AuthService {
   /**
    * Invalidate session
    */
-  invalidateSession(sessionId) {
-    this.sessions.delete(sessionId);
+  async invalidateSession(sessionId) {
+    const db = getDb();
+    await db.session.delete({ where: { id: sessionId } }).catch(() => {});
   }
 
   /**
-   * Cleanup expired challenges
+   * Cleanup expired challenges (DB only)
    */
-  cleanupChallenges() {
-    const now = Date.now();
-    for (const [nonce, challenge] of this.challenges.entries()) {
-      if (now > challenge.expiresAt) {
-        this.challenges.delete(nonce);
-      }
+  async cleanupChallenges() {
+    const db = getDb();
+    const result = await db.authChallenge.deleteMany({
+      where: { expiresAt: { lt: new Date() } },
+    });
+    if (result.count > 0) {
+      console.log(`[AuthService] Cleaned up ${result.count} expired challenge(s)`);
     }
   }
 
   /**
-   * Cleanup expired sessions
+   * Cleanup expired sessions (DB only)
    */
-  cleanupSessions() {
-    const now = Date.now();
-    for (const [sessionId, session] of this.sessions.entries()) {
-      if (now > session.expiresAt) {
-        this.sessions.delete(sessionId);
-      }
+  async cleanupSessions() {
+    const db = getDb();
+    const result = await db.session.deleteMany({
+      where: { expiresAt: { lt: new Date() } },
+    });
+    if (result.count > 0) {
+      console.log(`[AuthService] Cleaned up ${result.count} expired session(s)`);
     }
   }
 }

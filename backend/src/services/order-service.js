@@ -34,36 +34,19 @@ const { getCantonSDKClient } = require('./canton-sdk-client');
 Decimal.set({ precision: 20, rounding: Decimal.ROUND_DOWN });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// BALANCE RESERVATION TRACKER
-// Prevents overselling by tracking how much balance is "spoken for" by
-// open orders that haven't settled yet. The Canton SDK's soft balance check
-// only sees the on-chain available balance — it doesn't know about pending
-// orders in the order book that will require those funds at settlement time.
-//
-// Key: "partyId::asset" → total reserved amount (Decimal)
-// Updated on: order placement (+), cancellation (-), settlement fill (-)
+// BALANCE RESERVATION TRACKER — PostgreSQL via Prisma (Neon)
+// ALL reads/writes go directly to PostgreSQL. No in-memory cache.
 // ═══════════════════════════════════════════════════════════════════════════
-const _reservations = new Map();    // "partyId::asset" → Decimal amount
-const _orderReservations = new Map(); // "orderId" → { partyId, asset, amount, allocationContractId }
+const { getDb } = require('./db');
 
 // ═══════════════════════════════════════════════════════════════════════════
-// GLOBAL OPEN ORDER REGISTRY
-// 
-// Canton's party-based access control means the operator may NOT see orders
-// created through other backend instances (e.g. Vercel) if those instances
-// used a different operator party or a code path that didn't include the
-// operator as a stakeholder.
-//
-// This registry is populated when user-specific order queries return OPEN
-// orders. The OrderBookService merges these into the global order book view.
-//
-// Key: contractId → { orderId, owner, tradingPair, orderType, price, quantity, filled, status, timestamp }
+// GLOBAL OPEN ORDER REGISTRY (in-memory — rebuilt from Canton on each query)
+// This is OK: it's a Canton data cache, not application state.
 // ═══════════════════════════════════════════════════════════════════════════
 const _globalOpenOrders = new Map();
 
 function registerOpenOrders(orders) {
   if (!Array.isArray(orders)) return;
-  // Collect current contractIds for this batch to detect stale entries
   for (const order of orders) {
     if (order.status === 'OPEN' && order.contractId) {
       _globalOpenOrders.set(order.contractId, {
@@ -82,7 +65,6 @@ function registerOpenOrders(orders) {
       });
     }
   }
-  // Remove orders that are no longer OPEN (their status changed to FILLED/CANCELLED)
   for (const order of orders) {
     if (order.status !== 'OPEN' && order.contractId && _globalOpenOrders.has(order.contractId)) {
       _globalOpenOrders.delete(order.contractId);
@@ -94,72 +76,93 @@ function getGlobalOpenOrders() {
   return [..._globalOpenOrders.values()];
 }
 
-function _reservationKey(partyId, asset) {
-  return `${partyId}::${asset}`;
-}
-
-function getReservedBalance(partyId, asset) {
-  const key = _reservationKey(partyId, asset);
-  return _reservations.get(key) || new Decimal(0);
-}
-
-function addReservation(orderId, partyId, asset, amount, allocationContractId = null) {
-  const key = _reservationKey(partyId, asset);
-  const current = _reservations.get(key) || new Decimal(0);
-  _reservations.set(key, current.plus(new Decimal(amount)));
-  _orderReservations.set(orderId, {
-    partyId,
-    asset,
-    amount: new Decimal(amount).toString(),
-    allocationContractId,
+async function getReservedBalance(partyId, asset) {
+  const db = getDb();
+  const result = await db.orderReservation.aggregate({
+    where: { partyId, asset },
+    _sum: { amount: true },
   });
-  console.log(`[BalanceReservation] ➕ Reserved ${amount} ${asset} for ${orderId} (total reserved: ${_reservations.get(key).toString()}, allocation: ${allocationContractId ? allocationContractId.substring(0, 30) + '...' : 'none'})`);
-}
-
-function releaseReservation(orderId) {
-  const reservation = _orderReservations.get(orderId);
-  if (!reservation) return;
-
-  const key = _reservationKey(reservation.partyId, reservation.asset);
-  const current = _reservations.get(key) || new Decimal(0);
-  const newAmount = Decimal.max(current.minus(new Decimal(reservation.amount)), new Decimal(0));
-  _reservations.set(key, newAmount);
-  _orderReservations.delete(orderId);
-  console.log(`[BalanceReservation] ➖ Released ${reservation.amount} ${reservation.asset} for ${orderId} (total reserved: ${newAmount.toString()})`);
-}
-
-function releasePartialReservation(orderId, filledAmount) {
-  const reservation = _orderReservations.get(orderId);
-  if (!reservation) return;
-
-  const key = _reservationKey(reservation.partyId, reservation.asset);
-  const current = _reservations.get(key) || new Decimal(0);
-  const releaseAmt = Decimal.min(new Decimal(filledAmount), new Decimal(reservation.amount));
-  const newReserved = Decimal.max(current.minus(releaseAmt), new Decimal(0));
-  _reservations.set(key, newReserved);
-
-  // Update the order's remaining reservation
-  const remaining = Decimal.max(new Decimal(reservation.amount).minus(releaseAmt), new Decimal(0));
-  if (remaining.lte(0)) {
-    _orderReservations.delete(orderId);
-  } else {
-    reservation.amount = remaining.toString();
+  // amount is stored as String (Decimal). Aggregate returns null if no rows.
+  // Since Prisma stores Decimal as String, we need to sum manually.
+  const rows = await db.orderReservation.findMany({
+    where: { partyId, asset },
+    select: { amount: true },
+  });
+  let total = new Decimal(0);
+  for (const r of rows) {
+    total = total.plus(new Decimal(r.amount || '0'));
   }
-  console.log(`[BalanceReservation] ➖ Partially released ${filledAmount} ${reservation.asset} for ${orderId} (remaining reservation: ${remaining.toString()})`);
+  return total;
+}
+
+async function addReservation(orderId, partyId, asset, amount, allocationContractId = null) {
+  const db = getDb();
+  const amountStr = new Decimal(amount).toString();
+  await db.orderReservation.upsert({
+    where: { orderId },
+    create: { orderId, partyId, asset, amount: amountStr, allocationContractId },
+    update: { partyId, asset, amount: amountStr, allocationContractId },
+  });
+  console.log(`[BalanceReservation] ➕ Reserved ${amount} ${asset} for ${orderId} (allocation: ${allocationContractId ? allocationContractId.substring(0, 30) + '...' : 'none'})`);
+}
+
+async function releaseReservation(orderId) {
+  const db = getDb();
+  try {
+    const reservation = await db.orderReservation.findUnique({ where: { orderId } });
+    if (!reservation) return;
+    await db.orderReservation.delete({ where: { orderId } });
+    console.log(`[BalanceReservation] ➖ Released ${reservation.amount} ${reservation.asset} for ${orderId}`);
+  } catch (err) {
+    console.warn(`[BalanceReservation] releaseReservation failed for ${orderId}: ${err.message}`);
+  }
+}
+
+async function releasePartialReservation(orderId, filledAmount) {
+  const db = getDb();
+  try {
+    const reservation = await db.orderReservation.findUnique({ where: { orderId } });
+    if (!reservation) return;
+
+    const releaseAmt = Decimal.min(new Decimal(filledAmount), new Decimal(reservation.amount));
+    const remaining = Decimal.max(new Decimal(reservation.amount).minus(releaseAmt), new Decimal(0));
+
+    if (remaining.lte(0)) {
+      await db.orderReservation.delete({ where: { orderId } });
+    } else {
+      await db.orderReservation.update({
+        where: { orderId },
+        data: { amount: remaining.toString() },
+      });
+    }
+    console.log(`[BalanceReservation] ➖ Partially released ${filledAmount} ${reservation.asset} for ${orderId} (remaining: ${remaining.toString()})`);
+  } catch (err) {
+    console.warn(`[BalanceReservation] releasePartialReservation failed for ${orderId}: ${err.message}`);
+  }
 }
 
 /**
  * Get the allocation contract ID stored for an order's reservation.
  */
-function getAllocationContractIdForOrder(orderId) {
-  const reservation = _orderReservations.get(orderId);
+async function getAllocationContractIdForOrder(orderId) {
+  const db = getDb();
+  const reservation = await db.orderReservation.findUnique({
+    where: { orderId },
+    select: { allocationContractId: true },
+  });
   return reservation?.allocationContractId || null;
 }
 
-function setAllocationContractIdForOrder(orderId, allocationContractId) {
-  const reservation = _orderReservations.get(orderId);
-  if (!reservation) return;
-  reservation.allocationContractId = allocationContractId || null;
+async function setAllocationContractIdForOrder(orderId, allocationContractId) {
+  const db = getDb();
+  try {
+    await db.orderReservation.update({
+      where: { orderId },
+      data: { allocationContractId: allocationContractId || null },
+    });
+  } catch (err) {
+    console.warn(`[BalanceReservation] setAllocationContractId failed for ${orderId}: ${err.message}`);
+  }
 }
 
 class OrderService {
@@ -339,7 +342,7 @@ class OrderService {
       const availableBalance = parseFloat(balance.available || '0');
 
       // Deduct balance already reserved by other open orders (prevents overselling)
-      const reserved = getReservedBalance(partyId, asset);
+      const reserved = await getReservedBalance(partyId, asset);
       const effectiveAvailable = new Decimal(availableBalance).minus(reserved);
       
       if (effectiveAvailable.lt(new Decimal(amount))) {
@@ -380,7 +383,7 @@ class OrderService {
 
     // Find the allocationContractId from the reservation if not provided
     if (!allocationContractId) {
-      allocationContractId = getAllocationContractIdForOrder(orderId);
+      allocationContractId = await getAllocationContractIdForOrder(orderId);
     }
 
     if (!allocationContractId) {
@@ -609,7 +612,7 @@ class OrderService {
     let allocationContractId = null;
 
     // ═══ RESERVE BALANCE to prevent overselling ═══
-    addReservation(orderId, partyId, lockInfo.asset, lockInfo.amount, allocationContractId);
+    await addReservation(orderId, partyId, lockInfo.asset, lockInfo.amount, allocationContractId);
 
     // Determine initial order status
     // STOP_LOSS orders start as 'PENDING_TRIGGER' — NOT added to active order book
@@ -782,7 +785,7 @@ class OrderService {
       }
       
       if (orderMeta.orderId && allocationContractId) {
-        setAllocationContractIdForOrder(orderMeta.orderId, allocationContractId);
+        await setAllocationContractIdForOrder(orderMeta.orderId, allocationContractId);
         console.log(`[OrderService] ✅ Allocation linked to order ${orderMeta.orderId}: ${allocationContractId.substring(0, 30)}...`);
       }
 
@@ -949,7 +952,7 @@ class OrderService {
       
       // Release reservation on failure
       if (orderMeta.orderId && orderMeta.stage !== 'ORDER_CREATE_PREPARED') {
-        releaseReservation(orderMeta.orderId);
+        await releaseReservation(orderMeta.orderId);
       }
       throw error;
     }
@@ -1018,7 +1021,7 @@ class OrderService {
     // ═══ Cancel the Allocation — release locked funds via Allocation_Cancel ═══
     const orderId_cancel = orderDetails?.orderId;
     if (orderId_cancel) {
-      const allocationCid = orderDetails?.allocationCid || getAllocationContractIdForOrder(orderId_cancel);
+      const allocationCid = orderDetails?.allocationCid || await getAllocationContractIdForOrder(orderId_cancel);
       if (allocationCid) {
         try {
           const allocationCancelResult = await this.cancelAllocationForOrder(orderId_cancel, allocationCid, partyId);
@@ -1043,7 +1046,7 @@ class OrderService {
       try {
         const { getStopLossService } = require('./stopLossService');
         const stopLossService = getStopLossService();
-        stopLossService.unregisterStopLoss(orderContractId);
+        await stopLossService.unregisterStopLoss(orderContractId);
         console.log(`[OrderService] ✅ Stop-loss unregistered for cancelled order`);
       } catch (slErr) {
         console.warn(`[OrderService] ⚠️ Could not unregister stop-loss: ${slErr.message}`);
@@ -1142,7 +1145,7 @@ class OrderService {
       
       // Release balance reservation
       if (cancelMeta.orderId) {
-        releaseReservation(cancelMeta.orderId);
+        await releaseReservation(cancelMeta.orderId);
       }
       
       // Remove from tracking

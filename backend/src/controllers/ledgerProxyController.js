@@ -32,8 +32,8 @@ async function getEd25519() {
   return ed25519Cache;
 }
 
-// In-memory challenge store: userId -> { challenge, expiresAt }
-const challengeStore = new Map();
+// Challenge store — PostgreSQL via Prisma (no in-memory cache)
+const { getDb } = require('../services/db');
 
 function toBytesUtf8(str) {
   return new TextEncoder().encode(str);
@@ -66,34 +66,40 @@ class LedgerProxyController {
     this.onboardingService = new OnboardingService();
   }
 
-  issueChallenge(req, res) {
+  async issueChallenge(req, res) {
     const userId = req.userId;
     const challenge = `clob:${userId}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
     const expiresAt = Date.now() + 2 * 60 * 1000; // 2 minutes
-    challengeStore.set(userId, { challenge, expiresAt });
+
+    // Store directly in PostgreSQL
+    const db = getDb();
+    await db.authChallenge.create({
+      data: { nonce: challenge, walletId: userId, expiresAt: new Date(expiresAt) },
+    });
+
     res.json({ challenge, expiresAt });
   }
 
   async verifyChallengeSignatureOrThrow(userId, challenge, signatureBase64) {
-    const stored = challengeStore.get(userId);
-    if (!stored || !stored.challenge) {
+    // Look up challenge from PostgreSQL
+    const db = getDb();
+    const stored = await db.authChallenge.findFirst({
+      where: { walletId: userId, nonce: challenge },
+    });
+
+    if (!stored) {
       const err = new Error('Missing server challenge. Call GET /api/ledger/challenge first.');
       err.statusCode = 401;
       throw err;
     }
-    if (Date.now() > stored.expiresAt) {
-      challengeStore.delete(userId);
+    if (Date.now() > stored.expiresAt.getTime()) {
+      await db.authChallenge.delete({ where: { nonce: challenge } });
       const err = new Error('Challenge expired. Please retry.');
       err.statusCode = 401;
       throw err;
     }
-    if (stored.challenge !== challenge) {
-      const err = new Error('Challenge mismatch.');
-      err.statusCode = 401;
-      throw err;
-    }
 
-    const publicKeyBase64 = requirePublicKey(userId);
+    const publicKeyBase64 = await requirePublicKey(userId);
     const publicKeyBytes = new Uint8Array(Buffer.from(publicKeyBase64, 'base64'));
     const sigBytes = new Uint8Array(Buffer.from(signatureBase64, 'base64'));
     const msgBytes = toBytesUtf8(challenge);
@@ -106,8 +112,8 @@ class LedgerProxyController {
       throw err;
     }
 
-    // One-time use
-    challengeStore.delete(userId);
+    // One-time use — delete from DB
+    await db.authChallenge.delete({ where: { nonce: challenge } });
   }
 
   async withCantonTokenRetry(fn) {
@@ -136,7 +142,7 @@ class LedgerProxyController {
       return res.status(400).json({ error: 'templateId is required (string)' });
     }
 
-    const partyId = requirePartyId(userId);
+    const partyId = await requirePartyId(userId);
     const completionOffset = req.body?.offset ?? null;
     const limit = Number.isFinite(Number(limitInput))
       ? Math.min(Math.max(Number(limitInput), 1), 200)
@@ -198,7 +204,7 @@ class LedgerProxyController {
     if (!contractId || typeof contractId !== 'string') {
       return res.status(400).json({ error: 'contractId is required (string)' });
     }
-    const partyId = requirePartyId(userId);
+    const partyId = await requirePartyId(userId);
 
     const contract = await this.withCantonTokenRetry(async (token) => {
       const activeAtOffset = await cantonService.getActiveAtOffset(token, offset ?? null);
@@ -251,7 +257,7 @@ class LedgerProxyController {
     if (!Array.isArray(contractIds) || contractIds.length === 0) {
       return res.status(400).json({ error: 'contractIds is required (non-empty array)' });
     }
-    const partyId = requirePartyId(userId);
+    const partyId = await requirePartyId(userId);
 
     const contracts = await this.withCantonTokenRetry(async (token) => {
       const activeAtOffset = await cantonService.getActiveAtOffset(token, offset ?? null);
@@ -315,7 +321,7 @@ class LedgerProxyController {
 
     await this.verifyChallengeSignatureOrThrow(userId, String(challenge), String(signatureBase64));
 
-    const userPartyId = requirePartyId(userId);
+    const userPartyId = await requirePartyId(userId);
     const operatorPartyId = config.canton.operatorPartyId;
 
     const actAsParty = actAs === 'operator' ? operatorPartyId : userPartyId;
@@ -359,7 +365,7 @@ class LedgerProxyController {
 
     await this.verifyChallengeSignatureOrThrow(userId, String(challenge), String(signatureBase64));
 
-    const userPartyId = requirePartyId(userId);
+    const userPartyId = await requirePartyId(userId);
     const operatorPartyId = config.canton.operatorPartyId;
     const actAsParty = actAs === 'operator' ? operatorPartyId : userPartyId;
     const readAsParty = readAs === 'operator' ? operatorPartyId : userPartyId;
