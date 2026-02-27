@@ -355,6 +355,13 @@ class StreamingReadModel extends EventEmitter {
 
   /**
    * Handle a single update message from /v2/updates/flats
+   *
+   * Canton v2 JSON API wraps protobuf oneofs with { TypeName: { value: {...} } }
+   * for top-level union types (Transaction, OffsetCheckpoint), BUT event-level
+   * unions (CreatedEvent, ArchivedEvent) may or may NOT use the .value wrapper
+   * depending on the Canton version / serialization config.
+   *
+   * We handle ALL known formats defensively.
    */
   _handleUpdateMessage(msg) {
     const update = msg.update;
@@ -367,28 +374,62 @@ class StreamingReadModel extends EventEmitter {
     }
 
     // Transaction update — process events
-    const tx = update.Transaction?.value;
-    if (!tx) return;
+    // Handle both wrapped (.value) and unwrapped formats
+    const tx = update.Transaction?.value || update.Transaction;
+    if (!tx || typeof tx !== 'object') return;
 
     const events = tx.events || [];
-    let newEvents = 0;
+    let createdCount = 0;
+    let archivedCount = 0;
 
     for (const event of events) {
-      // Created event
-      const created = event.CreatedEvent || event.created || event.createdEvent;
+      // ── Created event ──────────────────────────────────────────────
+      // Canton v2 may send as:
+      //   { CreatedEvent: { value: { contractId, ... } } }  (wrapped)
+      //   { CreatedEvent: { contractId, ... } }              (unwrapped)
+      //   { created: { contractId, ... } }                   (gRPC field name)
+      //   { createdEvent: { contractId, ... } }              (camelCase)
+      let created = null;
+      if (event.CreatedEvent) {
+        created = event.CreatedEvent.value || event.CreatedEvent;
+      } else if (event.created) {
+        created = event.created.value || event.created;
+      } else if (event.createdEvent) {
+        created = event.createdEvent.value || event.createdEvent;
+      }
+
       if (created) {
         const contract = this._normalizeContract({ createdEvent: created });
         if (contract && contract.contractId) {
           this._processContract(contract);
-          newEvents++;
+          createdCount++;
         }
       }
 
-      // Archived event
-      const archived = event.ArchivedEvent || event.archived || event.archivedEvent;
+      // ── Archived event ─────────────────────────────────────────────
+      // Canton v2 may send as:
+      //   { ArchivedEvent: { value: { contractId, ... } } }  (wrapped)
+      //   { ArchivedEvent: { contractId, ... } }              (unwrapped)
+      //   { archived: { contractId, ... } }                   (gRPC field name)
+      //   { archivedEvent: { contractId, ... } }              (camelCase)
+      let archived = null;
+      if (event.ArchivedEvent) {
+        archived = event.ArchivedEvent.value || event.ArchivedEvent;
+      } else if (event.archived) {
+        archived = event.archived.value || event.archived;
+      } else if (event.archivedEvent) {
+        archived = event.archivedEvent.value || event.archivedEvent;
+      }
+
       if (archived) {
         this._processArchivedEvent(archived);
-        newEvents++;
+        archivedCount++;
+      }
+
+      // ── Diagnostic: unknown event format ───────────────────────────
+      if (!created && !archived) {
+        const keys = Object.keys(event).join(', ');
+        console.warn(`[StreamingReadModel] ⚠️ Unrecognized event format (keys: ${keys}) — raw: ${JSON.stringify(event).substring(0, 300)}`);
       }
     }
 
@@ -397,12 +438,13 @@ class StreamingReadModel extends EventEmitter {
       this.lastOffset = tx.offset;
     }
 
-    if (newEvents > 0) {
+    const totalEvents = createdCount + archivedCount;
+    if (totalEvents > 0) {
       // Log significant updates (orders/trades, not just offsets)
-      if (newEvents <= 10) {
-        console.log(`[StreamingReadModel] 📡 ${newEvents} event(s) at offset ${this.lastOffset} — orders: ${this.orders.size}, trades: ${this.trades.size}`);
+      if (totalEvents <= 10) {
+        console.log(`[StreamingReadModel] 📡 ${totalEvents} event(s) at offset ${this.lastOffset} — +${createdCount} created, -${archivedCount} archived — orders: ${this.orders.size}, trades: ${this.trades.size}`);
       }
-      this.emit('update', { type: 'websocket', events: newEvents, offset: this.lastOffset });
+      this.emit('update', { type: 'websocket', events: totalEvents, offset: this.lastOffset });
     }
   }
 
@@ -471,9 +513,14 @@ class StreamingReadModel extends EventEmitter {
 
   _processArchivedEvent(event) {
     const contractId = event.contractId || event.contract_id;
-    if (!contractId) return;
+    if (!contractId) {
+      console.warn(`[StreamingReadModel] ⚠️ ArchivedEvent with no contractId — keys: ${Object.keys(event).join(', ')}`);
+      return;
+    }
 
     if (this.orders.has(contractId)) {
+      const order = this.orders.get(contractId);
+      console.log(`[StreamingReadModel] 🗑️ Order archived: ${order.orderId || contractId} (status=${order.status}, filled=${order.filled}/${order.quantity})`);
       this._removeOrder(contractId);
     } else if (this.trades.has(contractId)) {
       this._removeTrade(contractId);

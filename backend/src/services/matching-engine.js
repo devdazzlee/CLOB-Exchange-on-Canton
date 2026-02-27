@@ -916,6 +916,9 @@ class MatchingEngine {
     // ═══════════════════════════════════════════════════════════════════
     console.log(`[MatchingEngine] 📝 Step 2: Filling orders on-chain (operator-only submission)...`);
 
+    // Keep a reference to the streaming model for immediate eviction after FillOrder
+    const streaming = this._getStreamingModel();
+
     try {
       const buyFillArg = {
         fillQuantity: matchQtyStr,
@@ -934,11 +937,21 @@ class MatchingEngine {
         readAs: [operatorPartyId, buyOrder.owner],
       });
       console.log(`[MatchingEngine] ✅ Buy order filled: ${buyOrder.orderId}${buyIsPartial ? ' (partial, remainder alloc: ' + (replacementBuyAllocationCid?.substring(0,20) || 'none') + '...)' : ' (complete)'}`);
+
+      // Immediately evict old contract from streaming model.
+      // FillOrder is a consuming choice — the old contract ID is now archived
+      // on the ledger. The WebSocket ArchivedEvent will also remove it, but
+      // this ensures the order book is updated instantly (belt-and-suspenders).
+      if (streaming) {
+        streaming.evictOrder(buyOrder.contractId);
+      }
     } catch (fillError) {
       console.error(`[MatchingEngine] ❌ Buy FillOrder FAILED after settlement: ${fillError.message}`);
       if (!fillError.message?.includes('already filled') && !fillError.message?.includes('CONTRACT_NOT_FOUND')) {
         throw new Error(`Post-settlement Buy FillOrder failed: ${fillError.message}`);
       }
+      // Even on "already filled" / "CONTRACT_NOT_FOUND", evict — it's stale
+      if (streaming) streaming.evictOrder(buyOrder.contractId);
     }
 
     try {
@@ -959,11 +972,18 @@ class MatchingEngine {
         readAs: [operatorPartyId, sellOrder.owner],
       });
       console.log(`[MatchingEngine] ✅ Sell order filled: ${sellOrder.orderId}${sellIsPartial ? ' (partial, remainder alloc: ' + (replacementSellAllocationCid?.substring(0,20) || 'none') + '...)' : ' (complete)'}`);
+
+      // Immediately evict old contract from streaming model (same as buy above)
+      if (streaming) {
+        streaming.evictOrder(sellOrder.contractId);
+      }
     } catch (fillError) {
       console.error(`[MatchingEngine] ❌ Sell FillOrder FAILED after settlement: ${fillError.message}`);
       if (!fillError.message?.includes('already filled') && !fillError.message?.includes('CONTRACT_NOT_FOUND')) {
         throw new Error(`Post-settlement Sell FillOrder failed: ${fillError.message}`);
       }
+      // Even on "already filled" / "CONTRACT_NOT_FOUND", evict — it's stale
+      if (streaming) streaming.evictOrder(sellOrder.contractId);
     }
 
     // ═══════════════════════════════════════════════════════════════════
