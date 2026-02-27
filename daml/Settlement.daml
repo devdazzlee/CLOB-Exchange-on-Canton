@@ -216,69 +216,169 @@ template BatchSettlement
         return results
 
 -- =============================================================================
--- ALLOCATION RECORD — Fallback for when Splice Allocation Factory is unavailable
+-- EXCHANGE ALLOCATION — Propose-Accept Pattern for External Parties
 -- =============================================================================
-
--- | AllocationRecord — tracks locked funds for an exchange order.
 --
--- Created by the backend (via canton-sdk-client.js _createDirectAllocation)
--- when the Splice Allocation Factory API is unavailable.
+-- Solves the Canton protocol limitation:
+--   "Only transactions requiring authorization from a single party are supported"
+--   for external parties.
 --
--- Primary path: SDK's Allocation Factory API (creates native Splice Allocations)
--- Fallback path: This template (creates AllocationRecord on the exchange's own contracts)
+-- The Splice DvpLegAllocation contract requires BOTH operator AND external party
+-- to co-authorize Allocation_ExecuteTransfer. Canton cannot do this when one
+-- party is external (hosted as CPN, not SPN).
 --
--- Flow:
---   1. ORDER PLACEMENT: Backend creates AllocationRecord (funds conceptually locked)
---   2. MATCH TIME:      Exchange exercises ExecuteAllocation (no user key needed)
---   3. CANCELLATION:    Backend exercises CancelAllocation (funds returned)
+-- PROPOSE-ACCEPT PATTERN:
+--   Step 1 (PROPOSE): External party creates ExchangeAllocation at ORDER TIME.
+--     → Single-party tx by external party (user signs via interactive submission).
+--     → User's consent is embedded on-chain as the contract's signatory.
 --
--- Fields match what canton-sdk-client.js sends in _createDirectAllocation:
---   allocationId, orderId, sender, receiver, executor, amount, instrument,
---   holdingCids, status, createdAt, operator
+--   Step 2 (ACCEPT): Operator exercises Execute_Settlement at MATCH TIME.
+--     → Single-party tx by operator (non-interactive, Keycloak token).
+--     → Operator is the controller. Owner's authorization carries forward from
+--       being signatory of the consumed contract (DAML authorization rule).
+--     → NO external party key needed at settlement.
 --
-template AllocationRecord
+-- This replaces:
+--   - Splice AllocationFactory_Allocate + DvpLegAllocation (broken for ext parties)
+--   - AllocationRecord (operator-only signatory, no user consent on-chain)
+--
+-- @see https://docs.digitalasset.com/build/3.4/sdlc-howtos/smart-contracts/develop/patterns/propose-accept.html
+--
+template ExchangeAllocation
   with
     allocationId : Text       -- Unique allocation ID (e.g., "alloc-order-123")
-    orderId : Text            -- The exchange order ID this allocation belongs to
-    sender : Party            -- The order placer (funds locked from this party)
-    receiver : Text           -- The counterparty (empty string if unknown at order time)
-    executor : Party          -- The exchange party (settles at match time with its own key)
-    amount : Text             -- Amount allocated (Decimal as string)
-    instrument : Text         -- Token symbol (e.g., "CC", "CBTC", "USDT")
-    holdingCids : [Text]      -- References to the holding UTXOs backing this allocation
+    orderId : Text            -- The exchange order this allocation belongs to
+    owner : Party             -- The order placer (external party) — SIGNATORY
+    executor : Party          -- The exchange operator — CONTROLLER of Execute
+    amount : Decimal          -- Amount locked/committed
+    instrumentSymbol : Text   -- Token symbol (e.g., "CC", "CBTC")
+    side : Text               -- "BUY" or "SELL"
+    tradingPair : Text        -- e.g., "CC/CBTC"
     status : Text             -- "PENDING", "EXECUTED", "CANCELLED"
-    createdAt : Text          -- ISO timestamp of creation
-    operator : Party          -- Exchange operator (same as executor in most cases)
+    createdAt : Text          -- ISO timestamp
   where
-    signatory operator
-    observer sender, executor
+    -- CRITICAL: owner (external party) is the SOLE signatory.
+    -- This means the external party can create this contract alone (single-party tx).
+    -- The operator's authorization is NOT needed at creation time.
+    signatory owner
+    observer executor
 
-    -- Execute the allocation — transfer funds from sender to receiver.
-    -- Called by the exchange (executor) at MATCH TIME.
-    -- NO user key needed — the exchange acts as executor.
-    choice ExecuteAllocation : ContractId AllocationRecord
+    -- Execute the settlement at MATCH TIME.
+    --
+    -- The operator (executor) exercises this choice as a single-party tx.
+    -- DAML authorization rule: inside a choice body, the controller (executor)
+    -- AND all signatories of the consumed contract (owner) have authorization.
+    -- This gives combined authorization WITHOUT co-submission.
+    --
+    -- The choice is CONSUMING: the original ExchangeAllocation is archived.
+    --
+    -- PARTIAL FILLS: If matchQuantity < amount, two contracts are created:
+    --   1. EXECUTED allocation for the filled portion
+    --   2. PENDING allocation for the remaining amount (returned as result)
+    -- This allows subsequent matches to settle the remainder.
+    --
+    -- FULL FILLS: If matchQuantity >= amount, one EXECUTED contract is created.
+    --
+    -- Returns the PENDING remainder contract (for partial fills),
+    -- or the EXECUTED contract (for full fills).
+    choice Execute_Settlement : ContractId ExchangeAllocation
+      with
+        matchPrice : Decimal    -- The price the trade executed at
+        matchQuantity : Decimal -- Quantity matched
+        counterparty : Text     -- Party ID of the counterparty
+        tradeId : Text          -- Reference to the Trade record
       controller executor
       do
         assertMsg "Allocation not in PENDING status" (status == "PENDING")
-        create this with status = "EXECUTED"
+        assertMsg "Match quantity must be positive" (matchQuantity > 0.0)
 
-    -- Cancel the allocation — release locked funds back to sender.
-    -- Called when an order is cancelled. Either sender or executor can cancel.
-    choice CancelAllocation : ContractId AllocationRecord
-      controller executor
+        let remainingAmount = amount - matchQuantity
+
+        if remainingAmount > 0.0
+          then do
+            -- PARTIAL FILL: create EXECUTED record for filled portion
+            _ <- create this with
+              status = "EXECUTED"
+              amount = matchQuantity
+
+            -- Create PENDING remainder for subsequent matches
+            create this with
+              allocationId = allocationId <> "-remainder-" <> tradeId
+              amount = remainingAmount
+              status = "PENDING"
+          else do
+            -- FULL FILL: mark entire allocation as EXECUTED
+            create this with status = "EXECUTED"
+
+    -- Owner cancels their own allocation (e.g., user cancels order).
+    -- Single-party tx by the external party (owner signs alone).
+    choice Cancel_Settlement : ContractId ExchangeAllocation
+      controller owner
       do
         assertMsg "Allocation not in PENDING status" (status == "PENDING")
         create this with status = "CANCELLED"
 
-    -- Sender can also cancel their own allocation (e.g., user cancels order)
-    choice SenderCancelAllocation : ContractId AllocationRecord
-      controller sender
+    -- Operator cancels (e.g., expired allocation, ACS cleanup, order rejection).
+    -- Single-party tx by the operator.
+    --
+    -- DAML authorization: executor is controller, owner is signatory of the
+    -- consumed contract. Creating a new contract with signatory = owner is
+    -- allowed because owner's auth carries forward.
+    choice Operator_Cancel_Settlement : ContractId ExchangeAllocation
+      controller executor
       do
         assertMsg "Allocation not in PENDING status" (status == "PENDING")
         create this with status = "CANCELLED"
 
     -- Archive a completed allocation to free ACS space.
     -- Only EXECUTED or CANCELLED allocations can be archived.
+    choice Archive_ExchangeAllocation : ()
+      controller executor
+      do
+        assertMsg "Can only archive completed allocations" (status == "EXECUTED" || status == "CANCELLED")
+
+
+-- =============================================================================
+-- LEGACY: ALLOCATION RECORD (kept for backward compatibility)
+-- =============================================================================
+-- NOTE: New code should use ExchangeAllocation (Propose-Accept) above.
+-- AllocationRecord is kept for existing contracts in the ACS.
+--
+template AllocationRecord
+  with
+    allocationId : Text
+    orderId : Text
+    sender : Party
+    receiver : Text
+    executor : Party
+    amount : Text
+    instrument : Text
+    holdingCids : [Text]
+    status : Text
+    createdAt : Text
+    operator : Party
+  where
+    signatory operator
+    observer sender, executor
+
+    choice ExecuteAllocation : ContractId AllocationRecord
+      controller executor
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        create this with status = "EXECUTED"
+
+    choice CancelAllocation : ContractId AllocationRecord
+      controller executor
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        create this with status = "CANCELLED"
+
+    choice SenderCancelAllocation : ContractId AllocationRecord
+      controller sender
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        create this with status = "CANCELLED"
+
     choice ArchiveAllocation : ()
       controller operator
       do

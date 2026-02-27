@@ -23,7 +23,7 @@
 const EventEmitter = require('events');
 const WebSocket = require('ws');
 const config = require('../config');
-const { TOKEN_STANDARD_PACKAGE_ID, LEGACY_PACKAGE_ID } = require('../config/constants');
+const { TOKEN_STANDARD_PACKAGE_ID, INTERMEDIATE_LEGACY_PACKAGE_ID, LEGACY_PACKAGE_ID } = require('../config/constants');
 const tokenProvider = require('./tokenProvider');
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -60,6 +60,7 @@ class StreamingReadModel extends EventEmitter {
     this.operatorPartyId = config.canton.operatorPartyId;
     this.packageId = config.canton.packageIds?.clobExchange;
     this.legacyPackageId = LEGACY_PACKAGE_ID;
+    this.intermediateLegacyPackageId = INTERMEDIATE_LEGACY_PACKAGE_ID;
 
     // Template IDs to subscribe to
     this.templateIds = [];
@@ -83,7 +84,15 @@ class StreamingReadModel extends EventEmitter {
       `${this.packageId}:Order:Order`,
       `${this.packageId}:Settlement:Trade`,
       `${this.packageId}:Settlement:AllocationRecord`,
+      `${this.packageId}:Settlement:ExchangeAllocation`,
     ];
+    // Intermediate legacy (v2.3.0) — existing Order/Trade contracts on old package
+    if (this.intermediateLegacyPackageId && this.intermediateLegacyPackageId !== this.packageId) {
+      this.templateIds.push(`${this.intermediateLegacyPackageId}:Order:Order`);
+      this.templateIds.push(`${this.intermediateLegacyPackageId}:Settlement:Trade`);
+      this.templateIds.push(`${this.intermediateLegacyPackageId}:Settlement:AllocationRecord`);
+    }
+    // Original legacy (v1.0.0) — oldest Order/Trade contracts
     if (this.legacyPackageId && this.legacyPackageId !== this.packageId) {
       this.templateIds.push(`${this.legacyPackageId}:Order:Order`);
       this.templateIds.push(`${this.legacyPackageId}:Trade:Trade`);
@@ -500,7 +509,7 @@ class StreamingReadModel extends EventEmitter {
 
   _isAllocationTemplate(templateId) {
     const tid = typeof templateId === 'string' ? templateId : JSON.stringify(templateId);
-    return tid.includes('AllocationRecord');
+    return tid.includes('AllocationRecord') || tid.includes('ExchangeAllocation');
   }
 
   // ─── Order management ─────────────────────────────────────────────────
@@ -622,13 +631,17 @@ class StreamingReadModel extends EventEmitter {
       templateId,
       allocationId: payload.allocationId,
       orderId: payload.orderId,
-      sender: payload.sender,
+      // ExchangeAllocation uses owner/executor; AllocationRecord uses sender/receiver/executor
+      sender: payload.sender || payload.owner,
       receiver: payload.receiver,
       executor: payload.executor,
       amount: payload.amount,
-      instrument: payload.instrument,
+      instrument: payload.instrument || payload.instrumentSymbol,
       status: payload.status,
       createdAt: payload.createdAt,
+      // ExchangeAllocation-specific fields
+      side: payload.side,
+      tradingPair: payload.tradingPair,
     });
   }
 

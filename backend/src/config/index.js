@@ -122,9 +122,12 @@ const config = {
   },
 
   // Matching engine
+  // DISABLED BY DEFAULT — Huz reported our backend is flooding the participant
+  // node with CONTRACT_NOT_FOUND errors causing congestion.
+  // Must be explicitly enabled with MATCHING_ENGINE_ENABLED=true
   matchingEngine: {
-    enabled: process.env.MATCHING_ENGINE_ENABLED !== 'false',
-    intervalMs: parseInt(process.env.MATCHING_ENGINE_INTERVAL_MS || '1000', 10),
+    enabled: process.env.MATCHING_ENGINE_ENABLED === 'true',
+    intervalMs: parseInt(process.env.MATCHING_ENGINE_INTERVAL_MS || '5000', 10),
   },
 
   // Logging

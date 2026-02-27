@@ -74,6 +74,19 @@ class MatchingEngine {
     this._MEDIUM_INTERVAL = 10000;
     this._SLOW_INTERVAL = 30000;
     this._lastMatchTime = 0;
+
+    // ═══ CIRCUIT BREAKER — prevents flooding participant node ═══
+    // If we hit too many consecutive settlement failures, PAUSE the engine.
+    // This protects the Canton participant from CONTRACT_NOT_FOUND spam.
+    this._consecutiveSettlementFailures = 0;
+    this._CIRCUIT_BREAKER_THRESHOLD = 5;  // After 5 consecutive failures → pause
+    this._CIRCUIT_BREAKER_PAUSE_MS = 120000; // 2 minutes pause
+    this._circuitBreakerUntil = 0;
+    this._totalFailuresSinceStart = 0;
+
+    // ═══ Global CONTRACT_NOT_FOUND blacklist ═══
+    // Track allocation CIDs that returned CONTRACT_NOT_FOUND — never retry them.
+    this._archivedAllocationCids = new Set();
   }
 
   async getAdminToken() {
@@ -191,12 +204,24 @@ class MatchingEngine {
   }
 
   async _tryCancelStaleOrder(order, token) {
+    // ═══ DISABLED: Do NOT submit cancel commands to participant ═══
+    // Huz reported that our backend is flooding the participant node with
+    // CONTRACT_NOT_FOUND errors causing congestion. Cancel attempts on
+    // stale orders just generate MORE failed commands.
+    // Instead, just evict from local read model silently.
     if (!order?.contractId) return;
+    const orderId = order.orderId || order.contractId.substring(0, 24);
+    console.warn(`[MatchingEngine] 🚫 Skipping CancelOrder for ${orderId} — evicting from read model only (protecting participant from spam)`);
+    const streaming = this._getStreamingModel();
+    if (streaming) streaming.evictOrder(order.contractId);
+    if (order.allocationContractId) this._archivedAllocationCids.add(order.allocationContractId);
+    return;
+
+    /* ORIGINAL CODE - DISABLED TO PREVENT PARTICIPANT SPAM
     const packageId = config.canton.packageIds?.clobExchange;
     const operatorPartyId = config.canton.operatorPartyId;
     if (!packageId || !operatorPartyId) return;
 
-    const orderId = order.orderId || order.contractId.substring(0, 24);
     const templateId = order.templateId || `${packageId}:Order:Order`;
 
     // CancelOrder usually requires both operator + owner authorizers.
@@ -229,11 +254,9 @@ class MatchingEngine {
           break;
         } catch (attemptErr) {
           const msg = String(attemptErr?.message || attemptErr || '');
-          // CONTRACT_NOT_FOUND: The order contract is already archived.
-          // Stop immediately — no point trying other actAs strategies.
           if (msg.includes('CONTRACT_NOT_FOUND') || msg.includes('could not be found') ||
               msg.includes('Contract could not be found')) {
-            throw attemptErr; // Will be caught by outer catch which handles this
+            throw attemptErr;
           }
           const isAuthorizerError =
             msg.includes('DAML_AUTHORIZATION_ERROR') || msg.includes('requires authorizers');
@@ -255,7 +278,6 @@ class MatchingEngine {
     } catch (cancelErr) {
       const msg = cancelErr.message || '';
       if (msg.includes('CONTRACT_NOT_FOUND') || msg.includes('could not be found') || msg.includes('already')) {
-        // Order is already archived on the ledger — evict from read model
         const streaming = this._getStreamingModel();
         if (streaming) streaming.evictOrder(order.contractId);
         return;
@@ -265,9 +287,16 @@ class MatchingEngine {
         console.warn(`[MatchingEngine] ⚠️ CancelOrder failed for ${orderId}: ${msg.substring(0, 120)}`);
       }
     }
+    END OF DISABLED CODE */
   }
 
   async runMatchingCycle() {
+    // ═══ CIRCUIT BREAKER — protect participant from spam ═══
+    if (Date.now() < this._circuitBreakerUntil) {
+      // Silently skip — don't even log (to avoid log spam too)
+      return;
+    }
+
     if (this.matchingInProgress) {
       if (Date.now() - this.matchingStartTime > 25000) {
         console.warn('[MatchingEngine] ⚠️ matchingInProgress stuck for >25s — force-resetting');
@@ -570,12 +599,34 @@ class MatchingEngine {
 
         this.recentlyMatchedOrders.set(matchKey, Date.now());
 
+        // ═══ Pre-flight: Skip if either order's allocation is already known-archived ═══
+        if (buyOrder.allocationContractId && this._archivedAllocationCids.has(buyOrder.allocationContractId)) {
+          this._markInvalidSettlementOrder(buyOrder, 'Allocation archived (blacklisted)');
+          continue;
+        }
+        if (sellOrder.allocationContractId && this._archivedAllocationCids.has(sellOrder.allocationContractId)) {
+          this._markInvalidSettlementOrder(sellOrder, 'Allocation archived (blacklisted)');
+          continue;
+        }
+
         try {
           await this.executeMatch(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, token);
           console.log(`[MatchingEngine] ✅ Match executed successfully via Allocation API`);
+          // Reset circuit breaker on success
+          this._consecutiveSettlementFailures = 0;
           return true;
         } catch (error) {
-          console.error(`[MatchingEngine] ❌ Match execution failed:`, error.message);
+          this._consecutiveSettlementFailures++;
+          this._totalFailuresSinceStart++;
+          console.error(`[MatchingEngine] ❌ Match execution failed (${this._consecutiveSettlementFailures}/${this._CIRCUIT_BREAKER_THRESHOLD}):`, error.message?.substring(0, 200));
+
+          // ═══ CIRCUIT BREAKER: Too many consecutive failures → pause engine ═══
+          if (this._consecutiveSettlementFailures >= this._CIRCUIT_BREAKER_THRESHOLD) {
+            this._circuitBreakerUntil = Date.now() + this._CIRCUIT_BREAKER_PAUSE_MS;
+            console.error(`[MatchingEngine] 🛑 CIRCUIT BREAKER TRIPPED — ${this._consecutiveSettlementFailures} consecutive failures. Pausing for ${this._CIRCUIT_BREAKER_PAUSE_MS / 1000}s to protect participant node.`);
+            return false;
+          }
+
           // If auth/token expired, refresh immediately and allow instant retry
           // instead of waiting for the 30s recentlyMatched cooldown.
           if (error.message?.includes('401') || error.message?.includes('security-sensitive')) {
@@ -588,11 +639,17 @@ class MatchingEngine {
               error.message?.includes('could not be found') ||
               error.message?.includes('CONTRACT_NOT_FOUND')) {
             // Contract is archived on the ledger — evict from read model permanently
+            // AND blacklist the allocation CID to prevent future commands
             const streaming = this._getStreamingModel();
             if (streaming) {
               streaming.evictOrder(buyOrder.contractId);
               streaming.evictOrder(sellOrder.contractId);
             }
+            // Blacklist allocation CIDs permanently
+            if (buyOrder.allocationContractId) this._archivedAllocationCids.add(buyOrder.allocationContractId);
+            if (sellOrder.allocationContractId) this._archivedAllocationCids.add(sellOrder.allocationContractId);
+            this._markInvalidSettlementOrder(buyOrder, 'CONTRACT_NOT_FOUND — allocation archived');
+            this._markInvalidSettlementOrder(sellOrder, 'CONTRACT_NOT_FOUND — allocation archived');
             this.recentlyMatchedOrders.delete(matchKey);
             if (error.message?.includes('Buy FillOrder failed')) {
               break;
@@ -601,11 +658,6 @@ class MatchingEngine {
           }
 
           // Transient synchronizer errors — skip this match, retry on next cycle.
-          // IMPORTANT: Check the FULL error message (including inner cause) because the
-          // outer error may be wrapped as SELLER_ALLOCATION_FAILED or BUYER_ALLOCATION_FAILED
-          // but the underlying cause is a transient synchronizer disconnection.
-          // NOTE: FAILED_TO_EXECUTE_TRANSACTION is NOT transient — it means the operator's
-          // key is not hosted on the participant (a permanent config issue, not a network glitch).
           const isTransient = error.message?.includes('TRANSIENT_SYNCHRONIZER_ERROR') ||
               error.message?.includes('NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT') ||
               error.message?.includes('Not connected to a synchronizer') ||
@@ -613,6 +665,9 @@ class MatchingEngine {
           if (isTransient) {
             console.warn(`[MatchingEngine] ⏳ Transient synchronizer error — will retry on next cycle`);
             this.recentlyMatchedOrders.delete(matchKey);
+            // Quarantine BOTH orders' allocations to prevent immediate re-submission
+            this._markInvalidSettlementOrder(buyOrder, 'Synchronizer error — quarantined');
+            this._markInvalidSettlementOrder(sellOrder, 'Synchronizer error — quarantined');
             continue;
           }
 
@@ -620,15 +675,32 @@ class MatchingEngine {
           // Don't quarantine — the key may arrive when they re-login or place an order.
           if (error.message?.includes('SIGNING_KEY_MISSING')) {
             console.warn(`[MatchingEngine] ⚠️ Signing key not available for external party — skipping match (will retry when key is stored)`);
-            // Don't delete from recentlyMatchedOrders — keep the cooldown to avoid log spam
             continue;
           }
 
-          // Permanent allocation failures — quarantine the affected order and try to cancel it.
-          // IMPORTANT: SELLER_ALLOCATION_FAILED / BUYER_ALLOCATION_FAILED are only permanent
-          // if the cause is NOT a transient synchronizer error. The transient check above
-          // already catches those cases, so if we reach here, the cause is truly permanent
-          // (e.g., stale allocation, deadline expired, authorization mismatch).
+          // FAILED_TO_EXECUTE_TRANSACTION — Canton limitation with external parties.
+          // This is a PERMANENT protocol error (not transient). Quarantine both orders
+          // and DO NOT retry — it will never succeed with current architecture.
+          if (error.message?.includes('FAILED_TO_EXECUTE_TRANSACTION') ||
+              error.message?.includes('did not provide an external signature')) {
+            console.error(`[MatchingEngine] 🚫 Canton external party protocol limitation — quarantining orders (requires Propose-Accept redesign)`);
+            this._markInvalidSettlementOrder(buyOrder, 'Canton external party limitation');
+            this._markInvalidSettlementOrder(sellOrder, 'Canton external party limitation');
+            this.recentlyMatchedOrders.delete(matchKey);
+            continue;
+          }
+
+          // DAML_AUTHORIZATION_ERROR — permanent, quarantine
+          if (error.message?.includes('DAML_AUTHORIZATION_ERROR') || error.message?.includes('requires authorizers')) {
+            console.error(`[MatchingEngine] 🚫 DAML authorization error — quarantining orders`);
+            this._markInvalidSettlementOrder(buyOrder, 'DAML authorization error');
+            this._markInvalidSettlementOrder(sellOrder, 'DAML authorization error');
+            this.recentlyMatchedOrders.delete(matchKey);
+            continue;
+          }
+
+          // Permanent allocation failures — quarantine the affected order.
+          // DO NOT call _tryCancelStaleOrder to avoid generating more commands.
           const isPermanent = error.message?.includes('STALE_ALLOCATION_LOCK_MISSING') ||
               error.message?.includes('STALE_ALLOCATION_EXPIRED') ||
               error.message?.includes('SELLER_ALLOCATION_FAILED') ||
@@ -637,16 +709,14 @@ class MatchingEngine {
             const isSeller = error.message?.includes('SELLER_ALLOCATION_FAILED');
             const isBuyer = error.message?.includes('BUYER_ALLOCATION_FAILED');
             if (isSeller) {
-              this._markInvalidSettlementOrder(sellOrder, error.message);
-              await this._tryCancelStaleOrder(sellOrder, token);
+              this._markInvalidSettlementOrder(sellOrder, error.message?.substring(0, 100));
+              if (sellOrder.allocationContractId) this._archivedAllocationCids.add(sellOrder.allocationContractId);
             } else if (isBuyer) {
-              this._markInvalidSettlementOrder(buyOrder, error.message);
-              await this._tryCancelStaleOrder(buyOrder, token);
+              this._markInvalidSettlementOrder(buyOrder, error.message?.substring(0, 100));
+              if (buyOrder.allocationContractId) this._archivedAllocationCids.add(buyOrder.allocationContractId);
             } else {
-              this._markInvalidSettlementOrder(buyOrder, error.message);
-              this._markInvalidSettlementOrder(sellOrder, error.message);
-              await this._tryCancelStaleOrder(buyOrder, token);
-              await this._tryCancelStaleOrder(sellOrder, token);
+              this._markInvalidSettlementOrder(buyOrder, error.message?.substring(0, 100));
+              this._markInvalidSettlementOrder(sellOrder, error.message?.substring(0, 100));
             }
             this.recentlyMatchedOrders.delete(matchKey);
             continue;
@@ -727,153 +797,136 @@ class MatchingEngine {
     let tradeContractId = null;
     const buyIsPartial = new Decimal(buyOrder.remaining).gt(matchQty);
     const sellIsPartial = new Decimal(sellOrder.remaining).gt(matchQty);
-    const remainingBuyBase = new Decimal(buyOrder.remaining).minus(matchQty);
-    const remainingSellBase = new Decimal(sellOrder.remaining).minus(matchQty);
-    const buyLockPrice = new Decimal(buyOrder.price ?? matchPrice);
-    const remainingBuyQuote = remainingBuyBase.times(buyLockPrice);
     
     const sdkClient = getCantonSDKClient();
 
     // ═══════════════════════════════════════════════════════════════════
-    // STEP 1: Execute pre-authorized order allocations + operator payouts
+    // STEP 1: Execute pre-authorized ExchangeAllocations (Propose-Accept)
+    //
+    // Uses the ExchangeAllocation contract (Settlement.daml) which solves
+    // the Canton protocol limitation: DvpLegAllocation requires co-auth from
+    // operator + external party in a single tx → NOT supported for ext parties.
+    //
+    // ExchangeAllocation flow:
+    //   ORDER TIME: User creates ExchangeAllocation (signatory=owner, single-party)
+    //   MATCH TIME: Operator exercises Execute_Settlement (controller=executor, single-party)
+    //   → Owner's auth carries from signatory of consumed contract (DAML rule)
+    //   → NO external party co-authorization needed at settlement!
     // ═══════════════════════════════════════════════════════════════════
     console.log(`[MatchingEngine] 🔄 Settlement: ${matchQtyStr} ${baseSymbol} @ ${matchPrice} ${quoteSymbol}`);
-    console.log(`[MatchingEngine] 💰 Step 1: Executing pre-authorized allocations...`);
-    console.log(`[MatchingEngine]    Leg A lock: ${sellOrder.allocationContractId ? sellOrder.allocationContractId.substring(0, 24) + '...' : 'missing'} (${baseSymbol})`);
-    console.log(`[MatchingEngine]    Leg B lock: ${buyOrder.allocationContractId ? buyOrder.allocationContractId.substring(0, 24) + '...' : 'missing'} (${quoteSymbol})`);
+    console.log(`[MatchingEngine] 💰 Step 1: Executing ExchangeAllocation settlements (Propose-Accept)...`);
+    console.log(`[MatchingEngine]    Seller alloc: ${sellOrder.allocationContractId ? sellOrder.allocationContractId.substring(0, 24) + '...' : 'missing'} (${baseSymbol})`);
+    console.log(`[MatchingEngine]    Buyer alloc:  ${buyOrder.allocationContractId ? buyOrder.allocationContractId.substring(0, 24) + '...' : 'missing'} (${quoteSymbol})`);
 
     if (!sellOrder.allocationContractId || !buyOrder.allocationContractId) {
-      throw new Error('Settlement aborted: missing pre-authorized allocation on one or both orders');
+      throw new Error('Settlement aborted: missing ExchangeAllocation on one or both orders');
     }
 
-    let baseTransferResult = null;
-    let quoteTransferResult = null;
-    let replacementBuyAllocationCid = null;
-    let replacementSellAllocationCid = null;
+    const tradeId = `trade-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
 
-    // Execute inbound allocation locks (user -> operator escrow).
-    // Wrap each leg separately so the error identifies which order's allocation failed.
+    // For partial fills, Execute_Settlement returns a NEW ExchangeAllocation
+    // contract with status=PENDING and the remaining amount. We need this
+    // contract ID to update the Order's allocationCid via FillOrder.
+    let replacementSellAllocationCid = null;
+    let replacementBuyAllocationCid = null;
+
+    // Execute seller's ExchangeAllocation → operator-only single-party tx
     try {
-      baseTransferResult = await sdkClient.executeAllocation(
+      const sellerResult = await sdkClient.executeExchangeSettlement(
         sellOrder.allocationContractId,
         operatorPartyId,
-        baseSymbol,
-        sellOrder.owner,
-        operatorPartyId
+        matchPrice,
+        matchQty.toFixed(10),
+        buyOrder.owner,
+        tradeId,
+        sellOrder.owner
       );
-      if (!baseTransferResult) {
-        throw new Error(`${baseSymbol} inbound allocation execution returned null`);
+      if (!sellerResult) {
+        throw new Error(`${baseSymbol} seller Execute_Settlement returned null`);
+      }
+      // For partial fills, extract the PENDING remainder contract ID
+      if (sellIsPartial && sellerResult?.transaction?.events) {
+        for (const event of sellerResult.transaction.events) {
+          const created = event.created || event.CreatedEvent;
+          if (created?.contractId) {
+            const payload = created.createArgument || created.payload || {};
+            if (payload.status === 'PENDING') {
+              replacementSellAllocationCid = created.contractId;
+              break;
+            }
+          }
+        }
       }
     } catch (sellAllocErr) {
       const msg = sellAllocErr.message || String(sellAllocErr);
       throw new Error(`SELLER_ALLOCATION_FAILED: ${msg}`);
     }
 
+    // Execute buyer's ExchangeAllocation → operator-only single-party tx
     try {
-      quoteTransferResult = await sdkClient.executeAllocation(
+      const buyerResult = await sdkClient.executeExchangeSettlement(
         buyOrder.allocationContractId,
         operatorPartyId,
-        quoteSymbol,
-        buyOrder.owner,
-        operatorPartyId
-      );
-      if (!quoteTransferResult) {
-        throw new Error(`${quoteSymbol} inbound allocation execution returned null`);
+        matchPrice,
+        matchQty.toFixed(10),
+      sellOrder.owner,
+        tradeId,
+      buyOrder.owner
+    );
+      if (!buyerResult) {
+        throw new Error(`${quoteSymbol} buyer Execute_Settlement returned null`);
+      }
+      // For partial fills, extract the PENDING remainder contract ID
+      if (buyIsPartial && buyerResult?.transaction?.events) {
+        for (const event of buyerResult.transaction.events) {
+          const created = event.created || event.CreatedEvent;
+          if (created?.contractId) {
+            const payload = created.createArgument || created.payload || {};
+            if (payload.status === 'PENDING') {
+              replacementBuyAllocationCid = created.contractId;
+              break;
+            }
+          }
+        }
       }
     } catch (buyAllocErr) {
       const msg = buyAllocErr.message || String(buyAllocErr);
       throw new Error(`BUYER_ALLOCATION_FAILED: ${msg}`);
     }
 
-    // Create and execute payout allocations from operator to counterparties.
-    const payoutBase = await sdkClient.createAllocation(
-      operatorPartyId,
-      buyOrder.owner,
-      matchQtyStr,
-      baseSymbol,
-      operatorPartyId,
-      `payout-${sellOrder.orderId}-${Date.now()}`
-    );
-    const payoutQuote = await sdkClient.createAllocation(
-      operatorPartyId,
-      sellOrder.owner,
-      quoteAmountStr,
-      quoteSymbol,
-      operatorPartyId,
-      `payout-${buyOrder.orderId}-${Date.now()}`
-    );
-
-    const payoutBaseResult = await sdkClient.executeAllocation(
-      payoutBase?.allocationContractId,
-      operatorPartyId,
-      baseSymbol,
-      operatorPartyId,
-      buyOrder.owner
-    );
-    const payoutQuoteResult = await sdkClient.executeAllocation(
-      payoutQuote?.allocationContractId,
-      operatorPartyId,
-      quoteSymbol,
-      operatorPartyId,
-      sellOrder.owner
-    );
-
-    if (!payoutBaseResult || !payoutQuoteResult) {
-      throw new Error('Settlement aborted: operator payout allocation execution failed');
-    }
-
-    // For partial fills, re-lock the remaining collateral under operator-owned allocations.
-    // The new allocation CIDs are persisted back into the updated Order via FillOrder(newAllocationCid).
-    if (buyIsPartial) {
-      const buyReplacement = await sdkClient.createAllocation(
-        operatorPartyId,
-        operatorPartyId,
-        remainingBuyQuote.toFixed(10),
-        quoteSymbol,
-        operatorPartyId,
-        `relock-buy-${buyOrder.orderId}-${Date.now()}`
-      );
-      replacementBuyAllocationCid = buyReplacement?.allocationContractId || null;
-      if (!replacementBuyAllocationCid) {
-        throw new Error(`Settlement aborted: failed to create replacement quote allocation for partial BUY ${buyOrder.orderId}`);
-      }
-    }
-
-    if (sellIsPartial) {
-      const sellReplacement = await sdkClient.createAllocation(
-        operatorPartyId,
-        operatorPartyId,
-        remainingSellBase.toFixed(10),
-        baseSymbol,
-        operatorPartyId,
-        `relock-sell-${sellOrder.orderId}-${Date.now()}`
-      );
-      replacementSellAllocationCid = sellReplacement?.allocationContractId || null;
-      if (!replacementSellAllocationCid) {
-        throw new Error(`Settlement aborted: failed to create replacement base allocation for partial SELL ${sellOrder.orderId}`);
-      }
-    }
-
-    console.log(`[MatchingEngine]    ✅ Settlement COMPLETE via pre-authorized allocations + operator payout allocations`);
+    console.log(`[MatchingEngine]    ✅ Settlement COMPLETE via ExchangeAllocation (Propose-Accept, operator-only)`);
 
     // ═══════════════════════════════════════════════════════════════════
     // STEP 2: FillOrder on BOTH Canton order contracts AFTER settlement
+    //
+    // FillOrder controller = operator. Owner's auth carries from signatory
+    // of the consumed contract (DAML authorization rule).
+    // → OPERATOR-ONLY actAs — no external party co-auth needed.
+    //
+    // Previously used actAsParty: [operatorPartyId, buyOrder.owner] which
+    // caused NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT for external
+    // parties. Fixed: operator submits alone.
     // ═══════════════════════════════════════════════════════════════════
-    console.log(`[MatchingEngine] 📝 Step 2: Filling orders on-chain (post-settlement)...`);
+    console.log(`[MatchingEngine] 📝 Step 2: Filling orders on-chain (operator-only submission)...`);
 
     try {
-      const buyFillArg = { fillQuantity: matchQtyStr };
-      if (buyOrder.isNewPackage) buyFillArg.newAllocationCid = buyIsPartial ? replacementBuyAllocationCid : null;
+      const buyFillArg = {
+        fillQuantity: matchQtyStr,
+        // For partial fills, point Order to the PENDING remainder ExchangeAllocation
+        newAllocationCid: buyIsPartial && replacementBuyAllocationCid
+          ? replacementBuyAllocationCid
+          : null,
+      };
       await cantonService.exerciseChoice({
         token,
-        actAsParty: [operatorPartyId, buyOrder.owner],
+        actAsParty: [operatorPartyId],  // OPERATOR ONLY — owner auth from signatory
         templateId: buyOrder.templateId || `${packageId}:Order:Order`,
         contractId: buyOrder.contractId,
         choice: 'FillOrder',
         choiceArgument: buyFillArg,
         readAs: [operatorPartyId, buyOrder.owner],
       });
-      console.log(`[MatchingEngine] ✅ Buy order filled: ${buyOrder.orderId}${buyIsPartial ? ' (partial)' : ' (complete)'}`);
+      console.log(`[MatchingEngine] ✅ Buy order filled: ${buyOrder.orderId}${buyIsPartial ? ' (partial, remainder alloc: ' + (replacementBuyAllocationCid?.substring(0,20) || 'none') + '...)' : ' (complete)'}`);
     } catch (fillError) {
       console.error(`[MatchingEngine] ❌ Buy FillOrder FAILED after settlement: ${fillError.message}`);
       if (!fillError.message?.includes('already filled') && !fillError.message?.includes('CONTRACT_NOT_FOUND')) {
@@ -882,18 +935,23 @@ class MatchingEngine {
     }
 
     try {
-      const sellFillArg = { fillQuantity: matchQtyStr };
-      if (sellOrder.isNewPackage) sellFillArg.newAllocationCid = sellIsPartial ? replacementSellAllocationCid : null;
+      const sellFillArg = {
+        fillQuantity: matchQtyStr,
+        // For partial fills, point Order to the PENDING remainder ExchangeAllocation
+        newAllocationCid: sellIsPartial && replacementSellAllocationCid
+          ? replacementSellAllocationCid
+          : null,
+      };
       await cantonService.exerciseChoice({
         token,
-        actAsParty: [operatorPartyId, sellOrder.owner],
+        actAsParty: [operatorPartyId],  // OPERATOR ONLY — owner auth from signatory
         templateId: sellOrder.templateId || `${packageId}:Order:Order`,
         contractId: sellOrder.contractId,
         choice: 'FillOrder',
         choiceArgument: sellFillArg,
         readAs: [operatorPartyId, sellOrder.owner],
       });
-      console.log(`[MatchingEngine] ✅ Sell order filled: ${sellOrder.orderId}${sellIsPartial ? ' (partial)' : ' (complete)'}`);
+      console.log(`[MatchingEngine] ✅ Sell order filled: ${sellOrder.orderId}${sellIsPartial ? ' (partial, remainder alloc: ' + (replacementSellAllocationCid?.substring(0,20) || 'none') + '...)' : ' (complete)'}`);
     } catch (fillError) {
       console.error(`[MatchingEngine] ❌ Sell FillOrder FAILED after settlement: ${fillError.message}`);
       if (!fillError.message?.includes('already filled') && !fillError.message?.includes('CONTRACT_NOT_FOUND')) {
@@ -913,7 +971,7 @@ class MatchingEngine {
     // ═══════════════════════════════════════════════════════════════════
     try {
       const tradeTemplateId = `${packageId}:Settlement:Trade`;
-      const tradeId = `trade-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
+      // Use the tradeId generated for ExchangeAllocation Execute_Settlement
       const tradeResult = await cantonService.createContractWithTransaction({
           token,
         actAsParty: operatorPartyId,
@@ -983,7 +1041,7 @@ class MatchingEngine {
       buyOrderId: buyOrder.orderId,
       sellOrderId: sellOrder.orderId,
       timestamp: new Date().toISOString(),
-      settlementType: 'Allocation',
+      settlementType: 'ExchangeAllocation',
       instrumentAllocationId: sellOrder.allocationContractId || null,
       paymentAllocationId: buyOrder.allocationContractId || null,
     };

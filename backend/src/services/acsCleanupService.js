@@ -146,7 +146,49 @@ class ACSCleanupService {
       console.warn(`[ACSCleanup] Order scan failed: ${err.message}`);
     }
 
-    // ═══ 2. Archive EXECUTED and CANCELLED allocations ═══
+    // ═══ 2a. Archive EXECUTED and CANCELLED ExchangeAllocations (new Propose-Accept) ═══
+    try {
+      const exchangeAllocs = await cantonService.queryActiveContracts({
+        party: operatorPartyId,
+        templateIds: [`${packageId}:Settlement:ExchangeAllocation`],
+        pageSize: 200,
+      }, token);
+
+      const archivableExchange = (Array.isArray(exchangeAllocs) ? exchangeAllocs : []).filter(c => {
+        const payload = c.payload || c.createArgument || {};
+        return payload.status === 'EXECUTED' || payload.status === 'CANCELLED';
+      });
+
+      if (archivableExchange.length > 0) {
+        const batch = archivableExchange.slice(0, BATCH_SIZE);
+        for (const contract of batch) {
+          try {
+            await cantonService.exerciseChoice({
+              token,
+              actAsParty: [operatorPartyId],
+              templateId: `${packageId}:Settlement:ExchangeAllocation`,
+              contractId: contract.contractId,
+              choice: 'Archive_ExchangeAllocation',
+              choiceArgument: {},
+              readAs: [operatorPartyId],
+            });
+            this.stats.allocationsArchived++;
+            archivedThisCycle++;
+          } catch (err) {
+            if (!err.message?.includes('CONTRACT_NOT_FOUND')) {
+              console.warn(`[ACSCleanup] Failed to archive ExchangeAllocation: ${err.message}`);
+            }
+          }
+        }
+        if (batch.length > 0) {
+          console.log(`[ACSCleanup] Archived ${batch.length} completed ExchangeAllocations (${archivableExchange.length} total eligible)`);
+        }
+      }
+    } catch (err) {
+      console.warn(`[ACSCleanup] ExchangeAllocation scan failed: ${err.message}`);
+    }
+
+    // ═══ 2b. Archive EXECUTED and CANCELLED legacy AllocationRecords ═══
     try {
       const allocations = await cantonService.queryActiveContracts({
         party: operatorPartyId,
@@ -157,7 +199,6 @@ class ACSCleanupService {
       const archivable = (Array.isArray(allocations) ? allocations : []).filter(c => {
         const payload = c.payload || c.createArgument || {};
         if (payload.status !== 'EXECUTED' && payload.status !== 'CANCELLED') return false;
-        // Skip contracts from old packages that lack the ArchiveAllocation choice
         if (!this._isCompatiblePackage(c.templateId)) {
           return false;
         }
@@ -168,7 +209,6 @@ class ACSCleanupService {
         const batch = archivable.slice(0, BATCH_SIZE);
         for (const contract of batch) {
           try {
-            // CRITICAL: Always use CURRENT package template ID (has ArchiveAllocation choice)
             await cantonService.exerciseChoice({
               token,
               actAsParty: [operatorPartyId],
@@ -182,16 +222,16 @@ class ACSCleanupService {
             archivedThisCycle++;
           } catch (err) {
             if (!err.message?.includes('CONTRACT_NOT_FOUND')) {
-              console.warn(`[ACSCleanup] Failed to archive allocation: ${err.message}`);
+              console.warn(`[ACSCleanup] Failed to archive legacy allocation: ${err.message}`);
             }
           }
         }
         if (batch.length > 0) {
-          console.log(`[ACSCleanup] Archived ${batch.length} completed allocations (${archivable.length} total eligible)`);
+          console.log(`[ACSCleanup] Archived ${batch.length} completed legacy allocations (${archivable.length} total eligible)`);
         }
       }
     } catch (err) {
-      console.warn(`[ACSCleanup] Allocation scan failed: ${err.message}`);
+      console.warn(`[ACSCleanup] Legacy allocation scan failed: ${err.message}`);
     }
 
     // ═══ 3. Archive old trade records (after persisting to cache) ═══

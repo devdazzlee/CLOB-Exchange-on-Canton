@@ -1895,15 +1895,14 @@ class CantonSDKClient {
       throw new Error(`SIGNING_KEY_MISSING: No signing key stored for external parties: ${missing}. Users must re-onboard or re-login to store their signing key.`);
     }
 
-    // Per Huz: In interactive submission, ALL actAs parties must provide external
-    // signatures. The operator party's key is Keycloak-managed — we CAN'T sign for
-    // it externally (causes FAILED_TO_EXECUTE_TRANSACTION). So we try TWO strategies:
-    //   A) External parties only in actAs (executor excluded — its approval may
-    //      already be embedded in the allocation from creation time)
-    //   B) All parties in actAs (only works if operator key IS hosted locally)
-    const extOnlyActAs = [...new Set(externalParties)];
+    // Interactive submission requires explicit external signatures for ALL actAs
+    // parties. The DvpLegAllocation contract requires BOTH operator + ext-party
+    // as authorizers, so we MUST include both in actAs. We try TWO strategies:
+    //   A) All parties in actAs (required for DvpLegAllocation — operator + ext-party)
+    //   B) External parties only (fallback if operator approval is embedded in allocation)
     const allActAs = [...new Set([executorPartyId, ownerPartyId, receiverPartyId].filter(Boolean))];
-    const actAsStrategies = [extOnlyActAs, allActAs]
+    const extOnlyActAs = [...new Set(externalParties)];
+    const actAsStrategies = [allActAs, extOnlyActAs]
       .filter(arr => arr.length > 0)
       .filter((arr, i, self) => self.findIndex(x => x.join('|') === arr.join('|')) === i);
     
@@ -2034,16 +2033,16 @@ class CantonSDKClient {
         const keyInfo = await userRegistry.getSigningKey(partyId);
         if (!keyInfo) continue;
         console.log(`[CantonSDK]    🔑 Signing hash for ${partyId.substring(0, 30)}... (fingerprint: ${keyInfo.fingerprint?.substring(0, 20)}...)`);
-        const signatureBase64 = await signHashWithKey(keyInfo.keyBase64, prepareResult.preparedTransactionHash);
-        partySignatureEntries.push({
+      const signatureBase64 = await signHashWithKey(keyInfo.keyBase64, prepareResult.preparedTransactionHash);
+      partySignatureEntries.push({
           party: partyId,
-          signatures: [{
-            format: 'SIGNATURE_FORMAT_RAW',
-            signature: signatureBase64,
-            signedBy: keyInfo.fingerprint,
-            signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
-          }],
-        });
+        signatures: [{
+          format: 'SIGNATURE_FORMAT_RAW',
+          signature: signatureBase64,
+          signedBy: keyInfo.fingerprint,
+          signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
+        }],
+      });
       } else {
         unsignedParties.push(partyId);
       }
@@ -2056,7 +2055,7 @@ class CantonSDKClient {
         if (unsignedParties.length > 0) {
           console.warn(`[CantonSDK]    ⚠️ Missing signing keys for: ${unsignedParties.map(p => p.substring(0, 30) + '...').join(', ')}`);
           console.warn(`[CantonSDK]    💡 To fix: store the operator's signing key via POST /api/onboarding/store-signing-key`);
-        }
+    }
 
     const partySignatures = { signatures: partySignatureEntries };
         console.log(`[CantonSDK]    Collected ${partySignatureEntries.length} signature(s) for ${currentActAs.length} actAs parties (${unsignedParties.length} unsigned)`);
@@ -2286,8 +2285,24 @@ class CantonSDKClient {
         }
       }
 
-      // ── Strategy 3: All-parties non-interactive (last resort) ─────
+      // ── Strategy 3: DISABLED — all-parties non-interactive (last resort) ───
+      // DISABLED: Including external parties in actAs for non-interactive submission
+      // ALWAYS causes NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT.
+      // Per Canton docs: "External parties, Single submitting party: Only transactions
+      // requiring authorization from a single party are supported."
+      // Sending this command just floods the participant with rejected submissions.
+      //
+      // The correct fix is to redesign settlement using the Propose-Accept pattern:
+      // - Step 1: User authorizes allocation at order time (single-party tx)
+      // - Step 2: Operator executes transfer alone (single-party tx)
+      // See: https://docs.digitalasset.com/build/3.4/sdlc-howtos/smart-contracts/develop/patterns/propose-accept.html
       const allActAs = [...new Set([executorPartyId, ownerPartyId, receiverPartyId].filter(Boolean))];
+      const hasExtInActAs = allActAs.some(p => isExtParty(p));
+      if (hasExtInActAs) {
+        console.error(`[CantonSDK]    ❌ Cannot settle with external parties in actAs (Canton protocol limitation). Requires Propose-Accept redesign.`);
+        throw new Error('CANTON_EXTERNAL_PARTY_LIMITATION: Cannot co-authorize with external party. Redesign needed.');
+      }
+      // Only attempt if no external parties in actAs (e.g. operator→operator transfers)
       console.log(`[CantonSDK]    Utilities: last resort all-parties actAs: [${allActAs.map(p => p.substring(0, 20) + '...').join(', ')}]`);
       const result = await cantonService.exerciseChoice({
         token: adminToken,
@@ -2578,6 +2593,194 @@ class CantonSDKClient {
 
     console.warn(`[CantonSDK]    ⚠️ Could not cancel Utilities allocation ${allocationContractId.substring(0, 30)}... — may already be cancelled`);
     return null;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // EXCHANGE ALLOCATION — Propose-Accept Pattern for External Parties
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // Replaces Splice AllocationFactory_Allocate + DvpLegAllocation which require
+  // co-authorization from BOTH operator and external party (unsupported by Canton).
+  //
+  // Flow:
+  //   1. ORDER TIME: User creates ExchangeAllocation (single-party, user signs)
+  //   2. MATCH TIME: Operator exercises Execute_Settlement (single-party, operator submits)
+  //
+  // @see Settlement.daml ExchangeAllocation template
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Build a CreateCommand for ExchangeAllocation.
+   *
+   * This replaces buildAllocationInteractiveCommand() which called the Splice
+   * AllocationFactory_Allocate API (creates DvpLegAllocation → co-auth problem).
+   *
+   * ExchangeAllocation has signatory=owner only, so it's a single-party tx
+   * that the external party signs via interactive submission.
+   *
+   * @param {string} ownerPartyId - The order placer (external party, signatory)
+   * @param {string} executorPartyId - The exchange operator (controller of Execute)
+   * @param {string} amount - Amount to lock (Decimal)
+   * @param {string} symbol - Token symbol (e.g., "CC", "CBTC")
+   * @param {string} side - "BUY" or "SELL"
+   * @param {string} tradingPair - e.g., "CC/CBTC"
+   * @param {string} orderId - Unique order ID
+   * @returns {{ command: object }} Ready-to-submit CreateCommand
+   */
+  buildExchangeAllocationCreateCommand(ownerPartyId, executorPartyId, amount, symbol, side, tradingPair, orderId) {
+    const configModule = require('../config');
+    const packageId = configModule.canton.packageIds.clobExchange;
+
+    if (!packageId) {
+      throw new Error('CLOB_EXCHANGE_PACKAGE_ID is not configured');
+    }
+
+    const allocationId = `alloc-${orderId}`;
+    const now = new Date().toISOString();
+
+    return {
+      command: {
+        CreateCommand: {
+          templateId: `${packageId}:Settlement:ExchangeAllocation`,
+          createArguments: {
+            allocationId,
+            orderId,
+            owner: ownerPartyId,
+            executor: executorPartyId,
+            amount: toDamlNumericString(amount),
+            instrumentSymbol: symbol,
+            side: side.toUpperCase(),
+            tradingPair,
+            status: 'PENDING',
+            createdAt: now,
+          },
+        },
+      },
+      readAs: [ownerPartyId, executorPartyId],
+      synchronizerId: configModule.canton.synchronizerId,
+    };
+  }
+
+  /**
+   * Execute settlement on an ExchangeAllocation contract.
+   *
+   * Replaces executeAllocation() which exercised Allocation_ExecuteTransfer on
+   * Splice's DvpLegAllocation (requires co-auth from operator + external party).
+   *
+   * Execute_Settlement has controller=executor (operator). Owner's authorization
+   * carries forward from being signatory of the consumed contract (DAML rule).
+   * → Single-party non-interactive submission by the operator.
+   *
+   * @param {string} allocationContractId - The ExchangeAllocation contract ID
+   * @param {string} executorPartyId - The exchange operator
+   * @param {Decimal|string} matchPrice - Price the trade executed at
+   * @param {Decimal|string} matchQuantity - Quantity matched
+   * @param {string} counterparty - Counterparty party ID
+   * @param {string} tradeId - Trade reference
+   * @param {string} ownerPartyId - The allocation owner (for readAs)
+   * @returns {Object} Exercise result
+   */
+  async executeExchangeSettlement(allocationContractId, executorPartyId, matchPrice, matchQuantity, counterparty, tradeId, ownerPartyId) {
+    if (!allocationContractId) {
+      console.warn('[CantonSDK] No allocationContractId — skipping Execute_Settlement');
+      return null;
+    }
+
+    const configModule = require('../config');
+    const packageId = configModule.canton.packageIds.clobExchange;
+    const token = await tokenProvider.getServiceToken();
+    const synchronizerId = await cantonService.resolveSubmissionSynchronizerId(
+      token,
+      configModule.canton.synchronizerId
+    );
+
+    if (!packageId) {
+      throw new Error('CLOB_EXCHANGE_PACKAGE_ID is not configured');
+    }
+
+    console.log(`[CantonSDK] 🔄 Execute_Settlement on ExchangeAllocation: ${allocationContractId.substring(0, 30)}...`);
+    console.log(`[CantonSDK]    Executor: ${executorPartyId.substring(0, 30)}...`);
+    console.log(`[CantonSDK]    Owner: ${ownerPartyId ? ownerPartyId.substring(0, 30) + '...' : 'N/A'}`);
+
+    const readAsParties = [...new Set([executorPartyId, ownerPartyId].filter(Boolean))];
+
+    try {
+      const result = await cantonService.exerciseChoice({
+        token,
+        actAsParty: [executorPartyId],  // OPERATOR ONLY — single-party tx
+        templateId: `${packageId}:Settlement:ExchangeAllocation`,
+        contractId: allocationContractId,
+        choice: 'Execute_Settlement',
+        choiceArgument: {
+          matchPrice: toDamlNumericString(matchPrice),
+          matchQuantity: toDamlNumericString(matchQuantity),
+          counterparty: counterparty || '',
+          tradeId: tradeId || '',
+        },
+        readAs: readAsParties,
+        synchronizerId,
+      });
+
+      console.log(`[CantonSDK]    ✅ Execute_Settlement succeeded — updateId: ${result?.transaction?.updateId || 'N/A'}`);
+      return result;
+    } catch (err) {
+      const msg = String(err?.message || err || '');
+      console.error(`[CantonSDK]    ❌ Execute_Settlement failed: ${msg.substring(0, 200)}`);
+
+      if (msg.includes('CONTRACT_NOT_FOUND') || msg.includes('could not be found')) {
+        throw new Error(`STALE_ALLOCATION_LOCK_MISSING: CONTRACT_NOT_FOUND: ${msg.substring(0, 200)}`);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Cancel an ExchangeAllocation via Operator_Cancel_Settlement.
+   *
+   * Operator-only single-party submission. Used when:
+   * - The matching engine detects a stale allocation
+   * - ACS cleanup finds expired allocations
+   * - Order is cancelled (if Splice cancel also fails)
+   *
+   * @param {string} allocationContractId - The ExchangeAllocation contract ID
+   * @param {string} executorPartyId - The exchange operator
+   * @param {string} ownerPartyId - The allocation owner (for readAs)
+   * @returns {Object} Exercise result
+   */
+  async cancelExchangeAllocation(allocationContractId, executorPartyId, ownerPartyId = null) {
+    if (!allocationContractId) return null;
+
+    const configModule = require('../config');
+    const packageId = configModule.canton.packageIds.clobExchange;
+    const token = await tokenProvider.getServiceToken();
+    const synchronizerId = configModule.canton.synchronizerId;
+
+    if (!packageId) return null;
+
+    const readAsParties = [...new Set([executorPartyId, ownerPartyId].filter(Boolean))];
+
+    try {
+      const result = await cantonService.exerciseChoice({
+        token,
+        actAsParty: [executorPartyId],
+        templateId: `${packageId}:Settlement:ExchangeAllocation`,
+        contractId: allocationContractId,
+        choice: 'Operator_Cancel_Settlement',
+        choiceArgument: {},
+        readAs: readAsParties,
+        synchronizerId,
+      });
+
+      console.log(`[CantonSDK]    ✅ ExchangeAllocation cancelled: ${allocationContractId.substring(0, 30)}...`);
+      return { cancelled: true, result };
+    } catch (err) {
+      const msg = String(err?.message || err || '');
+      if (msg.includes('CONTRACT_NOT_FOUND') || msg.includes('could not be found')) {
+        return { cancelled: false, skipped: true, reason: 'already archived' };
+      }
+      console.warn(`[CantonSDK]    ⚠️ ExchangeAllocation cancel failed: ${msg.substring(0, 120)}`);
+      return { cancelled: false, skipped: false, reason: msg };
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════

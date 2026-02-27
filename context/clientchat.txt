@@ -358,3 +358,83 @@ What’s confusing us is why isn’t the operator party auto-signing here? Its k
 As the actAs parameter have 2 different parties it needs to have 2 different signature while submitting the transaction, I havent created a multi-sign tx before so dont have much idea on it , check out requestBody in /v2/interactive-submission/execute route, in partySignatures.signatures we can add multiple signatures (can find similar in ledger-api).
 
 But, we can run the choice Allocation_ExecuteTransfer with just the executor if all the other parties in transferleg have already sign the allocation. Also, just want to know in which scenario we would be needing both parties signature?
+
+[3:02 PM, 2/27/2026] +91 79903 24401: @AHMED 
+Are you running a service which is constantly submitting commands to ledger?, as the logs are filled with CONTRACT_NOT_FOUND. Please fix this as its causing a lot of congestion in participant node
+
+
+{"@timestamp":"2026-02-27T09:59:08.587Z","message":"Phase 1 started: Submitting 1 command(s) for interpretation on behalf of 8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c....","logger_name":"c.d.c.p.a.s.c.CommandSubmissionServiceImpl:participant=participant","thread_name":"canton-env-ec-218","level":"INFO","span-id":"56e50c23093b8c1f","span-parent-id":"ce24247ac87f6be5","trace-id":"f30c0daef4824064289279ea63a97ab4","span-name":"StreamTracker.track"}
+{"@timestamp":"2026-02-27T09:59:08.591Z","message":"CONTRACT_NOT_FOUND(11,29d73675): Contract could not be found with id 005118345ad74a3b1b4596c33a724a4a72f2e4654faf0115fd7ab75c73144dc814ca1212208a30a8c1297f8da60c55e2b9082339da5d1ffffdda36e619ffbdf3520b039520","logger_name":"c.d.c.p.a.s.c.CommandSubmissionServiceImpl:participant=participant","thread_name":"canton-env-ec-221","level":"INFO","trace-id":"f30c0daef4824064289279ea63a97ab4","location":"RejectionGenerators.scala:100","span-id":"56e50c23093b8c1f","error-code":"CONTRACT_NOT_FOUND(11,29d73675)","span-parent-id":"ce24247ac87f6be5","participant":"'participant'","commands":"{readAs: ['ext-c66004aee097::12206e3f47b598ddf574e13ab09896b837a921c0efd7d592fe1bf63339f97283707c'], deduplicationPeriod: {duration: 'PT30S'}, submittedAt: '2026-02-27T09:59:08.587494Z', submissionId: '29d73675-cd18-42f5-931a-670ea37cde20', actAs: ['8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c37332a753379c58e18d397e39cb82c68c15e4af7134be46561974292'], commandId: 'cmd-exercise-657027a2-f2f2-4b63-a435-3bd1f266dd2a', userId: '652db10c-71a6-458b-baf3-906418723859', workflowId: }","span-name":"StreamTracker.track"}
+{"@timestamp":"2026-02-27T09:59:08.591Z","message":"Request com.daml.ledger.api.v2.CommandService/SubmitAndWaitForTransaction by inprocess-grpc-5001: failed with NOT_FOUND/CONTRACT_NOT_FOUND(11,29d73675): Contract could not be found with id 005118345ad74a3b1b4596c33a724a4a72f2e4654faf0115fd7ab75c73144dc814ca1212208a30a8c1297f8da60c55e2b9082339da5d1ffffdda36e619ffbdf3520b039520","logger_name":"c.d.c.n.g.ApiRequestLogger:participant=participant","thread_name":"canton-env-ec-43","level":"INFO","span-id":"7088f4b0f0883f76","span-parent-id":"ce24247ac87f6be5","trace-id":"f30c0daef4824064289279ea63a97ab4","span-name":"logger"}
+{"@timestamp":"2026-02-27T09:59:08.776Z","message":"Phase 1 started: Submitting 1 command(s) for interpretation on behalf of 8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c....","logger_name":"c.d.c.p.a.s.c.CommandSubmissionServiceImpl:participant=participant","thread_name":"canton-env-ec-221","level":"INFO","span-id":"1b960379e38aee5c","span-parent-id":"12adc0239c0e3289","trace-id":"4fdcbcbe322e92355bb8dd45f2156c3b","span-name":"StreamTracker.track"}
+{"@timestamp":"2026-02-27T09:59:08.780Z","message":"CONTRACT_NOT_FOUND(11,2c97d0a1): Contract could not be found with id 005118345ad74a3b1b4596c33a724a4a72f2e4654faf0115fd7ab75c73144dc814ca1212208a30a8c1297f8da60c55e2b9082339da5d1ffffdda36e619ffbdf3520b039520","logger_name":"c.d.c.p.a.s.c.CommandSubmissionServiceImpl:participant=participant","thread_name":"canton-env-ec-215","level":"INFO","trace-id":"4fdcbcbe322e92355bb8dd45f2156c3b","location":"RejectionGenerators.scala:100","span-id":"1b960379e38aee5c","error-code":"CONTRACT_NOT_FOUND(11,2c97d0a1)","span-parent-id":"12adc0239c0e3289","participant":"'participant'","commands":"{readAs: ['ext-c66004aee097::12206e3f47b598ddf574e13ab09896b837a921c0efd7d592fe1bf63339f97283707c'], deduplicationPeriod: {duration: 'PT30S'}, submittedAt: '2026-02-27T09:59:08.776332Z', submissionId: '2c97d0a1-8e62-4823-b6a8-7d3c8e9b6dc6', actAs: ['8100b2db-86cf-40a1-8351-55483c151…
+[4:22 PM, 2/27/2026] AHMED: @~huz 
+we made progress signing keys are now stored and interactive settlement is being attempted. But we're hitting one last issue:
+When we do an interactive submission for Allocation_ExecuteTransfer with both the operator (8100b2db-...) and the external party (ext-edded1b16c64::...) in actAs, we provide the external party's Ed25519 signature in partySignatures. The participant should auto-sign for the operator (since it's a hosted party), but we get:
+
+FAILED_TO_EXECUTE_TRANSACTION: The following actAs parties did not provide an external signature: 8100b2db-86cf-40a1-8351-55483c151cdc::122087fa...
+
+The participant is NOT auto-signing for the operator in interactive mode. And when we try executor-only (non-interactive), the DAML DvpLegAllocation c
+?
+[4:22 PM, 2/27/2026] AHMED: @AHMED 
+Are you running a service which is constantly submitting commands to ledger?, as the logs are filled with CONTRACT_NOT_FOUND. Please fix this as its causing a lot of congestion in participant node
+
+
+{"@timestamp":"2026-02-27T09:59:08.587Z","message":"Phase 1 started: Submitting 1 command(s) for interpretation on behalf of 8100b2db-86cf-40a1-8351-55483c151cdc::122087fa379c....","logger_name":"c.d.c.p.a.s.c.CommandSubmissionServiceImpl:participant=participant","thread_name":"canton-env-ec-218","level":"INFO","span-id":"56e50c23093b8c1f","span-parent-id":"ce24247ac87f6be5","trace-id":"f30c0daef4824064289279ea63a97ab4","span-name":"StreamTracker.track"}
+{"@timestamp":"2026-02-27T09:59:08.591Z","message":"CONTRACT_NOT_FOUND(11,29d73675): Contract
+I’ll check
+
+
+[4:22 PM, 2/27/2026] AHMED: I’ll check
+[7:15 PM, 2/27/2026] Konain Bhai: @~huz 
+we made progress signing keys are now stored and interactive settlement is being attempted. But we're hitting one last issue:
+When we do an interactive submission for Allocation_ExecuteTransfer with both the operator (8100b2db-...) and the external party (ext-edded1b16c64::...) in actAs, we provide the external party's Ed25519 signature in partySignatures. The participant should auto-sign for the operator (since it's a hosted party), but we get:
+
+FAILED_TO_EXECUTE_TRANSACTION: The following actAs parties did not provide an external signature: 8100b2db-86cf-40a1-8351-55483c151cdc::122087fa...
+
+The participant is NOT auto-signing for the operator in interactive mode. And when we try executor-only (non-interactive), the DAML DvpLegAllocation c
+@~huz Kindly respond to this so that we can proceed
+[8:22 PM, 2/27/2026] +91 73530 98307: @~huz 
+we made progress signing keys are now stored and interactive settlement is being attempted. But we're hitting one last issue:
+When we do an interactive submission for Allocation_ExecuteTransfer with both the operator (8100b2db-...) and the external party (ext-edded1b16c64::...) in actAs, we provide the external party's Ed25519 signature in partySignatures. The participant should auto-sign for the operator (since it's a hosted party), but we get:
+
+FAILED_TO_EXECUTE_TRANSACTION: The following actAs parties did not provide an external signature: 8100b2db-86cf-40a1-8351-55483c151cdc::122087fa...
+
+The participant is NOT auto-signing for the operator in interactive mode. And when we try executor-only (non-interactive), the DAML DvpLegAllocation c
+@AHMED
+
+Neither of the two things you're asking for will fix this. coz:
+
+The root cause is a Canton protocol limitation documented here:
+https://docs.digitalasset.com/overview/3.3/explanations/canton/external-party.html
+
+Under Limitations it explicitly states:
+"External parties, Single submitting party: Only transactions requiring authorization from a single party are supported."
+
+Your DvpLegAllocation contract requires both the operator (internal party) AND the external party to co-authorize Allocation_ExecuteTransfer simultaneously. Canton's protocol does not support this. It doesn't matter how the operator key is hosted or shared.. the protocol will never allow an external party and a local party to co-authorize the same transaction together.
+
+The fix requires a redesign of your DvpLegAllocation contract. The correct Canton pattern for a CLOB settlement flow is:
+
+Step 1, External party authorizes at allocation time (single party transaction)
+When the user calls AllocationFactory_Allocate, they embed their consent into the allocation contract itself by signing it as the sole authorizer. Their authorization is captured on-chain at this point.
+
+Step 2: Operator executes alone (single party transaction)
+Allocation_ExecuteTransfer is exercised by the operator only. The operator consumes the allocation contract (which already contains the external party's embedded consent from Step 1) and executes. Only operator in actAs participant auto-signs, no interactive submission needed, no external signature required at execution time.
+
+This is the standard Canton Propose-and-Accept / Authorization pattern for multi-party workflows involving external parties. It is also the correct architecture for a CLOB at scale. you cannot require per-settlement external signatures if you want high throughput.
+
+References:
+- Canton external party limitations: https://docs.digitalasset.com/overview/3.3/explanations/canton/external-party.html
+- Daml Authorization Pattern: https://docs.digitalasset.com/build/3.4/sdlc-howtos/smart-contracts/develop/patterns/authorization.html
+- Daml Propose and Accept Pattern: https://docs.digitalasset.com/build/3.4/sdlc-howtos/smart-contracts/develop/patterns/propose-accept.html
+
+The contract redesign needs to happen.
+[9:53 PM, 2/27/2026] +91 79903 24401: @~huz 
+we made progress signing keys are now stored and interactive settlement is being attempted. But we're hitting one last issue:
+When we do an interactive submission for Allocation_ExecuteTransfer with both the operator (8100b2db-...) and the external party (ext-edded1b16c64::...) in actAs, we provide the external party's Ed25519 signature in partySignatures. The participant should auto-sign for the operator (since it's a hosted party), but we get:
+
+FAILED_TO_EXECUTE_TRANSACTION: The following actAs parties did not provide an external signature: 8100b2db-86cf-40a1-8351-55483c151cdc::122087fa...
+
+The participant is NOT auto-signing for the operator in interactive mode. And when we try executor-only (non-interactive), the DAML DvpLegAllocation c
+As @~Srishti Suratkal🖐🏻 mentioned the participant node will act as CPN and not SPN and for this reason we will need to give signature of every party present in actAs parameter.
+[10:00 PM, 2/27/2026] +91 79903 24401: You can create a signature from admin api using TopologyManagerWriteService but we would advise not to use this approach, rather as mentioned by @~Srishti Suratkal🖐🏻 please use a design pattern which can exercise Allocation_ExecuteTransfer with all signatories  https://docs.digitalasset.com/build/3.4/sdlc-howtos/smart-contracts/develop/patterns.html#

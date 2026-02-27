@@ -110,7 +110,7 @@ async function releaseReservation(orderId) {
   const db = getDb();
   try {
     const reservation = await db.orderReservation.findUnique({ where: { orderId } });
-    if (!reservation) return;
+  if (!reservation) return;
     await db.orderReservation.delete({ where: { orderId } });
     console.log(`[BalanceReservation] ➖ Released ${reservation.amount} ${reservation.asset} for ${orderId}`);
   } catch (err) {
@@ -122,19 +122,19 @@ async function releasePartialReservation(orderId, filledAmount) {
   const db = getDb();
   try {
     const reservation = await db.orderReservation.findUnique({ where: { orderId } });
-    if (!reservation) return;
+  if (!reservation) return;
 
-    const releaseAmt = Decimal.min(new Decimal(filledAmount), new Decimal(reservation.amount));
-    const remaining = Decimal.max(new Decimal(reservation.amount).minus(releaseAmt), new Decimal(0));
+  const releaseAmt = Decimal.min(new Decimal(filledAmount), new Decimal(reservation.amount));
+  const remaining = Decimal.max(new Decimal(reservation.amount).minus(releaseAmt), new Decimal(0));
 
-    if (remaining.lte(0)) {
+  if (remaining.lte(0)) {
       await db.orderReservation.delete({ where: { orderId } });
-    } else {
+  } else {
       await db.orderReservation.update({
         where: { orderId },
         data: { amount: remaining.toString() },
       });
-    }
+  }
     console.log(`[BalanceReservation] ➖ Partially released ${filledAmount} ${reservation.asset} for ${orderId} (remaining: ${remaining.toString()})`);
   } catch (err) {
     console.warn(`[BalanceReservation] releasePartialReservation failed for ${orderId}: ${err.message}`);
@@ -206,6 +206,9 @@ class OrderService {
   _extractOrderRefFromAllocationPayload(payload) {
     if (!payload || typeof payload !== 'object') return null;
     return (
+      // ExchangeAllocation (new Propose-Accept pattern)
+      payload?.orderId ||
+      // Splice allocation payloads (legacy)
       payload?.settlement?.settlementRef?.id ||
       payload?.allocation?.settlement?.settlementRef?.id ||
       payload?.settlementRef?.id ||
@@ -395,12 +398,25 @@ class OrderService {
     const sdkClient = getCantonSDKClient();
 
     try {
-      // cancelAllocation now works with or without SDK (has direct API fallback)
+      // Try new ExchangeAllocation cancel first (operator-only, single-party tx)
+      const exchangeCancelResult = await sdkClient.cancelExchangeAllocation(
+        allocationContractId, executorPartyId, partyId
+      );
+      if (exchangeCancelResult?.cancelled) {
+        console.log(`[OrderService] ✅ ExchangeAllocation cancelled for order ${orderId} — funds released`);
+        return exchangeCancelResult;
+      }
+      if (exchangeCancelResult?.skipped) {
+        console.log(`[OrderService] ⏭️ ExchangeAllocation cancel skipped for order ${orderId}: ${exchangeCancelResult.reason}`);
+        return exchangeCancelResult;
+      }
+
+      // Fallback: try legacy Splice allocation cancel
       const cancelResult = await sdkClient.cancelAllocation(allocationContractId, partyId, executorPartyId);
       if (cancelResult?.cancelled) {
-        console.log(`[OrderService] ✅ Allocation cancelled for order ${orderId} — funds released`);
+        console.log(`[OrderService] ✅ Legacy allocation cancelled for order ${orderId} — funds released`);
       } else if (cancelResult?.skipped) {
-        console.log(`[OrderService] ⏭️ Allocation cancel skipped for order ${orderId}: ${cancelResult.reason}`);
+        console.log(`[OrderService] ⏭️ Legacy allocation cancel skipped for order ${orderId}: ${cancelResult.reason}`);
       } else {
         console.warn(`[OrderService] ⚠️ Allocation cancel not confirmed for order ${orderId}`);
       }
@@ -621,22 +637,30 @@ class OrderService {
     // Create Order contract on Canton
     const timestamp = new Date().toISOString();
 
-    // All parties are external (Confirmation permission).
-    // Use interactive submission: prepare → user signs in browser → execute.
-    console.log(`[OrderService] Preparing allocation via interactive submission (step 1/2)`);
+    // ═══════════════════════════════════════════════════════════════════
+    // PROPOSE-ACCEPT PATTERN: Create ExchangeAllocation (user signs)
+    //
+    // Replaces Splice AllocationFactory_Allocate which creates DvpLegAllocation
+    // requiring co-authorization from operator + external party (unsupported).
+    //
+    // ExchangeAllocation has signatory=owner only → single-party interactive tx.
+    // At match time, the operator exercises Execute_Settlement (single-party tx).
+    // ═══════════════════════════════════════════════════════════════════
+    console.log(`[OrderService] Preparing ExchangeAllocation via interactive submission (step 1/2)`);
 
     const sdkClient = getCantonSDKClient();
-    const allocationPrep = await sdkClient.buildAllocationInteractiveCommand(
+    const allocationPrep = sdkClient.buildExchangeAllocationCreateCommand(
       partyId,
       operatorPartyId,
       String(lockInfo.amount),
       lockInfo.asset,
-      operatorPartyId,
+      orderType,
+      tradingPair,
       orderId
     );
 
     const readAs = [...new Set([operatorPartyId, partyId, ...(allocationPrep.readAs || [])])];
-    const disclosedContracts = allocationPrep.disclosedContracts || [];
+    const disclosedContracts = [];
     const synchronizerId = allocationPrep.synchronizerId || config.canton.synchronizerId;
 
     const prepareResult = await cantonService.prepareInteractiveSubmission({
@@ -772,14 +796,14 @@ class OrderService {
           if (!contractId && templateId.includes(':Order:Order')) {
             contractId = created.contractId;
           }
-          if (!allocationContractId && templateId.includes('Allocation')) {
+          // Match both ExchangeAllocation (new) and legacy Allocation contracts
+          if (!allocationContractId && (templateId.includes('ExchangeAllocation') || templateId.includes('Allocation'))) {
             allocationContractId = created.contractId;
           }
         }
       }
 
-      // Some allocation factory executions return allocationCid only in exercise-result payload,
-      // not as a top-level CreatedEvent. Extract it from the full execute response shape.
+      // Fallback: extract from nested payload structure
       if (!allocationContractId) {
         allocationContractId = this._extractAllocationCidFromExecuteResult(result);
       }
