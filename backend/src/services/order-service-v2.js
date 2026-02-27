@@ -157,8 +157,8 @@ class OrderServiceV2 {
       const baseInstrumentId = instrumentService.getInstrumentId(baseSymbol);
       const quoteInstrumentId = instrumentService.getInstrumentId(quoteSymbol);
 
-      // Legacy Order template arguments (from dd500bf8... Order.daml)
-      // Uses simple strings instead of variants
+     // Order template arguments
+     // Uses simple strings instead of variants
       const orderArgs = {
         orderId,
         owner: partyId,

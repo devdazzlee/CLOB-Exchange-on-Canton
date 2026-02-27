@@ -1004,11 +1004,7 @@ class OrderService {
     // First, get the order details to know what was locked
     let orderDetails = null;
     try {
-      const legacyPackageId = config.canton.packageIds?.legacy;
       const templateIdsToQuery = [`${packageId}:Order:Order`];
-      if (legacyPackageId && legacyPackageId !== packageId) {
-        templateIdsToQuery.push(`${legacyPackageId}:Order:Order`);
-      }
       const contracts = await cantonService.queryActiveContracts({
         party: partyId,
         templateIds: templateIdsToQuery,
@@ -1228,11 +1224,7 @@ class OrderService {
     }
 
     try {
-      const legacyPackageId = config.canton.packageIds?.legacy;
       const templateIdsToQuery = [`${packageId}:Order:Order`];
-      if (legacyPackageId && legacyPackageId !== packageId) {
-        templateIdsToQuery.push(`${legacyPackageId}:Order:Order`);
-      }
       const contracts = await cantonService.queryActiveContracts({
         party: partyId,
         templateIds: templateIdsToQuery,

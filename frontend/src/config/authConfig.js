@@ -10,18 +10,16 @@ import {
   OPERATOR_PARTY_ID, 
   API_BASE_URL,
   TOKEN_STANDARD_PACKAGE_ID, 
-  LEGACY_PACKAGE_ID 
 } from './constants';
 
 // Re-export everything from constants
-export { OPERATOR_PARTY_ID, API_BASE_URL, LEGACY_PACKAGE_ID };
+export { OPERATOR_PARTY_ID, API_BASE_URL };
 
-// Package ID for DAML contracts - from centralized constants
+// Package ID for DAML contracts - from centralized constants (v2.4.0)
 export const PACKAGE_ID = import.meta.env.VITE_PACKAGE_ID || TOKEN_STANDARD_PACKAGE_ID;
 
 export default {
   OPERATOR_PARTY_ID,
   API_BASE_URL,
   PACKAGE_ID,
-  LEGACY_PACKAGE_ID
 };

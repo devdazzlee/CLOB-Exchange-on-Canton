@@ -11,10 +11,15 @@
 
 const express = require('express');
 const router = express.Router();
+const Decimal = require('decimal.js');
 const { success, error } = require('../utils/response');
 const asyncHandler = require('../middleware/asyncHandler');
 const { ValidationError } = require('../utils/errors');
 const { getCantonSDKClient } = require('../services/canton-sdk-client');
+const { getAllNetTradeBalances } = require('../services/tradeSettlementService');
+const { getDb } = require('../services/db');
+
+Decimal.set({ precision: 20, rounding: Decimal.ROUND_DOWN });
 
 // ─────────────────────────────────────────────────────────
 // GET /api/balance/:partyId
@@ -32,6 +37,7 @@ router.get('/:partyId', asyncHandler(async (req, res) => {
   const sdkClient = getCantonSDKClient();
   
   try {
+    // ─── 1. Splice holdings from Canton SDK (UTXO-based) ───
     const balances = await sdkClient.getAllBalances(partyId);
     
     const available = {};
@@ -48,7 +54,46 @@ router.get('/:partyId', asyncHandler(async (req, res) => {
       total[sym] = parseFloat(amt) || 0;
     }
 
-    console.log(`[Balance] Balances:`, available);
+    // ─── 2. Trade credits/debits from PostgreSQL (hybrid model) ───
+    // ExchangeAllocation settlement does NOT move Splice token holdings.
+    // We add trade credits and subtract trade debits to get the real balance.
+    try {
+      const tradeAdjustments = await getAllNetTradeBalances(partyId);
+      for (const [sym, adj] of Object.entries(tradeAdjustments)) {
+        const adjNum = parseFloat(adj.toString()) || 0;
+        if (adjNum !== 0) {
+          available[sym] = (available[sym] || 0) + adjNum;
+          total[sym] = (total[sym] || 0) + adjNum;
+        }
+      }
+    } catch (tradeErr) {
+      console.warn(`[Balance] Trade adjustments lookup failed (non-critical): ${tradeErr.message}`);
+    }
+
+    // ─── 3. Subtract open order reservations ───
+    // Funds reserved for open orders reduce available balance.
+    try {
+      const db = getDb();
+      const reservations = await db.orderReservation.findMany({
+        where: { partyId },
+        select: { asset: true, amount: true },
+      });
+      for (const r of reservations) {
+        const resAmt = parseFloat(r.amount || '0');
+        if (resAmt > 0 && r.asset) {
+          available[r.asset] = (available[r.asset] || 0) - resAmt;
+        }
+      }
+    } catch (resErr) {
+      console.warn(`[Balance] Reservation lookup failed (non-critical): ${resErr.message}`);
+    }
+
+    // Clamp negatives to zero (rounding can cause tiny negatives)
+    for (const sym of Object.keys(available)) {
+      if (available[sym] < 0) available[sym] = 0;
+    }
+
+    console.log(`[Balance] Balances (hybrid):`, available);
 
     return success(res, {
       partyId,
@@ -58,8 +103,8 @@ router.get('/:partyId', asyncHandler(async (req, res) => {
       total,
       holdings: [],
       tokenStandard: true,
-      source: 'canton-sdk',
-    }, 'Balances retrieved from Canton SDK');
+      source: 'canton-sdk-hybrid',
+    }, 'Balances retrieved (hybrid: Splice holdings + trade adjustments)');
   } catch (err) {
     console.error(`[Balance] Canton SDK query failed:`, err.message);
     return success(res, {
@@ -159,6 +204,7 @@ router.get('/v2/:partyId', asyncHandler(async (req, res) => {
   const sdkClient = getCantonSDKClient();
   
   try {
+    // ─── 1. Splice holdings from Canton SDK ───
     const balances = await sdkClient.getAllBalances(partyId);
     
     const available = {};
@@ -175,7 +221,43 @@ router.get('/v2/:partyId', asyncHandler(async (req, res) => {
       total[sym] = parseFloat(amt) || 0;
     }
 
-    console.log(`[Balance V2] Balances for ${partyId.substring(0, 30)}...:`, available);
+    // ─── 2. Trade credits/debits (hybrid model) ───
+    try {
+      const tradeAdjustments = await getAllNetTradeBalances(partyId);
+      for (const [sym, adj] of Object.entries(tradeAdjustments)) {
+        const adjNum = parseFloat(adj.toString()) || 0;
+        if (adjNum !== 0) {
+          available[sym] = (available[sym] || 0) + adjNum;
+          total[sym] = (total[sym] || 0) + adjNum;
+        }
+      }
+    } catch (tradeErr) {
+      console.warn(`[Balance V2] Trade adjustments failed (non-critical): ${tradeErr.message}`);
+    }
+
+    // ─── 3. Subtract open order reservations ───
+    try {
+      const db = getDb();
+      const reservations = await db.orderReservation.findMany({
+        where: { partyId },
+        select: { asset: true, amount: true },
+      });
+      for (const r of reservations) {
+        const resAmt = parseFloat(r.amount || '0');
+        if (resAmt > 0 && r.asset) {
+          available[r.asset] = (available[r.asset] || 0) - resAmt;
+        }
+      }
+    } catch (resErr) {
+      console.warn(`[Balance V2] Reservation lookup failed (non-critical): ${resErr.message}`);
+    }
+
+    // Clamp negatives to zero
+    for (const sym of Object.keys(available)) {
+      if (available[sym] < 0) available[sym] = 0;
+    }
+
+    console.log(`[Balance V2] Balances (hybrid) for ${partyId.substring(0, 30)}...:`, available);
 
     return success(res, {
       partyId,
@@ -184,9 +266,9 @@ router.get('/v2/:partyId', asyncHandler(async (req, res) => {
       locked,
       total,
       holdings: [],
-      source: 'canton-sdk',
+      source: 'canton-sdk-hybrid',
       tokenStandard: true,
-    }, 'Balances retrieved from Canton SDK');
+    }, 'Balances retrieved (hybrid: Splice holdings + trade adjustments)');
   } catch (err) {
     console.error('[Balance V2] Canton SDK query failed:', err.message);
     return success(res, {

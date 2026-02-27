@@ -165,3 +165,35 @@ model QuotaCounter {
   @@unique([period, periodKey])
   @@index([period, periodKey])
 }
+
+// ─── 10. Trade Settlements ──────────────────────────────────────────────
+// Tracks balance changes from executed trades (hybrid balance model).
+//
+// When a trade matches, the ExchangeAllocation tracks on-chain authorization
+// but Splice token holdings don't actually move (Canton external-party
+// limitation). This table records the balance effect so the balance API
+// can return accurate available/locked amounts.
+//
+// Balance formula:
+//   available = Splice holdings + SUM(TradeSettlement.amount where partyId, asset)
+//             - SUM(OrderReservation.amount where partyId, asset)
+//
+// Positive amount = CREDIT (received tokens from trade)
+// Negative amount = DEBIT  (sent tokens in trade)
+model TradeSettlement {
+  id         String   @id @default(uuid())
+  tradeId    String   // Reference to on-chain Trade contract
+  partyId    String   // Party whose balance changes
+  asset      String   // Token symbol (e.g., "CC", "CBTC")
+  amount     String   // Decimal string — positive = credit, negative = debit
+  side       String   // "BUY" or "SELL" — the party's side in the trade
+  orderId    String?  // Order that was filled
+  tradingPair String  // e.g., "CC/CBTC"
+  price      String   // Trade execution price
+  quantity   String   // Trade quantity (base asset)
+  createdAt  DateTime @default(now())
+
+  @@index([partyId, asset])
+  @@index([tradeId])
+  @@index([partyId])
+}

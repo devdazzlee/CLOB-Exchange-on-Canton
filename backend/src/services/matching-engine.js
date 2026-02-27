@@ -456,7 +456,14 @@ class MatchingEngine {
         const contractTemplateId = payload.templateId || `${packageId}:Order:Order`;
         const isNewPackage = contractTemplateId.startsWith(packageId);
 
-        // Extract allocationCid (Allocation contract ID for settlement)
+        // CRITICAL: Skip orders from old packages — their allocations are
+        // DvpLegAllocation or AllocationRecord, NOT ExchangeAllocation.
+        // Trying Execute_Settlement on those causes CONTRACT_NOT_FOUND.
+        if (!isNewPackage) {
+          continue;
+        }
+
+        // Extract allocationCid (ExchangeAllocation contract ID for settlement)
         const rawAllocationCid = payload.allocationCid || '';
         let allocationCid = (rawAllocationCid && rawAllocationCid !== 'FILL_ONLY' && rawAllocationCid !== 'NONE' && rawAllocationCid.length >= 10)
           ? rawAllocationCid
@@ -957,6 +964,36 @@ class MatchingEngine {
       if (!fillError.message?.includes('already filled') && !fillError.message?.includes('CONTRACT_NOT_FOUND')) {
         throw new Error(`Post-settlement Sell FillOrder failed: ${fillError.message}`);
       }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // STEP 2b: Record trade balance effects in PostgreSQL
+    //
+    // ExchangeAllocation settlement does NOT move Splice token holdings.
+    // We record credits/debits so the balance API can compute accurate
+    // available balances using the hybrid model:
+    //   available = Splice holdings + trade credits - trade debits - reservations
+    // ═══════════════════════════════════════════════════════════════════
+    try {
+      const { recordTradeSettlement, isTradeRecorded } = require('./tradeSettlementService');
+      const alreadyRecorded = await isTradeRecorded(tradeId);
+      if (!alreadyRecorded) {
+        await recordTradeSettlement({
+          tradeId,
+          buyer: buyOrder.owner,
+          seller: sellOrder.owner,
+          baseSymbol,
+          quoteSymbol,
+          baseAmount: matchQtyStr,
+          quoteAmount: quoteAmountStr,
+          price: matchPrice,
+          tradingPair,
+          buyOrderId: buyOrder.orderId,
+          sellOrderId: sellOrder.orderId,
+        });
+      }
+    } catch (tsErr) {
+      console.warn(`[MatchingEngine] ⚠️ TradeSettlement recording failed (non-critical): ${tsErr.message}`);
     }
 
     // Release balance reservations for filled quantities

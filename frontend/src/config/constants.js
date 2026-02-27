@@ -32,16 +32,11 @@ export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ||
 // =============================================================================
 
 /**
- * Token Standard Package (clob-wolfedge-tokens v2.0.0)
- * Contains: Instrument, Holding, Settlement, OrderV3
+ * Token Standard Package (clob-wolfedge-tokens v2.4.0)
+ * Contains: Instrument, Holding, Settlement, Order, OrderV3, ExchangeAllocation
+ * THIS IS THE ONLY PACKAGE ID — all old packages are retired.
  */
-export const TOKEN_STANDARD_PACKAGE_ID = 'f552adda6b4c5ed9caa3c943d004c0e727cc29df62e1fdc91b9f1797491f9390';
-
-/**
- * Legacy Package (clob-exchange v1.0.0)
- * Contains: UserAccount, Order, Trade, MasterOrderBook
- */
-export const LEGACY_PACKAGE_ID = 'dd500bf887d7e153ee6628b3f6722f234d3d62ce855572ff7ce73b7b3c2afefd';
+export const TOKEN_STANDARD_PACKAGE_ID = '0224efbf74e4ecb40083f7090a9f12145c607d76da220a91eedc21ca491d24fa';
 
 // =============================================================================
 // TRADING PAIRS
@@ -88,7 +83,6 @@ export default {
   
   // Package IDs
   TOKEN_STANDARD_PACKAGE_ID,
-  LEGACY_PACKAGE_ID,
   
   // Trading
   TRADING_PAIRS,

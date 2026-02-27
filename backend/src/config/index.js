@@ -13,7 +13,6 @@
 // Import centralized constants
 const {
   TOKEN_STANDARD_PACKAGE_ID,
-  LEGACY_PACKAGE_ID,
   TEMPLATE_IDS,
   TRADING_PAIRS,
   SUPPORTED_TOKENS,
@@ -58,9 +57,9 @@ const config = {
     // Package name for template IDs (package-name format)
     packageName: process.env.PACKAGE_NAME || 'clob-exchange',
 
-    // Package ID for template IDs (package-id format) - REQUIRED for UserAccount creation
-    // Uses centralized constant from constants.js
-    packageId: process.env.CLOB_EXCHANGE_PACKAGE_ID || LEGACY_PACKAGE_ID,
+    // Package ID for template IDs — uses the current Token Standard package
+    // All old/legacy package IDs have been removed per client requirement
+    packageId: process.env.CLOB_EXCHANGE_PACKAGE_ID || TOKEN_STANDARD_PACKAGE_ID,
     
     // Token Standard Package ID (Instrument, Holding, Settlement, OrderV3)
     // Uses centralized constant from constants.js
@@ -75,17 +74,13 @@ const config = {
       scope: process.env.OAUTH_SCOPE || 'openid profile email daml_ledger_api',
     },
 
-    // Add packageIds for validation compatibility
+    // All package IDs now point to the SAME current package (v2.4.0)
     get packageIds() {
       return {
-        // For Order creation/matching: use new package (v2.1.0 with FillOrder partial fill support)
         clobExchange: this.tokenStandardPackageId,
-        // For UserAccount: keep using legacy package
-        userAccount: this.packageId || this.packageName,
-        // Token Standard package (Holding, Settlement, etc.)
+        userAccount: this.tokenStandardPackageId,
         tokenStandard: this.tokenStandardPackageId,
-        // Legacy package (for querying old orders that haven't been matched yet)
-        legacy: this.packageId || LEGACY_PACKAGE_ID,
+        legacy: this.tokenStandardPackageId, // No more old packages
       };
     },
 
@@ -231,7 +226,6 @@ const config = {
 // Re-export constants for convenience
 config.constants = {
   TOKEN_STANDARD_PACKAGE_ID,
-  LEGACY_PACKAGE_ID,
   TEMPLATE_IDS,
   TRADING_PAIRS,
   SUPPORTED_TOKENS,

@@ -147,154 +147,117 @@ class ExchangeController {
 
   /**
    * POST /v1/orders
-   * Place a new order using Canton ledger
+   * Place a new order using ExchangeAllocation (Propose-Accept) flow.
+   *
+   * Delegates to OrderService.placeOrder() which:
+   * 1. Validates balance via Canton SDK
+   * 2. Reserves balance in database
+   * 3. Prepares ExchangeAllocation creation (interactive submission)
+   *
+   * If the user is an external party, returns { requiresSignature: true }
+   * so the frontend can sign the prepared transaction. The frontend then
+   * calls POST /api/orders/execute-place with the signature.
+   *
+   * CRITICAL: The old direct-create approach set allocationCid: "" which
+   * caused the matching engine to skip these orders (allocationCid is required).
    */
   placeOrder = asyncHandler(async (req, res) => {
     const requestId = crypto.randomUUID();
     const {
       pair,
+      tradingPair: altPair,
       side,
+      orderType: altSide,
       type,
+      orderMode: altType,
       price,
       quantity,
-      clientOrderId
+      clientOrderId,
+      partyId: bodyPartyId,
     } = req.body;
 
+    // Normalize field names (support both v1 format and legacy format)
+    const effectivePair = pair || altPair;
+    const effectiveSide = (side || altSide || '').toUpperCase();
+    const effectiveType = (type || altType || 'LIMIT').toUpperCase();
+    const effectiveQuantity = quantity;
+    const stopPrice = req.body.stopLossPrice || req.body.stopPrice || null;
+
     // Validation
-    if (!pair || !side || !type || !quantity) {
-      throw new ValidationError('Missing required fields: pair, side, type, quantity', {
-        missing: ['pair', 'side', 'type', 'quantity'].filter(f => !req.body[f])
+    if (!effectivePair || !effectiveSide || !effectiveType || !effectiveQuantity) {
+      throw new ValidationError('Missing required fields: pair/tradingPair, side/orderType, type/orderMode, quantity', {
+        missing: ['pair', 'side', 'type', 'quantity'].filter(f => !req.body[f] && !req.body[{pair:'tradingPair',side:'orderType',type:'orderMode'}[f] || ''])
       });
     }
 
-    if (type.toUpperCase() === 'LIMIT' && !price) {
+    if (effectiveType === 'LIMIT' && !price) {
       throw new ValidationError('Price is required for LIMIT orders');
     }
 
-    if (!['BUY', 'SELL'].includes(side.toUpperCase())) {
+    if (!['BUY', 'SELL'].includes(effectiveSide)) {
       throw new ValidationError('Invalid side. Must be BUY or SELL');
     }
 
-    if (!['LIMIT', 'MARKET', 'STOP_LOSS'].includes(type.toUpperCase())) {
+    if (!['LIMIT', 'MARKET', 'STOP_LOSS'].includes(effectiveType)) {
       throw new ValidationError('Invalid type. Must be LIMIT, MARKET, or STOP_LOSS');
     }
 
-    // Validate STOP_LOSS specific fields
-    if (type.toUpperCase() === 'STOP_LOSS') {
-      const stopLossPrice = req.body.stopLossPrice || req.body.stopPrice;
-      if (!stopLossPrice || parseFloat(stopLossPrice) <= 0) {
+    if (effectiveType === 'STOP_LOSS') {
+      if (!stopPrice || parseFloat(stopPrice) <= 0) {
         throw new ValidationError('stopLossPrice (or stopPrice) is required and must be positive for STOP_LOSS orders');
       }
     }
 
-    // Get party from authenticated request (WALLET AUTH, NOT KEYCLOAK)
-    const partyId = req.walletId;
+    // Get party from wallet auth OR request body (for legacy compat)
+    const partyId = req.walletId || bodyPartyId || req.headers['x-user-id'];
     if (!partyId) {
-      throw new LedgerError(ErrorCodes.UNAUTHORIZED, 'Wallet authentication required');
+      throw new LedgerError(ErrorCodes.UNAUTHORIZED, 'Wallet authentication required (walletId, partyId, or x-user-id header)');
     }
 
-    // Generate deterministic command ID for idempotency
-    const orderId = clientOrderId || crypto.randomUUID();
-    const commandId = `cmd-place-${orderId}`;
-
-    console.log(`[ExchangeAPI] Placing order: ${orderId} (${side} ${quantity} ${pair} @ ${price || 'MARKET'})`);
+    console.log(`[ExchangeAPI] Placing order via ExchangeAllocation flow: ${effectiveSide} ${effectiveQuantity} ${effectivePair} @ ${price || 'MARKET'}`);
 
     try {
-      const token = await tokenProvider.getServiceToken();
-
-      // Use template ID helper for proper format
-      const { orderTemplateId } = require('../../utils/templateId');
-      const templateId = orderTemplateId();
-
-      // Determine initial status (STOP_LOSS starts as PENDING_TRIGGER)
-      const isStopLoss = type.toUpperCase() === 'STOP_LOSS';
-      const initialStatus = isStopLoss ? 'PENDING_TRIGGER' : 'OPEN';
-      const stopLossPrice = req.body.stopLossPrice || req.body.stopPrice || null;
-
-      // Determine price to store
-      let orderPrice;
-      if (type.toUpperCase() === 'LIMIT' && price) {
-        orderPrice = price.toString();
-      } else if (isStopLoss && stopLossPrice) {
-        orderPrice = stopLossPrice.toString();
-      } else {
-        orderPrice = null;
-      }
-
-      // Submit CreateCommand via submit-and-wait-for-transaction
-      const result = await cantonService.createContractWithTransaction({
-        token,
-        actAsParty: partyId,
-        templateId,
-        createArguments: {
-          orderId,
-          owner: partyId,
-          orderType: side.toUpperCase(),
-          orderMode: type.toUpperCase(),
-          tradingPair: pair,
-          price: orderPrice,
-          quantity: quantity.toString(),
-          filled: "0.0",
-          status: initialStatus,
-          timestamp: new Date().toISOString(),
-          operator: config.canton.operatorPartyId,
-          allocationCid: ""
-        },
-        readAs: [config.canton.operatorPartyId]
+      // Delegate to OrderService — handles ExchangeAllocation + balance + reservation
+      const orderService = getOrderServiceInstance();
+      const result = await orderService.placeOrder({
+        partyId,
+        tradingPair: effectivePair,
+        orderType: effectiveSide,
+        orderMode: effectiveType,
+        price: price || null,
+        quantity: effectiveQuantity,
+        stopPrice,
       });
 
-      // Extract from response per Canton spec
-      const transaction = result.transaction;
-      const createdEvent = transaction?.events?.find(e => e.created || e.CreatedEvent);
-      const contractId = createdEvent?.created?.contractId ||
-        createdEvent?.CreatedEvent?.contractId;
-
-      console.log(`[ExchangeAPI] ✅ Order placed: ${orderId} -> ${contractId}`);
-
-      // Register stop-loss if this is a STOP_LOSS order or has stopLossPrice
-      let stopLossRegistered = false;
-      const effectiveStopPrice = stopLossPrice || req.body.stopLossPrice || null;
-      if (isStopLoss || (effectiveStopPrice && parseFloat(effectiveStopPrice) > 0)) {
-        try {
-          const { getStopLossService } = require('../../services/stopLossService');
-          const stopLossService = getStopLossService();
-          
-          await stopLossService.registerStopLoss({
-            orderContractId: contractId,
-            orderId,
-            tradingPair: pair,
-            orderType: side.toUpperCase(),
-            stopPrice: effectiveStopPrice,
-            partyId: partyId,
-            quantity: quantity?.toString() || '0',
-            allocationContractId: null, // Set by order-service when using Allocation flow
-          });
-          
-          stopLossRegistered = true;
-          console.log(`[ExchangeAPI] ✅ Stop-loss registered for order ${orderId} (triggers at ${effectiveStopPrice})`);
-        } catch (stopLossError) {
-          console.warn(`[ExchangeAPI] ⚠️  Failed to register stop-loss:`, stopLossError.message);
-          // Don't fail the order placement if stop-loss registration fails
-        }
+      // If interactive signing is needed, return the prepared transaction
+      if (result.requiresSignature) {
+        console.log(`[ExchangeAPI] ↩ Returning prepared transaction for interactive signing (step: ${result.step})`);
+        return res.status(200).json({
+          success: true,
+          data: result,
+        });
       }
+
+      // Order placed directly (local party / no signing needed)
+      console.log(`[ExchangeAPI] ✅ Order placed: ${result.orderId} -> ${result.contractId}`);
 
       return success(res, {
         order: {
-          contractId,
-          clientOrderId: orderId,
-          pair,
-          side: side.toUpperCase(),
-          type: type.toUpperCase(),
-          price: type.toUpperCase() === 'LIMIT' ? price : null,
-          quantity,
+          contractId: result.contractId,
+          clientOrderId: result.orderId,
+          pair: effectivePair,
+          side: effectiveSide,
+          type: effectiveType,
+          price: effectiveType === 'LIMIT' ? price : null,
+          quantity: effectiveQuantity,
           filledQuantity: '0',
-          status: initialStatus,
+          status: result.status || 'OPEN',
           createdAt: new Date().toISOString(),
-          stopPrice: effectiveStopPrice,
-          stopLossRegistered
+          stopPrice,
+          allocationContractId: result.allocationContractId || null,
         }
       }, {
-        updateId: transaction?.updateId
+        updateId: result.updateId || null
       }, 201);
 
     } catch (err) {
@@ -304,7 +267,6 @@ class ExchangeController {
         return error(res, err, requestId);
       }
 
-      // Check if it's a fetch response error
       if (err.response) {
         const ledgerError = await createLedgerErrorFromResponse(err.response, 'Place order');
         return error(res, ledgerError, requestId);
@@ -560,21 +522,65 @@ class ExchangeController {
     }
 
     try {
-      const token = await tokenProvider.getServiceToken();
+      // ── Use Canton SDK (hybrid model) for accurate balances ──
+      const { getCantonSDKClient } = require('../../services/canton-sdk-client');
+      const { getAllNetTradeBalances } = require('../../services/tradeSettlementService');
+      const { getDb } = require('../../services/db');
 
-      // Query Balance contracts from ledger
-      const templateId = 'clob-exchange:Balance';
+      const sdkClient = getCantonSDKClient();
+      const sdkBalances = await sdkClient.getAllBalances(partyId);
 
-      const balanceContracts = await cantonService.queryContracts({
-        templateId,
-        party: partyId
-      }, token);
+      const available = {};
+      const locked = {};
+      const total = {};
 
-      // Build balances array
-      const balances = balanceContracts.map(contract => ({
-        asset: contract.payload.asset,
-        available: contract.payload.available,
-        locked: contract.payload.locked
+      for (const [sym, amt] of Object.entries(sdkBalances.available || {})) {
+        available[sym] = parseFloat(amt) || 0;
+      }
+      for (const [sym, amt] of Object.entries(sdkBalances.locked || {})) {
+        locked[sym] = parseFloat(amt) || 0;
+      }
+      for (const [sym, amt] of Object.entries(sdkBalances.total || {})) {
+        total[sym] = parseFloat(amt) || 0;
+      }
+
+      // Add trade credits/debits (hybrid model)
+      try {
+        const tradeAdjustments = await getAllNetTradeBalances(partyId);
+        for (const [sym, adj] of Object.entries(tradeAdjustments)) {
+          const adjNum = parseFloat(adj.toString()) || 0;
+          if (adjNum !== 0) {
+            available[sym] = (available[sym] || 0) + adjNum;
+            total[sym] = (total[sym] || 0) + adjNum;
+          }
+        }
+      } catch (_) { /* non-critical */ }
+
+      // Subtract open order reservations
+      try {
+        const db = getDb();
+        const reservations = await db.orderReservation.findMany({
+          where: { partyId },
+          select: { asset: true, amount: true },
+        });
+        for (const r of reservations) {
+          const resAmt = parseFloat(r.amount || '0');
+          if (resAmt > 0 && r.asset) {
+            available[r.asset] = (available[r.asset] || 0) - resAmt;
+          }
+        }
+      } catch (_) { /* non-critical */ }
+
+      // Clamp negatives
+      for (const sym of Object.keys(available)) {
+        if (available[sym] < 0) available[sym] = 0;
+      }
+
+      // Build balances array for backward compatibility
+      const balances = Object.keys(available).map(asset => ({
+        asset,
+        available: available[asset].toString(),
+        locked: (locked[asset] || 0).toString(),
       }));
 
       const readModel = getReadModelService();
@@ -582,6 +588,10 @@ class ExchangeController {
       return success(res, {
         partyId,
         balances,
+        available,
+        locked,
+        total,
+        source: 'canton-sdk-hybrid',
         asOf: {
           updateId: readModel?.lastOffset || null
         }

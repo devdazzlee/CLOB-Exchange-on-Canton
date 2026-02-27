@@ -18,13 +18,10 @@
  *   - Runs at CLEANUP_INTERVAL_MS intervals (default: 5 minutes)
  *   - Non-critical: if archival fails, the contract stays in ACS (no data loss)
  * 
- * IMPORTANT — Package Version Compatibility:
- *   Archive choices (ArchiveOrder, ArchiveAllocation, ArchiveTrade) were added in
- *   clob-wolfedge-tokens v2.3.0 (TOKEN_STANDARD_PACKAGE_ID = 8f68102f...).
- *   Contracts created with OLDER package versions do NOT have these choices.
- *   We MUST always use the current package's template ID for the exercise command
- *   (Canton package upgrading allows exercising new choices on old contracts)
- *   AND skip contracts from genuinely incompatible old packages.
+ * IMPORTANT — Package Version:
+ *   All contracts now use TOKEN_STANDARD_PACKAGE_ID (v2.4.0 = 0224efbf...).
+ *   Archive choices (ArchiveOrder, ArchiveAllocation, ArchiveTrade, Archive_ExchangeAllocation)
+ *   are available on this package.
  */
 
 const config = require('../config');
@@ -107,7 +104,7 @@ class ACSCleanupService {
       const archivable = (Array.isArray(orders) ? orders : []).filter(c => {
         const payload = c.payload || c.createArgument || {};
         if (payload.status !== 'FILLED' && payload.status !== 'CANCELLED') return false;
-        // Skip contracts from old packages that lack the ArchiveOrder choice
+        // Skip contracts from incompatible packages
         if (!this._isCompatiblePackage(c.templateId)) {
           return false;
         }
@@ -118,8 +115,7 @@ class ACSCleanupService {
         const batch = archivable.slice(0, BATCH_SIZE);
         for (const contract of batch) {
           try {
-            // CRITICAL: Always use CURRENT package template ID (has ArchiveOrder choice)
-            // Do NOT use contract.templateId which may be from an old package
+            // Use current package template ID for archive choice
             await cantonService.exerciseChoice({
               token,
               actAsParty: [operatorPartyId],
@@ -188,7 +184,7 @@ class ACSCleanupService {
       console.warn(`[ACSCleanup] ExchangeAllocation scan failed: ${err.message}`);
     }
 
-    // ═══ 2b. Archive EXECUTED and CANCELLED legacy AllocationRecords ═══
+    // ═══ 2b. Archive EXECUTED and CANCELLED AllocationRecords ═══
     try {
       const allocations = await cantonService.queryActiveContracts({
         party: operatorPartyId,
@@ -222,16 +218,16 @@ class ACSCleanupService {
             archivedThisCycle++;
           } catch (err) {
             if (!err.message?.includes('CONTRACT_NOT_FOUND')) {
-              console.warn(`[ACSCleanup] Failed to archive legacy allocation: ${err.message}`);
+              console.warn(`[ACSCleanup] Failed to archive allocation: ${err.message}`);
             }
           }
         }
         if (batch.length > 0) {
-          console.log(`[ACSCleanup] Archived ${batch.length} completed legacy allocations (${archivable.length} total eligible)`);
+          console.log(`[ACSCleanup] Archived ${batch.length} completed allocations (${archivable.length} total eligible)`);
         }
       }
     } catch (err) {
-      console.warn(`[ACSCleanup] Legacy allocation scan failed: ${err.message}`);
+      console.warn(`[ACSCleanup] Allocation scan failed: ${err.message}`);
     }
 
     // ═══ 3. Archive old trade records (after persisting to cache) ═══
@@ -247,7 +243,7 @@ class ACSCleanupService {
         const payload = c.payload || c.createArgument || {};
         const tradeTime = new Date(payload.timestamp || 0).getTime();
         if ((now - tradeTime) <= TRADE_RETENTION_MS) return false;
-        // Skip contracts from old packages that lack the ArchiveTrade choice
+        // Skip contracts from incompatible packages
         if (!this._isCompatiblePackage(c.templateId)) {
           return false;
         }
@@ -292,21 +288,15 @@ class ACSCleanupService {
   }
 
   /**
-   * Check if a contract's templateId is from a package version that has Archive choices.
-   * 
-   * Archive choices (ArchiveOrder, ArchiveAllocation, ArchiveTrade) were added in
-   * clob-wolfedge-tokens v2.3.0 — the current TOKEN_STANDARD_PACKAGE_ID (8f68102f...).
-   * 
-   * Contracts created with older DAR versions (e.g. d1b3cb28..., 273cbc00...) do NOT
-   * have these choices and will cause INVALID_ARGUMENT errors if we try to exercise them.
+   * Check if a contract's templateId is from a compatible package version.
+   * All contracts should now be on TOKEN_STANDARD_PACKAGE_ID (v2.4.0 = 0224efbf...).
    * 
    * @param {string|Object} templateId - The contract's templateId from Canton
-   * @returns {boolean} true if the contract can be archived with the custom choices
+   * @returns {boolean} true if the contract can be archived
    */
   _isCompatiblePackage(templateId) {
-    if (!templateId) return true; // If unknown, try anyway (will fail gracefully)
+    if (!templateId) return true;
 
-    // Extract package ID from templateId string ("pkgId:Module:Entity") or object
     let contractPackageId;
     if (typeof templateId === 'string') {
       contractPackageId = templateId.split(':')[0];
@@ -314,17 +304,15 @@ class ACSCleanupService {
       contractPackageId = templateId.packageId;
     }
 
-    if (!contractPackageId) return true; // Can't determine — try anyway
+    if (!contractPackageId) return true;
 
-    // Only the current TOKEN_STANDARD_PACKAGE_ID has the archive choices
     if (contractPackageId !== TOKEN_STANDARD_PACKAGE_ID) {
-      // Log once per old package to avoid spam
       if (!this._warnedPackages) this._warnedPackages = new Set();
       if (!this._warnedPackages.has(contractPackageId)) {
         this._warnedPackages.add(contractPackageId);
         console.warn(
-          `[ACSCleanup] Skipping contracts from old package ${contractPackageId.substring(0, 12)}... ` +
-          `(no Archive choices — only ${TOKEN_STANDARD_PACKAGE_ID.substring(0, 12)}... has them)`
+          `[ACSCleanup] Skipping contracts from package ${contractPackageId.substring(0, 12)}... ` +
+          `(expected ${TOKEN_STANDARD_PACKAGE_ID.substring(0, 12)}...)`
         );
       }
       return false;

@@ -11,7 +11,7 @@
  * Uses Canton JSON Ledger API v2:
  * - POST /v2/commands/submit-and-wait-for-transaction
  * 
- * DAML Templates (package f552adda...):
+ * DAML Templates (current TOKEN_STANDARD package):
  * - Settlement:SettlementInstruction - Holds locked Holding references
  * - Settlement:Trade - Created atomically during settlement
  * - Holding:Holding - Locked/transferred during settlement

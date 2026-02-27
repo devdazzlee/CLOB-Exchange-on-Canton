@@ -61,37 +61,18 @@ const AMULET_PACKAGE_ID = process.env.AMULET_PACKAGE_ID ||
 // =============================================================================
 
 /**
- * Token Standard Package (clob-wolfedge-tokens v2.1.0)
- * Contains: Instrument, Holding, Settlement, Order, OrderV3
+ * Token Standard Package (clob-wolfedge-tokens v2.4.0)
+ * Contains: Instrument, Holding, Settlement, Order, OrderV3, ExchangeAllocation
  * 
  * Key feature: Holding contract has custodian-only signatory
  * This allows operator to mint tokens for external parties.
  * 
- * v2.1.0 changes: FillOrder choice now has Optional newAllocationCid
- * for partial fill allocation tracking (DvP settlement)
- * 
- * v2.4.0 changes: Added ExchangeAllocation template (Propose-Accept pattern)
+ * v2.4.0: Added ExchangeAllocation template (Propose-Accept pattern)
  * for external party settlement without co-authorization.
+ * 
+ * THIS IS THE ONLY PACKAGE ID USED — all old packages are retired.
  */
 const TOKEN_STANDARD_PACKAGE_ID = process.env.TOKEN_STANDARD_PACKAGE_ID || '0224efbf74e4ecb40083f7090a9f12145c607d76da220a91eedc21ca491d24fa';
-
-/**
- * Intermediate Legacy Package (clob-wolfedge-tokens v2.3.0)
- * Contains: Order, Settlement (without ExchangeAllocation), Trade, AllocationRecord
- * 
- * Existing contracts (212+ Order, 283 Trade) were created with this package.
- * New contracts use TOKEN_STANDARD_PACKAGE_ID (v2.4.0).
- * We must subscribe to both to see all contracts on the ledger.
- */
-const INTERMEDIATE_LEGACY_PACKAGE_ID = '8f68102fce27f5a9ac2a34cf44882ab5cb7fa8d2c45d4873b2bbaf7de35c2371';
-
-/**
- * Legacy Package (clob-exchange v1.0.0)
- * Contains: UserAccount, Order, Trade, MasterOrderBook
- * 
- * Note: Being phased out in favor of Token Standard
- */
-const LEGACY_PACKAGE_ID = 'dd500bf887d7e153ee6628b3f6722f234d3d62ce855572ff7ce73b7b3c2afefd';
 
 /**
  * Splice Token Standard Package ID
@@ -143,12 +124,12 @@ const TEMPLATE_IDS = {
   // Order template from new package (v2.2.0) - supports stopPrice, TriggerStopLoss, Allocation tracking
   orderNew: `${TOKEN_STANDARD_PACKAGE_ID}:Order:Order`,
   
-  // Legacy Templates (clob-exchange v1.0.0 - for backward compatibility)
-  userAccount: `${LEGACY_PACKAGE_ID}:UserAccount:UserAccount`,
-  order: `${LEGACY_PACKAGE_ID}:Order:Order`,
-  legacyTrade: `${LEGACY_PACKAGE_ID}:Trade:Trade`,
-  masterOrderBook: `${LEGACY_PACKAGE_ID}:MasterOrderBook:MasterOrderBook`,
-  masterOrderBookV2: `${LEGACY_PACKAGE_ID}:MasterOrderBookV2:MasterOrderBookV2`,
+  // Legacy-compatible Templates — now using current TOKEN_STANDARD_PACKAGE_ID
+  userAccount: `${TOKEN_STANDARD_PACKAGE_ID}:UserAccount:UserAccount`,
+  order: `${TOKEN_STANDARD_PACKAGE_ID}:Order:Order`,
+  legacyTrade: `${TOKEN_STANDARD_PACKAGE_ID}:Trade:Trade`,
+  masterOrderBook: `${TOKEN_STANDARD_PACKAGE_ID}:MasterOrderBook:MasterOrderBook`,
+  masterOrderBookV2: `${TOKEN_STANDARD_PACKAGE_ID}:MasterOrderBookV2:MasterOrderBookV2`,
 };
 
 // =============================================================================
@@ -242,7 +223,7 @@ function getTokenStandardTemplateIds() {
 }
 
 /**
- * Get all Legacy template IDs
+ * Get all Legacy template IDs (now using current package)
  * @returns {Object} Object with all legacy template IDs
  */
 function getLegacyTemplateIds() {
@@ -274,8 +255,6 @@ module.exports = {
   
   // Package IDs
   TOKEN_STANDARD_PACKAGE_ID,
-  INTERMEDIATE_LEGACY_PACKAGE_ID,
-  LEGACY_PACKAGE_ID,
   AMULET_PACKAGE_ID,
   
   // Template IDs

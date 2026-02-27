@@ -173,9 +173,10 @@ class HoldingService {
           // Query for contracts using known templates (Order, our Holding) to get a sample
           // From those contracts, we might see references to other templates or get metadata
           try {
+            const { TOKEN_STANDARD_PACKAGE_ID } = require('../config/constants');
             const knownTemplates = [
-              'dd500bf887d7e153ee6628b3f6722f234d3d62ce855572ff7ce73b7b3c2afefd:Order:Order',
-              'f552adda6b4c5ed9caa3c943d004c0e727cc29df62e1fdc91b9f1797491f9390:Holding:Holding',
+              `${TOKEN_STANDARD_PACKAGE_ID}:Order:Order`,
+              `${TOKEN_STANDARD_PACKAGE_ID}:Holding:Holding`,
             ];
             
             // Get a sample of contracts to see what template IDs exist
