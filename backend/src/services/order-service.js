@@ -95,15 +95,15 @@ async function getReservedBalance(partyId, asset) {
   return total;
 }
 
-async function addReservation(orderId, partyId, asset, amount, allocationContractId = null) {
+async function addReservation(orderId, partyId, asset, amount, allocationContractId = null, allocationType = 'EXCHANGE') {
   const db = getDb();
   const amountStr = new Decimal(amount).toString();
   await db.orderReservation.upsert({
     where: { orderId },
-    create: { orderId, partyId, asset, amount: amountStr, allocationContractId },
-    update: { partyId, asset, amount: amountStr, allocationContractId },
+    create: { orderId, partyId, asset, amount: amountStr, allocationContractId, allocationType },
+    update: { partyId, asset, amount: amountStr, allocationContractId, allocationType },
   });
-  console.log(`[BalanceReservation] ➕ Reserved ${amount} ${asset} for ${orderId} (allocation: ${allocationContractId ? allocationContractId.substring(0, 30) + '...' : 'none'})`);
+  console.log(`[BalanceReservation] ➕ Reserved ${amount} ${asset} for ${orderId} (allocation: ${allocationContractId ? allocationContractId.substring(0, 30) + '...' : 'none'}, type: ${allocationType})`);
 }
 
 async function releaseReservation(orderId) {
@@ -153,16 +153,27 @@ async function getAllocationContractIdForOrder(orderId) {
   return reservation?.allocationContractId || null;
 }
 
-async function setAllocationContractIdForOrder(orderId, allocationContractId) {
+async function setAllocationContractIdForOrder(orderId, allocationContractId, allocationType = null) {
   const db = getDb();
   try {
+    const data = { allocationContractId: allocationContractId || null };
+    if (allocationType) data.allocationType = allocationType;
     await db.orderReservation.update({
       where: { orderId },
-      data: { allocationContractId: allocationContractId || null },
+      data,
     });
   } catch (err) {
     console.warn(`[BalanceReservation] setAllocationContractId failed for ${orderId}: ${err.message}`);
   }
+}
+
+async function getAllocationTypeForOrder(orderId) {
+  const db = getDb();
+  const reservation = await db.orderReservation.findUnique({
+    where: { orderId },
+    select: { allocationType: true },
+  });
+  return reservation?.allocationType || 'EXCHANGE';
 }
 
 class OrderService {
@@ -638,35 +649,73 @@ class OrderService {
     const timestamp = new Date().toISOString();
 
     // ═══════════════════════════════════════════════════════════════════
-    // PROPOSE-ACCEPT PATTERN: Create ExchangeAllocation (user signs)
+    // ALLOCATION STRATEGY: Try real Token Standard allocation first,
+    // fall back to ExchangeAllocation (custom Propose-Accept pattern).
     //
-    // Replaces Splice AllocationFactory_Allocate which creates DvpLegAllocation
-    // requiring co-authorization from operator + external party (unsupported).
+    // Real allocation: Uses Splice/Utilities AllocationFactory_Allocate
+    //   → Creates DvpLegAllocation → tokens locked on-chain → visible in
+    //     CC View / Token Standard explorers after settlement.
     //
-    // ExchangeAllocation has signatory=owner only → single-party interactive tx.
-    // At match time, the operator exercises Execute_Settlement (single-party tx).
+    // Exchange allocation (fallback): ExchangeAllocation template with
+    //   signatory=owner only → single-party interactive tx. At match time,
+    //   the operator exercises Execute_Settlement (single-party tx).
+    //   Tokens NOT visible in CC View until real Token Standard integration.
     // ═══════════════════════════════════════════════════════════════════
-    console.log(`[OrderService] Preparing ExchangeAllocation via interactive submission (step 1/2)`);
 
     const sdkClient = getCantonSDKClient();
-    const allocationPrep = sdkClient.buildExchangeAllocationCreateCommand(
-      partyId,
-      operatorPartyId,
-      String(lockInfo.amount),
-      lockInfo.asset,
-      orderType,
-      tradingPair,
-      orderId
-    );
+    let allocationCommand = null;
+    let readAs = null;
+    let disclosedContracts = [];
+    let synchronizerId = null;
+    let allocationType = 'ExchangeAllocation'; // default
 
-    const readAs = [...new Set([operatorPartyId, partyId, ...(allocationPrep.readAs || [])])];
-    const disclosedContracts = [];
-    const synchronizerId = allocationPrep.synchronizerId || config.canton.synchronizerId;
+    // ── ATTEMPT 1: Real Token Standard allocation ──
+    try {
+      const realAlloc = await sdkClient.tryBuildRealAllocationCommand(
+        partyId,
+        operatorPartyId,
+        String(lockInfo.amount),
+        lockInfo.asset,
+        orderId
+      );
+
+      if (realAlloc) {
+        allocationCommand = realAlloc.command;
+        readAs = [...new Set([operatorPartyId, partyId, ...(realAlloc.readAs || [])])];
+        disclosedContracts = realAlloc.disclosedContracts || [];
+        synchronizerId = realAlloc.synchronizerId || config.canton.synchronizerId;
+        allocationType = realAlloc.allocationType; // 'UtilitiesAllocation' or 'SpliceAllocation'
+        console.log(`[OrderService] 🎯 Using REAL Token Standard allocation (${allocationType}) for ${orderId}`);
+      }
+    } catch (err) {
+      console.warn(`[OrderService] Real allocation attempt failed, will use ExchangeAllocation: ${err.message}`);
+    }
+
+    // ── ATTEMPT 2: Fall back to ExchangeAllocation ──
+    if (!allocationCommand) {
+      console.log(`[OrderService] Preparing ExchangeAllocation via interactive submission (step 1/2)`);
+      const allocationPrep = sdkClient.buildExchangeAllocationCreateCommand(
+        partyId,
+        operatorPartyId,
+        String(lockInfo.amount),
+        lockInfo.asset,
+        orderType,
+        tradingPair,
+        orderId
+      );
+      allocationCommand = allocationPrep.command;
+      readAs = [...new Set([operatorPartyId, partyId, ...(allocationPrep.readAs || [])])];
+      synchronizerId = allocationPrep.synchronizerId || config.canton.synchronizerId;
+      allocationType = 'ExchangeAllocation';
+    }
+
+    // Store the allocation type with the reservation
+    await setAllocationContractIdForOrder(orderId, null, allocationType);
 
     const prepareResult = await cantonService.prepareInteractiveSubmission({
       token,
       actAsParty: [partyId],
-      commands: [allocationPrep.command],
+      commands: [allocationCommand],
       readAs,
       synchronizerId,
       disclosedContracts,
@@ -676,7 +725,7 @@ class OrderService {
       throw new Error('Prepare returned incomplete result: missing preparedTransaction or preparedTransactionHash');
     }
     
-    console.log(`[OrderService] ✅ Allocation prepared (step 1/2). Hash to sign: ${prepareResult.preparedTransactionHash.substring(0, 40)}...`);
+    console.log(`[OrderService] ✅ Allocation prepared (step 1/2, type: ${allocationType}). Hash to sign: ${prepareResult.preparedTransactionHash.substring(0, 40)}...`);
     
     return {
       requiresSignature: true,
@@ -694,6 +743,7 @@ class OrderService {
       partyId,
       lockInfo,
       stage: 'ALLOCATION_PREPARED',
+      allocationType,
     };
   }
 
@@ -809,8 +859,9 @@ class OrderService {
       }
       
       if (orderMeta.orderId && allocationContractId) {
-        await setAllocationContractIdForOrder(orderMeta.orderId, allocationContractId);
-        console.log(`[OrderService] ✅ Allocation linked to order ${orderMeta.orderId}: ${allocationContractId.substring(0, 30)}...`);
+        const allocType = orderMeta.allocationType || null;
+        await setAllocationContractIdForOrder(orderMeta.orderId, allocationContractId, allocType);
+        console.log(`[OrderService] ✅ Allocation linked to order ${orderMeta.orderId}: ${allocationContractId.substring(0, 30)}... (type: ${allocType || 'auto'})`);
       }
 
       // Step 1: allocation executed. Prepare Step 2: order create.
@@ -894,7 +945,7 @@ class OrderService {
       if (!contractId) {
         contractId = `${orderMeta.orderId}-pending`;
       }
-
+      
       console.log(`[OrderService] ✅ Order placed via interactive submission: ${orderMeta.orderId} (cid: ${hasRealCid ? contractId.substring(0, 30) + '...' : 'pending — WebSocket will deliver'})`);
       
       const finalAllocationCid = orderMeta.allocationContractId || allocationContractId || null;
@@ -1096,14 +1147,14 @@ class OrderService {
     let prepareResult;
     try {
       prepareResult = await cantonService.prepareInteractiveSubmission({
-        token,
-        actAsParty: [partyId],
-        templateId: `${packageId}:Order:Order`,
-        contractId: orderContractId,
-        choice: 'CancelOrder',
-        choiceArgument: {},
-        readAs: [operatorPartyId, partyId],
-      });
+      token,
+      actAsParty: [partyId],
+      templateId: `${packageId}:Order:Order`,
+      contractId: orderContractId,
+      choice: 'CancelOrder',
+      choiceArgument: {},
+      readAs: [operatorPartyId, partyId],
+    });
     } catch (prepErr) {
       if (prepErr.message?.includes('CONTRACT_NOT_FOUND') || prepErr.message?.includes('could not be found')) {
         console.warn(`[OrderService] Order contract already consumed/archived — treating as cancelled`);
@@ -1492,4 +1543,5 @@ module.exports.releasePartialReservation = releasePartialReservation;
 module.exports.getReservedBalance = getReservedBalance;
 module.exports.getAllocationContractIdForOrder = getAllocationContractIdForOrder;
 module.exports.setAllocationContractIdForOrder = setAllocationContractIdForOrder;
+module.exports.getAllocationTypeForOrder = getAllocationTypeForOrder;
 module.exports.getGlobalOpenOrders = getGlobalOpenOrders;

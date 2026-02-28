@@ -80,6 +80,7 @@ model OrderReservation {
   asset                String   // e.g. "CC", "CBTC"
   amount               String   // Decimal string
   allocationContractId String?
+  allocationType       String   @default("EXCHANGE") // "TOKEN_STANDARD" (real Splice allocation) or "EXCHANGE" (ExchangeAllocation)
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt
 

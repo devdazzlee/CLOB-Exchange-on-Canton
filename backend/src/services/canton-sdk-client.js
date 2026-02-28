@@ -2598,9 +2598,141 @@ class CantonSDKClient {
   // ═══════════════════════════════════════════════════════════════════════════
   // EXCHANGE ALLOCATION — Propose-Accept Pattern for External Parties
   // ═══════════════════════════════════════════════════════════════════════════
+  // TOKEN STANDARD WRAPPERS — Try real allocation, fall back to Exchange
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Try to build a REAL Token Standard allocation command for order placement.
+   *
+   * If the SDK is ready and the Allocation Factory API responds, this creates
+   * a real AllocationFactory_Allocate ExerciseCommand that locks real Splice/
+   * Utilities holdings on-chain. The user signs via interactive submission.
+   *
+   * If it fails (SDK not ready, no holdings, API unreachable), returns null
+   * so the caller can fall back to ExchangeAllocation.
+   *
+   * @param {string} senderPartyId - The order placer (will lock their holdings)
+   * @param {string} executorPartyId - The exchange operator
+   * @param {string} amount - Amount to lock
+   * @param {string} symbol - Token symbol (CC, CBTC)
+   * @param {string} orderId - Unique order ID (used as settlementRef)
+   * @returns {Promise<{command, readAs, disclosedContracts, synchronizerId, allocationType}|null>}
+   */
+  async tryBuildRealAllocationCommand(senderPartyId, executorPartyId, amount, symbol, orderId) {
+    try {
+      if (!this.isReady()) {
+        console.log(`[CantonSDK] SDK not ready — cannot build real allocation for ${symbol}`);
+        return null;
+      }
+
+      const tokenSystemType = getTokenSystemType(symbol);
+      if (tokenSystemType === 'unknown') {
+        console.log(`[CantonSDK] Token ${symbol} has no on-chain system — skipping real allocation`);
+        return null;
+      }
+
+      console.log(`[CantonSDK] 🔄 Trying REAL Token Standard allocation for ${amount} ${symbol} (${tokenSystemType})...`);
+
+      const result = await this.buildAllocationInteractiveCommand(
+        senderPartyId,
+        executorPartyId, // receiver = executor (exchange) at allocation time
+        amount,
+        symbol,
+        executorPartyId,
+        orderId
+      );
+
+      if (!result?.command) {
+        console.warn(`[CantonSDK] buildAllocationInteractiveCommand returned no command`);
+        return null;
+      }
+
+      const allocationType = tokenSystemType === 'utilities' ? 'UtilitiesAllocation' : 'SpliceAllocation';
+      console.log(`[CantonSDK] ✅ Real ${allocationType} command built successfully for ${orderId}`);
+
+      return {
+        ...result,
+        allocationType,
+      };
+    } catch (err) {
+      const msg = String(err?.message || err || '');
+      console.warn(`[CantonSDK] ⚠️ Real allocation build failed for ${symbol} (will use ExchangeAllocation): ${msg.substring(0, 200)}`);
+      return null;
+    }
+  }
+
+  /**
+   * Try to execute a REAL Token Standard allocation at settlement time.
+   *
+   * Uses the operator-only non-interactive path (Huz confirmed: executor
+   * alone can run Allocation_ExecuteTransfer if all other parties already
+   * signed the allocation at creation time).
+   *
+   * If successful, real tokens move on-chain — visible in CC View explorer.
+   * If it fails, returns null so the caller falls back to ExchangeAllocation.
+   *
+   * @param {string} allocationContractId - The DvpLegAllocation contract ID
+   * @param {string} executorPartyId - The exchange operator
+   * @param {string} symbol - Token symbol (CC, CBTC)
+   * @param {string} ownerPartyId - The allocation owner (for readAs)
+   * @param {string} receiverPartyId - The receiver (counterparty)
+   * @returns {Promise<object|null>} Exercise result or null on failure
+   */
+  async tryRealAllocationExecution(allocationContractId, executorPartyId, symbol, ownerPartyId, receiverPartyId) {
+    if (!allocationContractId) return null;
+
+    try {
+      const tokenSystemType = getTokenSystemType(symbol);
+      if (tokenSystemType === 'unknown') return null;
+
+      console.log(`[CantonSDK] 🔄 Trying REAL Token Standard allocation execution for ${symbol}...`);
+      console.log(`[CantonSDK]    Allocation: ${allocationContractId.substring(0, 30)}...`);
+      console.log(`[CantonSDK]    Executor: ${executorPartyId.substring(0, 30)}...`);
+
+      const adminToken = await tokenProvider.getServiceToken();
+      const configModule = require('../config');
+      const synchronizerId = await cantonService.resolveSubmissionSynchronizerId(
+        adminToken,
+        configModule.canton.synchronizerId
+      );
+
+      const readAsParties = [...new Set([executorPartyId, ownerPartyId, receiverPartyId].filter(Boolean))];
+
+      // Try non-interactive executor-only (fastest, operator auto-signs)
+      const result = await this._tryNonInteractiveExecutorOnly(
+        allocationContractId, executorPartyId, adminToken,
+        readAsParties, synchronizerId
+      );
+
+      if (result) {
+        console.log(`[CantonSDK] ✅ REAL Token Standard allocation executed — tokens transferred on-chain!`);
+        console.log(`[CantonSDK]    UpdateId: ${result?.transaction?.updateId || 'N/A'}`);
+        return result;
+      }
+
+      console.warn(`[CantonSDK] Real allocation execution returned null — no transfer`);
+      return null;
+    } catch (err) {
+      const msg = String(err?.message || err || '');
+
+      // Stale / expired → propagate so caller knows the allocation is dead
+      if (msg.includes('STALE_') || msg.includes('CONTRACT_NOT_FOUND') || msg.includes('could not be found')) {
+        console.error(`[CantonSDK] ❌ Real allocation is stale/archived: ${msg.substring(0, 150)}`);
+        throw err; // Let caller handle — this allocation can't be used
+      }
+
+      // Auth / synchronizer errors → log and return null (fall back to ExchangeAllocation)
+      console.warn(`[CantonSDK] ⚠️ Real allocation execution failed (will use ExchangeAllocation): ${msg.substring(0, 200)}`);
+      return null;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // EXCHANGE ALLOCATION — Custom Propose-Accept Pattern (Fallback)
+  // ═══════════════════════════════════════════════════════════════════════════
   //
-  // Replaces Splice AllocationFactory_Allocate + DvpLegAllocation which require
-  // co-authorization from BOTH operator and external party (unsupported by Canton).
+  // Used when real Token Standard allocation is not available.
+  // Records trade intent but does NOT move real Splice/Utilities holdings.
   //
   // Flow:
   //   1. ORDER TIME: User creates ExchangeAllocation (single-party, user signs)

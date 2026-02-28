@@ -274,6 +274,7 @@ export default function TradingInterface({ partyId }) {
             stopPrice: data.stopPrice,
             lockInfo: data.lockInfo,
             stage: data.stage || 'ALLOCATION_PREPARED',
+            allocationType: data.allocationType || null,
           },
           orderData, // original form data for success toast
         });
