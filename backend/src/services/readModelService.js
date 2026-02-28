@@ -201,15 +201,27 @@ class ReadModelService extends EventEmitter {
         return { ready: false, mode: 'rest-only' };
     }
 
-    // Compatibility methods (no-ops since there's no cache)
     stop() {
         if (this.streamingModel) {
             this.streamingModel.stop();
         }
     }
-    addOrder() {}
-    removeOrder() {}
-    addTrade() {}
+
+    addOrder(orderData) {
+        if (this.streamingModel?.isReady() && orderData) {
+            this.streamingModel.addOrder(orderData);
+        }
+    }
+
+    removeOrder(contractId) {
+        if (this.streamingModel?.isReady() && contractId) {
+            this.streamingModel.evictOrder(contractId);
+        }
+    }
+
+    addTrade(tradeData) {
+        // Trades arrive reliably via WebSocket; no immediate injection needed.
+    }
 }
 
 let instance = null;

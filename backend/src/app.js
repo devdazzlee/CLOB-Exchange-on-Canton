@@ -343,7 +343,30 @@ async function initializeReadModel() {
               });
             }
           });
-          console.log('✅ Streaming events wired to WebSocket broadcasts (pure WS, no polling)');
+          // ═══ EVENT-DRIVEN MATCHING ═══
+          // When Canton delivers a new OPEN order via WebSocket, the streaming
+          // model emits 'orderCreated'.  We debounce per trading pair (3s) and
+          // trigger the matching engine.  This is the single, canonical trigger
+          // path — no setTimeout hacks, no polling.
+          const { getMatchingEngine } = require('./services/matching-engine');
+          const matchEngine = getMatchingEngine();
+          const _matchDebounce = new Map();
+
+          streaming.on('orderCreated', (order) => {
+            if (order.status !== 'OPEN' || !order.tradingPair) return;
+            const pair = order.tradingPair;
+            if (_matchDebounce.has(pair)) clearTimeout(_matchDebounce.get(pair));
+            _matchDebounce.set(pair, setTimeout(async () => {
+              _matchDebounce.delete(pair);
+              try {
+                await matchEngine.triggerMatchingCycle(pair);
+              } catch (err) {
+                console.warn(`[EventMatch] ${pair}: ${err.message}`);
+              }
+            }, 3000));
+          });
+
+          console.log('✅ Streaming events wired to WebSocket broadcasts + event-driven matching');
         }
       } catch (_) {
         // Streaming not available — WebSocket still works but no auto-push

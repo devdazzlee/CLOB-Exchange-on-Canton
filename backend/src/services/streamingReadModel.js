@@ -426,8 +426,47 @@ class StreamingReadModel extends EventEmitter {
         archivedCount++;
       }
 
+      // ── Exercised event (consuming choices archive contracts) ───────
+      // Canton v2 may send as:
+      //   { ExercisedEvent: { value: {...} } } / { ExercisedEvent: {...} }
+      //   { exercised: {...} } / { exercisedEvent: {...} }
+      //
+      // For consuming exercises (e.g., CancelOrder/FillOrder), there may be no
+      // ArchivedEvent in the same payload shape. If we ignore these, stale OPEN
+      // orders remain in-memory and the matching engine retries archived CIDs.
+      let exercised = null;
+      if (event.ExercisedEvent) {
+        exercised = event.ExercisedEvent.value || event.ExercisedEvent;
+      } else if (event.exercised) {
+        exercised = event.exercised.value || event.exercised;
+      } else if (event.exercisedEvent) {
+        exercised = event.exercisedEvent.value || event.exercisedEvent;
+      }
+
+      let exercisedArchived = false;
+      if (exercised) {
+        const choice = exercised.choice || exercised.choiceName || '';
+        const consumingFromFlag =
+          exercised.consuming === true ||
+          exercised.isConsuming === true;
+        const consumingByChoiceName = [
+          'CancelOrder',
+          'FillOrder',
+          'Operator_Cancel_Settlement',
+          'Execute_Settlement',
+          'Allocation_ExecuteTransfer',
+        ].includes(choice);
+        const isConsuming = consumingFromFlag || consumingByChoiceName;
+
+        if (isConsuming && (exercised.contractId || exercised.contract_id)) {
+          this._processArchivedEvent(exercised);
+          archivedCount++;
+          exercisedArchived = true;
+        }
+      }
+
       // ── Diagnostic: unknown event format ───────────────────────────
-      if (!created && !archived) {
+      if (!created && !archived && !exercisedArchived) {
         const keys = Object.keys(event).join(', ');
         console.warn(`[StreamingReadModel] ⚠️ Unrecognized event format (keys: ${keys}) — raw: ${JSON.stringify(event).substring(0, 300)}`);
       }
@@ -789,6 +828,39 @@ class StreamingReadModel extends EventEmitter {
     return result
       .sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0))
       .slice(0, limit);
+  }
+
+  /**
+   * Public method to inject a newly placed order directly into the in-memory
+   * model so it is visible to the matching engine immediately, without waiting
+   * for the WebSocket to deliver the Canton create-event.
+   *
+   * Accepts the orderData shape produced by order-service.js (field names like
+   * allocationContractId are mapped to the internal allocationCid).
+   */
+  addOrder(orderData) {
+    if (!orderData?.contractId) return;
+
+    const config = require('../config');
+    const packageId = config.canton.packageIds?.clobExchange || '';
+    const templateId = orderData.templateId || `${packageId}:Order:Order`;
+
+    const payload = {
+      orderId: orderData.orderId,
+      owner: orderData.owner,
+      orderType: orderData.orderType,
+      orderMode: orderData.orderMode,
+      tradingPair: orderData.tradingPair,
+      price: orderData.price,
+      quantity: orderData.quantity,
+      filled: orderData.filled || '0',
+      status: orderData.status || 'OPEN',
+      timestamp: orderData.timestamp,
+      allocationCid: orderData.allocationContractId || orderData.allocationCid || '',
+      stopPrice: orderData.stopPrice,
+    };
+
+    this._addOrder(orderData.contractId, templateId, payload);
   }
 
   /**

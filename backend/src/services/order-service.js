@@ -878,13 +878,25 @@ class OrderService {
         };
       }
 
+      // Canton interactive execute may not return created contract IDs.
+      // Instead of blocking with a polling loop, we return immediately.
+      // The WebSocket streaming model will receive the real contract from
+      // Canton and emit 'orderCreated', which triggers matching via the
+      // event-driven wiring in app.js.
       if (!contractId) {
-        contractId = result.transaction?.updateId || result.updateId || `${orderMeta.orderId}-pending`;
+        const txUpdateId = result.transaction?.updateId || result.updateId;
+        if (txUpdateId && /^[0-9a-f]{40,}$/i.test(txUpdateId)) {
+          contractId = txUpdateId;
+        }
       }
 
-      console.log(`[OrderService] ✅ Order placed via interactive submission: ${orderMeta.orderId} (${contractId?.substring(0, 20)}...)`);
+      const hasRealCid = !!contractId;
+      if (!contractId) {
+        contractId = `${orderMeta.orderId}-pending`;
+      }
+
+      console.log(`[OrderService] ✅ Order placed via interactive submission: ${orderMeta.orderId} (cid: ${hasRealCid ? contractId.substring(0, 30) + '...' : 'pending — WebSocket will deliver'})`);
       
-      // Register in tracking systems
       const finalAllocationCid = orderMeta.allocationContractId || allocationContractId || null;
       const orderRecord = {
         contractId,
@@ -905,13 +917,15 @@ class OrderService {
         allocationContractId: finalAllocationCid,
       };
       
-      // Register in global open orders registry
       if (orderRecord.status === 'OPEN') {
         registerOpenOrders([orderRecord]);
       }
       
+      // Only inject if we have a real Canton contract ID.  When the CID is
+      // pending, we rely on the WebSocket stream to deliver the real contract
+      // which emits 'orderCreated' → event-driven matching.
       const readModel = getReadModelService();
-      if (readModel) {
+      if (readModel && hasRealCid) {
         readModel.addOrder({
           ...orderRecord,
           quantity: parseFloat(orderRecord.quantity),
@@ -937,13 +951,16 @@ class OrderService {
         });
       }
       
-      // Trigger matching engine for OPEN orders
-      if (orderRecord.status === 'OPEN') {
+      // Fast-path matching: if we have a real contract ID, the order is
+      // already in the streaming model via addOrder() above, so trigger now.
+      // Otherwise, the event-driven wiring (app.js) will trigger matching
+      // when the WebSocket delivers the real contract.
+      if (orderRecord.status === 'OPEN' && hasRealCid) {
         try {
           const { getMatchingEngine } = require('./matching-engine');
           const matchingEngine = getMatchingEngine();
           if (matchingEngine) {
-            console.log(`[OrderService] Triggering matching for ${orderMeta.tradingPair}`);
+            console.log(`[OrderService] Triggering matching for ${orderMeta.tradingPair} (fast-path)`);
             matchingEngine.triggerMatchingCycle(orderMeta.tradingPair).catch(err => {
               console.warn(`[OrderService] ⚠️ Matching cycle error: ${err.message}`);
             });
@@ -1076,15 +1093,34 @@ class OrderService {
     // CancelOrder is controlled by "owner" — external parties need interactive submission.
     console.log(`[OrderService] Preparing CancelOrder for interactive signing`);
     
-    const prepareResult = await cantonService.prepareInteractiveSubmission({
-      token,
-      actAsParty: [partyId],
-      templateId: `${packageId}:Order:Order`,
-      contractId: orderContractId,
-      choice: 'CancelOrder',
-      choiceArgument: {},
-      readAs: [operatorPartyId, partyId],
-    });
+    let prepareResult;
+    try {
+      prepareResult = await cantonService.prepareInteractiveSubmission({
+        token,
+        actAsParty: [partyId],
+        templateId: `${packageId}:Order:Order`,
+        contractId: orderContractId,
+        choice: 'CancelOrder',
+        choiceArgument: {},
+        readAs: [operatorPartyId, partyId],
+      });
+    } catch (prepErr) {
+      if (prepErr.message?.includes('CONTRACT_NOT_FOUND') || prepErr.message?.includes('could not be found')) {
+        console.warn(`[OrderService] Order contract already consumed/archived — treating as cancelled`);
+        const readModel = getReadModelService();
+        if (readModel) readModel.removeOrder(orderContractId);
+        _globalOpenOrders.delete(orderContractId);
+        if (orderDetails?.orderId) await releaseReservation(orderDetails.orderId);
+        return {
+          cancelled: true,
+          alreadyArchived: true,
+          orderContractId,
+          orderId: orderDetails?.orderId,
+          message: 'Order contract was already consumed (filled or archived). No action needed.',
+        };
+      }
+      throw prepErr;
+    }
     
     if (!prepareResult.preparedTransaction || !prepareResult.preparedTransactionHash) {
       throw new Error('Prepare returned incomplete result for CancelOrder');

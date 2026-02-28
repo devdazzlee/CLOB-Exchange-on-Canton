@@ -11,10 +11,47 @@ const OrderService = require('../services/order-service');
 const { success } = require('../utils/response');
 const asyncHandler = require('../middleware/asyncHandler');
 const { ValidationError } = require('../utils/errors');
+const userRegistry = require('../state/userRegistry');
 
 class OrderController {
   constructor() {
     this.orderService = new OrderService();
+  }
+
+  isUuidLike(value) {
+    return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.trim());
+  }
+
+  isPartyIdLike(value) {
+    return typeof value === 'string' && value.includes('::');
+  }
+
+  async resolveEffectivePartyId(req, bodyPartyId) {
+    const body = typeof bodyPartyId === 'string' ? bodyPartyId.trim() : '';
+    const headerPartyId = typeof req.headers['x-party-id'] === 'string' ? req.headers['x-party-id'].trim() : '';
+    const headerUserId = typeof req.headers['x-user-id'] === 'string' ? req.headers['x-user-id'].trim() : '';
+
+    // Explicit partyId values always win.
+    if (this.isPartyIdLike(body)) return body;
+    if (this.isPartyIdLike(headerPartyId)) return headerPartyId;
+
+    // Backward compatibility: some clients send partyId in x-user-id.
+    if (this.isPartyIdLike(headerUserId)) return headerUserId;
+
+    // If x-user-id is an app user UUID, resolve to partyId via registry.
+    if (headerUserId) {
+      const user = await userRegistry.getUser(headerUserId);
+      if (user?.partyId && this.isPartyIdLike(user.partyId)) {
+        return user.partyId;
+      }
+    }
+
+    // If body/header provided a UUID instead of partyId, surface a clear message.
+    if (this.isUuidLike(body) || this.isUuidLike(headerPartyId) || this.isUuidLike(headerUserId)) {
+      throw new ValidationError('Could not resolve Canton partyId from provided identity. Send x-party-id (ext-...::...) or onboard user mapping.');
+    }
+
+    throw new ValidationError('Missing partyId. Provide partyId in body or x-party-id header.');
   }
 
   /**
@@ -34,15 +71,10 @@ class OrderController {
       stopPrice,
     } = req.body;
 
-    // Get partyId from request body or header
-    const effectivePartyId = partyId || req.headers['x-user-id'] || req.headers['x-party-id'];
+    const effectivePartyId = await this.resolveEffectivePartyId(req, partyId);
 
     if (!tradingPair || !orderType || !orderMode || !quantity) {
       throw new ValidationError('Missing required fields: tradingPair, orderType, orderMode, quantity');
-    }
-
-    if (!effectivePartyId) {
-      throw new ValidationError('Missing partyId. Provide in request body or x-user-id header');
     }
 
     if (orderMode.toUpperCase() === 'LIMIT' && !price) {
@@ -119,23 +151,10 @@ class OrderController {
       }
     }
 
-    // ═══ AUTO-TRIGGER MATCHING ENGINE (FIRE-AND-FORGET) ═══
-    const response = success(res, { ...result, matchTriggered: true }, 'Order placed successfully', 201);
-
-    // Fire-and-forget: trigger matching after a short delay for Canton propagation
-    setTimeout(async () => {
-      try {
-        const { getMatchingEngine } = require('../services/matching-engine');
-        const engine = getMatchingEngine();
-        console.log(`[OrderController] ⚡ Auto-triggering matching for ${decodedTradingPair}...`);
-        const matchResult = await engine.triggerMatchingCycle(decodedTradingPair);
-        console.log(`[OrderController] ⚡ Matching cycle complete:`, matchResult?.success ? 'success' : matchResult?.reason || 'no matches');
-      } catch (matchErr) {
-        console.warn(`[OrderController] ⚠️ Auto-match trigger failed (non-critical):`, matchErr.message);
-      }
-    }, 1500);
-
-    return response;
+    // Matching is triggered by the event-driven wiring in app.js:
+    // Canton WebSocket → StreamingReadModel → 'orderCreated' event → MatchingEngine
+    // No setTimeout hacks needed.
+    return success(res, { ...result, matchTriggered: true }, 'Order placed successfully', 201);
   });
 
   /**
@@ -151,15 +170,10 @@ class OrderController {
       tradingPair
     } = req.body;
 
-    // Get partyId from request body or header
-    const effectivePartyId = partyId || req.headers['x-user-id'] || req.headers['x-party-id'];
+    const effectivePartyId = await this.resolveEffectivePartyId(req, partyId);
 
     if (!orderContractId) {
       throw new ValidationError('Missing required field: orderContractId');
-    }
-
-    if (!effectivePartyId) {
-      throw new ValidationError('Missing partyId. Provide in request body or x-user-id header');
     }
 
     console.log(`[OrderController] Cancelling order: ${orderContractId.substring(0, 30)}...`);
@@ -235,19 +249,7 @@ class OrderController {
 
     console.log(`[OrderController] ✅ Order placed via interactive submission: ${result.orderId}`);
 
-    // Fire-and-forget matching
-    if (result.tradingPair && result.status === 'OPEN') {
-      setTimeout(async () => {
-        try {
-          const { getMatchingEngine } = require('../services/matching-engine');
-          const engine = getMatchingEngine();
-          await engine.triggerMatchingCycle(result.tradingPair);
-        } catch (matchErr) {
-          console.warn(`[OrderController] ⚠️ Auto-match failed:`, matchErr.message);
-        }
-      }, 1500);
-    }
-
+    // Matching is event-driven: WebSocket → StreamingReadModel → 'orderCreated' → MatchingEngine
     return success(res, { ...result, matchTriggered: true }, 'Order placed via interactive submission', 201);
   });
 
@@ -281,14 +283,10 @@ class OrderController {
    */
   cancelOrderById = asyncHandler(async (req, res) => {
     const { orderId } = req.params;
-    const partyId = req.headers['x-user-id'] || req.headers['x-party-id'] || req.body?.partyId;
+    const partyId = await this.resolveEffectivePartyId(req, req.body?.partyId);
 
     if (!orderId) {
       throw new ValidationError('Missing required param: orderId');
-    }
-
-    if (!partyId) {
-      throw new ValidationError('Missing partyId. Provide x-user-id header or partyId in body');
     }
 
     console.log(`[OrderController] Cancelling order by ID: ${orderId}`);
