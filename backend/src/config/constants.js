@@ -32,8 +32,9 @@ const DEFAULT_SYNCHRONIZER_ID = process.env.DEFAULT_SYNCHRONIZER_ID ||
 
 // Registry Backend API - Used for Splice Token Standard operations (transfer accept, etc.)
 // Provides choice context and disclosed contracts needed for Splice transfers
+// Client confirmed: BACKEND_API="https://api.utilities.digitalasset-dev.com/api/utilities" (for devnet)
 const REGISTRY_BACKEND_API = process.env.REGISTRY_BACKEND_API || 
-  'https://api.utilities.digitalasset-dev.com/api/token-standard';
+  'https://api.utilities.digitalasset-dev.com/api/utilities';
 
 // Scan Proxy API - Used for Amulet/CC transfers (accept, send, reject)
 // This is the client's Scan Proxy on WolfEdge infrastructure

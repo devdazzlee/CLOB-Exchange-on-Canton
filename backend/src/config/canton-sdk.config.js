@@ -94,7 +94,7 @@ const CANTON_SDK_CONFIG = {
 // 
 // CBTC uses a DIFFERENT Transfer Factory Registry than CC:
 // - CC  → Splice SDK → Scan Proxy at http://65.108.40.104:8088
-// - CBTC → Utilities Backend API → https://api.utilities.digitalasset-dev.com/api/token-standard
+// - CBTC → Utilities Backend API → https://api.utilities.digitalasset-dev.com/api/utilities
 //
 // The Utilities Backend API has a different path structure:
 //   ${BACKEND}/v0/registrars/${ADMIN_PARTY}/registry/transfer-instruction/v1/transfer-factory
@@ -102,9 +102,10 @@ const CANTON_SDK_CONFIG = {
 // Reference: https://docs.digitalasset.com/utilities/devnet/how-tos/registry/transfer/transfer.html
 // ═══════════════════════════════════════════════════════════════════════════
 const UTILITIES_CONFIG = {
-  // DevNet Utilities Backend API (Token Standard)
-  // Client confirmed: use https://api.utilities.digitalasset-dev.com/api/token-standard for dev
-  BACKEND_URL: process.env.UTILITIES_BACKEND_URL || 'https://api.utilities.digitalasset-dev.com/api/token-standard',
+  // DevNet Utilities Backend API
+  // Client confirmed: BACKEND_API="https://api.utilities.digitalasset-dev.com/api/utilities" (for devnet)
+  // Ref: https://docs.digitalasset.com/utilities/devnet/how-tos/registry/transfer/transfer.html
+  BACKEND_URL: process.env.UTILITIES_BACKEND_URL || 'https://api.utilities.digitalasset-dev.com/api/utilities',
 
   // CBTC Admin Party (cBTC Network registrar)
   CBTC_ADMIN_PARTY: process.env.CBTC_ADMIN_PARTY || 'cbtc-network::12202a83c6f4082217c175e29bc53da5f2703ba2675778ab99217a5a881a949203ff',

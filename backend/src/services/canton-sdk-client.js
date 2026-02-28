@@ -531,7 +531,7 @@ class CantonSDKClient {
   //
   // Token routing:
   // - CC (Amulet): Registry at Scan Proxy (http://65.108.40.104:8088)
-  // - CBTC (Utilities): Registry at Utilities Backend (api/token-standard)
+  // - CBTC (Utilities): Registry at Utilities Backend (api/utilities)
   //
   // NOTE: When Splice Allocation Factory becomes available on this network,
   // the allocation path (below) will automatically be preferred.
