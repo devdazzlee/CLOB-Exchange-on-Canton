@@ -13,23 +13,7 @@ const { getDb } = require('../services/db');
 
 // ─── User helpers ─────────────────────────────────────────────────────────
 
-async function upsertUser(userId, updates) {
-  if (!userId) throw new Error('userId is required');
-  const db = getDb();
-  const result = await db.user.upsert({
-    where: { id: userId },
-    create: {
-      id: userId,
-      partyId: updates.partyId || null,
-      publicKeyBase64: updates.publicKeyBase64 || null,
-      displayName: updates.displayName || null,
-    },
-    update: {
-      ...(updates.partyId !== undefined ? { partyId: updates.partyId } : {}),
-      ...(updates.publicKeyBase64 !== undefined ? { publicKeyBase64: updates.publicKeyBase64 } : {}),
-      ...(updates.displayName !== undefined ? { displayName: updates.displayName } : {}),
-    },
-  });
+function toUserPayload(result) {
   return {
     partyId: result.partyId,
     publicKeyBase64: result.publicKeyBase64,
@@ -39,18 +23,72 @@ async function upsertUser(userId, updates) {
   };
 }
 
+async function upsertUser(userId, updates) {
+  if (!userId) throw new Error('userId is required');
+  const db = getDb();
+  const normalizedPartyId = typeof updates.partyId === 'string' ? updates.partyId.trim() : updates.partyId;
+
+  const createData = {
+    id: userId,
+    partyId: normalizedPartyId || null,
+    publicKeyBase64: updates.publicKeyBase64 || null,
+    displayName: updates.displayName || null,
+  };
+
+  const updateData = {
+    ...(normalizedPartyId !== undefined ? { partyId: normalizedPartyId } : {}),
+    ...(updates.publicKeyBase64 !== undefined ? { publicKeyBase64: updates.publicKeyBase64 } : {}),
+    ...(updates.displayName !== undefined ? { displayName: updates.displayName } : {}),
+  };
+
+  // If this partyId already belongs to a different user row, update that row
+  // instead of causing a unique constraint crash.
+  if (normalizedPartyId) {
+    const existingByParty = await db.user.findUnique({ where: { partyId: normalizedPartyId } });
+    if (existingByParty && existingByParty.id !== userId) {
+      const merged = await db.user.update({
+        where: { id: existingByParty.id },
+        data: {
+          ...(updates.publicKeyBase64 !== undefined ? { publicKeyBase64: updates.publicKeyBase64 } : {}),
+          ...(updates.displayName !== undefined ? { displayName: updates.displayName } : {}),
+        },
+      });
+      return toUserPayload(merged);
+    }
+  }
+
+  try {
+    const result = await db.user.upsert({
+      where: { id: userId },
+      create: createData,
+      update: updateData,
+    });
+    return toUserPayload(result);
+  } catch (err) {
+    // Handle races where another request writes the same partyId first.
+    if (err?.code === 'P2002' && normalizedPartyId) {
+      const existingByParty = await db.user.findUnique({ where: { partyId: normalizedPartyId } });
+      if (existingByParty) {
+        const merged = await db.user.update({
+          where: { id: existingByParty.id },
+          data: {
+            ...(updates.publicKeyBase64 !== undefined ? { publicKeyBase64: updates.publicKeyBase64 } : {}),
+            ...(updates.displayName !== undefined ? { displayName: updates.displayName } : {}),
+          },
+        });
+        return toUserPayload(merged);
+      }
+    }
+    throw err;
+  }
+}
+
 async function getUser(userId) {
   if (!userId) return null;
   const db = getDb();
   const u = await db.user.findUnique({ where: { id: userId } });
   if (!u) return null;
-  return {
-    partyId: u.partyId,
-    publicKeyBase64: u.publicKeyBase64,
-    displayName: u.displayName,
-    createdAt: u.createdAt?.getTime() || Date.now(),
-    updatedAt: u.updatedAt?.getTime() || Date.now(),
-  };
+  return toUserPayload(u);
 }
 
 async function requireUser(userId) {

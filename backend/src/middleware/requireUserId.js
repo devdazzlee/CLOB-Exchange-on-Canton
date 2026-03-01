@@ -17,10 +17,17 @@ module.exports = function requireUserId(req, res, next) {
   const partyId = req.header('x-party-id');
   const publicKeyBase64 = req.header('x-public-key');
 
-  if ((partyId && partyId.trim()) || (publicKeyBase64 && publicKeyBase64.trim())) {
-    userRegistry.upsertUser(trimmedUserId, {
-      ...(partyId && partyId.trim() ? { partyId: partyId.trim() } : {}),
-      ...(publicKeyBase64 && publicKeyBase64.trim() ? { publicKeyBase64: publicKeyBase64.trim() } : {}),
+  const hasParty = !!(partyId && partyId.trim());
+  const hasPublicKey = !!(publicKeyBase64 && publicKeyBase64.trim());
+  const hasMappableIdentity = trimmedUserId !== 'unknown' && trimmedUserId !== 'null';
+
+  if ((hasParty || hasPublicKey) && hasMappableIdentity) {
+    void userRegistry.upsertUser(trimmedUserId, {
+      ...(hasParty ? { partyId: partyId.trim() } : {}),
+      ...(hasPublicKey ? { publicKeyBase64: publicKeyBase64.trim() } : {}),
+    }).catch((err) => {
+      // Never crash request flow for registry-sync side effects.
+      console.warn('[requireUserId] Failed to sync user registry:', err.message);
     });
   }
 
