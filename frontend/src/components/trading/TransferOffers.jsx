@@ -126,6 +126,7 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
         offerContractId: offer.contractId,
         partyId: partyId,
         templateId: offer.templateId,
+        registrarParty: offer.registrarParty,
       });
       
       if (response.success) {

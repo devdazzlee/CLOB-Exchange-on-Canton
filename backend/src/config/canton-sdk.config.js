@@ -102,10 +102,14 @@ const CANTON_SDK_CONFIG = {
 // Reference: https://docs.digitalasset.com/utilities/devnet/how-tos/registry/transfer/transfer.html
 // ═══════════════════════════════════════════════════════════════════════════
 const UTILITIES_CONFIG = {
-  // DevNet Utilities Backend API
-  // Client confirmed: BACKEND_API="https://api.utilities.digitalasset-dev.com/api/utilities" (for devnet)
-  // Ref: https://docs.digitalasset.com/utilities/devnet/how-tos/registry/transfer/transfer.html
+  // DevNet Utilities Backend API (for operator info, instrument configs, etc.)
+  // Ref: https://docs.digitalasset.com/utilities/devnet/reference/operator-backend-api/index.html
   BACKEND_URL: process.env.UTILITIES_BACKEND_URL || 'https://api.utilities.digitalasset-dev.com/api/utilities',
+
+  // Token Standard API — the CORRECT base for transfer-instruction choice context endpoints.
+  // Ref: https://docs.digitalasset.com/utilities/devnet/overview/registry-user-guide/token-standard.html
+  // Pattern: ${TOKEN_STANDARD_URL}/v0/registrars/${REGISTRAR}/registry/transfer-instruction/v1/${CID}/choice-contexts/accept
+  TOKEN_STANDARD_URL: process.env.TOKEN_STANDARD_URL || 'https://api.utilities.digitalasset-dev.com/api/token-standard',
 
   // CBTC Admin Party (cBTC Network registrar)
   CBTC_ADMIN_PARTY: process.env.CBTC_ADMIN_PARTY || 'cbtc-network::12202a83c6f4082217c175e29bc53da5f2703ba2675778ab99217a5a881a949203ff',

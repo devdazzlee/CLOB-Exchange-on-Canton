@@ -55,7 +55,7 @@ router.get('/offers/:partyId', asyncHandler(async (req, res) => {
  * For INTERNAL parties: Accepts directly and returns { success: true }
  */
 router.post('/accept', asyncHandler(async (req, res) => {
-  const { offerContractId, partyId, templateId } = req.body;
+  const { offerContractId, partyId, templateId, registrarParty } = req.body;
   
   if (!offerContractId || !partyId) {
     throw new ValidationError('offerContractId and partyId are required');
@@ -65,12 +65,15 @@ router.post('/accept', asyncHandler(async (req, res) => {
   if (templateId) {
     console.log(`[Transfers] Using template: ${templateId}`);
   }
+  if (registrarParty) {
+    console.log(`[Transfers] Registrar (from contract): ${registrarParty.substring(0, 50)}...`);
+  }
   
   const adminToken = await tokenProvider.getServiceToken();
   const transferService = getTransferOfferService();
   await transferService.initialize();
   
-  const result = await transferService.acceptTransferOffer(offerContractId, partyId, adminToken, templateId);
+  const result = await transferService.acceptTransferOffer(offerContractId, partyId, adminToken, templateId, registrarParty);
   
   // For external parties, the result includes requiresSignature: true
   // The frontend must sign preparedTransactionHash and call /execute-accept
@@ -100,7 +103,7 @@ router.post('/accept', asyncHandler(async (req, res) => {
  * then call /execute-accept with the signature.
  */
 router.post('/prepare-accept', asyncHandler(async (req, res) => {
-  const { offerContractId, partyId, templateId } = req.body;
+  const { offerContractId, partyId, templateId, registrarParty } = req.body;
   
   if (!offerContractId || !partyId) {
     throw new ValidationError('offerContractId and partyId are required');
@@ -112,7 +115,7 @@ router.post('/prepare-accept', asyncHandler(async (req, res) => {
   const transferService = getTransferOfferService();
   await transferService.initialize();
   
-  const result = await transferService.prepareTransferAccept(offerContractId, partyId, adminToken, templateId);
+  const result = await transferService.prepareTransferAccept(offerContractId, partyId, adminToken, templateId, registrarParty);
   
   return success(res, {
     preparedTransaction: result.preparedTransaction,

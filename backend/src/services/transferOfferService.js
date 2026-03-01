@@ -1,41 +1,27 @@
 /**
  * Transfer Offer Service - Handle Canton/Splice Token Transfers
- * 
- * This service handles accepting transfer offers from external sources
- * like the Canton DevNet faucet (CBTC, etc.)
- * 
- * The client mentioned:
- * - Use utilities UI: https://utilities.dev.canton.wolfedgelabs.com/
- * - Navigate to: registry -> transfers
- * - Accept transfer-offers of tokens like CBTC
+ *
+ * Follows the official Splice Token Standard for 2-step transfers:
+ *   Ref: https://docs.digitalasset.com/utilities/devnet/how-tos/registry/transfer/transfer.html
+ *
+ * CC (Amulet)  → Scan Proxy registry
+ * CBTC (Utilities) → Utilities Backend API at /v0/registrars/{ADMIN}/registry/…
+ *
+ * The ADMIN_PARTY_ID (registrar) is extracted from the contract's
+ * transfer.instrumentId.admin field — never hardcoded.
  */
 
 const config = require('../config');
-const { getTokenStandardTemplateIds, OPERATOR_PARTY_ID, DSO_PARTY_ID, REGISTRY_BACKEND_API, SCAN_PROXY_API, VALIDATOR_SCAN_PROXY_API, TEMPLATE_IDS } = require('../config/constants');
-const { UTILITIES_CONFIG } = require('../config/canton-sdk.config');
+const { OPERATOR_PARTY_ID, DSO_PARTY_ID, SCAN_PROXY_API, VALIDATOR_SCAN_PROXY_API, getTokenStandardTemplateIds } = require('../config/constants');
+const { UTILITIES_CONFIG, CANTON_SDK_CONFIG } = require('../config/canton-sdk.config');
 const tokenProvider = require('./tokenProvider');
 
-// Get canton service instance
 let cantonServiceInstance = null;
 const getCantonService = () => {
   if (!cantonServiceInstance) {
     cantonServiceInstance = require('./cantonService');
   }
   return cantonServiceInstance;
-};
-
-// Canton SDK client (primary for all transfers)
-let sdkClientInstance = null;
-const getSDKClient = () => {
-  if (!sdkClientInstance) {
-    try {
-      const { getCantonSDKClient } = require('./canton-sdk-client');
-      sdkClientInstance = getCantonSDKClient();
-    } catch (e) {
-      console.log('[TransferOfferService] Canton SDK client not available:', e.message);
-    }
-  }
-  return sdkClientInstance;
 };
 
 class TransferOfferService {
@@ -50,30 +36,18 @@ class TransferOfferService {
     console.log('[TransferOfferService] Initialized');
   }
 
-  /**
-   * Query for pending transfer offers (TransferInstruction contracts) for a party
-   * Transfer offers can come from:
-   * - Canton utilities faucet (CBTC, etc.)
-   * - Other users sending tokens
-   * 
-   * In Splice Token Standard, transfers are 2-step:
-   * 1. Sender creates a TransferInstruction (the "offer")
-   * 2. Receiver exercises Accept choice on the TransferInstruction
-   * 
-   * @param {string} partyId - The party to check for offers
-   * @param {string} token - Admin token for Canton API
-   * @returns {Array} List of pending transfer offers
-   */
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Query pending transfer offers
+  // ═══════════════════════════════════════════════════════════════════════════
+
   async getTransferOffers(partyId, token) {
     await this.initialize();
-    
+
     try {
-      console.log(`[TransferOfferService] Querying transfer offers (TransferInstructions) for: ${partyId.substring(0, 30)}...`);
-      
+      console.log(`[TransferOfferService] Querying transfer offers for: ${partyId.substring(0, 30)}...`);
+
       let allOffers = [];
-      
-      // Method 1: Query using Splice TransferInstruction Interface (# prefix)
-      // This is the proper way to find all TransferInstruction contracts
+
       try {
         console.log(`[TransferOfferService] Trying InterfaceFilter for TransferInstruction...`);
         const spliceOffers = await this.cantonService.queryActiveContracts({
@@ -85,157 +59,116 @@ class TransferOfferService {
       } catch (e) {
         console.log(`[TransferOfferService] InterfaceFilter query failed: ${(e?.message || String(e)).substring(0, 100)}`);
       }
-      
-      // Method 2: Fallback - Query all contracts and filter
+
       if (allOffers.length === 0) {
         console.log(`[TransferOfferService] Fallback: querying all contracts...`);
-        
         const allContracts = await this.cantonService.queryActiveContracts({
           party: partyId,
-          templateIds: [],  // Wildcard - get all templates
+          templateIds: [],
         }, token);
-        
         console.log(`[TransferOfferService] Found ${allContracts.length} total contracts`);
-        
-        // Filter for PENDING transfer offers/instructions only
-        // Exclude already-executed/completed transfers (e.g., ExecutedTransfer, CompletedTransfer)
+
         const transferContracts = allContracts.filter(contract => {
-          const templateId = (contract.createdEvent?.templateId || contract.templateId || '').toLowerCase();
-          const payload = contract.payload || {};
-          
-          // Exclude completed/executed transfer artifacts
-          if (templateId.includes('executedtransfer') || 
-              templateId.includes('completedtransfer') ||
-              templateId.includes('archivedtransfer')) {
-            return false;
-          }
-          
-          // Include only actual pending transfer instructions/offers
-          const isPendingTransfer = 
-            templateId.includes('transferinstruction') ||
-            templateId.includes('transferoffer') ||
-            templateId.includes('transfer_instruction') ||
-            templateId.includes('transfer_offer') ||
-            (templateId.includes('instruction') && templateId.includes('transfer'));
-            
-          return isPendingTransfer;
+          const tid = (contract.createdEvent?.templateId || contract.templateId || '').toLowerCase();
+          if (tid.includes('executedtransfer') || tid.includes('completedtransfer') || tid.includes('archivedtransfer')) return false;
+          return tid.includes('transferinstruction') || tid.includes('transferoffer') ||
+                 tid.includes('transfer_instruction') || tid.includes('transfer_offer') ||
+                 (tid.includes('instruction') && tid.includes('transfer'));
         });
-        
         allOffers.push(...transferContracts);
       }
-      
+
       console.log(`[TransferOfferService] Found ${allOffers.length} potential transfer offers`);
-      
-      // Map to a consistent format
+
       return allOffers.map(contract => {
-        const payload = contract.payload || contract.interfaceView || {};
         const templateId = contract.createdEvent?.templateId || contract.templateId || '';
-        
-        // Handle nested transfer data structure (e.g., payload.transfer.amount)
-        // Splice/Canton uses: { transfer: { sender, receiver, amount, instrumentId: { id: "CBTC" } } }
-        const transferData = payload.transfer || {};
-        
-        // Extract token info - check nested structures first
-        let tokenSymbol = transferData.instrumentId?.id ||
-                          transferData.instrument?.id ||
-                          payload.instrument?.id || 
-                          payload.instrumentId?.id || 
-                          payload.token || 
-                          payload.asset ||
-                          'Unknown';
-        
-        // Extract amount - check nested transfer data first
-        let amount = transferData.amount || 
-                     payload.amount || 
-                     payload.quantity || 
-                     '0';
-        
-        // Extract sender/receiver - check nested structure first
-        let sender = transferData.sender || 
-                     payload.sender || 
-                     payload.provider || 
-                     payload.from || 
-                     'unknown';
-        
-        let receiver = transferData.receiver || 
-                       payload.receiver || 
-                       payload.recipient || 
-                       payload.to || 
-                       partyId;
-        
+
+        // Canton v2 InterfaceFilter returns data in createdEvent.interfaceViews[].viewValue
+        // while the raw template payload is in createdEvent.createArgument (= contract.payload).
+        const ifaceView = contract.createdEvent?.interfaceViews?.[0]?.viewValue || {};
+        const payload = contract.payload || contract.interfaceView || {};
+
+        // The interface view uses "transfer.instrumentId" structure;
+        // the raw payload may use the same or template-specific field names.
+        const transferData = ifaceView.transfer || payload.transfer || {};
+
+        const tokenSymbol = transferData.instrumentId?.id ||
+                            transferData.instrument?.id ||
+                            ifaceView.instrumentId?.id ||
+                            payload.instrumentId?.id ||
+                            payload.token || payload.asset || 'Unknown';
+
+        const amount = transferData.amount || ifaceView.amount || payload.amount || payload.quantity || '0';
+
+        const sender = transferData.sender || ifaceView.sender || payload.sender || payload.provider || payload.from || 'unknown';
+        const receiver = transferData.receiver || ifaceView.receiver || payload.receiver || payload.recipient || payload.to || partyId;
+
+        // The registrar (instrument admin) — needed by the accept choice context API.
+        // Per Splice Token Standard, this is transfer.instrumentId.admin.
+        const registrarParty = transferData.instrumentId?.admin ||
+                               ifaceView.instrumentId?.admin ||
+                               payload.instrumentId?.admin ||
+                               null;
+
+        if (registrarParty) {
+          console.log(`[TransferOfferService] Offer ${(contract.contractId || '').substring(0, 20)}... registrar: ${registrarParty.substring(0, 50)}...`);
+        }
+
         return {
           contractId: contract.contractId,
-          templateId: templateId,
-          payload: payload,
-          sender: sender,
-          receiver: receiver,
-          amount: amount,
+          templateId,
+          payload,
+          sender,
+          receiver,
+          amount,
           token: tokenSymbol,
+          registrarParty,
           isSplice: templateId.toLowerCase().includes('splice') || !!contract.interfaceView,
         };
       });
-      
+
     } catch (error) {
       console.error('[TransferOfferService] Failed to get transfer offers:', error.message);
       throw error;
     }
   }
 
-  /**
-   * STEP 1: Prepare transfer accept for interactive signing (external parties)
-   * 
-   * External parties with Confirmation permission require interactive submission:
-   * 1. Backend PREPARES the transaction → returns hash to sign
-   * 2. Frontend SIGNS the hash with user's Ed25519 private key
-   * 3. Backend EXECUTES with the user's signature
-   * 
-   * @param {string} offerContractId - The transfer offer contract ID
-   * @param {string} partyId - The external party accepting the offer
-   * @param {string} token - Admin/service token
-   * @param {string} templateId - Optional template ID hint
-   * @returns {Object} { preparedTransaction, preparedTransactionHash, choiceContextData, ... }
-   */
-  async prepareTransferAccept(offerContractId, partyId, token, templateId = null) {
+  // ═══════════════════════════════════════════════════════════════════════════
+  // STEP 1: Prepare transfer accept (interactive signing)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  async prepareTransferAccept(offerContractId, partyId, token, templateId = null, registrarParty = null) {
     await this.initialize();
-    
+
     const TRANSFER_INSTRUCTION_INTERFACE = '#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction';
-    
+
     try {
       console.log(`[TransferOfferService] PREPARE transfer accept: ${offerContractId.substring(0, 30)}... for ${partyId.substring(0, 30)}...`);
-      
+      if (registrarParty) {
+        console.log(`[TransferOfferService] Registrar (instrument admin): ${registrarParty.substring(0, 50)}...`);
+      }
+
       const operatorPartyId = config.canton.operatorPartyId;
       const synchronizerId = config.canton.synchronizerId;
       const adminToken = token || await tokenProvider.getServiceToken();
-      
-      // ─── Interactive submission: actAs must ONLY contain the external party ────
-      // In Canton's interactive submission flow, ALL actAs parties must provide
-      // external signatures. The operator is an internal party (participant-hosted)
-      // so it CANNOT provide an external signature.
-      //
-      // The operator's authorization comes from being a signatory on the
-      // TransferInstruction contract — it doesn't need to be in actAs.
-      // The TransferInstruction_Accept choice is controlled by the receiver only.
-      //
-      // readAs includes both parties so the command can read operator-visible contracts.
-      const actAsParties = [partyId];  // Only the external party (signer)
+
+      const actAsParties = [partyId];
       const readAsParties = [partyId];
       if (operatorPartyId && operatorPartyId !== partyId) {
         readAsParties.push(operatorPartyId);
       }
-      
+
       console.log(`[TransferOfferService] actAs: [${actAsParties.map(p => p.substring(0, 30) + '...').join(', ')}]`);
       console.log(`[TransferOfferService] readAs: [${readAsParties.map(p => p.substring(0, 30) + '...').join(', ')}]`);
-      
-      // ─── Get choice context (disclosed contracts) ──────────────────────────────
+
       const { disclosedContracts, choiceContextData } = await this._getAcceptChoiceContext(
-        offerContractId, adminToken, synchronizerId
+        offerContractId, adminToken, synchronizerId, templateId, registrarParty
       );
-      
+
       const utilitiesInterface = UTILITIES_CONFIG.TRANSFER_INSTRUCTION_INTERFACE || TRANSFER_INSTRUCTION_INTERFACE;
-      
-      // ─── Prepare interactive submission ─────────────────────────────────────────
+
       console.log(`[TransferOfferService] Preparing interactive submission for external party...`);
-      
+
       const prepareResult = await this.cantonService.prepareInteractiveSubmission({
         token: adminToken,
         actAsParty: actAsParties,
@@ -251,15 +184,15 @@ class TransferOfferService {
         readAs: readAsParties,
         disclosedContracts,
         synchronizerId,
-        verboseHashing: false
+        verboseHashing: false,
       });
-      
+
       if (!prepareResult.preparedTransaction || !prepareResult.preparedTransactionHash) {
         throw new Error('Prepare returned incomplete result: missing preparedTransaction or preparedTransactionHash');
       }
-      
+
       console.log(`[TransferOfferService] ✅ Transaction prepared. Hash to sign: ${prepareResult.preparedTransactionHash.substring(0, 40)}...`);
-      
+
       return {
         success: true,
         step: 'PREPARED',
@@ -271,86 +204,109 @@ class TransferOfferService {
         partyId,
         actAsParties,
       };
-      
+
     } catch (error) {
       console.error('[TransferOfferService] Failed to prepare transfer accept:', error.message);
       throw error;
     }
   }
 
-  /**
-   * STEP 2: Execute prepared transfer accept with user's signature
-   * 
-   * @param {string} preparedTransaction - Opaque blob from prepare step
-   * @param {string} partyId - The external party that signed the hash
-   * @param {string} signatureBase64 - User's Ed25519 signature of preparedTransactionHash
-   * @param {string} signedBy - Public key fingerprint that signed
-   * @param {string} token - Admin/service token
-   * @param {string|number} hashingSchemeVersion - From prepare response
-   * @returns {Object} Transaction result
-   */
+  // ═══════════════════════════════════════════════════════════════════════════
+  // STEP 2: Execute prepared transfer accept with user signature
+  // ═══════════════════════════════════════════════════════════════════════════
+
   async executeTransferAccept(preparedTransaction, partyId, signatureBase64, signedBy, token, hashingSchemeVersion = 1) {
     await this.initialize();
-    
+
     try {
       console.log(`[TransferOfferService] EXECUTE transfer accept for ${partyId.substring(0, 30)}...`);
-      
+
       const adminToken = token || await tokenProvider.getServiceToken();
-      
-      // Build partySignatures in Canton's FLAT format:
-      // partySignatures.signatures is an ARRAY of { party, signatures: [...] }
+
       const partySignatures = {
-        signatures: [
-          {
-            party: partyId,
-            signatures: [{
-              format: 'SIGNATURE_FORMAT_RAW',
-              signature: signatureBase64,
-              signedBy: signedBy,
-              signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519'
-            }]
-          }
-        ]
+        signatures: [{
+          party: partyId,
+          signatures: [{
+            format: 'SIGNATURE_FORMAT_RAW',
+            signature: signatureBase64,
+            signedBy,
+            signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
+          }],
+        }],
       };
-      
-      console.log(`[TransferOfferService] Executing with signature from party: ${partyId.substring(0, 30)}...`);
-      
+
       const result = await this.cantonService.executeInteractiveSubmission({
         preparedTransaction,
         partySignatures,
         hashingSchemeVersion,
       }, adminToken);
-      
+
       console.log('[TransferOfferService] ✅ Transfer accepted via interactive submission!');
       return { success: true, usedInteractiveSubmission: true, result };
-      
+
     } catch (error) {
       console.error('[TransferOfferService] Failed to execute transfer accept:', error.message);
       throw error;
     }
   }
 
-  /**
-   * Helper: Get accept choice context (disclosed contracts + choice context data)
-   * Tries multiple URL patterns for the Registry/Utilities Backend API
-   */
-  async _getAcceptChoiceContext(offerContractId, adminToken, synchronizerId) {
-    const backendUrl = UTILITIES_CONFIG.BACKEND_URL;
-    const adminParty = UTILITIES_CONFIG.CBTC_ADMIN_PARTY;
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Accept transfer offer (orchestrator)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  async acceptTransferOffer(offerContractId, partyId, token, templateId = null, registrarParty = null) {
+    await this.initialize();
+
+    try {
+      console.log(`[TransferOfferService] Accepting transfer: ${offerContractId.substring(0, 30)}... for ${partyId.substring(0, 30)}...`);
+      if (templateId) console.log(`[TransferOfferService] Template hint: ${templateId.substring(0, 60)}...`);
+      if (registrarParty) console.log(`[TransferOfferService] Registrar: ${registrarParty.substring(0, 50)}...`);
+
+      console.log(`[TransferOfferService] Using interactive submission (2-step flow)`);
+
+      const prepareResult = await this.prepareTransferAccept(offerContractId, partyId, token, templateId, registrarParty);
+      return { ...prepareResult, requiresSignature: true };
+
+    } catch (error) {
+      console.error('[TransferOfferService] Failed to accept transfer:', error.message);
+      throw error;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Choice context resolution — per official DA Token Standard docs
+  //
+  // Ref: https://docs.digitalasset.com/utilities/devnet/overview/registry-user-guide/token-standard.html
+  // URL: ${TOKEN_STANDARD_URL}/v0/registrars/${REGISTRAR}/registry/transfer-instruction/v1/${CID}/choice-contexts/accept
+  //
+  // The REGISTRAR is the instrument admin extracted from the contract's
+  // transfer.instrumentId.admin field.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  async _getAcceptChoiceContext(offerContractId, adminToken, synchronizerId, templateHint = null, registrarParty = null) {
     const encodedCid = encodeURIComponent(offerContractId);
-    const scanProxyBase = SCAN_PROXY_API || 'http://65.108.40.104:8088';
-    
-    const urlPatterns = [
-      `${backendUrl}/v0/registrars/${encodeURIComponent(adminParty)}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`,
-      `${backendUrl}/v0/registrars/${adminParty}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`,
-      `${scanProxyBase}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`,
-    ];
-    
-    for (const acceptContextUrl of urlPatterns) {
+    const tokenStandardBase = UTILITIES_CONFIG.TOKEN_STANDARD_URL;
+    const scanProxyBase = CANTON_SDK_CONFIG.REGISTRY_API_URL || SCAN_PROXY_API || 'http://65.108.40.104:8088';
+
+    const urls = [];
+
+    // 1. Token Standard API with registrar from contract (correct per docs)
+    if (registrarParty) {
+      const encoded = encodeURIComponent(registrarParty);
+      urls.push(`${tokenStandardBase}/v0/registrars/${encoded}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`);
+    }
+
+    // 2. Scan Proxy (for CC/Amulet transfers)
+    urls.push(`${scanProxyBase}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`);
+
+    console.log(`[TransferOfferService] Resolving accept context — registrar: ${(registrarParty || 'unknown').substring(0, 50)}, ${urls.length} endpoints`);
+
+    const errors = [];
+
+    for (const url of urls) {
       try {
-        console.log(`[TransferOfferService] Getting choice context: ${acceptContextUrl.substring(0, 120)}...`);
-        
-        const contextResponse = await fetch(acceptContextUrl, {
+        console.log(`[TransferOfferService] Trying: ${url.substring(0, 140)}...`);
+        const resp = await fetch(url, {
           method: 'POST',
           headers: {
             'Authorization': `Bearer ${adminToken}`,
@@ -359,108 +315,81 @@ class TransferOfferService {
           },
           body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
         });
-        
-        if (contextResponse.ok) {
-          const acceptContext = await contextResponse.json();
-          console.log(`[TransferOfferService] ✅ Got accept context (${acceptContext.disclosedContracts?.length || 0} disclosed contracts)`);
-          
-          const disclosedContracts = (acceptContext.disclosedContracts || []).map(dc => ({
+
+        if (resp.ok) {
+          const ctx = await resp.json();
+          console.log(`[TransferOfferService] ✅ Got accept context (${ctx.disclosedContracts?.length || 0} disclosed, ${Object.keys(ctx.choiceContextData?.values || {}).length} context keys)`);
+          const disclosedContracts = (ctx.disclosedContracts || []).map(dc => ({
             templateId: dc.templateId,
             contractId: dc.contractId,
             createdEventBlob: dc.createdEventBlob,
             synchronizerId: dc.synchronizerId || synchronizerId,
           }));
-          
-          const choiceContextData = acceptContext.choiceContextData || acceptContext.choiceContext?.choiceContextData || { values: {} };
-          
+          const choiceContextData = ctx.choiceContextData || ctx.choiceContext?.choiceContextData || { values: {} };
           return { disclosedContracts, choiceContextData };
-        } else {
-          const errorText = await contextResponse.text();
-          console.log(`[TransferOfferService] ${contextResponse.status}: ${errorText.substring(0, 150)}`);
         }
+
+        const errTxt = await resp.text();
+        const shortErr = `${resp.status}: ${errTxt.substring(0, 180)}`;
+        console.log(`[TransferOfferService] ${shortErr}`);
+        errors.push(shortErr);
       } catch (err) {
-        console.log(`[TransferOfferService] Failed: ${(err?.message || String(err)).substring(0, 120)}`);
+        const msg = (err?.message || String(err)).substring(0, 140);
+        console.log(`[TransferOfferService] Failed: ${msg}`);
+        errors.push(msg);
       }
     }
-    
+
     throw new Error(
-      'Could not get accept choice context. The transfer offer may have expired or the registry is unavailable.'
+      `Could not get accept choice context. Tried ${errors.length} endpoints. ` +
+      `Registrar: ${registrarParty || 'unknown'}. Last error: ${errors[errors.length - 1] || 'none'}`
     );
   }
 
   /**
-   * Accept a transfer offer (legacy single-step for internal parties OR 2-step interactive for external)
-   * 
-   * For EXTERNAL parties: Uses interactive submission (prepare → sign → execute)
-   * For INTERNAL parties: Uses direct exerciseChoice (deprecated path)
-   * 
-   * This method now defaults to interactive submission flow.
-   * 
-   * @param {string} offerContractId - The transfer offer contract ID
-   * @param {string} partyId - The party accepting the offer
-   * @param {string} token - Admin token
-   * @param {string} templateId - Optional template ID (if known)
-   * @returns {Object} For external parties: { requiresSignature, preparedTransaction, ... }
+   * Discover the operator party from the Utilities Backend.
+   * Ref: https://api.utilities.digitalasset-dev.com/api/utilities/v0/operator
    */
-  async acceptTransferOffer(offerContractId, partyId, token, templateId = null) {
-    await this.initialize();
-    
-    const TRANSFER_INSTRUCTION_INTERFACE = '#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction';
-    
+  async _discoverOperatorParty() {
+    if (this._cachedOperatorParty !== undefined) return this._cachedOperatorParty;
+
+    const url = `${UTILITIES_CONFIG.BACKEND_URL}/v0/operator`;
     try {
-      console.log(`[TransferOfferService] Accepting transfer: ${offerContractId.substring(0, 30)}... for ${partyId.substring(0, 30)}...`);
-      if (templateId) {
-        console.log(`[TransferOfferService] Template hint: ${templateId.substring(0, 60)}...`);
+      const resp = await fetch(url, { method: 'GET', headers: { 'Accept': 'application/json' } });
+      if (resp.ok) {
+        const data = await resp.json();
+        const partyId = data?.partyId || null;
+        if (partyId) {
+          console.log(`[TransferOfferService] Discovered operator party: ${partyId.substring(0, 50)}...`);
+        }
+        this._cachedOperatorParty = partyId;
+        return partyId;
       }
-      
-      const operatorPartyId = config.canton.operatorPartyId;
-      const synchronizerId = config.canton.synchronizerId;
-      
-      // All parties are external (Confirmation permission) — use interactive submission.
-      console.log(`[TransferOfferService] Using interactive submission (2-step flow)`);
-      console.log(`[TransferOfferService] Frontend must call /prepare-accept then /execute-accept with user signature`);
-      
-      const prepareResult = await this.prepareTransferAccept(offerContractId, partyId, token, templateId);
-      return {
-        ...prepareResult,
-        requiresSignature: true,
-      };
-      
-    } catch (error) {
-      console.error('[TransferOfferService] Failed to accept transfer:', error.message);
-      throw error;
+    } catch (e) {
+      console.log(`[TransferOfferService] Could not discover operator: ${(e?.message || '').substring(0, 80)}`);
     }
+    this._cachedOperatorParty = null;
+    return null;
   }
 
-  /**
-   * List all external tokens (from Splice/Canton infrastructure)
-   * These are tokens not created by our CLOB but available on the network
-   * 
-   * @param {string} token - Admin token
-   * @returns {Array} List of known external token types
-   */
+  // ═══════════════════════════════════════════════════════════════════════════
+  // List external tokens
+  // ═══════════════════════════════════════════════════════════════════════════
+
   async listExternalTokens(token) {
     await this.initialize();
-    
+
     try {
-      // Query for Instrument contracts on the network
-      // This will find both our instruments and external ones
       const templateIds = getTokenStandardTemplateIds();
-      
       const instruments = await this.cantonService.queryActiveContracts({
         party: OPERATOR_PARTY_ID,
         templateIds: [templateIds.instrument],
       }, token);
-      
-      // Also try to find Splice-native instruments
-      // These might be under different package IDs
-      
+
       const uniqueInstruments = new Map();
-      
       for (const contract of instruments) {
         const payload = contract.payload;
         const key = `${payload.instrumentId?.symbol || payload.symbol}`;
-        
         if (!uniqueInstruments.has(key)) {
           uniqueInstruments.set(key, {
             symbol: payload.instrumentId?.symbol || payload.symbol,
@@ -471,9 +400,8 @@ class TransferOfferService {
           });
         }
       }
-      
       return Array.from(uniqueInstruments.values());
-      
+
     } catch (error) {
       console.error('[TransferOfferService] Failed to list external tokens:', error.message);
       throw error;
@@ -481,7 +409,6 @@ class TransferOfferService {
   }
 }
 
-// Singleton
 let transferOfferServiceInstance = null;
 
 function getTransferOfferService() {
