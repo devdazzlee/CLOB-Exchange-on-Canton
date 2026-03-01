@@ -8,17 +8,17 @@ export default function TradingPageSkeleton() {
   return (
     <div className="space-y-6 animate-pulse">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <Skeleton className="h-9 w-48" />
-        <div className="flex items-center space-x-2">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <Skeleton className="h-9 w-40 sm:w-48" />
+        <div className="flex items-center space-x-2 self-start sm:self-auto">
           <Skeleton className="h-2 w-2 rounded-full" />
           <Skeleton className="h-4 w-20" />
         </div>
       </div>
       
-      {/* Order Form Row */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <Card className="bg-card/50 border-border/50">
+      {/* Order Form + Balance Row */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <Card className="lg:col-span-2 bg-card/50 border-border/50">
           <CardHeader>
             <div className="flex items-center justify-between">
               <Skeleton className="h-6 w-32" />
@@ -26,35 +26,41 @@ export default function TradingPageSkeleton() {
             </div>
           </CardHeader>
           <CardContent className="space-y-4">
-            {/* Pair selector */}
             <Skeleton className="h-10 w-full" />
-            
-            {/* Buy/Sell buttons */}
             <div className="grid grid-cols-2 gap-2">
               <Skeleton className="h-10 w-full" />
               <Skeleton className="h-10 w-full" />
             </div>
-            
-            {/* Order type tabs */}
             <div className="flex gap-2">
               <Skeleton className="h-8 w-20" />
               <Skeleton className="h-8 w-20" />
+              <Skeleton className="h-8 w-20" />
             </div>
-            
-            {/* Price input */}
             <div className="space-y-2">
               <Skeleton className="h-4 w-16" />
               <Skeleton className="h-12 w-full" />
             </div>
-            
-            {/* Quantity input */}
             <div className="space-y-2">
               <Skeleton className="h-4 w-20" />
               <Skeleton className="h-12 w-full" />
             </div>
-            
-            {/* Submit button */}
             <Skeleton className="h-12 w-full" />
+          </CardContent>
+        </Card>
+        <Card className="bg-card/50 border-border/50">
+          <CardHeader>
+            <Skeleton className="h-6 w-28" />
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {[...Array(4)].map((_, i) => (
+              <div key={`bal-${i}`} className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Skeleton className="h-8 w-8 rounded-full" />
+                  <Skeleton className="h-4 w-24" />
+                </div>
+                <Skeleton className="h-5 w-20" />
+              </div>
+            ))}
           </CardContent>
         </Card>
       </div>
@@ -62,7 +68,7 @@ export default function TradingPageSkeleton() {
       {/* Price Chart */}
       <Card className="bg-card/50 border-border/50">
         <CardHeader className="pb-2">
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-4">
               <div>
                 <Skeleton className="h-6 w-28 mb-2" />
@@ -86,9 +92,9 @@ export default function TradingPageSkeleton() {
                 </div>
               </div>
             </div>
-            <div className="flex items-center gap-2">
-              <Skeleton className="h-9 w-24" />
-              <Skeleton className="h-9 w-48" />
+            <div className="flex w-full sm:w-auto items-center gap-2">
+              <Skeleton className="h-9 w-20 sm:w-24 flex-shrink-0" />
+              <Skeleton className="h-9 flex-1 sm:flex-none sm:w-48 min-w-0" />
             </div>
           </div>
         </CardHeader>
@@ -102,9 +108,9 @@ export default function TradingPageSkeleton() {
         {/* Order Book */}
         <Card className="lg:col-span-2 bg-card/50 border-border/50">
           <CardHeader>
-            <div className="flex items-center justify-between">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <Skeleton className="h-6 w-40" />
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 self-start sm:self-auto">
                 <Skeleton className="h-6 w-24" />
                 <Skeleton className="h-8 w-8" />
               </div>

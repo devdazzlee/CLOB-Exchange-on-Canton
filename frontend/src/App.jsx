@@ -51,25 +51,15 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
   useEffect(() => {
-    // Check if wallet exists
     const wallet = loadWallet();
     if (wallet) {
-      // IMPORTANT:
-      // The real party id is allocated by Canton and returned by our backend.
-      // On refresh we must reuse that value, not re-derive a fake partyId from the public key.
       const storedPartyId = localStorage.getItem('canton_party_id');
       if (storedPartyId) {
         setPartyId(storedPartyId);
-        Promise.resolve(rehydrateUserMapping(storedPartyId, wallet))
-          .finally(() => setWalletReady(true));
-      } else {
-        // No fallback: force party registration via backend (WalletSetup will do it)
-        setPartyId(null);
-        setWalletReady(false);
+        setWalletReady(true);
+        rehydrateUserMapping(storedPartyId, wallet);
       }
     }
-    
-    // No Keycloak auth for end users. Wallet presence is the only gating signal.
   }, []);
 
   const handleWalletReady = (newPartyId) => {
