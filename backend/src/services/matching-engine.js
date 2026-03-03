@@ -964,16 +964,18 @@ class MatchingEngine {
         }
 
         if (isTransientLock) {
-          // Give Canton time to finalize uncertain verdicts, then reconcile with ledger state.
+          // Give Canton time to finalize uncertain verdicts, then reconcile via streaming read model.
+          // Root cause: /v2/contracts/lookup does not exist on this Canton deployment (404).
+          // Use streaming model as source of truth — it receives archive events from Canton WebSocket.
           await new Promise(r => setTimeout(r, 2000));
-          const stillActive = await cantonService.lookupContract(order.contractId, token);
-          if (!stillActive) {
-            console.warn(`[MatchingEngine] ${side} FillOrder reconciliation: contract already archived on ledger; treating as finalized`);
+          const stillInCache = streaming && streaming.orders.has(order.contractId);
+          if (!stillInCache) {
+            console.warn(`[MatchingEngine] ${side} FillOrder reconciliation: order evicted from streaming cache — treating as finalized`);
             if (streaming) streaming.evictOrder(order.contractId);
             return;
           }
 
-          console.warn(`[MatchingEngine] ${side} FillOrder deferred: contract still active after transient lock; next cycle will retry`);
+          console.warn(`[MatchingEngine] ${side} FillOrder deferred: order still in cache after transient lock; next cycle will retry`);
           return;
         }
 

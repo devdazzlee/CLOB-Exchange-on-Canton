@@ -78,12 +78,8 @@ function getGlobalOpenOrders() {
 
 async function getReservedBalance(partyId, asset) {
   const db = getDb();
-  const result = await db.orderReservation.aggregate({
-    where: { partyId, asset },
-    _sum: { amount: true },
-  });
-  // amount is stored as String (Decimal). Aggregate returns null if no rows.
-  // Since Prisma stores Decimal as String, we need to sum manually.
+  // OrderReservation.amount is String (Decimal). Prisma aggregate _sum does not support String.
+  // Use findMany + manual sum.
   const rows = await db.orderReservation.findMany({
     where: { partyId, asset },
     select: { amount: true },
@@ -1430,26 +1426,41 @@ class OrderService {
   }
 
   /**
-   * Get order by contract ID
+   * Get order by contract ID.
+   * Uses streaming read model first (avoids Canton lookup which may 404 on some deployments).
    */
   async getOrder(orderContractId) {
     if (!orderContractId) {
       throw new ValidationError('Order contract ID is required');
     }
 
-    console.log(`[OrderService] Getting order: ${orderContractId}`);
-
-    const token = await tokenProvider.getServiceToken();
-    
     try {
+      const readModel = getReadModelService();
+      const fromCache = await readModel.getOrderByContractId(orderContractId);
+      if (fromCache) {
+        return {
+          contractId: fromCache.contractId,
+          orderId: fromCache.orderId,
+          owner: fromCache.owner,
+          tradingPair: fromCache.tradingPair,
+          orderType: fromCache.orderType,
+          orderMode: fromCache.orderMode || 'LIMIT',
+          price: fromCache.price?.Some ?? fromCache.price,
+          quantity: fromCache.quantity,
+          filled: fromCache.filled || '0',
+          status: fromCache.status,
+          timestamp: fromCache.timestamp,
+          allocationCid: fromCache.allocationCid || null
+        };
+      }
+
+      const token = await tokenProvider.getServiceToken();
       const contract = await cantonService.lookupContract(orderContractId, token);
-      
       if (!contract) {
         throw new NotFoundError(`Order not found: ${orderContractId}`);
       }
 
       const payload = contract.payload || contract.createArgument || {};
-
       return {
         contractId: orderContractId,
         orderId: payload.orderId,
@@ -1465,6 +1476,7 @@ class OrderService {
         allocationCid: payload.allocationCid || null
       };
     } catch (error) {
+      if (error instanceof NotFoundError || error instanceof ValidationError) throw error;
       console.error('[OrderService] Error getting order:', error.message);
       throw error;
     }

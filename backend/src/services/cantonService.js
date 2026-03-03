@@ -202,11 +202,15 @@ class CantonService {
             error.code === 'LOCAL_VERDICT_LOCKED_CONTRACTS' &&
             (error.context?.definite_answer === 'false' || error.context?.definite_answer === false);
 
+          const isInactiveContracts =
+            error.code === 'LOCAL_VERDICT_INACTIVE_CONTRACTS';
+          // Expected when exercising already-consumed contracts (e.g. FillOrder after archive).
+          // Higher-level logic treats as stale and continues; avoid polluting error logs.
+
           if (isTransientLockedContract) {
-            // Canton explicitly marks this as an uncertain/transient verdict.
-            // Let higher-level reconciliation logic decide final state without
-            // polluting error logs with expected transient contention.
             console.warn(`[CantonService] ⚠️ Transient locked-contract verdict (definite_answer=false)`);
+          } else if (isInactiveContracts) {
+            console.warn(`[CantonService] ⚠️ Inactive contracts (expected when contract already consumed)`);
           } else {
             console.error(`[CantonService] ❌ Command failed:`, error);
           }
@@ -486,13 +490,12 @@ class CantonService {
   }
 
   /**
-   * Lookup a single contract by contract ID
-   * POST /v2/contracts/lookup
+   * Lookup a single contract by contract ID.
+   * NOTE: POST /v2/contracts/lookup may return 404 on some Canton deployments
+   * (endpoint not implemented). Use streaming read model for reconciliation where possible.
    */
   async lookupContract(contractId, token) {
     const url = `${this.jsonApiBase}/v2/contracts/lookup`;
-
-    console.log(`[CantonService] Looking up contract: ${contractId?.substring(0, 40)}...`);
 
     const res = await fetch(url, {
       method: "POST",
@@ -507,7 +510,13 @@ class CantonService {
 
     if (!res.ok) {
       const error = parseCantonError(await res.text(), res.status);
-      console.error(`[CantonService] ❌ Contract lookup failed:`, error);
+      // 404 = endpoint not available on this deployment; not an application bug.
+      const isEndpointUnavailable = res.status === 404;
+      if (isEndpointUnavailable) {
+        console.warn(`[CantonService] ⚠️ Contract lookup endpoint unavailable (404) — use streaming model for reconciliation`);
+      } else {
+        console.error(`[CantonService] ❌ Contract lookup failed:`, error);
+      }
       return null;
     }
 
