@@ -125,6 +125,9 @@ class OrderController {
         quantity: result.quantity,
         stopPrice: result.stopPrice,
         lockInfo: result.lockInfo,
+        stage: result.stage || null,
+        step: result.step || null,
+        allocationType: result.allocationType || null,
       }, 'Transaction prepared. Sign the hash and call /execute-place.');
     }
 
@@ -249,7 +252,24 @@ class OrderController {
 
     console.log(`[OrderController] ✅ Order placed via interactive submission: ${result.orderId}`);
 
-    // Matching is event-driven: WebSocket → StreamingReadModel → 'orderCreated' → MatchingEngine
+    // Trigger matching after order placement (non-blocking).
+    // The matching engine background loop may already pick this up, but an
+    // explicit trigger after a short delay ensures Allocation_ExecuteTransfer
+    // runs promptly even if the streaming read model is slow.
+    const tradingPairForMatch = result?.tradingPair || orderMeta?.tradingPair;
+    if (tradingPairForMatch) {
+      setTimeout(async () => {
+        try {
+          const { getMatchingEngine } = require('../services/matching-engine');
+          const matchingEngine = getMatchingEngine();
+          const triggerResult = await matchingEngine.triggerMatchingCycle(tradingPairForMatch);
+          console.log(`[OrderController] ⚡ Post-placement match trigger for ${tradingPairForMatch}: ${triggerResult?.success ? 'ok' : 'skipped'}`);
+        } catch (triggerErr) {
+          console.warn(`[OrderController] Match trigger failed (non-fatal): ${triggerErr.message}`);
+        }
+      }, 3000);
+    }
+
     return success(res, { ...result, matchTriggered: true }, 'Order placed via interactive submission', 201);
   });
 

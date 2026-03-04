@@ -438,7 +438,7 @@ async function startServer() {
       }
     } else {
       console.log('');
-      console.log('⚠️  Matching Engine disabled (set ENABLE_MATCHING_ENGINE=true to enable)');
+      console.log('⚠️  Matching Engine disabled (set MATCHING_ENGINE_ENABLED=true to enable)');
     }
 
     // Milestone 4: Start stop-loss service

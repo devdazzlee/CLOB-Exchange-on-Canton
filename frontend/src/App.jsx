@@ -8,6 +8,8 @@ import AuthGuard from './components/AuthGuard';
 import ErrorBoundary from './components/ErrorBoundary';
 import { ToastProvider } from './components/ui/toast';
 import { loadWallet, clearWallet, bytesToBase64 } from './wallet/keyManager';
+import { clearStoredSession } from './services/walletService';
+import authService from './services/authService';
 import { getOrCreateUserId } from './services/userId';
 import './index.css';
 
@@ -80,9 +82,17 @@ function App() {
   };
 
   const handleLogout = () => {
-    // Clear wallet + onboarding identity (frontend-side)
-    clearWallet();
+    // Clear ALL wallet + auth + session data so a fresh wallet can be created
+    clearWallet();                           // canton_wallet (localStorage + IndexedDB)
+    clearStoredSession();                    // canton_wallet_id, canton_session_token
+    authService.logout().catch(() => {});    // clob_access_token, clob_refresh_token, etc.
     localStorage.removeItem('canton_party_id');
+    localStorage.removeItem('canton_key_fingerprint');
+    // Legacy keys used by apiClient interceptors
+    localStorage.removeItem('accessToken');
+    localStorage.removeItem('refreshToken');
+    localStorage.removeItem('partyId');
+    try { sessionStorage.removeItem('canton_signing_key_b64'); } catch (_) {}
     // Reset all state
     setPartyId(null);
     setWalletReady(false);

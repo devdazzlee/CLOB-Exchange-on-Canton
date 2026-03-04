@@ -315,6 +315,11 @@ export default function TradingInterface({ partyId }) {
       // Refresh data after order placement
       setTimeout(() => refreshAllData(orderData.tradingPair || tradingPair), 1000);
       setTimeout(() => refreshAllData(orderData.tradingPair || tradingPair), 3000);
+
+      // Trigger matching engine so allocations get executed promptly
+      setTimeout(() => {
+        apiClient.post('/match/trigger', { pair: orderData.tradingPair || tradingPair }).catch(() => {});
+      }, 4000);
       
     } catch (error) {
       console.error('[Place Order] Failed:', error);
@@ -547,6 +552,11 @@ export default function TradingInterface({ partyId }) {
           
           setTimeout(() => refreshAllData(od.tradingPair || tradingPair), 1000);
           setTimeout(() => refreshAllData(od.tradingPair || tradingPair), 3000);
+
+          // Trigger matching engine so allocations get executed promptly
+          setTimeout(() => {
+            apiClient.post('/match/trigger', { pair: od.tradingPair || tradingPair }).catch(() => {});
+          }, 4000);
         } else {
           throw new Error(response.error || 'Failed to execute order placement');
         }

@@ -2708,19 +2708,23 @@ class CantonSDKClient {
         return result;
       }
 
-      console.warn(`[CantonSDK] Real allocation execution returned null — no transfer`);
-      return null;
+      // Never silently return null — client requirement: allocations must be executed.
+      // If we get here, executor-only path failed with no thrown error; treat as fatal.
+      const fatalMsg = `Allocation_ExecuteTransfer returned null for ${allocationContractId?.substring(0, 24)}... — tokens NOT transferred`;
+      console.error(`[CantonSDK] ❌ ${fatalMsg}`);
+      throw new Error(fatalMsg);
     } catch (err) {
       const msg = String(err?.message || err || '');
 
       // Stale / expired → propagate so caller knows the allocation is dead
       if (msg.includes('STALE_') || msg.includes('CONTRACT_NOT_FOUND') || msg.includes('could not be found')) {
         console.error(`[CantonSDK] ❌ Real allocation is stale/archived: ${msg.substring(0, 150)}`);
-        throw err; // Let caller handle — this allocation can't be used
+        throw err;
       }
 
-      console.warn(`[CantonSDK] Allocation execution failed: ${msg.substring(0, 200)}`);
-      return null;
+      // Always throw — never return null. Client requirement: allocations must execute.
+      console.error(`[CantonSDK] ❌ Allocation_ExecuteTransfer failed: ${msg.substring(0, 300)}`);
+      throw err;
     }
   }
 

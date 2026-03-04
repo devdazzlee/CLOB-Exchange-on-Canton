@@ -234,7 +234,8 @@ router.get('/v2/:partyId', asyncHandler(async (req, res) => {
       console.warn(`[Balance V2] Trade adjustments failed (non-critical): ${tradeErr.message}`);
     }
 
-    // ─── 3. Subtract open order reservations ───
+    // ─── 3. Subtract open order reservations (tokens locked at order placement) ───
+    const reserved = {};
     try {
       const db = getDb();
       const reservations = await db.orderReservation.findMany({
@@ -245,6 +246,7 @@ router.get('/v2/:partyId', asyncHandler(async (req, res) => {
         const resAmt = parseFloat(r.amount || '0');
         if (resAmt > 0 && r.asset) {
           available[r.asset] = (available[r.asset] || 0) - resAmt;
+          reserved[r.asset] = (reserved[r.asset] || 0) + resAmt;
         }
       }
     } catch (resErr) {
@@ -256,13 +258,14 @@ router.get('/v2/:partyId', asyncHandler(async (req, res) => {
       if (available[sym] < 0) available[sym] = 0;
     }
 
-    console.log(`[Balance V2] Balances (hybrid) for ${partyId.substring(0, 30)}...:`, available);
+    console.log(`[Balance V2] Balances (hybrid) for ${partyId.substring(0, 30)}...:`, available, 'reserved:', reserved);
 
     return success(res, {
       partyId,
       balance: available,
       available,
       locked,
+      reserved, // Tokens locked in open orders (AllocationFactory_Allocate on-chain + DB reservation)
       total,
       holdings: [],
       source: 'canton-sdk-hybrid',

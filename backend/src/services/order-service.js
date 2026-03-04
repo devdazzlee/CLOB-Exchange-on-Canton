@@ -668,10 +668,42 @@ class OrderService {
     // Store the allocation type with the reservation
     await setAllocationContractIdForOrder(orderId, null, allocationType);
 
+    // ═══════════════════════════════════════════════════════════════════
+    // SINGLE SIGNATURE: Combine allocation + order create into one prepare.
+    // Command 1 (AllocationFactory_Allocate) creates DvpLegAllocation → "#0"
+    // Command 2 (Order Create) references allocationCid: "#0" (relative ref)
+    // ═══════════════════════════════════════════════════════════════════
+    const orderStatus = orderMode.toUpperCase() === 'STOP_LOSS' ? 'PENDING_TRIGGER' : 'OPEN';
+    const packageId = config.canton.packageIds?.clobExchange;
+    if (!packageId) {
+      throw new Error('CLOB_EXCHANGE_PACKAGE_ID is not configured');
+    }
+
+    const orderCreateCommand = {
+      CreateCommand: {
+        templateId: `${packageId}:Order:Order`,
+        createArguments: {
+          orderId,
+          owner: partyId,
+          orderType: orderType.toUpperCase(),
+          orderMode: orderMode.toUpperCase(),
+          tradingPair,
+          price: orderMode.toUpperCase() === 'LIMIT' && price ? String(price) : null,
+          quantity: String(quantity),
+          filled: '0.0',
+          status: orderStatus,
+          timestamp: new Date().toISOString(),
+          operator: operatorPartyId,
+          allocationCid: '#0', // Reference allocation created by first command in same transaction
+          stopPrice: stopPrice || null,
+        },
+      },
+    };
+
     const prepareResult = await cantonService.prepareInteractiveSubmission({
       token,
       actAsParty: [partyId],
-      commands: [allocationCommand],
+      commands: [allocationCommand, orderCreateCommand],
       readAs,
       synchronizerId,
       disclosedContracts,
@@ -681,11 +713,11 @@ class OrderService {
       throw new Error('Prepare returned incomplete result: missing preparedTransaction or preparedTransactionHash');
     }
     
-    console.log(`[OrderService] ✅ Allocation prepared (step 1/2, type: ${allocationType}). Hash to sign: ${prepareResult.preparedTransactionHash.substring(0, 40)}...`);
+    console.log(`[OrderService] ✅ Allocation + Order combined (single sign, type: ${allocationType}). Hash to sign: ${prepareResult.preparedTransactionHash.substring(0, 40)}...`);
     
     return {
       requiresSignature: true,
-      step: 'ALLOCATION_PREPARED',
+      step: 'ALLOCATION_AND_ORDER_PREPARED',
       orderId,
       tradingPair,
       orderType: orderType.toUpperCase(),
@@ -698,7 +730,7 @@ class OrderService {
       hashingSchemeVersion: prepareResult.hashingSchemeVersion,
       partyId,
       lockInfo,
-      stage: 'ALLOCATION_PREPARED',
+      stage: 'ALLOCATION_AND_ORDER_PREPARED',
       allocationType,
     };
   }
@@ -819,8 +851,28 @@ class OrderService {
         console.log(`[OrderService] ✅ Allocation linked to order ${orderMeta.orderId}: ${allocationContractId.substring(0, 30)}... (type: ${allocType || 'auto'})`);
       }
 
-      // Step 1: allocation executed. Prepare Step 2: order create.
-      if (stage === 'ALLOCATION_PREPARED') {
+      // SINGLE-SIGN: Allocation + Order in one tx; skip second prepare.
+      if (stage === 'ALLOCATION_AND_ORDER_PREPARED') {
+        // If Canton execute response didn't include allocation CID in events,
+        // actively search for it so the matching engine can find it later.
+        if (!allocationContractId && orderMeta.orderId) {
+          console.log(`[OrderService] Single-sign: allocation CID not in events, searching...`);
+          try {
+            allocationContractId = await this._findAllocationCidForOrder(orderMeta.orderId, partyId, token);
+          } catch (searchErr) {
+            console.warn(`[OrderService] Allocation CID search failed: ${searchErr.message}`);
+          }
+        }
+        if (allocationContractId && orderMeta.orderId) {
+          const allocType = orderMeta.allocationType || null;
+          await setAllocationContractIdForOrder(orderMeta.orderId, allocationContractId, allocType);
+          console.log(`[OrderService] ✅ Single-sign: allocation CID stored for matching: ${allocationContractId.substring(0, 30)}...`);
+        } else {
+          console.warn(`[OrderService] ⚠️ Single-sign: could not resolve real allocation CID for ${orderMeta.orderId} — matching engine will retry via DB lookup`);
+        }
+        // Fall through to success path
+      } else if (stage === 'ALLOCATION_PREPARED') {
+        // LEGACY TWO-STEP: Allocation executed; prepare order create for second signature.
         const packageId = config.canton.packageIds.clobExchange;
         let effectiveAllocationCid = orderMeta.allocationContractId || allocationContractId;
         if (!effectiveAllocationCid) {
@@ -1041,7 +1093,11 @@ class OrderService {
     // ═══ Cancel the Allocation — release locked funds via Allocation_Cancel ═══
     const orderId_cancel = orderDetails?.orderId;
     if (orderId_cancel) {
-      const allocationCid = orderDetails?.allocationCid || await getAllocationContractIdForOrder(orderId_cancel);
+      const payloadAllocationCid = orderDetails?.allocationCid;
+      const isRealCid = typeof payloadAllocationCid === 'string' && payloadAllocationCid.length > 20 && !payloadAllocationCid.startsWith('#');
+      const allocationCid = isRealCid
+        ? payloadAllocationCid
+        : await getAllocationContractIdForOrder(orderId_cancel);
       if (allocationCid) {
         try {
           const allocationCancelResult = await this.cancelAllocationForOrder(orderId_cancel, allocationCid, partyId);

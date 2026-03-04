@@ -462,10 +462,14 @@ class MatchingEngine {
         }
 
         // Extract allocationCid (Token Standard allocation contract ID)
+        // '#0' is a relative reference from single-sign tx — NOT a real contract ID.
         const rawAllocationCid = payload.allocationCid || '';
-        let allocationCid = (rawAllocationCid && rawAllocationCid !== 'FILL_ONLY' && rawAllocationCid !== 'NONE' && rawAllocationCid.length >= 10)
-          ? rawAllocationCid
-          : null;
+        const isValidCid = rawAllocationCid
+          && rawAllocationCid !== 'FILL_ONLY'
+          && rawAllocationCid !== 'NONE'
+          && !rawAllocationCid.startsWith('#')
+          && rawAllocationCid.length >= 10;
+        let allocationCid = isValidCid ? rawAllocationCid : null;
         if (!allocationCid && payload.orderId) {
           try {
             const { getAllocationContractIdForOrder } = require('./order-service');

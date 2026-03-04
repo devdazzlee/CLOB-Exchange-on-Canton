@@ -30,11 +30,23 @@ export async function getBalances(partyId, useTokenStandard = USE_TOKEN_STANDARD
       : API_ROUTES.BALANCE.GET(partyId);
     
     const response = await apiClient.get(route);
+    const apiLocked = response.data?.locked || {};
+    const apiReserved = response.data?.reserved || {};
+    const mergedLocked = { ...apiLocked };
+
+    // Reservations represent tokens locked by open orders.
+    // Merge them into locked so UI surfaces lock state consistently.
+    for (const [symbol, amount] of Object.entries(apiReserved)) {
+      const current = parseFloat(mergedLocked[symbol] || 0) || 0;
+      const reserved = parseFloat(amount || 0) || 0;
+      mergedLocked[symbol] = current + reserved;
+    }
     
     // Normalize response format
     return {
       available: response.data?.available || response.data?.balance || {},
-      locked: response.data?.locked || {},
+      locked: mergedLocked,
+      reserved: apiReserved,
       total: response.data?.total || response.data?.balance || {},
       holdings: response.data?.holdings || [],
       tokenStandard: useTokenStandard,

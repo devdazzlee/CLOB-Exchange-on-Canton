@@ -36,9 +36,10 @@ export default function OrderForm({
 
   // Get base and quote tokens
   const [baseToken, quoteToken] = tradingPair.split('/');
-  // Available = Total - Locked (so user sees actual free funds)
-  const baseBalance = Math.max(0, parseFloat(balance[baseToken] || 0) - parseFloat(lockedBalance[baseToken] || 0));
-  const quoteBalance = Math.max(0, parseFloat(balance[quoteToken] || 0) - parseFloat(lockedBalance[quoteToken] || 0));
+  // balance already represents AVAILABLE funds (backend subtracts reservations).
+  // Do NOT subtract lockedBalance again — that would double-count.
+  const baseBalance = Math.max(0, parseFloat(balance[baseToken] || 0));
+  const quoteBalance = Math.max(0, parseFloat(balance[quoteToken] || 0));
 
   // Get best bid/ask prices - REAL DATA ONLY
   const bestBid = orderBook.buys?.[0]?.price || null;
