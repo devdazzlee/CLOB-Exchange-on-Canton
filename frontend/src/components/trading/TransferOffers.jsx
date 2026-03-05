@@ -157,7 +157,13 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
       }
     } catch (err) {
       console.error('[TransferOffers] Accept error:', err);
-      toast.error(`Failed to accept: ${err.message?.substring(0, 100)}`);
+      const msg = err.message || '';
+      if (msg.includes('no longer exists') || msg.includes('archived') || msg.includes('expired') || msg.includes('CONTRACT_NOT_FOUND') || msg.includes('not found')) {
+        setOffers(prev => prev.filter(o => o.contractId !== offer.contractId));
+        toast.info('Transfer already processed or expired — removed from list.');
+      } else {
+        toast.error(`Failed to accept: ${msg.substring(0, 100)}`);
+      }
     } finally {
       setAccepting(null);
     }

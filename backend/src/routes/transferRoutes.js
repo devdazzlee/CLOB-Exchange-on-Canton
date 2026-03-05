@@ -73,23 +73,32 @@ router.post('/accept', asyncHandler(async (req, res) => {
   const transferService = getTransferOfferService();
   await transferService.initialize();
   
-  const result = await transferService.acceptTransferOffer(offerContractId, partyId, adminToken, templateId, registrarParty);
-  
-  // For external parties, the result includes requiresSignature: true
-  // The frontend must sign preparedTransactionHash and call /execute-accept
-  if (result.requiresSignature) {
-    return success(res, {
-      requiresSignature: true,
-      preparedTransaction: result.preparedTransaction,
-      preparedTransactionHash: result.preparedTransactionHash,
-      hashingSchemeVersion: result.hashingSchemeVersion,
-      hashingDetails: result.hashingDetails,
-      offerContractId: result.offerContractId,
-      partyId: result.partyId,
-    }, 'Transaction prepared. Sign the hash and call /execute-accept.');
+  try {
+    const result = await transferService.acceptTransferOffer(offerContractId, partyId, adminToken, templateId, registrarParty);
+    
+    if (result.requiresSignature) {
+      return success(res, {
+        requiresSignature: true,
+        preparedTransaction: result.preparedTransaction,
+        preparedTransactionHash: result.preparedTransactionHash,
+        hashingSchemeVersion: result.hashingSchemeVersion,
+        hashingDetails: result.hashingDetails,
+        offerContractId: result.offerContractId,
+        partyId: result.partyId,
+      }, 'Transaction prepared. Sign the hash and call /execute-accept.');
+    }
+    
+    return success(res, result, 'Transfer offer accepted successfully');
+  } catch (err) {
+    if (err.code === 'CONTRACT_NOT_FOUND' || (err.message && err.message.includes('no longer exists'))) {
+      return res.status(410).json({
+        success: false,
+        error: err.message,
+        code: 'TRANSFER_ARCHIVED',
+      });
+    }
+    throw err;
   }
-  
-  return success(res, result, 'Transfer offer accepted successfully');
 }));
 
 /**

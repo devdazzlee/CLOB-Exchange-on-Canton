@@ -289,18 +289,29 @@ class TransferOfferService {
     const tokenStandardBase = UTILITIES_CONFIG.TOKEN_STANDARD_URL;
     const scanProxyBase = CANTON_SDK_CONFIG.REGISTRY_API_URL || SCAN_PROXY_API || 'http://65.108.40.104:8088';
 
+    const isSpliceToken = templateHint?.includes('Amulet') || templateHint?.includes('Splice')
+      || (registrarParty && registrarParty.startsWith('DSO::'));
+
     const urls = [];
 
-    if (registrarParty) {
-      const encoded = encodeURIComponent(registrarParty);
-      urls.push(`${tokenStandardBase}/v0/registrars/${encoded}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`);
+    if (isSpliceToken) {
+      urls.push(`${scanProxyBase}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`);
+      if (registrarParty) {
+        const encoded = encodeURIComponent(registrarParty);
+        urls.push(`${tokenStandardBase}/v0/registrars/${encoded}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`);
+      }
+    } else {
+      if (registrarParty) {
+        const encoded = encodeURIComponent(registrarParty);
+        urls.push(`${tokenStandardBase}/v0/registrars/${encoded}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`);
+      }
+      urls.push(`${scanProxyBase}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`);
     }
 
-    urls.push(`${scanProxyBase}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`);
-
-    console.log(`[TransferOfferService] Resolving accept context — registrar: ${(registrarParty || 'unknown').substring(0, 50)}, ${urls.length} endpoints`);
+    console.log(`[TransferOfferService] Resolving accept context — registrar: ${(registrarParty || 'unknown').substring(0, 50)}, ${urls.length} endpoints, splice=${isSpliceToken}`);
 
     const errors = [];
+    let notFoundCount = 0;
 
     for (const url of urls) {
       try {
@@ -323,16 +334,26 @@ class TransferOfferService {
 
         const status = err.response?.status;
         const respData = typeof err.response?.data === 'string' ? err.response?.data : JSON.stringify(err.response?.data || {});
-        if (status === 404 || respData.includes('CONTRACT_NOT_FOUND') || respData.includes('not found')) {
-          const archiveErr = new Error(`Transfer contract ${offerContractId.substring(0, 20)}... no longer exists (archived/expired)`);
-          archiveErr.code = 'CONTRACT_NOT_FOUND';
-          throw archiveErr;
+        const is404 = status === 404 || respData.includes('CONTRACT_NOT_FOUND') || respData.includes('not found');
+
+        if (is404) {
+          notFoundCount++;
+          const msg = `404 from ${url.substring(0, 80)}...`;
+          console.log(`[TransferOfferService] ${msg} — trying next endpoint`);
+          errors.push(msg);
+          continue;
         }
 
         const msg = (err?.message || String(err)).substring(0, 140);
         console.log(`[TransferOfferService] Failed: ${msg}`);
         errors.push(msg);
       }
+    }
+
+    if (notFoundCount === urls.length) {
+      const archiveErr = new Error(`Transfer contract ${offerContractId.substring(0, 20)}... no longer exists (archived/expired)`);
+      archiveErr.code = 'CONTRACT_NOT_FOUND';
+      throw archiveErr;
     }
 
     throw new Error(
