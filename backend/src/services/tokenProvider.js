@@ -12,6 +12,7 @@
 // and emit its own warning.
 
 const config = require('../config');
+const { getAuthApi } = require('../http/clients');
 
 class TokenProvider {
     constructor() {
@@ -130,24 +131,22 @@ class TokenProvider {
             ...(audience && { audience })
         });
 
-        const response = await fetch(tokenUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: params.toString(),
-        });
-
-        if (!response.ok) {
-            const errorText = await response.text();
-            console.error('[TokenProvider] Token request failed:', {
-                status: response.status,
-                statusText: response.statusText,
-                error: errorText
-            });
-            throw new Error(`Failed to fetch service token: ${response.status} - ${errorText}`);
+        try {
+            const response = await getAuthApi().post(tokenUrl, params.toString());
+            return response.data.access_token;
+        } catch (error) {
+            if (error.response) {
+                const errorText = typeof error.response.data === 'string'
+                    ? error.response.data : JSON.stringify(error.response.data);
+                console.error('[TokenProvider] Token request failed:', {
+                    status: error.response.status,
+                    statusText: error.response.statusText,
+                    error: errorText
+                });
+                throw new Error(`Failed to fetch service token: ${error.response.status} - ${errorText}`);
+            }
+            throw error;
         }
-
-        const data = await response.json();
-        return data.access_token;
     }
 
     /**

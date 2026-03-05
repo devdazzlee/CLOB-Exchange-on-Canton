@@ -17,6 +17,7 @@ const cantonService = require('./cantonService');
 const tokenProvider = require('./tokenProvider');
 const onboardingService = require('./onboarding-service');
 const crypto = require('crypto');
+const { getCantonApi } = require('../http/clients');
 const { ValidationError, LedgerError } = require('../utils/ledgerError');
 const { getDb } = require('./db');
 
@@ -66,21 +67,20 @@ class WalletService {
 
       console.log(`[WalletService] Generating topology for: ${generatePayload.partyHint}`);
 
-      const response = await fetch(generateUrl, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(generatePayload)
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new LedgerError('PARTY_TOPOLOGY_FAILED', `Topology generation failed: ${errorText}`);
+      let result;
+      try {
+        const response = await getCantonApi().post(generateUrl, generatePayload, {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        result = response.data;
+      } catch (error) {
+        if (error.response) {
+          const errorText = typeof error.response.data === 'string'
+            ? error.response.data : JSON.stringify(error.response.data);
+          throw new LedgerError('PARTY_TOPOLOGY_FAILED', `Topology generation failed: ${errorText}`);
+        }
+        throw error;
       }
-
-      const result = await response.json();
 
       console.log(`[WalletService] ✅ Topology generated: ${result.partyId}`);
 
@@ -227,18 +227,18 @@ class WalletService {
       const token = await tokenProvider.getServiceToken();
       const url = `${this.jsonApiBase}/v2/parties/${encodeURIComponent(partyId)}`;
 
-      const response = await fetch(url, {
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
-
-      if (!response.ok) {
-        if (response.status === 404) {
+      let cantonInfo;
+      try {
+        const response = await getCantonApi().get(url, {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        cantonInfo = response.data;
+      } catch (error) {
+        if (error.response?.status === 404) {
           return null;
         }
-        throw new Error(`Party info fetch failed: ${response.status}`);
+        throw new Error(`Party info fetch failed: ${error.response?.status || error.message}`);
       }
-
-      const cantonInfo = await response.json();
       
       // Merge with stored wallet info from DB
       const db = getDb();

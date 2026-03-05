@@ -13,6 +13,7 @@
 
 const config = require("../config");
 const crypto = require("crypto");
+const { getCantonApi } = require("../http/clients");
 
 /**
  * Normalize template ID to Identifier object format required by JSON Ledger API v2
@@ -97,27 +98,52 @@ function decodeTokenPayload(token) {
 /**
  * Parse Canton error response and extract useful details
  */
-function parseCantonError(text, status) {
+function parseCantonError(dataOrText, status) {
   let errorData = {};
-  try {
-    errorData = JSON.parse(text);
-  } catch (e) {
-    return {
-      code: 'UNKNOWN_ERROR',
-      message: text,
-      httpStatus: status
-    };
+  if (typeof dataOrText === 'object' && dataOrText !== null) {
+    errorData = dataOrText;
+  } else {
+    try {
+      errorData = JSON.parse(dataOrText);
+    } catch {
+      return { code: 'UNKNOWN_ERROR', message: String(dataOrText), httpStatus: status };
+    }
   }
 
   return {
     code: errorData.code || 'UNKNOWN_ERROR',
-    message: errorData.cause || errorData.message || text,
+    message: errorData.cause || errorData.message || String(dataOrText),
     correlationId: errorData.correlationId,
     traceId: errorData.traceId,
     context: errorData.context,
     errorCategory: errorData.errorCategory,
     httpStatus: status
   };
+}
+
+/**
+ * Convert an Axios error from Canton API into a domain error with
+ * code, correlationId, traceId, context — matching the shape that
+ * downstream callers (matching-engine, order-service, canton-sdk-client)
+ * rely on for error classification.
+ */
+function classifyCantonError(axiosErr) {
+  if (axiosErr.response) {
+    const parsed = parseCantonError(axiosErr.response.data, axiosErr.response.status);
+    const err = new Error(parsed.code ? `${parsed.code}: ${parsed.message}` : parsed.message);
+    err.code = parsed.code;
+    err.correlationId = parsed.correlationId;
+    err.traceId = parsed.traceId;
+    err.context = parsed.context;
+    err.httpStatus = parsed.httpStatus;
+    return err;
+  }
+  if (axiosErr.code === 'ECONNABORTED' || axiosErr.message?.includes('timeout')) {
+    const err = new Error(`Canton API timeout: ${axiosErr.message}`);
+    err.code = 'TIMEOUT';
+    return err;
+  }
+  return axiosErr;
 }
 
 class CantonService {
@@ -148,108 +174,25 @@ class CantonService {
    * @returns {Object} JsSubmitAndWaitForTransactionResponse with transaction
    */
   async submitAndWaitForTransaction(token, body, { maxRetries = 3 } = {}) {
-    const url = `${this.jsonApiBase}/v2/commands/submit-and-wait-for-transaction`;
-
-    // Extract commandId from nested structure
     const commandId = body.commands?.commandId || body.commandId || 'unknown';
     const actAs = body.commands?.actAs || [];
-    console.log(`[CantonService] POST submit-and-wait commandId: ${commandId} actAs: [${actAs.map(p => p.substring(0, 20) + '...').join(', ')}]`);
+    console.log(`[CantonService] submit-and-wait commandId: ${commandId} actAs: [${actAs.map(p => p.substring(0, 20) + '...').join(', ')}]`);
 
-    let lastError = null;
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        const res = await fetch(url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${token}`
-          },
-          body: JSON.stringify(body),
-        });
-
-        const text = await res.text();
-
-        if (!res.ok) {
-          const error = parseCantonError(text, res.status);
-
-          // Retry on 503 (server overloaded / timeout), 429 (rate limited),
-          // and transient NO_SYNCHRONIZER (participant temporarily disconnected).
-          // Retry ALL NO_SYNCHRONIZER errors, not just multi-submitter ones,
-          // because even single-submitter failures can be transient when the
-          // synchronizer connection is flapping.
-          // NEVER retry CONTRACT_NOT_FOUND — the contract is archived, retrying won't help
-          // and just floods the participant with useless commands.
-          const isContractGone = error.code === 'CONTRACT_NOT_FOUND' ||
-              (error.message && error.message.includes('could not be found'));
-          if (isContractGone) {
-            console.warn(`[CantonService] ⚠️ Contract not found (archived) — not retrying`);
-            const errMsg = error.code ? `${error.code}: ${error.message}` : error.message;
-            const err = new Error(errMsg);
-            err.code = error.code;
-            err.httpStatus = error.httpStatus;
-            throw err;
-          }
-          const isTransientSync = error.code === 'NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT';
-          if ((res.status === 503 || res.status === 429 || isTransientSync) && attempt < maxRetries) {
-            const delay = Math.min(2000 * attempt, 8000);
-            console.warn(`[CantonService] ⚠️ ${isTransientSync ? 'TRANSIENT_SYNC' : res.status} on attempt ${attempt}/${maxRetries} for ${commandId} — retrying in ${delay}ms...`);
-            await new Promise(r => setTimeout(r, delay));
-            lastError = error;
-            continue;
-          }
-
-          const isTransientLockedContract =
-            error.code === 'LOCAL_VERDICT_LOCKED_CONTRACTS' &&
-            (error.context?.definite_answer === 'false' || error.context?.definite_answer === false);
-
-          const isInactiveContracts =
-            error.code === 'LOCAL_VERDICT_INACTIVE_CONTRACTS';
-          // Expected when exercising already-consumed contracts (e.g. FillOrder after archive).
-          // Higher-level logic treats as stale and continues; avoid polluting error logs.
-
-          if (isTransientLockedContract) {
-            console.warn(`[CantonService] ⚠️ Transient locked-contract verdict (definite_answer=false)`);
-          } else if (isInactiveContracts) {
-            console.warn(`[CantonService] ⚠️ Inactive contracts (expected when contract already consumed)`);
-          } else {
-            console.error(`[CantonService] ❌ Command failed:`, error);
-          }
-          // Include error CODE in the message so downstream callers (canton-sdk-client,
-          // matching-engine) can classify errors by checking error.message.includes(...)
-          // without needing to also inspect error.code separately.
-          const errMsg = error.code ? `${error.code}: ${error.message}` : error.message;
-          const err = new Error(errMsg);
-          err.code = error.code;
-          err.correlationId = error.correlationId;
-          err.traceId = error.traceId;
-          err.context = error.context;
-          err.httpStatus = error.httpStatus;
-          throw err;
+    try {
+      const { data } = await getCantonApi().post(
+        '/v2/commands/submit-and-wait-for-transaction',
+        body,
+        {
+          headers: { Authorization: `Bearer ${token}` },
+          'axios-retry': { retries: maxRetries },
         }
+      );
 
-        const result = JSON.parse(text);
-        if (attempt > 1) {
-          console.log(`[CantonService] ✅ Transaction completed on retry ${attempt}: ${result.transaction?.updateId || 'unknown'}`);
-        } else {
-          console.log(`[CantonService] ✅ Transaction completed: ${result.transaction?.updateId || 'unknown'}`);
-        }
-        return result;
-      } catch (fetchErr) {
-        // Network-level errors (ECONNRESET, timeout, etc.) — retry
-        if (fetchErr.httpStatus) throw fetchErr; // Already a Canton error, re-throw
-        if (attempt < maxRetries) {
-          const delay = Math.min(2000 * attempt, 8000);
-          console.warn(`[CantonService] ⚠️ Network error on attempt ${attempt}/${maxRetries}: ${fetchErr.message} — retrying in ${delay}ms...`);
-          await new Promise(r => setTimeout(r, delay));
-          lastError = fetchErr;
-          continue;
-        }
-        throw fetchErr;
-      }
+      console.log(`[CantonService] Transaction completed: ${data.transaction?.updateId || 'unknown'}`);
+      return data;
+    } catch (axiosErr) {
+      throw classifyCantonError(axiosErr);
     }
-
-    // Should not reach here, but safety net
-    throw lastError || new Error('submitAndWaitForTransaction: max retries exhausted');
   }
 
   /**
@@ -428,26 +371,15 @@ class CantonService {
    * GET /v2/state/ledger-end
    */
   async getLedgerEndOffset(token) {
-    const url = `${this.jsonApiBase}/v2/state/ledger-end`;
-
-    console.log(`[CantonService] GET ${url}`);
-
-    const res = await fetch(url, {
-      method: "GET",
-      headers: {
-        "Authorization": `Bearer ${token}`
-      }
-    });
-
-    if (!res.ok) {
-      const error = parseCantonError(await res.text(), res.status);
-      console.error(`[CantonService] ❌ Ledger end query failed:`, error);
-      throw new Error(error.message);
+    try {
+      const { data } = await getCantonApi().get('/v2/state/ledger-end', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      console.log(`[CantonService] Ledger end offset: ${data.offset}`);
+      return data.offset;
+    } catch (axiosErr) {
+      throw classifyCantonError(axiosErr);
     }
-
-    const result = await res.json();
-    console.log(`[CantonService] ✅ Ledger end offset: ${result.offset}`);
-    return result.offset;
   }
 
   /**
@@ -455,38 +387,25 @@ class CantonService {
    * GET /v2/packages
    */
   async getPackages(token) {
-    const url = `${this.jsonApiBase}/v2/packages`;
+    try {
+      const { data } = await getCantonApi().get('/v2/packages', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
 
-    console.log(`[CantonService] GET ${url}`);
-
-    const res = await fetch(url, {
-      method: "GET",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${token}`
+      let packages = [];
+      if (Array.isArray(data)) {
+        packages = data;
+      } else if (data.packageIds && Array.isArray(data.packageIds)) {
+        packages = data.packageIds;
+      } else if (data.packages && Array.isArray(data.packages)) {
+        packages = data.packages;
       }
-    });
 
-    if (!res.ok) {
-      const error = parseCantonError(await res.text(), res.status);
-      console.error(`[CantonService] ❌ Get packages failed:`, error);
-      throw new Error(error.message);
+      console.log(`[CantonService] Found ${packages.length || 0} packages`);
+      return packages;
+    } catch (axiosErr) {
+      throw classifyCantonError(axiosErr);
     }
-
-    const result = await res.json();
-    // Handle different response formats
-    // Canton returns { packageIds: [...] } not a direct array
-    let packages = [];
-    if (Array.isArray(result)) {
-      packages = result;
-    } else if (result.packageIds && Array.isArray(result.packageIds)) {
-      packages = result.packageIds;
-    } else if (result.packages && Array.isArray(result.packages)) {
-      packages = result.packages;
-    }
-    
-    console.log(`[CantonService] ✅ Found ${packages.length || 0} packages`);
-    return packages;
   }
 
   /**
@@ -495,39 +414,23 @@ class CantonService {
    * (endpoint not implemented). Use streaming read model for reconciliation where possible.
    */
   async lookupContract(contractId, token) {
-    const url = `${this.jsonApiBase}/v2/contracts/lookup`;
-
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${token}`
-      },
-      body: JSON.stringify({
-        contractId: contractId
-      })
-    });
-
-    if (!res.ok) {
-      const error = parseCantonError(await res.text(), res.status);
-      // 404 = endpoint not available on this deployment; not an application bug.
-      const isEndpointUnavailable = res.status === 404;
-      if (isEndpointUnavailable) {
-        console.warn(`[CantonService] ⚠️ Contract lookup endpoint unavailable (404) — use streaming model for reconciliation`);
-      } else {
-        console.error(`[CantonService] ❌ Contract lookup failed:`, error);
+    try {
+      const { data } = await getCantonApi().post(
+        '/v2/contracts/lookup',
+        { contractId },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      return {
+        contractId: data.contractId || contractId,
+        payload: data.payload || data.argument || data.createArgument,
+        templateId: data.templateId,
+      };
+    } catch (err) {
+      if (err.response?.status === 404) {
+        console.warn(`[CantonService] Contract lookup endpoint unavailable (404)`);
       }
       return null;
     }
-
-    const result = await res.json();
-    console.log(`[CantonService] ✅ Contract found`);
-    
-    return {
-      contractId: result.contractId || contractId,
-      payload: result.payload || result.argument || result.createArgument,
-      templateId: result.templateId
-    };
   }
 
   /**
@@ -682,14 +585,13 @@ class CantonService {
    * POST /v2/state/active-contracts with pagination.
    */
   async _queryViaREST(filter, offset, verbose, token, templateLabel) {
-    const url = `${this.jsonApiBase}/v2/state/active-contracts`;
     const allContracts = [];
     let currentPageToken = null;
     let iterations = 0;
     const maxIterations = 20;
     const effectivePageSize = 100;
 
-    console.log(`[CantonService] 📡 REST fallback query — templates: ${templateLabel}`);
+    console.log(`[CantonService] REST fallback query — templates: ${templateLabel}`);
 
     while (iterations < maxIterations) {
       const body = {
@@ -700,34 +602,22 @@ class CantonService {
       };
       if (currentPageToken) body.pageToken = currentPageToken;
 
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
-        },
-        body: JSON.stringify(body)
-      });
+      try {
+        const { data } = await getCantonApi().post('/v2/state/active-contracts', body, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
 
-      const text = await res.text();
-
-      if (!res.ok) {
-        const error = parseCantonError(text, res.status);
-        console.error(`[CantonService] ❌ REST query failed:`, error);
-        throw new Error(error.message);
+        const rawContracts = data.activeContracts || data || [];
+        allContracts.push(...this._normalizeContracts(rawContracts));
+        currentPageToken = data.nextPageToken || null;
+        iterations++;
+        if (!currentPageToken) break;
+      } catch (axiosErr) {
+        throw classifyCantonError(axiosErr);
       }
-
-      const result = JSON.parse(text);
-      const rawContracts = result.activeContracts || result || [];
-      allContracts.push(...this._normalizeContracts(rawContracts));
-
-      currentPageToken = result.nextPageToken || null;
-      iterations++;
-
-      if (!currentPageToken) break;
     }
 
-    console.log(`[CantonService] ✅ REST returned ${allContracts.length} contracts`);
+    console.log(`[CantonService] REST returned ${allContracts.length} contracts`);
     return allContracts;
   }
 
@@ -917,102 +807,38 @@ class CantonService {
         console.log(JSON.stringify(body, null, 2));
       }
 
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
-        },
-        body: JSON.stringify(body)
-      });
-
       let result;
-      if (!res.ok) {
-        const errorText = await res.text();
-        // Check for 200 element limit - try to parse response anyway, might have pageToken
-        if (errorText.includes('JSON_API_MAXIMUM_LIST_ELEMENTS_NUMBER_REACHED')) {
-          console.log(`[CantonService] ℹ️ 200+ contracts found. Attempting to continue pagination...`);
-          try {
-            result = JSON.parse(errorText);
-            // If we got contracts and a pageToken, continue
-            if (result.activeContracts && result.nextPageToken) {
-              pageToken = result.nextPageToken;
-              // Process the contracts we got
-              const rawContracts = result.activeContracts || [];
-              const contracts = rawContracts.map(item => {
-                if (item.contractEntry?.JsActiveContract) {
-                  const activeContract = item.contractEntry.JsActiveContract;
-                  const createdEvent = activeContract.createdEvent || {};
-                  return {
-                    contractId: createdEvent.contractId,
-                    templateId: createdEvent.templateId,
-                    payload: createdEvent.createArgument,
-                    createArgument: createdEvent.createArgument,
-                    signatories: createdEvent.signatories,
-                    observers: createdEvent.observers,
-                    witnessParties: createdEvent.witnessParties,
-                    offset: createdEvent.offset,
-                    synchronizerId: activeContract.synchronizerId,
-                    createdAt: createdEvent.createdAt,
-                    createdEvent: createdEvent
-                  };
-                }
-                return item;
-              });
-              allContracts.push(...contracts);
-              iterations++;
-              continue; // Continue to next iteration with pageToken
-            }
-          } catch (parseErr) {
-            // Can't parse, return what we have
-            console.log(`[CantonService] Cannot parse error response, returning ${allContracts.length} contracts`);
-            return allContracts;
+      try {
+        const resp = await getCantonApi().post('/v2/state/active-contracts', body, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        result = resp.data;
+      } catch (axiosErr) {
+        const respData = axiosErr.response?.data;
+        const msg = typeof respData === 'string' ? respData : JSON.stringify(respData || {});
+        if (msg.includes('JSON_API_MAXIMUM_LIST_ELEMENTS_NUMBER_REACHED') && respData) {
+          const parsed = typeof respData === 'string' ? JSON.parse(respData) : respData;
+          if (parsed.activeContracts && parsed.nextPageToken) {
+            pageToken = parsed.nextPageToken;
+            allContracts.push(...this._normalizeContracts(parsed.activeContracts));
+            iterations++;
+            continue;
           }
         }
-        console.error(`[CantonService] Paginated query failed:`, errorText);
+        console.error(`[CantonService] Paginated query failed:`, axiosErr.message);
         break;
       }
 
-      result = await res.json();
       const rawContracts = result.activeContracts || result || [];
-      
-      // Normalize Canton JSON API v2 response format (same as regular query)
-      const contracts = rawContracts.map(item => {
-        if (item.contractEntry?.JsActiveContract) {
-          const activeContract = item.contractEntry.JsActiveContract;
-          const createdEvent = activeContract.createdEvent || {};
-          return {
-            contractId: createdEvent.contractId,
-            templateId: createdEvent.templateId,
-            payload: createdEvent.createArgument, // The actual contract data
-            createArgument: createdEvent.createArgument,
-            signatories: createdEvent.signatories,
-            observers: createdEvent.observers,
-            witnessParties: createdEvent.witnessParties,
-            offset: createdEvent.offset,
-            synchronizerId: activeContract.synchronizerId,
-            createdAt: createdEvent.createdAt,
-            // Add createdEvent for compatibility
-            createdEvent: createdEvent
-          };
-        }
-        // Fallback for other response formats
-        return item;
-      });
-      
-      allContracts.push(...contracts);
-      
-      // Check for next page token
+      allContracts.push(...this._normalizeContracts(rawContracts));
       pageToken = result.nextPageToken || null;
       iterations++;
-      
-      console.log(`[CantonService] Paginated query: got ${contracts.length} contracts (total: ${allContracts.length}), hasMore: ${!!pageToken}`);
-      
+
+      console.log(`[CantonService] Paginated query: got ${rawContracts.length} contracts (total: ${allContracts.length}), hasMore: ${!!pageToken}`);
+
     } while (pageToken && iterations < maxIterations);
-    
-    console.log(`[CantonService] ✅ Paginated query complete: ${allContracts.length} total contracts`);
-    
-    console.log(`[CantonService] ✅ Paginated query complete: ${allContracts.length} total contracts`);
+
+    console.log(`[CantonService] Paginated query complete: ${allContracts.length} total contracts`);
     return allContracts;
   }
 
@@ -1284,26 +1110,14 @@ class CantonService {
    * GET /v2/synchronizers
    */
   async getSynchronizers(token) {
-    const url = `${this.jsonApiBase}/v2/synchronizers`;
-
-    console.log(`[CantonService] GET ${url}`);
-
-    const res = await fetch(url, {
-      method: "GET",
-      headers: {
-        "Authorization": `Bearer ${token}`
-      }
-    });
-
-    const text = await res.text();
-
-    if (!res.ok) {
-      const error = parseCantonError(text, res.status);
-      throw new Error(`Failed to get synchronizers: ${error.message}`);
+    try {
+      const { data } = await getCantonApi().get('/v2/synchronizers', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      return data.synchronizers || [];
+    } catch (axiosErr) {
+      throw classifyCantonError(axiosErr);
     }
-
-    const result = JSON.parse(text);
-    return result.synchronizers || [];
   }
 
   /**
@@ -1311,32 +1125,22 @@ class CantonService {
    * GET /v2/state/connected-synchronizers
    */
   async getConnectedSynchronizers(token) {
-    const url = `${this.jsonApiBase}/v2/state/connected-synchronizers`;
-    console.log(`[CantonService] GET ${url}`);
+    try {
+      const { data } = await getCantonApi().get('/v2/state/connected-synchronizers', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const candidates = [
+        ...(Array.isArray(data?.connectedSynchronizers) ? data.connectedSynchronizers : []),
+        ...(Array.isArray(data?.synchronizers) ? data.synchronizers : []),
+        ...(Array.isArray(data) ? data : []),
+      ];
 
-    const res = await fetch(url, {
-      method: "GET",
-      headers: {
-        "Authorization": `Bearer ${token}`
-      }
-    });
-
-    const text = await res.text();
-    if (!res.ok) {
-      const error = parseCantonError(text, res.status);
-      throw new Error(`Failed to get connected synchronizers: ${error.message}`);
+      return candidates
+        .map((s) => s?.synchronizerId || s?.id)
+        .filter((id) => typeof id === "string" && id.length > 0);
+    } catch (axiosErr) {
+      throw classifyCantonError(axiosErr);
     }
-
-    const data = JSON.parse(text);
-    const candidates = [
-      ...(Array.isArray(data?.connectedSynchronizers) ? data.connectedSynchronizers : []),
-      ...(Array.isArray(data?.synchronizers) ? data.synchronizers : []),
-      ...(Array.isArray(data) ? data : []),
-    ];
-
-    return candidates
-      .map((s) => s?.synchronizerId || s?.id)
-      .filter((id) => typeof id === "string" && id.length > 0);
   }
 
   /**
@@ -1379,48 +1183,27 @@ class CantonService {
    * Allocate an external party
    * POST /v2/parties/external/allocate
    */
-  async allocateExternalParty({
-    partyIdHint,
-    annotations = {}
-  }, token) {
-    const url = `${this.jsonApiBase}/v2/parties/external/allocate`;
-
+  async allocateExternalParty({ partyIdHint, annotations = {} }, token) {
     const body = {
       partyIdHint,
       synchronizer: this.synchronizerId,
       localMetadata: {
         resourceVersion: "0",
-        annotations: {
-          app: "clob-exchange",
-          ...annotations
-        }
-      }
+        annotations: { app: "clob-exchange", ...annotations },
+      },
     };
 
-    console.log(`[CantonService] POST ${url}`);
     console.log(`[CantonService] Allocating party: ${partyIdHint}`);
 
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${token}`
-      },
-      body: JSON.stringify(body)
-    });
-
-    const text = await res.text();
-
-    if (!res.ok) {
-      const error = parseCantonError(text, res.status);
-      console.error(`[CantonService] ❌ Party allocation failed:`, error);
-      throw new Error(`Party allocation failed: ${error.message}`);
+    try {
+      const { data } = await getCantonApi().post('/v2/parties/external/allocate', body, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      console.log(`[CantonService] Party allocated: ${data.partyDetails?.party}`);
+      return data.partyDetails;
+    } catch (axiosErr) {
+      throw classifyCantonError(axiosErr);
     }
-
-    const result = JSON.parse(text);
-    console.log(`[CantonService] ✅ Party allocated: ${result.partyDetails?.party}`);
-
-    return result.partyDetails;
   }
 
   /**
@@ -1428,26 +1211,14 @@ class CantonService {
    * GET /v2/parties
    */
   async listParties(token) {
-    const url = `${this.jsonApiBase}/v2/parties`;
-
-    console.log(`[CantonService] GET ${url}`);
-
-    const res = await fetch(url, {
-      method: "GET",
-      headers: {
-        "Authorization": `Bearer ${token}`
-      }
-    });
-
-    const text = await res.text();
-
-    if (!res.ok) {
-      const error = parseCantonError(text, res.status);
-      throw new Error(`Failed to list parties: ${error.message}`);
+    try {
+      const { data } = await getCantonApi().get('/v2/parties', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      return data.partyDetails || [];
+    } catch (axiosErr) {
+      throw classifyCantonError(axiosErr);
     }
-
-    const result = JSON.parse(text);
-    return result.partyDetails || [];
   }
 
   // ==========================================================================
@@ -1459,26 +1230,14 @@ class CantonService {
    * GET /v2/packages
    */
   async listPackages(token) {
-    const url = `${this.jsonApiBase}/v2/packages`;
-
-    console.log(`[CantonService] GET ${url}`);
-
-    const res = await fetch(url, {
-      method: "GET",
-      headers: {
-        "Authorization": `Bearer ${token}`
-      }
-    });
-
-    const text = await res.text();
-
-    if (!res.ok) {
-      const error = parseCantonError(text, res.status);
-      throw new Error(`Failed to list packages: ${error.message}`);
+    try {
+      const { data } = await getCantonApi().get('/v2/packages', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      return data.packageIds || [];
+    } catch (axiosErr) {
+      throw classifyCantonError(axiosErr);
     }
-
-    const result = JSON.parse(text);
-    return result.packageIds || [];
   }
 
   /**
@@ -1486,25 +1245,15 @@ class CantonService {
    * GET /v2/packages/{packageId}/status
    */
   async getPackageStatus(packageId, token) {
-    const url = `${this.jsonApiBase}/v2/packages/${encodeURIComponent(packageId)}/status`;
-
-    console.log(`[CantonService] GET ${url}`);
-
-    const res = await fetch(url, {
-      method: "GET",
-      headers: {
-        "Authorization": `Bearer ${token}`
-      }
-    });
-
-    const text = await res.text();
-
-    if (!res.ok) {
-      const error = parseCantonError(text, res.status);
-      throw new Error(`Failed to get package status: ${error.message}`);
+    try {
+      const { data } = await getCantonApi().get(
+        `/v2/packages/${encodeURIComponent(packageId)}/status`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      return data;
+    } catch (axiosErr) {
+      throw classifyCantonError(axiosErr);
     }
-
-    return JSON.parse(text);
   }
 
   // ==========================================================================
@@ -1607,35 +1356,21 @@ class CantonService {
       verboseHashing
     };
 
-    console.log(`[CantonService] POST ${url}`);
     console.log(`[CantonService] Prepare request actAs:`, actAs.map(p => p.substring(0, 30) + '...'));
-    console.log(`[CantonService] Prepare request body:`, JSON.stringify(body, null, 2));
 
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${token}`
-      },
-      body: JSON.stringify(body)
-    });
-
-    const text = await res.text();
-
-    if (!res.ok) {
-      const error = parseCantonError(text, res.status);
-      console.error(`[CantonService] ❌ Prepare failed:`, error);
-      const prepErrMsg = error.code ? `Prepare failed: ${error.code}: ${error.message}` : `Prepare failed: ${error.message}`;
-      throw new Error(prepErrMsg);
+    try {
+      const { data } = await getCantonApi().post('/v2/interactive-submission/prepare', body, {
+        headers: { Authorization: `Bearer ${token}` },
+        timeout: 20_000,
+        'axios-retry': { retries: 0 },
+      });
+      console.log(`[CantonService] Prepare succeeded, hashToSign length: ${data.preparedTransactionHash?.length || 0}`);
+      return data;
+    } catch (axiosErr) {
+      const classified = classifyCantonError(axiosErr);
+      classified.message = `Prepare failed: ${classified.message}`;
+      throw classified;
     }
-
-    const result = JSON.parse(text);
-    console.log(`[CantonService] ✅ Prepare succeeded, hashToSign length: ${result.preparedTransactionHash?.length || 0}`);
-    console.log(`[CantonService] Prepare response keys:`, Object.keys(result));
-    if (result.hashingSchemeVersion !== undefined) {
-      console.log(`[CantonService] hashingSchemeVersion: ${result.hashingSchemeVersion}`);
-    }
-    return result;
   }
 
   /**
@@ -1669,65 +1404,38 @@ class CantonService {
     submissionId = null,
     deduplicationPeriod = null
   }, token) {
-    const url = `${this.jsonApiBase}/v2/interactive-submission/execute`;
-
-    // Build FLAT request body per Canton OpenAPI spec (JsExecuteSubmissionRequest)
-    // deduplicationPeriod MUST use PascalCase tagged union format per OpenAPI spec:
-    //   { "DeduplicationDuration": { "value": { "seconds": N, "nanos": 0 } } }
     const body = {
       preparedTransaction,
       submissionId: submissionId || `submit-exec-${crypto.randomUUID()}`,
       hashingSchemeVersion: String(hashingSchemeVersion),
       deduplicationPeriod: deduplicationPeriod || {
         DeduplicationDuration: {
-          value: { seconds: 600, nanos: 0 }   // 10 minutes default
-        }
-      },
-      partySignatures
-    };
-
-    console.log(`[CantonService] POST ${url}`);
-    console.log(`[CantonService] Execute request body:`, JSON.stringify(body, null, 2));
-
-    const executeOnce = async () => {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
+          value: { seconds: 600, nanos: 0 },
         },
-        body: JSON.stringify(body)
-      });
-      const text = await res.text();
-      return { res, text };
+      },
+      partySignatures,
     };
 
-    let attempt = await executeOnce();
-
-    if (!attempt.res.ok) {
-      let error = parseCantonError(attempt.text, attempt.res.status);
-
-      // Sequencer timeout can be transient; retry once with same prepared transaction/signature.
-      if (error.code === 'NOT_SEQUENCED_TIMEOUT') {
-        console.warn('[CantonService] Execute timed out at sequencer. Retrying once...');
-        await new Promise((resolve) => setTimeout(resolve, 800));
-        attempt = await executeOnce();
-        if (!attempt.res.ok) {
-          error = parseCantonError(attempt.text, attempt.res.status);
-          console.error(`[CantonService] ❌ Execute retry failed:`, error);
-          const retryErrMsg = error.code ? `Execute failed: ${error.code}: ${error.message}` : `Execute failed: ${error.message}`;
-          throw new Error(retryErrMsg);
-        }
-      } else {
-        console.error(`[CantonService] ❌ Execute failed:`, error);
-        const execErrMsg = error.code ? `Execute failed: ${error.code}: ${error.message}` : `Execute failed: ${error.message}`;
-        throw new Error(execErrMsg);
-      }
+    try {
+      const { data } = await getCantonApi().post('/v2/interactive-submission/execute', body, {
+        headers: { Authorization: `Bearer ${token}` },
+        timeout: 20_000,
+        'axios-retry': {
+          retries: 1,
+          retryDelay: () => 800,
+          retryCondition: (error) => {
+            const msg = JSON.stringify(error.response?.data || {});
+            return msg.includes('NOT_SEQUENCED_TIMEOUT');
+          },
+        },
+      });
+      console.log(`[CantonService] Execute succeeded, updateId: ${data.transaction?.updateId || 'unknown'}`);
+      return data;
+    } catch (axiosErr) {
+      const classified = classifyCantonError(axiosErr);
+      classified.message = `Execute failed: ${classified.message}`;
+      throw classified;
     }
-
-    const result = JSON.parse(attempt.text);
-    console.log(`[CantonService] ✅ Execute succeeded, updateId: ${result.transaction?.updateId || 'unknown'}`);
-    return result;
   }
 
   // ==========================================================================
@@ -1786,27 +1494,15 @@ class CantonService {
    * @returns {Object} User rights including canActAs and canReadAs
    */
   async getUserRights(token, userId) {
-    const url = `${this.jsonApiBase}/v2/users/${encodeURIComponent(userId)}/rights`;
-    
-    console.log(`[CantonService] GET ${url}`);
-    
-    const res = await fetch(url, {
-      method: "GET",
-      headers: {
-        "Authorization": `Bearer ${token}`
-      }
-    });
-
-    if (!res.ok) {
-      const text = await res.text();
-      const error = parseCantonError(text, res.status);
-      console.error(`[CantonService] ❌ Failed to get user rights:`, error);
-      throw new Error(`Failed to get user rights: ${error.message}`);
+    try {
+      const { data } = await getCantonApi().get(
+        `/v2/users/${encodeURIComponent(userId)}/rights`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      return data;
+    } catch (axiosErr) {
+      throw classifyCantonError(axiosErr);
     }
-
-    const result = await res.json();
-    console.log(`[CantonService] ✅ User rights retrieved:`, JSON.stringify(result, null, 2));
-    return result;
   }
 
   /**
@@ -1857,29 +1553,19 @@ class CantonService {
       rights 
     };
     
-    console.log(`[CantonService] POST ${url}`);
     console.log(`[CantonService] Granting rights for user ${userId}, parties:`, partyIds);
-    console.log(`[CantonService] Request body:`, JSON.stringify(body, null, 2));
-    
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${token}`
-      },
-      body: JSON.stringify(body)
-    });
 
-    if (!res.ok) {
-      const text = await res.text();
-      const error = parseCantonError(text, res.status);
-      console.error(`[CantonService] ❌ Failed to grant user rights:`, error);
-      throw new Error(`Failed to grant user rights: ${error.message}`);
+    try {
+      const { data } = await getCantonApi().post(
+        `/v2/users/${encodeURIComponent(userId)}/rights`,
+        body,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      console.log(`[CantonService] User rights granted`);
+      return data;
+    } catch (axiosErr) {
+      throw classifyCantonError(axiosErr);
     }
-
-    const result = await res.json();
-    console.log(`[CantonService] ✅ User rights granted:`, JSON.stringify(result, null, 2));
-    return result;
   }
 
   /**

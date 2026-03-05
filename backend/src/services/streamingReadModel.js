@@ -25,6 +25,7 @@ const WebSocket = require('ws');
 const config = require('../config');
 const { TOKEN_STANDARD_PACKAGE_ID } = require('../config/constants');
 const tokenProvider = require('./tokenProvider');
+const { getCantonApi } = require('../http/clients');
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const WS_RECONNECT_DELAY_MS = 3000;
@@ -141,11 +142,9 @@ class StreamingReadModel extends EventEmitter {
     const token = await tokenProvider.getServiceToken();
 
     // First, get ledger end offset (REST — one call, always works)
-    const endRes = await fetch(`${config.canton.jsonApiBase}/v2/state/ledger-end`, {
-      headers: { 'Authorization': `Bearer ${token}` }
+    const { data: endData } = await getCantonApi().get('/v2/state/ledger-end', {
+      headers: { Authorization: `Bearer ${token}` },
     });
-    if (!endRes.ok) throw new Error(`Failed to get ledger-end: ${endRes.status}`);
-    const endData = await endRes.json();
     this.lastOffset = endData.offset;
     console.log(`[StreamingReadModel] Ledger offset: ${this.lastOffset}`);
 

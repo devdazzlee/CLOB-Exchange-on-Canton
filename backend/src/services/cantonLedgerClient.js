@@ -13,6 +13,7 @@
 
 const config = require('../config');
 const EventEmitter = require('events');
+const { getCantonApi, getAuthApi } = require('../http/clients');
 
 class CantonLedgerClient extends EventEmitter {
   constructor() {
@@ -38,20 +39,8 @@ class CantonLedgerClient extends EventEmitter {
       scope: 'openid profile email daml_ledger_api',
     });
 
-    const response = await fetch(tokenUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: params,
-    });
-
-    if (!response.ok) {
-      throw new Error(`Token fetch failed: ${response.status}`);
-    }
-
-    const data = await response.json();
-    return data.access_token;
+    const response = await getAuthApi().post(tokenUrl, params.toString());
+    return response.data.access_token;
   }
 
   /**
@@ -70,21 +59,13 @@ class CantonLedgerClient extends EventEmitter {
 
     console.log('[CantonClient] Submitting command:', JSON.stringify(requestBody, null, 2));
 
-    const response = await fetch(`${this.cantonApiBase}/v2/commands/submit-and-wait-for-transaction`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(requestBody),
-    });
+    const response = await getCantonApi().post(
+      `${this.cantonApiBase}/v2/commands/submit-and-wait-for-transaction`,
+      requestBody,
+      { headers: { 'Authorization': `Bearer ${token}` } }
+    );
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Command submission failed: ${response.status} - ${errorText}`);
-    }
-
-    const result = await response.json();
+    const result = response.data;
     console.log('[CantonClient] Command successful:', result);
     
     // Update offset from transaction
@@ -155,22 +136,16 @@ class CantonLedgerClient extends EventEmitter {
 
     console.log('[CantonClient] Request body:', JSON.stringify(requestBody, null, 2));
 
-    const response = await fetch(`${this.cantonApiBase}/v2/state/active-contracts`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(requestBody),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
+    try {
+      const { data } = await getCantonApi().post('/v2/state/active-contracts', requestBody, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      return data;
+    } catch (error) {
+      const errorText = error.response?.data;
       console.error('[CantonClient] Active contracts query failed:', errorText);
-      throw new Error(`Active contracts query failed: ${response.status} - ${errorText}`);
+      throw new Error(`Active contracts query failed: ${error.response?.status} - ${typeof errorText === 'string' ? errorText : JSON.stringify(errorText)}`);
     }
-
-    return await response.json();
   }
 
   /**
@@ -179,18 +154,9 @@ class CantonLedgerClient extends EventEmitter {
   async getLedgerEnd() {
     const token = await this.getToken();
     
-    const response = await fetch(`${this.cantonApiBase}/v2/state/ledger-end`, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-      },
+    const { data: result } = await getCantonApi().get('/v2/state/ledger-end', {
+      headers: { Authorization: `Bearer ${token}` },
     });
-
-    if (!response.ok) {
-      throw new Error(`Ledger end query failed: ${response.status}`);
-    }
-
-    const result = await response.json();
     this.currentOffset = result.offset;
     return result.offset;
   }
@@ -317,22 +283,16 @@ class CantonLedgerClient extends EventEmitter {
    * Get OpenAPI spec for client generation
    */
   async getOpenAPISpec() {
-    const response = await fetch(`${this.cantonApiBase}/docs/openapi`);
-    if (!response.ok) {
-      throw new Error(`OpenAPI spec fetch failed: ${response.status}`);
-    }
-    return await response.json();
+    const { data } = await getCantonApi().get('/docs/openapi');
+    return data;
   }
 
   /**
    * Get AsyncAPI spec for WebSocket client generation
    */
   async getAsyncAPISpec() {
-    const response = await fetch(`${this.cantonApiBase}/docs/asyncapi`);
-    if (!response.ok) {
-      throw new Error(`AsyncAPI spec fetch failed: ${response.status}`);
-    }
-    return await response.json();
+    const { data } = await getCantonApi().get('/docs/asyncapi');
+    return data;
   }
 }
 

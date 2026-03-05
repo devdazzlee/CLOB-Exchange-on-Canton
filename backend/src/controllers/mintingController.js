@@ -6,6 +6,7 @@
 const cantonService = require('../services/cantonService');
 const { broadcastBalanceUpdate } = require('../services/websocketService');
 const config = require('../config');
+const { getCantonApi } = require('../http/clients');
 
 function normalizeDecimal(value) {
   if (value === null || value === undefined) return '0';
@@ -50,44 +51,43 @@ async function discoverSynchronizerId() {
       return config.canton.synchronizerId;
     }
 
-    const response = await fetch(`${config.canton.jsonApiBase}/v2/state/connected-synchronizers`, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${await cantonService.getAdminToken()}`,
-        'Content-Type': 'application/json',
-      },
-    });
-    
-    if (response.ok) {
-      const data = await response.json().catch(() => ({}));
-      let synchronizerId = null;
+    const response = await getCantonApi().get(
+      `${config.canton.jsonApiBase}/v2/state/connected-synchronizers`,
+      {
+        headers: {
+          'Authorization': `Bearer ${await cantonService.getAdminToken()}`,
+        },
+      }
+    );
 
-      if (data.connectedSynchronizers && Array.isArray(data.connectedSynchronizers) && data.connectedSynchronizers.length > 0) {
-        const synchronizers = data.connectedSynchronizers;
-        const globalSync = synchronizers.find(s =>
-          s.synchronizerAlias === 'global' || s.alias === 'global'
+    const data = response.data || {};
+    let synchronizerId = null;
+
+    if (data.connectedSynchronizers && Array.isArray(data.connectedSynchronizers) && data.connectedSynchronizers.length > 0) {
+      const synchronizers = data.connectedSynchronizers;
+      const globalSync = synchronizers.find(s =>
+        s.synchronizerAlias === 'global' || s.alias === 'global'
+      );
+      if (globalSync?.synchronizerId) {
+        synchronizerId = globalSync.synchronizerId;
+      } else {
+        const globalDomainSync = synchronizers.find(s =>
+          s.synchronizerId && s.synchronizerId.includes('global-domain')
         );
-        if (globalSync?.synchronizerId) {
-          synchronizerId = globalSync.synchronizerId;
-        } else {
-          const globalDomainSync = synchronizers.find(s =>
-            s.synchronizerId && s.synchronizerId.includes('global-domain')
-          );
-          synchronizerId = globalDomainSync?.synchronizerId || synchronizers[0].synchronizerId || synchronizers[0].id;
-        }
-      } else if (data.synchronizers && Array.isArray(data.synchronizers) && data.synchronizers.length > 0) {
-        const first = data.synchronizers[0];
-        synchronizerId = typeof first === 'string' ? first : (first.synchronizerId || first.id);
-      } else if (data.synchronizerId) {
-        synchronizerId = data.synchronizerId;
-      } else if (Array.isArray(data) && data.length > 0) {
-        const first = data[0];
-        synchronizerId = typeof first === 'string' ? first : (first.synchronizerId || first.id);
+        synchronizerId = globalDomainSync?.synchronizerId || synchronizers[0].synchronizerId || synchronizers[0].id;
       }
+    } else if (data.synchronizers && Array.isArray(data.synchronizers) && data.synchronizers.length > 0) {
+      const first = data.synchronizers[0];
+      synchronizerId = typeof first === 'string' ? first : (first.synchronizerId || first.id);
+    } else if (data.synchronizerId) {
+      synchronizerId = data.synchronizerId;
+    } else if (Array.isArray(data) && data.length > 0) {
+      const first = data[0];
+      synchronizerId = typeof first === 'string' ? first : (first.synchronizerId || first.id);
+    }
 
-      if (synchronizerId) {
-        return synchronizerId;
-      }
+    if (synchronizerId) {
+      return synchronizerId;
     }
     throw new Error('No synchronizers found');
   } catch (error) {

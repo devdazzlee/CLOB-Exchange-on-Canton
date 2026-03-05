@@ -2,6 +2,7 @@
 // Exchanges Keycloak OAuth token for Canton Ledger API token
 const config = require('../config');
 const jwt = require('jsonwebtoken');
+const { getCantonApi, getAuthApi } = require('../http/clients');
 
 class TokenExchangeService {
   constructor() {
@@ -65,13 +66,9 @@ class TokenExchangeService {
       const adminToken = await this.getAdminToken();
       
       // Query user's permissions from Canton
-      const response = await fetch(`${config.canton.jsonApiBase}/v2/state/active-contracts`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${adminToken}`
-        },
-        body: JSON.stringify({
+      const response = await getCantonApi().post(
+        `${config.canton.jsonApiBase}/v2/state/active-contracts`,
+        {
           filter: {
             filtersByParty: {
               [userId]: {
@@ -81,14 +78,11 @@ class TokenExchangeService {
               }
             }
           }
-        })
-      });
+        },
+        { headers: { 'Authorization': `Bearer ${adminToken}` } }
+      );
 
-      if (!response.ok) {
-        throw new Error(`Permission check failed: ${response.status}`);
-      }
-
-      const data = await response.json();
+      const data = response.data;
       
       // User has permissions if they have a UserAccount contract
       return data.contractEntry && data.contractEntry.length > 0;
@@ -112,20 +106,8 @@ class TokenExchangeService {
       scope: 'openid profile email daml_ledger_api'
     });
 
-    const response = await fetch(tokenUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: params
-    });
-
-    if (!response.ok) {
-      throw new Error(`Admin token fetch failed: ${response.status}`);
-    }
-
-    const data = await response.json();
-    return data.access_token;
+    const response = await getAuthApi().post(tokenUrl, params.toString());
+    return response.data.access_token;
   }
 
   // Proxy ledger API calls with proper token validation and forwarding
@@ -146,17 +128,15 @@ class TokenExchangeService {
       const { ledgerToken } = await this.exchangeToken(keycloakToken);
       
       // Forward request to Canton with the exchanged ledger token
-      const response = await fetch(`${config.canton.jsonApiBase}${req.url}`, {
+      const response = await getCantonApi().request({
         method: req.method,
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${ledgerToken}`
-        },
-        body: req.method !== 'GET' ? JSON.stringify(req.body) : undefined
+        url: `${config.canton.jsonApiBase}${req.url}`,
+        headers: { 'Authorization': `Bearer ${ledgerToken}` },
+        data: req.method !== 'GET' ? req.body : undefined,
+        validateStatus: () => true,
       });
-      
-      const data = await response.json();
-      res.status(response.status).json(data);
+
+      res.status(response.status).json(response.data);
       
     } catch (error) {
       console.error('Ledger API proxy error:', error);

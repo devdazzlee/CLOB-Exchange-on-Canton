@@ -12,6 +12,7 @@ const config = require('../config');
 const OnboardingService = require('../services/onboarding-service');
 const cantonService = require('../services/cantonService');
 const { requirePartyId, requirePublicKey } = require('../state/userRegistry');
+const { getCantonApi } = require('../http/clients');
 
 // Dynamic import for ESM modules - loaded when needed
 let ed25519Cache = null;
@@ -152,13 +153,9 @@ class LedgerProxyController {
       const qualified = await qualifyTemplateId(templateId, token);
       const activeAtOffset = await cantonService.getActiveAtOffset(token, completionOffset);
 
-      const response = await fetch(`${config.canton.jsonApiBase}/v2/state/active-contracts?limit=${limit}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
-        },
-        body: JSON.stringify({
+      const response = await getCantonApi().post(
+        `${config.canton.jsonApiBase}/v2/state/active-contracts?limit=${limit}`,
+        {
           readAs: [partyId],
           activeAtOffset,
           verbose: true,
@@ -171,14 +168,11 @@ class LedgerProxyController {
               },
             },
           },
-        }),
-      });
+        },
+        { headers: { 'Authorization': `Bearer ${token}` } }
+      );
 
-      const text = await response.text();
-      if (!response.ok) {
-        throw new Error(`Failed to query contracts: ${response.status} - ${text}`);
-      }
-      const data = JSON.parse(text);
+      const data = response.data;
       const contracts = data.activeContracts || [];
       return contracts.map((entry) => {
         const c = entry.contractEntry?.JsActiveContract?.createdEvent || entry.createdEvent || entry;
@@ -208,13 +202,9 @@ class LedgerProxyController {
 
     const contract = await this.withCantonTokenRetry(async (token) => {
       const activeAtOffset = await cantonService.getActiveAtOffset(token, offset ?? null);
-      const response = await fetch(`${config.canton.jsonApiBase}/v2/state/active-contracts?limit=10`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
-        },
-        body: JSON.stringify({
+      const response = await getCantonApi().post(
+        `${config.canton.jsonApiBase}/v2/state/active-contracts?limit=10`,
+        {
           readAs: [partyId],
           activeAtOffset,
           verbose: true,
@@ -227,12 +217,11 @@ class LedgerProxyController {
               },
             },
           },
-        }),
-      });
+        },
+        { headers: { 'Authorization': `Bearer ${token}` } }
+      );
 
-      const text = await response.text();
-      if (!response.ok) throw new Error(`Failed to fetch contract: ${response.status} - ${text}`);
-      const data = JSON.parse(text);
+      const data = response.data;
       const entries = data.activeContracts || [];
       if (entries.length === 0) return null;
       const c = entries[0].contractEntry?.JsActiveContract?.createdEvent || entries[0].createdEvent || entries[0];
@@ -261,13 +250,9 @@ class LedgerProxyController {
 
     const contracts = await this.withCantonTokenRetry(async (token) => {
       const activeAtOffset = await cantonService.getActiveAtOffset(token, offset ?? null);
-      const response = await fetch(`${config.canton.jsonApiBase}/v2/state/active-contracts?limit=200`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
-        },
-        body: JSON.stringify({
+      const response = await getCantonApi().post(
+        `${config.canton.jsonApiBase}/v2/state/active-contracts?limit=200`,
+        {
           readAs: [partyId],
           activeAtOffset,
           verbose: true,
@@ -280,11 +265,11 @@ class LedgerProxyController {
               },
             },
           },
-        }),
-      });
-      const text = await response.text();
-      if (!response.ok) throw new Error(`Failed to fetch contracts: ${response.status} - ${text}`);
-      const data = JSON.parse(text);
+        },
+        { headers: { 'Authorization': `Bearer ${token}` } }
+      );
+
+      const data = response.data;
       const entries = data.activeContracts || [];
       return entries.map((entry) => {
         const c = entry.contractEntry?.JsActiveContract?.createdEvent || entry.createdEvent || entry;

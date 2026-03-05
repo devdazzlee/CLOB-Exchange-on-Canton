@@ -15,6 +15,7 @@ const config = require('../config');
 const { OPERATOR_PARTY_ID, DSO_PARTY_ID, SCAN_PROXY_API, VALIDATOR_SCAN_PROXY_API, getTokenStandardTemplateIds } = require('../config/constants');
 const { UTILITIES_CONFIG, CANTON_SDK_CONFIG } = require('../config/canton-sdk.config');
 const tokenProvider = require('./tokenProvider');
+const { getRegistryApi } = require('../http/clients');
 
 let cantonServiceInstance = null;
 const getCantonService = () => {
@@ -290,13 +291,11 @@ class TransferOfferService {
 
     const urls = [];
 
-    // 1. Token Standard API with registrar from contract (correct per docs)
     if (registrarParty) {
       const encoded = encodeURIComponent(registrarParty);
       urls.push(`${tokenStandardBase}/v0/registrars/${encoded}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`);
     }
 
-    // 2. Scan Proxy (for CC/Amulet transfers)
     urls.push(`${scanProxyBase}/registry/transfer-instruction/v1/${encodedCid}/choice-contexts/accept`);
 
     console.log(`[TransferOfferService] Resolving accept context — registrar: ${(registrarParty || 'unknown').substring(0, 50)}, ${urls.length} endpoints`);
@@ -306,34 +305,30 @@ class TransferOfferService {
     for (const url of urls) {
       try {
         console.log(`[TransferOfferService] Trying: ${url.substring(0, 140)}...`);
-        const resp = await fetch(url, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${adminToken}`,
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-          },
-          body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
+        const { data: ctx } = await getRegistryApi().post(url, { meta: {}, excludeDebugFields: true }, {
+          headers: { Authorization: `Bearer ${adminToken}`, Accept: 'application/json' },
         });
 
-        if (resp.ok) {
-          const ctx = await resp.json();
-          console.log(`[TransferOfferService] ✅ Got accept context (${ctx.disclosedContracts?.length || 0} disclosed, ${Object.keys(ctx.choiceContextData?.values || {}).length} context keys)`);
-          const disclosedContracts = (ctx.disclosedContracts || []).map(dc => ({
-            templateId: dc.templateId,
-            contractId: dc.contractId,
-            createdEventBlob: dc.createdEventBlob,
-            synchronizerId: dc.synchronizerId || synchronizerId,
-          }));
-          const choiceContextData = ctx.choiceContextData || ctx.choiceContext?.choiceContextData || { values: {} };
-          return { disclosedContracts, choiceContextData };
+        console.log(`[TransferOfferService] Got accept context (${ctx.disclosedContracts?.length || 0} disclosed, ${Object.keys(ctx.choiceContextData?.values || {}).length} context keys)`);
+        const disclosedContracts = (ctx.disclosedContracts || []).map(dc => ({
+          templateId: dc.templateId,
+          contractId: dc.contractId,
+          createdEventBlob: dc.createdEventBlob,
+          synchronizerId: dc.synchronizerId || synchronizerId,
+        }));
+        const choiceContextData = ctx.choiceContextData || ctx.choiceContext?.choiceContextData || { values: {} };
+        return { disclosedContracts, choiceContextData };
+      } catch (err) {
+        if (err.code === 'CONTRACT_NOT_FOUND') throw err;
+
+        const status = err.response?.status;
+        const respData = typeof err.response?.data === 'string' ? err.response?.data : JSON.stringify(err.response?.data || {});
+        if (status === 404 || respData.includes('CONTRACT_NOT_FOUND') || respData.includes('not found')) {
+          const archiveErr = new Error(`Transfer contract ${offerContractId.substring(0, 20)}... no longer exists (archived/expired)`);
+          archiveErr.code = 'CONTRACT_NOT_FOUND';
+          throw archiveErr;
         }
 
-        const errTxt = await resp.text();
-        const shortErr = `${resp.status}: ${errTxt.substring(0, 180)}`;
-        console.log(`[TransferOfferService] ${shortErr}`);
-        errors.push(shortErr);
-      } catch (err) {
         const msg = (err?.message || String(err)).substring(0, 140);
         console.log(`[TransferOfferService] Failed: ${msg}`);
         errors.push(msg);
@@ -341,7 +336,7 @@ class TransferOfferService {
     }
 
     throw new Error(
-      `Could not get accept choice context. Tried ${errors.length} endpoints. ` +
+      `Could not get accept choice context after ${errors.length} endpoints. ` +
       `Registrar: ${registrarParty || 'unknown'}. Last error: ${errors[errors.length - 1] || 'none'}`
     );
   }
@@ -355,16 +350,13 @@ class TransferOfferService {
 
     const url = `${UTILITIES_CONFIG.BACKEND_URL}/v0/operator`;
     try {
-      const resp = await fetch(url, { method: 'GET', headers: { 'Accept': 'application/json' } });
-      if (resp.ok) {
-        const data = await resp.json();
-        const partyId = data?.partyId || null;
-        if (partyId) {
-          console.log(`[TransferOfferService] Discovered operator party: ${partyId.substring(0, 50)}...`);
-        }
-        this._cachedOperatorParty = partyId;
-        return partyId;
+      const { data } = await getRegistryApi().get(url, { headers: { Accept: 'application/json' }, timeout: 8000 });
+      const partyId = data?.partyId || null;
+      if (partyId) {
+        console.log(`[TransferOfferService] Discovered operator party: ${partyId.substring(0, 50)}...`);
       }
+      this._cachedOperatorParty = partyId;
+      return partyId;
     } catch (e) {
       console.log(`[TransferOfferService] Could not discover operator: ${(e?.message || '').substring(0, 80)}`);
     }

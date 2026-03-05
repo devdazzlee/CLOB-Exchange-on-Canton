@@ -13,6 +13,7 @@ const tokenProvider = require('./tokenProvider');
 const fs = require('fs');
 const path = require('path');
 const grpc = require('@grpc/grpc-js');
+const { getCantonApi } = require('../http/clients');
 const protoLoader = require('@grpc/proto-loader');
 
 class CantonAdminService {
@@ -100,12 +101,10 @@ class CantonAdminService {
    */
   async listParties(token) {
     const url = `${this.jsonApiBase}/v2/parties`;
-    const res = await fetch(url, {
+    const { data } = await getCantonApi().get(url, {
       headers: { 'Authorization': `Bearer ${token}` }
     });
-    if (!res.ok) throw new Error(`List parties failed: ${res.status}`);
-    const json = await res.json();
-    return json.partyDetails || [];
+    return data.partyDetails || [];
   }
 
   /**
@@ -113,12 +112,10 @@ class CantonAdminService {
    */
   async getPackages(token) {
     const url = `${this.jsonApiBase}/v2/packages`;
-    const res = await fetch(url, {
+    const { data } = await getCantonApi().get(url, {
       headers: { 'Authorization': `Bearer ${token}` }
     });
-    if (!res.ok) throw new Error(`List packages failed: ${res.status}`);
-    const json = await res.json();
-    return json.packageIds || [];
+    return data.packageIds || [];
   }
 
   /**
@@ -126,11 +123,10 @@ class CantonAdminService {
    */
   async getPackage(packageId, token) {
     const url = `${this.jsonApiBase}/v2/packages/${encodeURIComponent(packageId)}/status`;
-    const res = await fetch(url, {
+    const { data } = await getCantonApi().get(url, {
       headers: { 'Authorization': `Bearer ${token}` }
     });
-    if (!res.ok) throw new Error(`Get package status failed: ${res.status}`);
-    return res.json();
+    return data;
   }
 
   /**
@@ -138,13 +134,11 @@ class CantonAdminService {
    */
   async getSynchronizers(token) {
     const url = `${this.jsonApiBase}/v2/synchronizers`;
-    const res = await fetch(url, {
+    // Note: This endpoint might output 404 in some envs; handle gracefully in caller if needed
+    const { data } = await getCantonApi().get(url, {
       headers: { 'Authorization': `Bearer ${token}` }
     });
-    // Note: This endpoint might output 404 in some envs; handle gracefully in caller if needed
-    if (!res.ok) throw new Error(`List synchronizers failed: ${res.status}`);
-    const json = await res.json();
-    return json.synchronizers || [];
+    return data.synchronizers || [];
   }
 }
 

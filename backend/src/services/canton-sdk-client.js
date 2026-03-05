@@ -28,6 +28,7 @@ const cantonService = require('./cantonService');
 const tokenProvider = require('./tokenProvider');
 const Decimal = require('decimal.js');
 const userRegistry = require('../state/userRegistry');
+const { getRegistryApi } = require('../http/clients');
 
 // ─── Ed25519 Signing for Interactive Settlement ──────────────────────────
 // Used to sign Allocation_ExecuteTransfer for external parties at match time.
@@ -312,18 +313,11 @@ class CantonSDKClient {
         if (!this.instrumentAdminPartyId) {
           try {
             const scanUrl = `${CANTON_SDK_CONFIG.SCAN_PROXY_URL}/api/scan/v0/amulet-rules`;
-            const resp = await fetch(scanUrl, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({}),
-            });
-            if (resp.ok) {
-              const data = await resp.json();
-              const dso = data?.amulet_rules_update?.contract?.payload?.dso;
-              if (dso) {
-                this.instrumentAdminPartyId = dso;
-                console.log(`[CantonSDK] ✅ Discovered DSO party from Scan API: ${dso.substring(0, 40)}...`);
-              }
+            const { data: scanData } = await getRegistryApi().get(scanUrl);
+            const dso = scanData?.amulet_rules_update?.contract?.payload?.dso;
+            if (dso) {
+              this.instrumentAdminPartyId = dso;
+              console.log(`[CantonSDK] ✅ Discovered DSO party from Scan API: ${dso.substring(0, 40)}...`);
             }
           } catch (scanErr) {
             console.warn(`[CantonSDK] ⚠️ Scan API fallback failed: ${scanErr.message}`);
@@ -572,105 +566,106 @@ class CantonSDKClient {
     const adminParty = this.getInstrumentAdminForSymbol(symbol);
     const tokenType = getTokenSystemType(symbol);
 
-    console.log(`[CantonSDK] 🔄 Transfer (fallback): ${amount} ${symbol} (${instrumentId})`);
+    console.log(`[CantonSDK] Transfer: ${amount} ${symbol} (${instrumentId})`);
     console.log(`[CantonSDK]    From: ${senderPartyId.substring(0, 30)}...`);
     console.log(`[CantonSDK]    To:   ${receiverPartyId.substring(0, 30)}...`);
 
-    // Get sender's holdings for this instrument
-    const holdings = await this._withPartyContext(senderPartyId, async () => {
-      return await this.sdk.tokenStandard?.listHoldingUtxos(false) || [];
-    });
-
-    const holdingCids = holdings
-      .filter(h => extractInstrumentId(h.interfaceViewValue?.instrumentId) === instrumentId)
-      .map(h => h.contractId);
-
-    if (holdingCids.length === 0) {
-      throw new Error(`No ${symbol} holdings found for sender ${senderPartyId.substring(0, 30)}...`);
-    }
-
-    console.log(`[CantonSDK]    Found ${holdingCids.length} ${symbol} holding UTXOs`);
-
-    // ── Build Transfer Factory URL ─────────────────────────────────────
-    const registryUrl = this._getTransferFactoryUrl(tokenType);
-    const now = new Date().toISOString();
-    const executeBefore = new Date(Date.now() + 86400000).toISOString();
-
-    // ── Step 1: POST to Transfer Factory to get context ────────────────
-    console.log(`[CantonSDK]    📤 Calling Transfer Factory: ${registryUrl}`);
-    const factoryResponse = await fetch(registryUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        choiceArguments: {
-          expectedAdmin: adminParty,
-          transfer: {
-            sender: senderPartyId,
-            receiver: receiverPartyId,
-            amount: toDamlNumericString(amount),
-            instrumentId: { id: instrumentId, admin: adminParty },
-            requestedAt: now,
-            executeBefore,
-            inputHoldingCids: holdingCids,
-            meta: { values: {} },
-          },
-          extraArgs: {
-            context: { values: {} },
-            meta: { values: {} },
-          },
-        },
-        excludeDebugFields: true,
-      }),
-    });
-
-    if (!factoryResponse.ok) {
-      const errorText = await factoryResponse.text();
-      throw new Error(`Transfer Factory API failed (${factoryResponse.status}): ${errorText.substring(0, 300)}`);
-    }
-
-    const factory = await factoryResponse.json();
-    console.log(`[CantonSDK]    ✅ Transfer Factory returned — factoryId: ${factory.factoryId?.substring(0, 30)}...`);
-
-    // ── Step 2: Exercise TransferFactory_Transfer on the factory ────────
-    const TRANSFER_FACTORY_INTERFACE = UTILITIES_CONFIG.TRANSFER_FACTORY_INTERFACE
-      || '#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferFactory';
-    
     const adminToken = await tokenProvider.getServiceToken();
     const configModule = require('../config');
     const synchronizerId = configModule.canton.synchronizerId;
+    const MAX_ATTEMPTS = 3;
 
-    const result = await cantonService.exerciseChoice({
-      token: adminToken,
-      actAsParty: [senderPartyId],
-      templateId: TRANSFER_FACTORY_INTERFACE,
-      contractId: factory.factoryId,
-      choice: 'TransferFactory_Transfer',
-      choiceArgument: {
-        expectedAdmin: adminParty,
-        transfer: {
-          sender: senderPartyId,
-          receiver: receiverPartyId,
-          amount: toDamlNumericString(amount),
-          instrumentId: { id: instrumentId, admin: adminParty },
-          requestedAt: now,
-          executeBefore,
-          inputHoldingCids: holdingCids,
-          meta: { values: {} },
-        },
-        extraArgs: {
-          context: factory.choiceContext?.choiceContextData || { values: {} },
-          meta: { values: {} },
-        },
-      },
-      readAs: [senderPartyId, receiverPartyId],
-      synchronizerId,
-      disclosedContracts: (factory.choiceContext?.disclosedContracts || []).map(dc => ({
-        templateId: dc.templateId,
-        contractId: dc.contractId,
-        createdEventBlob: dc.createdEventBlob,
-        synchronizerId: dc.synchronizerId || synchronizerId,
-      })),
-    });
+    let result;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      // Canton UTXO model: holding contract IDs change on every fee/merge/transfer.
+      // Fetching inside the loop guarantees fresh IDs on each attempt.
+      const holdings = await this._withPartyContext(senderPartyId, async () => {
+        return await this.sdk.tokenStandard?.listHoldingUtxos(false) || [];
+      });
+
+      const holdingCids = holdings
+        .filter(h => extractInstrumentId(h.interfaceViewValue?.instrumentId) === instrumentId)
+        .map(h => h.contractId);
+
+      if (holdingCids.length === 0) {
+        throw new Error(`No ${symbol} holdings found for sender ${senderPartyId.substring(0, 30)}...`);
+      }
+
+      console.log(`[CantonSDK]    Found ${holdingCids.length} ${symbol} UTXOs (attempt ${attempt}/${MAX_ATTEMPTS})`);
+
+      const registryUrl = this._getTransferFactoryUrl(tokenType);
+      const now = new Date().toISOString();
+      const executeBefore = new Date(Date.now() + 86400000).toISOString();
+
+      try {
+        const { data: factory } = await getRegistryApi().post(registryUrl, {
+          choiceArguments: {
+            expectedAdmin: adminParty,
+            transfer: {
+              sender: senderPartyId,
+              receiver: receiverPartyId,
+              amount: toDamlNumericString(amount),
+              instrumentId: { id: instrumentId, admin: adminParty },
+              requestedAt: now,
+              executeBefore,
+              inputHoldingCids: holdingCids,
+              meta: { values: {} },
+            },
+            extraArgs: { context: { values: {} }, meta: { values: {} } },
+          },
+          excludeDebugFields: true,
+        });
+
+        console.log(`[CantonSDK]    Transfer Factory returned — factoryId: ${factory.factoryId?.substring(0, 30)}...`);
+
+        const TRANSFER_FACTORY_INTERFACE = UTILITIES_CONFIG.TRANSFER_FACTORY_INTERFACE
+          || '#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferFactory';
+
+        result = await cantonService.exerciseChoice({
+          token: adminToken,
+          actAsParty: [senderPartyId],
+          templateId: TRANSFER_FACTORY_INTERFACE,
+          contractId: factory.factoryId,
+          choice: 'TransferFactory_Transfer',
+          choiceArgument: {
+            expectedAdmin: adminParty,
+            transfer: {
+              sender: senderPartyId,
+              receiver: receiverPartyId,
+              amount: toDamlNumericString(amount),
+              instrumentId: { id: instrumentId, admin: adminParty },
+              requestedAt: now,
+              executeBefore,
+              inputHoldingCids: holdingCids,
+              meta: { values: {} },
+            },
+            extraArgs: {
+              context: factory.choiceContext?.choiceContextData || { values: {} },
+              meta: { values: {} },
+            },
+          },
+          readAs: [senderPartyId, receiverPartyId],
+          synchronizerId,
+          disclosedContracts: (factory.choiceContext?.disclosedContracts || []).map(dc => ({
+            templateId: dc.templateId,
+            contractId: dc.contractId,
+            createdEventBlob: dc.createdEventBlob,
+            synchronizerId: dc.synchronizerId || synchronizerId,
+          })),
+        });
+        break; // success — exit loop
+      } catch (err) {
+        const msg = err.message || '';
+        const isStaleUtxo = msg.includes('CONTRACT_NOT_FOUND') ||
+          msg.includes('could not be found') ||
+          msg.includes('INACTIVE_CONTRACTS');
+
+        if (!isStaleUtxo || attempt === MAX_ATTEMPTS) throw err;
+
+        console.warn(`[CantonSDK]    Stale UTXO on attempt ${attempt} — refreshing holdings...`);
+        await new Promise(r => setTimeout(r, 1500 * attempt));
+      }
+    }
 
     // Find TransferInstruction CID from the result
     let tiCid = null;
@@ -735,15 +730,7 @@ class CantonSDKClient {
         // SDK accept failed — try direct registry accept
         console.warn(`[CantonSDK]    SDK accept failed: ${sdkAcceptErr.message} — trying registry API`);
         const acceptUrl = `${this._getRegistryBaseUrl(tokenType)}/registry/transfer-instructions/v1/${encodeURIComponent(tiCid)}/choice-contexts/accept`;
-        const acceptResp = await fetch(acceptUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ excludeDebugFields: true }),
-        });
-        if (!acceptResp.ok) {
-          throw new Error(`Accept API failed (${acceptResp.status}): ${(await acceptResp.text()).substring(0, 200)}`);
-        }
-        const acceptCtx = await acceptResp.json();
+        const { data: acceptCtx } = await getRegistryApi().post(acceptUrl, { excludeDebugFields: true });
         const TRANSFER_INSTRUCTION_INTERFACE = '#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction';
         const res = await cantonService.exerciseChoice({
           token: adminToken,
@@ -856,24 +843,27 @@ class CantonSDKClient {
       console.warn(`[CantonSDK]    SDK exerciseTransferInstructionChoice failed: ${sdkErr.message} — trying registry API`);
     }
 
-    // Fallback: Get accept choice context from registry API, then exercise directly
     const registryBase = this._getRegistryBaseUrl(tokenType);
     const acceptContextUrl = `${registryBase}/registry/transfer-instruction/v1/${encodeURIComponent(transferInstructionCid)}/choice-contexts/accept`;
 
     console.log(`[CantonSDK]    Trying registry accept context: ${acceptContextUrl.substring(0, 100)}...`);
 
-    const contextResp = await fetch(acceptContextUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ excludeDebugFields: true }),
-    });
-
-    if (!contextResp.ok) {
-      const errText = await contextResp.text();
-      throw new Error(`Accept context API failed (${contextResp.status}): ${errText.substring(0, 200)}`);
+    let acceptCtx;
+    try {
+      const { data } = await getRegistryApi().post(acceptContextUrl, { excludeDebugFields: true });
+      acceptCtx = data;
+    } catch (ctxErr) {
+      const status = ctxErr.response?.status;
+      const errText = typeof ctxErr.response?.data === 'string'
+        ? ctxErr.response.data
+        : JSON.stringify(ctxErr.response?.data ?? ctxErr.message);
+      if (status === 404 || errText.includes('CONTRACT_NOT_FOUND') || errText.includes('not found')) {
+        const gone = new Error(`Transfer instruction ${transferInstructionCid.substring(0, 20)}... already archived/expired`);
+        gone.code = 'CONTRACT_NOT_FOUND';
+        throw gone;
+      }
+      throw new Error(`Accept context API failed (${status}): ${errText.substring(0, 200)}`);
     }
-
-    const acceptCtx = await contextResp.json();
     console.log(`[CantonSDK]    ✅ Got accept context (${acceptCtx.disclosedContracts?.length || 0} disclosed contracts)`);
 
     const result = await cantonService.exerciseChoice({
@@ -1047,21 +1037,10 @@ class CantonSDKClient {
       ? `${UTILITIES_CONFIG.TOKEN_STANDARD_URL}/v0/registrars/${encodeURIComponent(adminParty)}/registry/allocation-instruction/v1/allocation-factory`
       : `${CANTON_SDK_CONFIG.REGISTRY_API_URL}/registry/allocation-instruction/v1/allocation-factory`;
 
-    const factoryResponse = await fetch(allocationFactoryUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        choiceArguments: choiceArgs,
-        excludeDebugFields: true,
-      }),
+    const { data: factory } = await getRegistryApi().post(allocationFactoryUrl, {
+      choiceArguments: choiceArgs,
+      excludeDebugFields: true,
     });
-
-    if (!factoryResponse.ok) {
-      const errorText = await factoryResponse.text();
-      throw new Error(`Allocation factory API failed (${factoryResponse.status}): ${errorText.substring(0, 300)}`);
-    }
-
-    const factory = await factoryResponse.json();
 
     const exerciseArgs = this._buildAllocationChoiceArgs({
       adminParty,
@@ -1216,21 +1195,10 @@ class CantonSDKClient {
 
       console.log(`[CantonSDK]    Calling Splice allocation-factory: ${allocationFactoryUrl}`);
 
-          const factoryResponse = await fetch(allocationFactoryUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-          choiceArguments: choiceArgs,
-              excludeDebugFields: true,
-            }),
-          });
-
-      if (!factoryResponse.ok) {
-            const errorText = await factoryResponse.text();
-        throw new Error(`Splice allocation factory API failed (${factoryResponse.status}): ${errorText.substring(0, 300)}`);
-      }
-
-      const factory = await factoryResponse.json();
+      const { data: factory } = await getRegistryApi().post(allocationFactoryUrl, {
+        choiceArguments: choiceArgs,
+        excludeDebugFields: true,
+      });
       console.log(`[CantonSDK]    ✅ Splice allocation factory returned — factoryId: ${factory.factoryId?.substring(0, 30)}...`);
 
       // ── Build exercise command with real choice context from factory ─
@@ -1311,21 +1279,10 @@ class CantonSDKClient {
 
     console.log(`[CantonSDK]    Calling Utilities allocation-factory: ${allocationFactoryUrl}`);
 
-      const factoryResponse = await fetch(allocationFactoryUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        choiceArguments: choiceArgs,
-        excludeDebugFields: true,
-      }),
+    const { data: factory } = await getRegistryApi().post(allocationFactoryUrl, {
+      choiceArguments: choiceArgs,
+      excludeDebugFields: true,
     });
-
-    if (!factoryResponse.ok) {
-      const errorText = await factoryResponse.text();
-      throw new Error(`Utilities allocation factory API failed (${factoryResponse.status}): ${errorText.substring(0, 300)}`);
-    }
-
-    const factory = await factoryResponse.json();
     console.log(`[CantonSDK]    ✅ Utilities allocation factory returned — factoryId: ${factory.factoryId?.substring(0, 30)}...`);
 
     // Build exercise command with real choice context from factory
@@ -1667,17 +1624,7 @@ class CantonSDKClient {
       const registryUrl = CANTON_SDK_CONFIG.REGISTRY_API_URL;
       const encodedCid = encodeURIComponent(allocationContractId);
       const executeContextUrl = `${registryUrl}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
-      const resp = await fetch(executeContextUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ excludeDebugFields: true }),
-      });
-      if (!resp.ok) {
-        const errText = await resp.text();
-        throw new Error(`Registry execute-transfer returned ${resp.status}: ${errText.substring(0, 300)}`);
-      }
-
-      const context = await resp.json();
+      const { data: context } = await getRegistryApi().post(executeContextUrl, { excludeDebugFields: true });
       const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
       return cantonService.exerciseChoice({
         token: adminToken,
@@ -1818,17 +1765,7 @@ class CantonSDKClient {
     const encodedCid = encodeURIComponent(allocationContractId);
     const executeContextUrl = `${registryUrl}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
 
-    const resp = await fetch(executeContextUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ excludeDebugFields: true }),
-    });
-    if (!resp.ok) {
-      const errText = await resp.text();
-      throw new Error(`Registry execute-transfer returned ${resp.status}: ${errText.substring(0, 300)}`);
-    }
-
-    const context = await resp.json();
+    const { data: context } = await getRegistryApi().post(executeContextUrl, { excludeDebugFields: true });
     const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
 
     return cantonService.exerciseChoice({
@@ -1964,18 +1901,7 @@ class CantonSDKClient {
       const executeContextUrl = `${registryUrl}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
       
       console.log(`[CantonSDK]    Fetching choice-context from registry: ${executeContextUrl}`);
-      const resp = await fetch(executeContextUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ excludeDebugFields: true }),
-      });
-      
-      if (!resp.ok) {
-        const errText = await resp.text();
-        throw new Error(`Registry execute-transfer returned ${resp.status}: ${errText.substring(0, 300)}`);
-      }
-      
-      const context = await resp.json();
+      const { data: context } = await getRegistryApi().post(executeContextUrl, { excludeDebugFields: true });
       const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
       
       commands = [{
@@ -2123,20 +2049,18 @@ class CantonSDKClient {
       console.log(`[CantonSDK]    Using submission synchronizer: ${synchronizerId || 'none'}`);
 
       console.log(`[CantonSDK]    📤 Calling Utilities execute-transfer API: ${executeContextUrl}`);
-      const resp = await fetch(executeContextUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
-      });
-
-      if (!resp.ok) {
-        const errText = await resp.text();
-        console.warn(`[CantonSDK]    ⚠️ Utilities execute-transfer API returned ${resp.status}: ${errText.substring(0, 200)}`);
+      let context;
+      try {
+        const { data } = await getRegistryApi().post(executeContextUrl, { meta: {}, excludeDebugFields: true });
+        context = data;
+      } catch (apiErr) {
+        const errText = typeof apiErr.response?.data === 'string'
+          ? apiErr.response.data
+          : JSON.stringify(apiErr.response?.data ?? apiErr.message);
+        console.warn(`[CantonSDK]    ⚠️ Utilities execute-transfer API returned ${apiErr.response?.status}: ${errText.substring(0, 200)}`);
         console.error(`[CantonSDK]    ❌ Utilities allocation execution failed — API error`);
         return null;
       }
-
-      const context = await resp.json();
       const disclosedContracts = (context.disclosedContracts || []).map(dc => ({
         templateId: dc.templateId,
         contractId: dc.contractId,
@@ -2434,43 +2358,32 @@ class CantonSDKClient {
       const cancelContextUrl = `${registryUrl}/registry/allocations/v1/${encodedCid}/choice-contexts/cancel`;
 
       console.log(`[CantonSDK]    Trying Splice registry cancel API: ${cancelContextUrl}`);
-      const resp = await fetch(cancelContextUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ excludeDebugFields: true }),
+      const { data: context } = await getRegistryApi().post(cancelContextUrl, { excludeDebugFields: true });
+      const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
+      const result = await cantonService.exerciseChoice({
+        token: adminToken,
+        actAsParty: actAsParties,
+        templateId: ALLOCATION_INTERFACE,
+        contractId: allocationContractId,
+        choice: 'Allocation_Cancel',
+        choiceArgument: {
+          extraArgs: {
+            context: context.choiceContextData || { values: {} },
+            meta: { values: {} },
+          },
+        },
+        readAs: readAsParties,
+        synchronizerId,
+        disclosedContracts: (context.disclosedContracts || []).map(dc => ({
+          templateId: dc.templateId,
+          contractId: dc.contractId,
+          createdEventBlob: dc.createdEventBlob,
+          synchronizerId: dc.synchronizerId || synchronizerId,
+        })),
       });
 
-      if (resp.ok) {
-        const context = await resp.json();
-        const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
-        const result = await cantonService.exerciseChoice({
-          token: adminToken,
-          actAsParty: actAsParties,
-          templateId: ALLOCATION_INTERFACE,
-          contractId: allocationContractId,
-          choice: 'Allocation_Cancel',
-          choiceArgument: {
-            extraArgs: {
-              context: context.choiceContextData || { values: {} },
-              meta: { values: {} },
-            },
-          },
-          readAs: readAsParties,
-          synchronizerId,
-          disclosedContracts: (context.disclosedContracts || []).map(dc => ({
-            templateId: dc.templateId,
-            contractId: dc.contractId,
-            createdEventBlob: dc.createdEventBlob,
-            synchronizerId: dc.synchronizerId || synchronizerId,
-          })),
-        });
-
-        console.log(`[CantonSDK]    ✅ Allocation cancelled via registry API — funds released`);
-        return { cancelled: true, result };
-      } else {
-        const errText = await resp.text();
-        console.warn(`[CantonSDK]    ⚠️ Registry cancel API returned ${resp.status}: ${errText.substring(0, 200)}`);
-      }
+      console.log(`[CantonSDK]    ✅ Allocation cancelled via registry API — funds released`);
+      return { cancelled: true, result };
     } catch (registryErr) {
       console.warn(`[CantonSDK]    ⚠️ Splice registry cancel failed: ${registryErr.message}`);
     }
@@ -2526,43 +2439,31 @@ class CantonSDKClient {
 
     try {
       console.log(`[CantonSDK]    📤 Calling Utilities cancel API: ${cancelContextUrl}`);
-      const resp = await fetch(cancelContextUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ meta: {}, excludeDebugFields: true }),
+      const { data: context } = await getRegistryApi().post(cancelContextUrl, { meta: {}, excludeDebugFields: true });
+      const result = await cantonService.exerciseChoice({
+        token: adminToken,
+        actAsParty: actAsParties,
+        templateId: UTILITIES_CONFIG.ALLOCATION_INTERFACE,
+        contractId: allocationContractId,
+        choice: 'Allocation_Cancel',
+        choiceArgument: {
+          extraArgs: {
+            context: context.choiceContextData || { values: {} },
+            meta: { values: {} },
+          },
+        },
+        readAs: readAsParties,
+        synchronizerId,
+        disclosedContracts: (context.disclosedContracts || []).map(dc => ({
+          templateId: dc.templateId,
+          contractId: dc.contractId,
+          createdEventBlob: dc.createdEventBlob,
+          synchronizerId: dc.synchronizerId || synchronizerId,
+        })),
       });
 
-      if (!resp.ok) {
-        const errText = await resp.text();
-        console.warn(`[CantonSDK]    ⚠️ Utilities cancel API returned ${resp.status}: ${errText.substring(0, 200)}`);
-        // Fall through to direct exercise below
-      } else {
-        const context = await resp.json();
-        const result = await cantonService.exerciseChoice({
-          token: adminToken,
-          actAsParty: actAsParties,
-          templateId: UTILITIES_CONFIG.ALLOCATION_INTERFACE,
-          contractId: allocationContractId,
-          choice: 'Allocation_Cancel',
-          choiceArgument: {
-            extraArgs: {
-              context: context.choiceContextData || { values: {} },
-              meta: { values: {} },
-            },
-          },
-          readAs: readAsParties,
-          synchronizerId,
-          disclosedContracts: (context.disclosedContracts || []).map(dc => ({
-            templateId: dc.templateId,
-            contractId: dc.contractId,
-            createdEventBlob: dc.createdEventBlob,
-            synchronizerId: dc.synchronizerId || synchronizerId,
-          })),
-        });
-
-        console.log(`[CantonSDK]    ✅ Utilities allocation cancelled — funds released`);
-        return result;
-      }
+      console.log(`[CantonSDK]    ✅ Utilities allocation cancelled — funds released`);
+      return result;
     } catch (err) {
       console.warn(`[CantonSDK]    ⚠️ Utilities cancel API failed: ${err.message}`);
     }

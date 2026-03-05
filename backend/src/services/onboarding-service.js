@@ -8,6 +8,7 @@
 
 const crypto = require('crypto');
 const config = require('../config');
+const { getCantonApi, getAuthApi } = require('../http/clients');
 const cantonService = require('./cantonService');
 
 class OnboardingService {
@@ -49,20 +50,17 @@ class OnboardingService {
       scope: 'openid profile email daml_ledger_api',
     });
 
-    const response = await fetch(tokenUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: params,
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Failed to get Canton token: ${response.status} - ${errorText}`);
+    let data;
+    try {
+      const response = await getAuthApi().post(tokenUrl, params.toString());
+      data = response.data;
+    } catch (error) {
+      const status = error.response?.status || 'unknown';
+      const errorText = typeof error.response?.data === 'string'
+        ? error.response.data
+        : JSON.stringify(error.response?.data);
+      throw new Error(`Failed to get Canton token: ${status} - ${errorText}`);
     }
-
-    const data = await response.json();
 
     if (!data || !data.access_token) {
       throw new Error('Token response missing access_token');
@@ -97,20 +95,19 @@ class OnboardingService {
 
     console.log('[OnboardingService] Discovering synchronizerId from:', url);
 
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Failed to discover synchronizerId: ${response.status} - ${errorText}`);
+    let data;
+    try {
+      const response = await getCantonApi().get('/v2/state/connected-synchronizers', {
+        headers: { 'Authorization': `Bearer ${token}` },
+      });
+      data = response.data;
+    } catch (error) {
+      const status = error.response?.status || 'unknown';
+      const errorText = typeof error.response?.data === 'string'
+        ? error.response.data
+        : JSON.stringify(error.response?.data);
+      throw new Error(`Failed to discover synchronizerId: ${status} - ${errorText}`);
     }
-
-    const data = await response.json();
 
     // Extract synchronizerId from response
     // Response format: { connectedSynchronizers: [{ synchronizerAlias: "global", synchronizerId: "global-domain::..." }] }
@@ -195,8 +192,6 @@ class OnboardingService {
 
     console.log('[OnboardingService] Generating topology for partyHint:', effectivePartyHint);
 
-    const url = `${config.canton.jsonApiBase}/v2/parties/external/generate-topology`;
-
     // Construct publicKey object with proper format
     const publicKeyObj = {
       format: 'CRYPTO_KEY_FORMAT_RAW',
@@ -218,27 +213,18 @@ class OnboardingService {
 
     console.log('[OnboardingService] Generate-topology request (external party, Confirmation permission):', JSON.stringify(requestBody, null, 2));
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(requestBody),
-    });
-
-    const responseText = await response.text();
-
-    if (!response.ok) {
-      // Return more helpful error
-      throw new Error(`Generate topology failed (${response.status}): ${responseText}`);
-    }
-
     let data;
     try {
-      data = JSON.parse(responseText);
-    } catch (e) {
-      throw new Error(`Invalid JSON response from generate-topology: ${responseText}`);
+      const response = await getCantonApi().post('/v2/parties/external/generate-topology', requestBody, {
+        headers: { 'Authorization': `Bearer ${token}` },
+      });
+      data = response.data;
+    } catch (error) {
+      const status = error.response?.status || 'unknown';
+      const errorText = typeof error.response?.data === 'string'
+        ? error.response.data
+        : JSON.stringify(error.response?.data);
+      throw new Error(`Generate topology failed (${status}): ${errorText}`);
     }
 
     console.log('[OnboardingService] Generate-topology response:', JSON.stringify(data, null, 2));
@@ -276,19 +262,17 @@ class OnboardingService {
    */
   async discoverIdentityProviderId() {
     const token = await this.getCantonToken();
-    const url = `${config.canton.jsonApiBase}/v2/idps`;
 
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${token}` }
-    });
-
-    if (!res.ok) {
-      console.warn('[Onboarding] Failed to list IDPs, using empty string:', res.status, await res.text());
+    let data;
+    try {
+      const res = await getCantonApi().get('/v2/idps', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      data = res.data;
+    } catch (error) {
+      console.warn('[Onboarding] Failed to list IDPs, using empty string:', error.response?.status, error.response?.data || error.message);
       return ""; // Fallback to empty string if endpoint not available
     }
-
-    const data = await res.json();
 
     // Handle different response formats
     const idps = data.identityProviderConfigs || data.result || data || [];
@@ -425,115 +409,15 @@ class OnboardingService {
     const maxDelay = 10000; // 10 seconds max
 
     try {
-      const res = await fetch(`${config.canton.jsonApiBase}/v2/parties/external/allocate`, {
-        method: 'POST',
-        headers: { 
-          Authorization: `Bearer ${token}`, 
-          "Content-Type": "application/json" 
-        },
-        body: JSON.stringify(body),
+      const res = await getCantonApi().post('/v2/parties/external/allocate', body, {
+        headers: { Authorization: `Bearer ${token}` },
       });
 
-      const text = await res.text();
       console.log('[OnboardingService] Allocate response status:', res.status);
-      console.log('[OnboardingService] Allocate response text:', text);
+      console.log('[OnboardingService] Allocate response text:', JSON.stringify(res.data));
 
-      if (!res.ok) {
-        // Handle 409 REQUEST_ALREADY_IN_FLIGHT - allocation is in progress
-        if (res.status === 409) {
-          try {
-            const errorData = JSON.parse(text);
-            
-            // Check if it's REQUEST_ALREADY_IN_FLIGHT (retryable)
-            if (errorData.code === 'REQUEST_ALREADY_IN_FLIGHT') {
-              // Extract party hint from error message
-              const partyMatch = errorData.cause?.match(/Party\s+([\w-]+)\s+is in the process/);
-              const allocatingPartyHint = partyMatch ? partyMatch[1] : null;
-              
-              if (retryCount < maxRetries) {
-                // Use Canton's retryInfo if available, otherwise use exponential backoff
-                let delay = baseDelay;
-                
-                if (errorData.retryInfo) {
-                  // Parse retryInfo (e.g., "1 second" or "2 seconds")
-                  const retryMatch = errorData.retryInfo.match(/(\d+)\s*(second|seconds?)/i);
-                  if (retryMatch) {
-                    delay = parseInt(retryMatch[1]) * 1000;
-                  }
-                } else {
-                  // Exponential backoff with jitter
-                  delay = Math.min(
-                    baseDelay * Math.pow(2, retryCount) + Math.random() * 1000,
-                    maxDelay
-                  );
-                }
-                
-                console.log(`[OnboardingService] Allocation in progress (409), retrying in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-                return this._allocateParty(body, token, synchronizerId, retryCount + 1);
-              }
-              
-              // Exhausted retries - check if party was actually allocated
-              console.log(`[OnboardingService] Exhausted retries. Checking if party ${allocatingPartyHint} was allocated...`);
-              if (allocatingPartyHint) {
-                try {
-                  // Wait a bit more for allocation to complete
-                  await new Promise(resolve => setTimeout(resolve, 3000));
-                  
-                  // Try to list parties to check if it exists
-                  const cantonService = require('./cantonService');
-                  const parties = await cantonService.listParties(token);
-                  
-                  // Find our party in the list
-                  const foundParty = parties.find(p => 
-                    p.identifier?.party?.includes(allocatingPartyHint) ||
-                    p.party?.includes(allocatingPartyHint)
-                  );
-                  
-                  if (foundParty) {
-                    const partyId = foundParty.identifier?.party || foundParty.party;
-                    console.log(`[OnboardingService] Party was allocated successfully: ${partyId}`);
-                    
-                    // Return a synthetic result mimicking the successful allocation response
-                    return {
-                      partyId: partyId,
-                      userId: body.identityProviderId ? null : undefined, // External allocation doesn't create user
-                      _recoveredFromInFlight: true
-                    };
-                  }
-                } catch (checkError) {
-                  console.warn(`[OnboardingService] Could not verify party allocation: ${checkError.message}`);
-                }
-              }
-            }
-            
-            // Other 409 errors or couldn't verify allocation - don't retry
-            throw new Error(`Allocate failed 409: ${text}`);
-          } catch (parseError) {
-            // If we can't parse the error, treat as non-retryable
-            throw new Error(`Allocate failed 409 (unparseable): ${text}`);
-          }
-        }
-        
-        // Handle 503 (timeout) - allocation may still be processing
-        if (res.status === 503 && retryCount < maxRetries) {
-          // Exponential backoff with jitter
-          const delay = Math.min(
-            baseDelay * Math.pow(2, retryCount) + Math.random() * 1000,
-            maxDelay
-          );
-          console.log(`[OnboardingService] Allocate timeout (503), retrying in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})`);
-          await new Promise(resolve => setTimeout(resolve, delay));
-          return this._allocateParty(body, token, synchronizerId, retryCount + 1);
-        }
-        
-        // Other errors - don't retry
-        throw new Error(`Allocate failed ${res.status}: ${text}`);
-      }
+      const result = res.data;
 
-      // Success - parse and return the JSON data
-      const result = JSON.parse(text);
-      
       // Clear in-flight tracking on success
       const partyHint = body.onboardingTransactions?.[0]?.transaction 
         ? this._extractPartyHintFromTransaction(body.onboardingTransactions[0].transaction)
@@ -544,8 +428,109 @@ class OnboardingService {
       
       return result;
     } catch (error) {
+      const status = error.response?.status;
+      const responseData = error.response?.data;
+      const text = typeof responseData === 'string'
+        ? responseData
+        : JSON.stringify(responseData || {});
+
+      if (status) {
+        console.log('[OnboardingService] Allocate response status:', status);
+        console.log('[OnboardingService] Allocate response text:', text);
+      }
+
+      // Handle 409 REQUEST_ALREADY_IN_FLIGHT - allocation is in progress
+      if (status === 409) {
+        try {
+          const errorData = typeof responseData === 'object' && responseData !== null
+            ? responseData
+            : JSON.parse(text);
+          
+          // Check if it's REQUEST_ALREADY_IN_FLIGHT (retryable)
+          if (errorData.code === 'REQUEST_ALREADY_IN_FLIGHT') {
+            // Extract party hint from error message
+            const partyMatch = errorData.cause?.match(/Party\s+([\w-]+)\s+is in the process/);
+            const allocatingPartyHint = partyMatch ? partyMatch[1] : null;
+            
+            if (retryCount < maxRetries) {
+              // Use Canton's retryInfo if available, otherwise use exponential backoff
+              let delay = baseDelay;
+              
+              if (errorData.retryInfo) {
+                // Parse retryInfo (e.g., "1 second" or "2 seconds")
+                const retryMatch = errorData.retryInfo.match(/(\d+)\s*(second|seconds?)/i);
+                if (retryMatch) {
+                  delay = parseInt(retryMatch[1]) * 1000;
+                }
+              } else {
+                // Exponential backoff with jitter
+                delay = Math.min(
+                  baseDelay * Math.pow(2, retryCount) + Math.random() * 1000,
+                  maxDelay
+                );
+              }
+              
+              console.log(`[OnboardingService] Allocation in progress (409), retrying in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})`);
+              await new Promise(resolve => setTimeout(resolve, delay));
+              return this._allocateParty(body, token, synchronizerId, retryCount + 1);
+            }
+            
+            // Exhausted retries - check if party was actually allocated
+            console.log(`[OnboardingService] Exhausted retries. Checking if party ${allocatingPartyHint} was allocated...`);
+            if (allocatingPartyHint) {
+              try {
+                // Wait a bit more for allocation to complete
+                await new Promise(resolve => setTimeout(resolve, 3000));
+                
+                // Try to list parties to check if it exists
+                const cantonService = require('./cantonService');
+                const parties = await cantonService.listParties(token);
+                
+                // Find our party in the list
+                const foundParty = parties.find(p => 
+                  p.identifier?.party?.includes(allocatingPartyHint) ||
+                  p.party?.includes(allocatingPartyHint)
+                );
+                
+                if (foundParty) {
+                  const partyId = foundParty.identifier?.party || foundParty.party;
+                  console.log(`[OnboardingService] Party was allocated successfully: ${partyId}`);
+                  
+                  // Return a synthetic result mimicking the successful allocation response
+                  return {
+                    partyId: partyId,
+                    userId: body.identityProviderId ? null : undefined,
+                    _recoveredFromInFlight: true
+                  };
+                }
+              } catch (checkError) {
+                console.warn(`[OnboardingService] Could not verify party allocation: ${checkError.message}`);
+              }
+            }
+          }
+          
+          // Other 409 errors or couldn't verify allocation - don't retry
+          throw new Error(`Allocate failed 409: ${text}`);
+        } catch (parseError) {
+          // If we can't parse the error, treat as non-retryable
+          throw new Error(`Allocate failed 409 (unparseable): ${text}`);
+        }
+      }
+      
+      // Handle 503 (timeout) - allocation may still be processing
+      if (status === 503 && retryCount < maxRetries) {
+        // Exponential backoff with jitter
+        const delay = Math.min(
+          baseDelay * Math.pow(2, retryCount) + Math.random() * 1000,
+          maxDelay
+        );
+        console.log(`[OnboardingService] Allocate timeout (503), retrying in ${delay}ms (attempt ${retryCount + 1}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        return this._allocateParty(body, token, synchronizerId, retryCount + 1);
+      }
+      
       // Network errors - retry if we haven't exhausted retries
-      if (error.name === 'TypeError' && retryCount < maxRetries) {
+      if (!error.response && retryCount < maxRetries) {
         const delay = Math.min(
           baseDelay * Math.pow(2, retryCount) + Math.random() * 1000,
           maxDelay
@@ -561,6 +546,10 @@ class OnboardingService {
         : null;
       if (partyHint) {
         this.inFlightAllocations.delete(partyHint);
+      }
+      
+      if (status) {
+        throw new Error(`Allocate failed ${status}: ${text}`);
       }
       
       throw error;

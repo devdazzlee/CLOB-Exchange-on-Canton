@@ -10,6 +10,7 @@
  */
 
 const config = require('../config');
+const { getRegistryApi } = require('../http/clients');
 
 class ScanService {
     constructor() {
@@ -25,31 +26,20 @@ class ScanService {
         }
 
         const url = `${this.baseUrl}${path}`;
+        const method = (options.method || 'GET').toLowerCase();
+        const headers = {
+            ...(options.token && { Authorization: `Bearer ${options.token}` }),
+            ...options.headers,
+        };
 
-        console.log(`[ScanService] ${options.method || 'GET'} ${url}`);
+        const axiosConfig = { headers };
+        if (options.timeoutMs) axiosConfig.timeout = options.timeoutMs;
 
-        const res = await fetch(url, {
-            method: options.method || 'GET',
-            headers: {
-                'Content-Type': 'application/json',
-                ...(options.token && { 'Authorization': `Bearer ${options.token}` }),
-                ...options.headers
-            },
-            ...(options.body && { body: JSON.stringify(options.body) })
-        });
+        const { data } = method === 'get'
+            ? await getRegistryApi().get(url, axiosConfig)
+            : await getRegistryApi()[method](url, options.body || {}, axiosConfig);
 
-        const text = await res.text();
-
-        if (!res.ok) {
-            console.error(`[ScanService] ❌ Request failed: ${res.status} - ${text}`);
-            throw new Error(`Scan API error: ${res.status} - ${text}`);
-        }
-
-        try {
-            return JSON.parse(text);
-        } catch (e) {
-            return text;
-        }
+        return data;
     }
 
     // ==========================================================================
