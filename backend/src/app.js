@@ -465,6 +465,19 @@ async function startServer() {
       console.warn('⚠️  ACS Cleanup service not available:', error.message);
     }
 
+    // Auto-Accept Incoming Transfers Service
+    // Like Binance/Coinbase: incoming token transfers are automatically accepted
+    console.log('');
+    console.log('📨 Starting Auto-Accept Incoming Transfers Service...');
+    try {
+      const { getAutoAcceptService } = require('./services/autoAcceptService');
+      const autoAcceptService = getAutoAcceptService();
+      await autoAcceptService.start();
+      console.log('✅ Auto-Accept Service started (incoming transfers auto-accepted)');
+    } catch (error) {
+      console.warn('⚠️  Auto-Accept service not available:', error.message);
+    }
+
     console.log('');
     console.log('📋 Exchange API Endpoints:');
     console.log('  POST /api/v1/orders        - Place order');

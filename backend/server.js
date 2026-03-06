@@ -56,21 +56,16 @@ if (isVercel) {
   console.log('[Server] Running in traditional server mode');
   const { app, server } = startServer();
 
-  // Graceful shutdown
-  process.on('SIGTERM', () => {
-    console.log('SIGTERM received, shutting down gracefully...');
-    if (server && typeof server.close === 'function') {
-      server.close(() => {
-        console.log('Server closed');
-        process.exit(0);
-      });
-    } else {
-      process.exit(0);
-    }
-  });
+  // Graceful shutdown helper — stops background services before closing
+  function gracefulShutdown(signal) {
+    console.log(`${signal} received, shutting down gracefully...`);
 
-  process.on('SIGINT', () => {
-    console.log('SIGINT received, shutting down gracefully...');
+    // Stop auto-accept service
+    try {
+      const { getAutoAcceptService } = require('./src/services/autoAcceptService');
+      getAutoAcceptService().stop();
+    } catch (_) { /* not critical */ }
+
     if (server && typeof server.close === 'function') {
       server.close(() => {
         console.log('Server closed');
@@ -79,7 +74,10 @@ if (isVercel) {
     } else {
       process.exit(0);
     }
-  });
+  }
+
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
   // Handle unhandled promise rejections
   process.on('unhandledRejection', (err) => {
