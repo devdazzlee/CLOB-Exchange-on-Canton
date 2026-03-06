@@ -127,6 +127,9 @@ class AutoAcceptService extends EventEmitter {
       console.warn(`[AutoAccept] WebSocket connection failed (will retry): ${err.message}`);
       this._scheduleReconnect();
     }
+
+    // Step 3: Periodic cleanup — prevent tracking Sets from growing unbounded
+    this._cleanupTimer = setInterval(() => this._cleanupTracking(), 30 * 60 * 1000); // every 30 min
   }
 
   stop() {
@@ -144,6 +147,10 @@ class AutoAcceptService extends EventEmitter {
     if (this._tokenRefreshTimer) {
       clearInterval(this._tokenRefreshTimer);
       this._tokenRefreshTimer = null;
+    }
+    if (this._cleanupTimer) {
+      clearInterval(this._cleanupTimer);
+      this._cleanupTimer = null;
     }
 
     console.log('[AutoAccept] Stopped');
@@ -467,11 +474,8 @@ class AutoAcceptService extends EventEmitter {
     const transfer = this._extractTransferInfoFromCreatedEvent(createdEvent);
     if (!transfer) return;
 
-    // Check if receiver is one of our registered users
-    const partyIds = await userRegistry.getAllPartyIds();
-    const ourParties = new Set(partyIds);
-
-    if (!ourParties.has(transfer.receiver)) return;
+    // Check if receiver is one of our registered users (use cached set, no DB call)
+    if (!this._subscribedParties || !this._subscribedParties.has(transfer.receiver)) return;
 
     console.log(`[AutoAccept] ⚡ New incoming transfer detected: ${transfer.amount} ${transfer.tokenSymbol} → ${transfer.receiver.substring(0, 30)}...`);
 
@@ -717,6 +721,16 @@ class AutoAcceptService extends EventEmitter {
     const payload = contract.payload || {};
     const transferData = ifaceView.transfer || payload.transfer || {};
 
+    // Skip expired transfers — deadline already passed, Canton will reject them
+    const executeBefore = transferData.executeBefore || ifaceView.executeBefore || payload.executeBefore;
+    if (executeBefore) {
+      const deadline = new Date(executeBefore);
+      if (!isNaN(deadline.getTime()) && deadline <= new Date()) {
+        this._archived.add(contractId); // Mark so we never retry
+        return null;
+      }
+    }
+
     const receiver = transferData.receiver || ifaceView.receiver || payload.receiver || payload.recipient || payload.to || '';
     if (!receiver) return null;
 
@@ -759,6 +773,16 @@ class AutoAcceptService extends EventEmitter {
 
     const payload = createdEvent.createArgument || createdEvent.create_argument || createdEvent.payload || {};
     const transferData = viewValue.transfer || payload.transfer || {};
+
+    // Skip expired transfers
+    const executeBefore = transferData.executeBefore || viewValue.executeBefore || payload.executeBefore;
+    if (executeBefore) {
+      const deadline = new Date(executeBefore);
+      if (!isNaN(deadline.getTime()) && deadline <= new Date()) {
+        this._archived.add(contractId);
+        return null;
+      }
+    }
 
     const receiver = transferData.receiver || viewValue.receiver || payload.receiver || payload.recipient || payload.to || '';
     if (!receiver) return null;
