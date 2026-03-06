@@ -93,6 +93,9 @@ class AutoAcceptService extends EventEmitter {
     this._acceptQueue = [];
     this._processingQueue = false;
 
+    // Track which user parties are subscribed
+    this._subscribedParties = new Set();
+
     // Config
     const httpBase = config.canton.jsonApiBase || 'http://localhost:31539';
     this._wsBase = httpBase.replace(/^http/, 'ws');
@@ -155,11 +158,6 @@ class AutoAcceptService extends EventEmitter {
     const cantonService = getCantonService();
     const token = await tokenProvider.getServiceToken();
 
-    if (!this._operatorPartyId) {
-      console.warn('[AutoAccept] No operator party — skipping initial scan');
-      return;
-    }
-
     console.log('[AutoAccept] 📋 Running initial ACS scan for pending transfers...');
 
     const partyIds = await userRegistry.getAllPartyIds();
@@ -168,38 +166,39 @@ class AutoAcceptService extends EventEmitter {
       return;
     }
 
-    let transferInstructions = [];
-    try {
-      transferInstructions = await cantonService.queryActiveContracts({
-        party: this._operatorPartyId,
-        interfaceIds: [TRANSFER_INSTRUCTION_INTERFACE],
-      }, token);
-    } catch (err) {
-      console.warn(`[AutoAccept] ACS scan failed: ${err.message}`);
-      return;
-    }
-
-    // Also fetch the current ledger offset so the WebSocket starts from here
+    // Fetch the current ledger offset so the WebSocket starts from here
     try {
       this._lastOffset = await cantonService.getLedgerEndOffset(token);
     } catch (_) {}
 
-    if (transferInstructions.length === 0) {
-      console.log('[AutoAccept] ✅ No pending transfers found in ACS');
-      return;
+    // Query EACH USER PARTY individually — TransferInstruction contracts
+    // are only visible to the receiver party, NOT to the operator.
+    let totalFound = 0;
+    for (const partyId of partyIds) {
+      if (this._stopped) break;
+      try {
+        const transferInstructions = await cantonService.queryActiveContracts({
+          party: partyId,
+          interfaceIds: [TRANSFER_INSTRUCTION_INTERFACE],
+        }, token);
+
+        for (const contract of transferInstructions) {
+          const transfer = this._extractTransferInfo(contract);
+          if (!transfer) continue;
+          // Override receiver with the party we queried for (contract is visible to them)
+          if (!transfer.receiver) transfer.receiver = partyId;
+          totalFound++;
+          this._enqueueAccept(transfer);
+        }
+      } catch (err) {
+        console.warn(`[AutoAccept] ACS scan for ${partyId.substring(0, 25)}... failed: ${err.message}`);
+      }
     }
 
-    console.log(`[AutoAccept] 📋 Found ${transferInstructions.length} TransferInstruction(s) in ACS`);
-
-    const ourParties = new Set(partyIds);
-
-    for (const contract of transferInstructions) {
-      const transfer = this._extractTransferInfo(contract);
-      if (!transfer) continue;
-      if (!ourParties.has(transfer.receiver)) continue;
-
-      // Queue for acceptance
-      this._enqueueAccept(transfer);
+    if (totalFound === 0) {
+      console.log('[AutoAccept] ✅ No pending transfers found in ACS');
+    } else {
+      console.log(`[AutoAccept] 📋 Found ${totalFound} TransferInstruction(s) in ACS — queued for auto-accept`);
     }
   }
 
@@ -215,7 +214,18 @@ class AutoAcceptService extends EventEmitter {
     const token = await tokenProvider.getServiceToken();
     const url = `${this._wsBase}/v2/updates/flats`;
 
-    console.log(`[AutoAccept] 🔌 Connecting WebSocket stream: ${url}`);
+    // CRITICAL: We must subscribe with each USER party, not the operator.
+    // TransferInstruction contracts are only visible to the receiver party.
+    // The operator is NOT a stakeholder and would see zero events.
+    const partyIds = await userRegistry.getAllPartyIds();
+    if (partyIds.length === 0) {
+      console.log('[AutoAccept] No registered users — WebSocket subscription deferred');
+      // Schedule a retry in case users register later
+      this._scheduleReconnect();
+      return;
+    }
+
+    console.log(`[AutoAccept] 🔌 Connecting WebSocket stream: ${url} (${partyIds.length} user parties)`);
 
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(url, ['daml.ws.auth'], {
@@ -226,32 +236,37 @@ class AutoAcceptService extends EventEmitter {
       ws.on('open', () => {
         console.log('[AutoAccept] ✅ WebSocket CONNECTED — streaming TransferInstruction events');
 
-        // Subscribe to TransferInstruction via InterfaceFilter
-        // This uses the operator party which has readAs on all external parties
-        const filter = {
-          verbose: false,
-          beginExclusive: this._lastOffset || 0,
-          filter: {
-            filtersByParty: {
-              [this._operatorPartyId]: {
-                cumulative: [{
-                  identifierFilter: {
-                    InterfaceFilter: {
-                      value: {
-                        interfaceId: TRANSFER_INSTRUCTION_INTERFACE,
-                        includeCreatedEventBlob: true,
-                        includeInterfaceView: true,
-                      },
-                    },
-                  },
-                }],
+        // Build filtersByParty with EACH user party — each needs to be a separate
+        // entry because Canton returns contracts where the party is a stakeholder.
+        const filtersByParty = {};
+        const interfaceFilter = {
+          identifierFilter: {
+            InterfaceFilter: {
+              value: {
+                interfaceId: TRANSFER_INSTRUCTION_INTERFACE,
+                includeCreatedEventBlob: true,
+                includeInterfaceView: true,
               },
             },
           },
         };
 
+        for (const partyId of partyIds) {
+          filtersByParty[partyId] = { cumulative: [interfaceFilter] };
+        }
+
+        const filter = {
+          verbose: false,
+          beginExclusive: this._lastOffset || 0,
+          filter: { filtersByParty },
+        };
+
         ws.send(JSON.stringify(filter));
-        console.log(`[AutoAccept] 📡 Subscribed from offset ${this._lastOffset || 0}`);
+
+        // Track which parties are subscribed
+        this._subscribedParties = new Set(partyIds);
+
+        console.log(`[AutoAccept] 📡 Subscribed from offset ${this._lastOffset || 0} for ${partyIds.length} parties`);
 
         this._updatesWs = ws;
         this._startTokenRefresh();
@@ -301,6 +316,51 @@ class AutoAcceptService extends EventEmitter {
         this._scheduleReconnect();
       });
     }, WS_RECONNECT_DELAY_MS);
+  }
+
+  /**
+   * Called when a new user registers or rehydrates. If this party isn't
+   * already in our WebSocket subscription, reconnect to include it.
+   * Also does a one-time ACS scan for this party to catch pending transfers.
+   */
+  async onNewPartyRegistered(partyId) {
+    if (!this.isRunning || this._stopped) return;
+    if (!partyId) return;
+
+    // Already subscribed?
+    if (this._subscribedParties.has(partyId)) return;
+
+    console.log(`[AutoAccept] 👤 New party registered: ${partyId.substring(0, 30)}... — reconnecting WebSocket to include them`);
+
+    // 1. Quick ACS scan for this party to catch any pending transfers
+    try {
+      const cantonService = getCantonService();
+      const token = await tokenProvider.getServiceToken();
+      const transfers = await cantonService.queryActiveContracts({
+        party: partyId,
+        interfaceIds: [TRANSFER_INSTRUCTION_INTERFACE],
+      }, token);
+
+      for (const contract of transfers) {
+        const transfer = this._extractTransferInfo(contract);
+        if (!transfer) continue;
+        if (!transfer.receiver) transfer.receiver = partyId;
+        console.log(`[AutoAccept] ⚡ Found pending transfer for new party: ${transfer.amount} ${transfer.tokenSymbol}`);
+        this._enqueueAccept(transfer);
+      }
+    } catch (err) {
+      console.warn(`[AutoAccept] ACS scan for new party failed: ${err.message}`);
+    }
+
+    // 2. Reconnect WebSocket to include the new party
+    if (this._updatesWs) {
+      this._updatesWs.close(); // close handler triggers reconnect with updated party list
+    } else {
+      this._connectUpdatesWebSocket().catch(err => {
+        console.warn(`[AutoAccept] Reconnect for new party failed: ${err.message}`);
+        this._scheduleReconnect();
+      });
+    }
   }
 
   _startTokenRefresh() {

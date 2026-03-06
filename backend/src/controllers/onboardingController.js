@@ -8,6 +8,7 @@ const { success, error } = require('../utils/response');
 const asyncHandler = require('../middleware/asyncHandler');
 const quota = require('../state/quota');
 const userRegistry = require('../state/userRegistry');
+const { getAutoAcceptService } = require('../services/autoAcceptService');
 
 class OnboardingController {
   constructor() {
@@ -122,6 +123,8 @@ class OnboardingController {
         if (signingKeyBase64 && typeof signingKeyBase64 === 'string' && signingKeyBase64.trim()) {
           await userRegistry.storeSigningKey(result.partyId, signingKeyBase64.trim(), publicKeyFingerprint || '');
           console.log(`[OnboardingController] 🔑 Signing key stored for party ${result.partyId.substring(0, 30)}...`);
+          // Notify auto-accept service so it subscribes to this party's transfers
+          getAutoAcceptService().onNewPartyRegistered(result.partyId).catch(() => {});
         } else {
           console.warn(`[OnboardingController] ⚠️ No signingKeyBase64 provided — interactive settlement will not work until key is stored`);
         }
@@ -179,6 +182,8 @@ class OnboardingController {
       const fingerprint = publicKeyFingerprint || '';
       await userRegistry.storeSigningKey(partyId.trim(), signingKeyBase64.trim(), fingerprint);
       console.log(`[OnboardingController] 🔑 Signing key restored during rehydrate for ${partyId.substring(0, 30)}...`);
+      // Notify auto-accept service so it subscribes to this party's transfers
+      getAutoAcceptService().onNewPartyRegistered(partyId.trim()).catch(() => {});
     }
 
     return success(res, { partyId: partyId.trim() }, 'User mapping restored', 200);
@@ -244,8 +249,9 @@ class OnboardingController {
 
     const fingerprint = publicKeyFingerprint || '';
     await userRegistry.storeSigningKey(partyId.trim(), signingKeyBase64.trim(), fingerprint);
-
     console.log(`[OnboardingController] 🔑 Signing key stored via /store-signing-key for ${partyId.substring(0, 30)}...`);
+    // Notify auto-accept service so it subscribes to this party's transfers
+    getAutoAcceptService().onNewPartyRegistered(partyId.trim()).catch(() => {});
     return success(res, { stored: true, partyId: partyId.trim() }, 'Signing key stored successfully', 200);
   });
 }
