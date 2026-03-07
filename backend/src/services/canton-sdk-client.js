@@ -667,6 +667,15 @@ class CantonSDKClient {
       }
     }
 
+    // Self-transfer: skip Accept step; extract created holding CIDs for caller
+    const isSelfTransfer = senderPartyId === receiverPartyId;
+    if (isSelfTransfer) {
+      console.log(`[CantonSDK]    Self-transfer completed — no Accept needed`);
+      const createdHoldings = this._extractCreatedHoldingCids(result);
+      console.log(`[CantonSDK]    Created ${createdHoldings.length} new holding(s) from self-transfer`);
+      return { ...result, createdHoldingCids: createdHoldings, isSelfTransfer: true };
+    }
+
     // Find TransferInstruction CID from the result
     let tiCid = null;
     for (const event of (result?.transaction?.events || [])) {
@@ -998,7 +1007,7 @@ class CantonSDKClient {
    * This does NOT submit the command; caller includes the returned command in
    * /v2/interactive-submission/prepare so the external party signs it.
    */
-  async buildAllocationInteractiveCommand(senderPartyId, receiverPartyId, amount, symbol, executorPartyId, orderId = '') {
+  async buildAllocationInteractiveCommand(senderPartyId, receiverPartyId, amount, symbol, executorPartyId, orderId = '', overrideHoldingCids = null) {
     if (!this.isReady()) {
       throw new Error('Canton SDK not initialized');
     }
@@ -1007,13 +1016,19 @@ class CantonSDKClient {
     const instrumentId = toCantonInstrument(symbol);
     const adminParty = this.getInstrumentAdminForSymbol(symbol);
 
-    const holdings = await this._withPartyContext(senderPartyId, async () => {
-      return await this.sdk.tokenStandard?.listHoldingUtxos(false) || [];
-    });
+    let holdingCids;
+    if (overrideHoldingCids && overrideHoldingCids.length > 0) {
+      holdingCids = overrideHoldingCids;
+      console.log(`[CantonSDK]    Using ${holdingCids.length} pre-specified holding CID(s) for allocation`);
+    } else {
+      const holdings = await this._withPartyContext(senderPartyId, async () => {
+        return await this.sdk.tokenStandard?.listHoldingUtxos(false) || [];
+      });
 
-    const holdingCids = holdings
-      .filter(h => extractInstrumentId(h.interfaceViewValue?.instrumentId) === instrumentId)
-      .map(h => h.contractId);
+      holdingCids = holdings
+        .filter(h => extractInstrumentId(h.interfaceViewValue?.instrumentId) === instrumentId)
+        .map(h => h.contractId);
+    }
 
     if (holdingCids.length === 0) {
       throw new Error(`No ${symbol} holdings found for allocation sender ${senderPartyId.substring(0, 30)}...`);
@@ -1152,6 +1167,29 @@ class CantonSDKClient {
         meta: { values: {} },
       },
     };
+  }
+
+  /**
+   * Extract created Amulet/Holding contract IDs from transaction events.
+   * Used after self-transfers to find the newly created exact-amount holding.
+   */
+  _extractCreatedHoldingCids(result) {
+    const created = [];
+    for (const event of (result?.transaction?.events || [])) {
+      const ev = event.created || event.CreatedEvent;
+      if (ev?.contractId) {
+        const tpl = typeof ev.templateId === 'string' ? ev.templateId : '';
+        if ((tpl.includes('Amulet') || tpl.includes('Holding')) &&
+            !tpl.includes('Locked') && !tpl.includes('Allocation') &&
+            !tpl.includes('Reward') && !tpl.includes('Marker') &&
+            !tpl.includes('FeaturedApp')) {
+          const payload = ev.createArgument || ev.payload || {};
+          const amt = payload?.amount?.initialAmount || payload?.amount || null;
+          created.push({ contractId: ev.contractId, amount: amt });
+        }
+      }
+    }
+    return created;
   }
 
   _pickSynchronizerIdFromDisclosed(disclosedContracts, fallbackSynchronizerId) {
@@ -2268,6 +2306,134 @@ class CantonSDKClient {
    * The exchange (as executor) can cancel on behalf of the user.
    * 
    * @param {string} allocationContractId - The Allocation contract ID
+   * @param {string} ownerPartyId - The allocation owner
+   * @param {string} executorPartyId - The exchange party (operator)
+   * @param {string} symbol - Token symbol for routing
+   * @returns {Promise<{amuletCids: string[], result: Object}>} Unlocked holding CIDs + exercise result
+   */
+  async withdrawAllocation(allocationContractId, ownerPartyId, executorPartyId, symbol = null) {
+    if (!allocationContractId) {
+      console.log('[CantonSDK] No allocationContractId — skipping withdrawal');
+      return null;
+    }
+
+    console.log(`[CantonSDK] Withdrawing Allocation: ${allocationContractId.substring(0, 30)}...`);
+
+    const adminToken = await tokenProvider.getServiceToken();
+    const configRef = require('../config');
+    const operatorPartyId = configRef.canton.operatorPartyId;
+    const synchronizerId = configRef.canton.synchronizerId;
+    const tokenSystemType = symbol ? getTokenSystemType(symbol) : null;
+
+    const actAsParties = [...new Set([executorPartyId, ownerPartyId, operatorPartyId].filter(Boolean))];
+    const readAsParties = [...actAsParties];
+
+    // Try SDK path first
+    if (this.isReady() && this.sdk.tokenStandard && typeof this.sdk.tokenStandard.exerciseAllocationChoice === 'function') {
+      try {
+        const result = await this._withPartyContext(ownerPartyId, async () => {
+          const [withdrawCmd, disclosed] = await this.sdk.tokenStandard.exerciseAllocationChoice(
+            allocationContractId,
+            'Withdraw'
+          );
+          const commands = Array.isArray(withdrawCmd) ? withdrawCmd : [withdrawCmd];
+          let res = null;
+          for (const rawCmd of commands) {
+            const cmd = rawCmd.ExerciseCommand || rawCmd;
+            res = await cantonService.exerciseChoice({
+              token: adminToken,
+              actAsParty: actAsParties,
+              templateId: cmd.templateId,
+              contractId: cmd.contractId,
+              choice: cmd.choice,
+              choiceArgument: cmd.choiceArgument,
+              readAs: readAsParties,
+              synchronizerId,
+              disclosedContracts: (disclosed || []).map(dc => ({
+                templateId: dc.templateId,
+                contractId: dc.contractId,
+                createdEventBlob: dc.createdEventBlob,
+                synchronizerId: dc.synchronizerId || synchronizerId,
+              })),
+            });
+          }
+          console.log(`[CantonSDK]    Allocation withdrawn via SDK — tokens unlocked`);
+          return { amuletCids: this._extractCreatedHoldingCids(res).map(h => h.contractId), result: res };
+        });
+        if (result) return result;
+      } catch (sdkErr) {
+        console.warn(`[CantonSDK]    SDK withdrawAllocation failed: ${sdkErr.message} — trying registry API`);
+      }
+    }
+
+    // Registry path
+    try {
+      const registryUrl = CANTON_SDK_CONFIG.REGISTRY_API_URL;
+      const encodedCid = encodeURIComponent(allocationContractId);
+      const withdrawContextUrl = `${registryUrl}/registry/allocations/v1/${encodedCid}/choice-contexts/withdraw`;
+
+      console.log(`[CantonSDK]    Trying registry withdraw API: ${withdrawContextUrl}`);
+      const { data: context } = await getRegistryApi().post(withdrawContextUrl, { excludeDebugFields: true });
+      const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
+      const result = await cantonService.exerciseChoice({
+        token: adminToken,
+        actAsParty: actAsParties,
+        templateId: ALLOCATION_INTERFACE,
+        contractId: allocationContractId,
+        choice: 'Allocation_Withdraw',
+        choiceArgument: {
+          extraArgs: {
+            context: context.choiceContextData || { values: {} },
+            meta: { values: {} },
+          },
+        },
+        readAs: readAsParties,
+        synchronizerId,
+        disclosedContracts: (context.disclosedContracts || []).map(dc => ({
+          templateId: dc.templateId,
+          contractId: dc.contractId,
+          createdEventBlob: dc.createdEventBlob,
+          synchronizerId: dc.synchronizerId || synchronizerId,
+        })),
+      });
+
+      console.log(`[CantonSDK]    Allocation withdrawn via registry API — tokens unlocked`);
+      return { amuletCids: this._extractCreatedHoldingCids(result).map(h => h.contractId), result };
+    } catch (registryErr) {
+      console.warn(`[CantonSDK]    Registry withdraw failed: ${registryErr.message}`);
+    }
+
+    // Last resort: direct exercise
+    try {
+      const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
+      const result = await cantonService.exerciseChoice({
+        token: adminToken,
+        actAsParty: actAsParties,
+        templateId: ALLOCATION_INTERFACE,
+        contractId: allocationContractId,
+        choice: 'Allocation_Withdraw',
+        choiceArgument: {
+          extraArgs: {
+            context: { values: {} },
+            meta: { values: {} },
+          },
+        },
+        readAs: readAsParties,
+        synchronizerId,
+      });
+
+      console.log(`[CantonSDK]    Allocation withdrawn (direct) — tokens unlocked`);
+      return { amuletCids: this._extractCreatedHoldingCids(result).map(h => h.contractId), result };
+    } catch (directErr) {
+      console.error(`[CantonSDK]    Direct allocation withdraw failed: ${directErr.message}`);
+      throw directErr;
+    }
+  }
+
+  /**
+   * Cancel an Allocation, returning locked tokens to the sender.
+   *
+   * @param {string} allocationContractId - The Allocation contract ID
    * @param {string} senderPartyId - The order placer (funds returned to)
    * @param {string} executorPartyId - The exchange party
    * @param {string} symbol - Symbol for routing
@@ -2517,7 +2683,7 @@ class CantonSDKClient {
    * @param {string} orderId - Unique order ID (used as settlementRef)
    * @returns {Promise<{command, readAs, disclosedContracts, synchronizerId, allocationType}|null>}
    */
-  async tryBuildRealAllocationCommand(senderPartyId, executorPartyId, amount, symbol, orderId) {
+  async tryBuildRealAllocationCommand(senderPartyId, executorPartyId, amount, symbol, orderId, overrideHoldingCids = null) {
     try {
       if (!this.isReady()) {
         console.log(`[CantonSDK] SDK not ready — cannot build real allocation for ${symbol}`);
@@ -2531,14 +2697,16 @@ class CantonSDKClient {
       }
 
       console.log(`[CantonSDK] 🔄 Trying REAL Token Standard allocation for ${amount} ${symbol} (${tokenSystemType})...`);
+      console.log(`[CantonSDK]    Allocation: sender=${senderPartyId.substring(0, 30)}..., receiver=executor(operator), executor=${executorPartyId.substring(0, 30)}...`);
 
       const result = await this.buildAllocationInteractiveCommand(
         senderPartyId,
-        executorPartyId, // receiver = executor (exchange) at allocation time
+        executorPartyId,  // receiver = executor (operator receives at settlement, then forwards)
         amount,
         symbol,
         executorPartyId,
-        orderId
+        orderId,
+        overrideHoldingCids
       );
 
       if (!result?.command) {
@@ -2626,6 +2794,70 @@ class CantonSDKClient {
       // Always throw — never return null. Client requirement: allocations must execute.
       console.error(`[CantonSDK] ❌ Allocation_ExecuteTransfer failed: ${msg.substring(0, 300)}`);
       throw err;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // HOLDING CONTRACT VERIFICATION — Source of Truth
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Verify holding state by querying active Holding contracts via the
+   * splice-api-token-holding-v1 interface (source of truth per client).
+   *
+   * @param {string} partyId - Party to verify
+   * @param {string} [symbol] - Optional symbol filter
+   * @returns {Promise<{holdings: Array, locked: Array, total: string}>}
+   */
+  async verifyHoldingState(partyId, symbol = null) {
+    const adminToken = await tokenProvider.getServiceToken();
+    const HOLDING_INTERFACE = '#splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:Holding';
+    const instrumentId = symbol ? toCantonInstrument(symbol) : null;
+
+    try {
+      const activeContracts = await cantonService.queryActiveContracts({
+        party: partyId,
+        templateIds: [HOLDING_INTERFACE],
+      }, adminToken);
+
+      const holdings = [];
+      const locked = [];
+
+      for (const contract of (activeContracts || [])) {
+        const payload = contract.createArgument || contract.payload || {};
+        const tpl = typeof contract.templateId === 'string' ? contract.templateId : '';
+        const amt = payload?.amount?.initialAmount || payload?.amount || '0';
+        const instId = extractInstrumentId(payload?.instrumentId);
+        const isLocked = tpl.includes('Locked') || !!payload?.lock;
+
+        if (instrumentId && instId !== instrumentId) continue;
+
+        const entry = {
+          contractId: contract.contractId,
+          templateId: tpl,
+          amount: amt,
+          instrumentId: instId,
+          isLocked,
+        };
+
+        if (isLocked) {
+          locked.push(entry);
+        } else {
+          holdings.push(entry);
+        }
+      }
+
+      const totalAvailable = holdings.reduce((sum, h) => sum.plus(h.amount || '0'), new Decimal(0)).toFixed();
+      const totalLocked = locked.reduce((sum, h) => sum.plus(h.amount || '0'), new Decimal(0)).toFixed();
+
+      console.log(`[CantonSDK] Holding state for ${partyId.substring(0, 30)}...${symbol ? ` (${symbol})` : ''}:`);
+      console.log(`[CantonSDK]    Available: ${totalAvailable} (${holdings.length} UTXOs)`);
+      console.log(`[CantonSDK]    Locked:    ${totalLocked} (${locked.length} UTXOs)`);
+
+      return { holdings, locked, totalAvailable, totalLocked };
+    } catch (err) {
+      console.warn(`[CantonSDK] verifyHoldingState failed: ${err.message}`);
+      return { holdings: [], locked: [], totalAvailable: '0', totalLocked: '0' };
     }
   }
 

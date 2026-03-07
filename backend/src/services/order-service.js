@@ -663,7 +663,7 @@ class OrderService {
     disclosedContracts = realAlloc.disclosedContracts || [];
     synchronizerId = realAlloc.synchronizerId || config.canton.synchronizerId;
     allocationType = realAlloc.allocationType;
-    console.log(`[OrderService] Token Standard allocation (${allocationType}) — tokens locked on-chain for ${orderId}`);
+    console.log(`[OrderService] Allocation (${allocationType}) — tokens locked on-chain for ${orderId} (receiver=operator, settlement via execute+forward)`);
 
     // Store the allocation type with the reservation
     await setAllocationContractIdForOrder(orderId, null, allocationType);
@@ -826,6 +826,14 @@ class OrderService {
         const allocType = orderMeta.allocationType || null;
         await setAllocationContractIdForOrder(orderMeta.orderId, allocationContractId, allocType);
         console.log(`[OrderService] ✅ Allocation linked to order ${orderMeta.orderId}: ${allocationContractId.substring(0, 30)}... (type: ${allocType || 'auto'})`);
+
+        try {
+          const sdkClient = getCantonSDKClient();
+          const holdingState = await sdkClient.verifyHoldingState(partyId, orderMeta.lockInfo?.asset);
+          console.log(`[OrderService] Holding verification after allocation: ${holdingState.totalAvailable} available, ${holdingState.totalLocked} locked (${orderMeta.lockInfo?.asset})`);
+        } catch (verifyErr) {
+          console.warn(`[OrderService] Post-allocation holding verification skipped: ${verifyErr.message}`);
+        }
       }
 
       // SINGLE-SIGN: Allocation + Order in one tx; skip second prepare.

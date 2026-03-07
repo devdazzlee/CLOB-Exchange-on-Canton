@@ -837,15 +837,22 @@ class MatchingEngine {
     const sdkClient = getCantonSDKClient();
 
     // ═══════════════════════════════════════════════════════════════════
-    // STEP 1: Execute Allocation_ExecuteTransfer for both sides
+    // STEP 1: Temple Settlement Pattern
     //
-    // Uses the real Splice Token Standard: Allocation_ExecuteTransfer
-    // transfers the locked tokens on-chain to the counterparty.
-    // The operator (executor) submits alone — user consent was captured
-    // at allocation creation time (order placement).
+    // Phase A: Execute both allocations (tokens user → operator)
+    //   Allocation_ExecuteTransfer moves locked tokens to the operator.
+    //   Operator key is hosted → non-interactive, no user sig needed.
+    //
+    // Phase B: Operator forwards tokens to counterparties
+    //   Operator sends base tokens to buyer, quote tokens to seller.
+    //   Uses performTransfer which routes through ExternalPartyAmuletRules
+    //   for external parties (auto-completes, no Accept needed).
+    //
+    // Phase C: Verify Holding contracts on-chain (source of truth)
+    //
+    // Result: Holdings on Canton explorer accurately reflect settlement.
     // ═══════════════════════════════════════════════════════════════════
-    console.log(`[MatchingEngine] Settlement: ${matchQtyStr} ${baseSymbol} @ ${matchPrice} ${quoteSymbol}`);
-    console.log(`[MatchingEngine] Step 1: Executing Allocation_ExecuteTransfer...`);
+    console.log(`[MatchingEngine] Settlement (Temple pattern): ${matchQtyStr} ${baseSymbol} @ ${matchPrice} ${quoteSymbol}`);
     console.log(`[MatchingEngine]    Seller alloc: ${sellOrder.allocationContractId ? sellOrder.allocationContractId.substring(0, 24) + '...' : 'missing'} (${baseSymbol}, type: ${sellOrder.allocationType})`);
     console.log(`[MatchingEngine]    Buyer alloc:  ${buyOrder.allocationContractId ? buyOrder.allocationContractId.substring(0, 24) + '...' : 'missing'} (${quoteSymbol}, type: ${buyOrder.allocationType})`);
 
@@ -858,7 +865,10 @@ class MatchingEngine {
     let replacementSellAllocationCid = null;
     let replacementBuyAllocationCid = null;
 
-    // ── Execute SELLER allocation (Allocation_ExecuteTransfer) ────
+    // ── Phase A: Execute both allocations (tokens → operator) ──────
+    console.log(`[MatchingEngine] Step 1A: Executing allocations (tokens → operator)...`);
+
+    // ── Execute SELLER allocation ────
     try {
       console.log(`[MatchingEngine]    Seller: Allocation_ExecuteTransfer (${sellOrder.allocationType})...`);
       const sellerResult = await sdkClient.tryRealAllocationExecution(
@@ -866,12 +876,12 @@ class MatchingEngine {
         operatorPartyId,
         baseSymbol,
         sellOrder.owner,
-        buyOrder.owner
+        operatorPartyId
       );
       if (!sellerResult) {
         throw new Error(`${baseSymbol} seller Allocation_ExecuteTransfer returned null`);
       }
-      console.log(`[MatchingEngine]    Seller: Allocation_ExecuteTransfer succeeded — tokens transferred on-chain`);
+      console.log(`[MatchingEngine]    Seller: ${baseSymbol} tokens transferred to operator`);
 
       if (sellIsPartial && sellerResult?.transaction?.events) {
         for (const event of sellerResult.transaction.events) {
@@ -890,7 +900,7 @@ class MatchingEngine {
       throw new Error(`SELLER_ALLOCATION_FAILED: ${msg}`);
     }
 
-    // ── Execute BUYER allocation (Allocation_ExecuteTransfer) ─────
+    // ── Execute BUYER allocation ─────
     try {
       console.log(`[MatchingEngine]    Buyer: Allocation_ExecuteTransfer (${buyOrder.allocationType})...`);
       const buyerResult = await sdkClient.tryRealAllocationExecution(
@@ -898,12 +908,12 @@ class MatchingEngine {
         operatorPartyId,
         quoteSymbol,
         buyOrder.owner,
-        sellOrder.owner
+        operatorPartyId
       );
       if (!buyerResult) {
         throw new Error(`${quoteSymbol} buyer Allocation_ExecuteTransfer returned null`);
       }
-      console.log(`[MatchingEngine]    Buyer: Allocation_ExecuteTransfer succeeded — tokens transferred on-chain`);
+      console.log(`[MatchingEngine]    Buyer: ${quoteSymbol} tokens transferred to operator`);
 
       if (buyIsPartial && buyerResult?.transaction?.events) {
         for (const event of buyerResult.transaction.events) {
@@ -922,7 +932,55 @@ class MatchingEngine {
       throw new Error(`BUYER_ALLOCATION_FAILED: ${msg}`);
     }
 
-    console.log(`[MatchingEngine]    Settlement COMPLETE via Allocation_ExecuteTransfer (both sides), operator-only`);
+    console.log(`[MatchingEngine]    Phase A complete — both allocations executed, tokens with operator`);
+
+    // ── Phase B: Operator forwards tokens to counterparties ────────
+    // Seller's base tokens (now with operator) → Buyer
+    // Buyer's quote tokens (now with operator) → Seller
+    console.log(`[MatchingEngine] Step 1B: Operator forwarding tokens to counterparties...`);
+
+    try {
+      console.log(`[MatchingEngine]    Operator→Buyer: ${matchQtyStr} ${baseSymbol}`);
+      await sdkClient.performTransfer(
+        operatorPartyId,
+        buyOrder.owner,
+        matchQtyStr,
+        baseSymbol
+      );
+      console.log(`[MatchingEngine]    Operator→Buyer: ${baseSymbol} transfer succeeded`);
+    } catch (transferErr) {
+      const msg = transferErr.message || String(transferErr);
+      console.error(`[MatchingEngine]    Operator→Buyer transfer failed: ${msg.substring(0, 150)}`);
+      throw new Error(`SETTLEMENT_TRANSFER_FAILED: Operator→Buyer ${baseSymbol}: ${msg}`);
+    }
+
+    try {
+      console.log(`[MatchingEngine]    Operator→Seller: ${quoteAmountStr} ${quoteSymbol}`);
+      await sdkClient.performTransfer(
+        operatorPartyId,
+        sellOrder.owner,
+        quoteAmountStr,
+        quoteSymbol
+      );
+      console.log(`[MatchingEngine]    Operator→Seller: ${quoteSymbol} transfer succeeded`);
+    } catch (transferErr) {
+      const msg = transferErr.message || String(transferErr);
+      console.error(`[MatchingEngine]    Operator→Seller transfer failed: ${msg.substring(0, 150)}`);
+      throw new Error(`SETTLEMENT_TRANSFER_FAILED: Operator→Seller ${quoteSymbol}: ${msg}`);
+    }
+
+    console.log(`[MatchingEngine]    Settlement COMPLETE — Temple pattern (execute + forward), operator-only`);
+
+    // ── Phase C: Verify holdings after settlement ──────────────────
+    try {
+      console.log(`[MatchingEngine] Step 1C: Verifying Holding contracts after settlement...`);
+      const sellerHoldings = await sdkClient.verifyHoldingState(sellOrder.owner, baseSymbol);
+      const buyerHoldings = await sdkClient.verifyHoldingState(buyOrder.owner, baseSymbol);
+      console.log(`[MatchingEngine]    Seller ${baseSymbol}: ${sellerHoldings.totalAvailable} available, ${sellerHoldings.totalLocked} locked`);
+      console.log(`[MatchingEngine]    Buyer ${baseSymbol}:  ${buyerHoldings.totalAvailable} available, ${buyerHoldings.totalLocked} locked`);
+    } catch (verifyErr) {
+      console.warn(`[MatchingEngine]    Holding verification skipped: ${verifyErr.message}`);
+    }
 
     // ═══════════════════════════════════════════════════════════════════
     // STEP 2: FillOrder on BOTH Canton order contracts AFTER settlement
