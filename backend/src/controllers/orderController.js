@@ -1,0 +1,326 @@
+/**
+ * Order Controller
+ * Handles order-related HTTP requests
+ * 
+ * Uses Canton JSON Ledger API v2:
+ * - POST /v2/commands/submit-and-wait-for-transaction - Place/Cancel orders
+ * - POST /v2/state/active-contracts - Query orders
+ */
+
+const OrderService = require('../services/order-service');
+const { success } = require('../utils/response');
+const asyncHandler = require('../middleware/asyncHandler');
+const { ValidationError } = require('../utils/errors');
+const userRegistry = require('../state/userRegistry');
+
+class OrderController {
+  constructor() {
+    this.orderService = new OrderService();
+  }
+
+  isUuidLike(value) {
+    return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.trim());
+  }
+
+  isPartyIdLike(value) {
+    return typeof value === 'string' && value.includes('::');
+  }
+
+  async resolveEffectivePartyId(req, bodyPartyId) {
+    const body = typeof bodyPartyId === 'string' ? bodyPartyId.trim() : '';
+    const headerPartyId = typeof req.headers['x-party-id'] === 'string' ? req.headers['x-party-id'].trim() : '';
+    const headerUserId = typeof req.headers['x-user-id'] === 'string' ? req.headers['x-user-id'].trim() : '';
+
+    // Explicit partyId values always win.
+    if (this.isPartyIdLike(body)) return body;
+    if (this.isPartyIdLike(headerPartyId)) return headerPartyId;
+
+    // Backward compatibility: some clients send partyId in x-user-id.
+    if (this.isPartyIdLike(headerUserId)) return headerUserId;
+
+    // If x-user-id is an app user UUID, resolve to partyId via registry.
+    if (headerUserId) {
+      const user = await userRegistry.getUser(headerUserId);
+      if (user?.partyId && this.isPartyIdLike(user.partyId)) {
+        return user.partyId;
+      }
+    }
+
+    // If body/header provided a UUID instead of partyId, surface a clear message.
+    if (this.isUuidLike(body) || this.isUuidLike(headerPartyId) || this.isUuidLike(headerUserId)) {
+      throw new ValidationError('Could not resolve Canton partyId from provided identity. Send x-party-id (ext-...::...) or onboard user mapping.');
+    }
+
+    throw new ValidationError('Missing partyId. Provide partyId in body or x-party-id header.');
+  }
+
+  /**
+   * Place an order
+   * POST /api/orders/place
+   * 
+   * Creates an Order contract on Canton ledger
+   */
+  place = asyncHandler(async (req, res) => {
+    const {
+      tradingPair,
+      orderType,
+      orderMode,
+      price,
+      quantity,
+      partyId,
+      stopPrice,
+    } = req.body;
+
+    const effectivePartyId = await this.resolveEffectivePartyId(req, partyId);
+
+    if (!tradingPair || !orderType || !orderMode || !quantity) {
+      throw new ValidationError('Missing required fields: tradingPair, orderType, orderMode, quantity');
+    }
+
+    if (orderMode.toUpperCase() === 'LIMIT' && !price) {
+      throw new ValidationError('Price is required for LIMIT orders');
+    }
+
+    if (orderMode.toUpperCase() === 'STOP_LOSS' && !stopPrice) {
+      throw new ValidationError('stopPrice is required for STOP_LOSS orders');
+    }
+
+    const decodedTradingPair = decodeURIComponent(tradingPair);
+
+    console.log(`[OrderController] Placing order:`, {
+      tradingPair: decodedTradingPair,
+      orderType,
+      orderMode,
+      price,
+      quantity,
+      stopPrice: stopPrice || null,
+      partyId: effectivePartyId.substring(0, 30) + '...'
+    });
+
+    // Place order directly using OrderService
+    const result = await this.orderService.placeOrder({
+      partyId: effectivePartyId,
+      tradingPair: decodedTradingPair,
+      orderType: orderType.toUpperCase(),
+      orderMode: orderMode.toUpperCase(),
+      price,
+      quantity,
+      stopPrice: stopPrice || null,
+    });
+
+    // For external parties: return requiresSignature so frontend can sign
+    if (result.requiresSignature) {
+      console.log(`[OrderController] External party — returning prepared transaction for signing`);
+      return success(res, {
+        requiresSignature: true,
+        orderId: result.orderId,
+        preparedTransaction: result.preparedTransaction,
+        preparedTransactionHash: result.preparedTransactionHash,
+        hashingSchemeVersion: result.hashingSchemeVersion,
+        partyId: result.partyId,
+        tradingPair: result.tradingPair,
+        orderType: result.orderType,
+        orderMode: result.orderMode,
+        price: result.price,
+        quantity: result.quantity,
+        stopPrice: result.stopPrice,
+        lockInfo: result.lockInfo,
+        stage: result.stage || null,
+        step: result.step || null,
+        allocationType: result.allocationType || null,
+      }, 'Transaction prepared. Sign the hash and call /execute-place.');
+    }
+
+    console.log(`[OrderController] ✅ Order placed: ${result.orderId}`);
+
+    // Register stop-loss with StopLossService if applicable
+    if (orderMode.toUpperCase() === 'STOP_LOSS' && result.contractId) {
+      try {
+        const { getStopLossService } = require('../services/stopLossService');
+        const stopLossService = getStopLossService();
+        await stopLossService.registerStopLoss({
+          orderContractId: result.contractId,
+          orderId: result.orderId,
+          tradingPair: decodedTradingPair,
+          orderType: orderType.toUpperCase(),
+          stopPrice: stopPrice,
+          partyId: effectivePartyId,
+          quantity: quantity?.toString() || '0',
+          allocationContractId: result.allocationContractId || null,
+        });
+        console.log(`[OrderController] ✅ Stop-loss registered for ${result.orderId} (triggers at ${stopPrice})`);
+      } catch (slErr) {
+        console.warn(`[OrderController] ⚠️ Failed to register stop-loss:`, slErr.message);
+      }
+    }
+
+    // Matching is triggered by the event-driven wiring in app.js:
+    // Canton WebSocket → StreamingReadModel → 'orderCreated' event → MatchingEngine
+    // No setTimeout hacks needed.
+    return success(res, { ...result, matchTriggered: true }, 'Order placed successfully', 201);
+  });
+
+  /**
+   * Cancel an order
+   * POST /api/orders/cancel
+   * 
+   * Exercises CancelOrder choice on Order contract
+   */
+  cancel = asyncHandler(async (req, res) => {
+    const {
+      orderContractId,
+      partyId,
+      tradingPair
+    } = req.body;
+
+    const effectivePartyId = await this.resolveEffectivePartyId(req, partyId);
+
+    if (!orderContractId) {
+      throw new ValidationError('Missing required field: orderContractId');
+    }
+
+    console.log(`[OrderController] Cancelling order: ${orderContractId.substring(0, 30)}...`);
+
+    const result = await this.orderService.cancelOrder(
+      orderContractId,
+      effectivePartyId,
+      tradingPair
+    );
+
+    // For external parties: return requiresSignature so frontend can sign
+    if (result.requiresSignature) {
+      console.log(`[OrderController] External party — returning prepared CancelOrder for signing`);
+      return success(res, result, 'Transaction prepared. Sign the hash and call /execute-cancel.');
+    }
+
+    console.log(`[OrderController] ✅ Order cancelled`);
+
+    return success(res, result, 'Order cancelled successfully');
+  });
+
+  /**
+   * Get user's active orders
+   * GET /api/orders/user/:partyId
+   */
+  getUserOrders = asyncHandler(async (req, res) => {
+    const { partyId } = req.params;
+    const { status = 'OPEN', limit = 100 } = req.query;
+
+    if (!partyId) {
+      throw new ValidationError('Missing required param: partyId');
+    }
+
+    console.log(`[OrderController] Getting orders for party: ${partyId.substring(0, 30)}...`);
+
+    const orders = await this.orderService.getUserOrders(partyId, status, parseInt(limit));
+
+    console.log(`[OrderController] Found ${orders.length} orders`);
+
+    return success(res, { orders }, 'User orders fetched successfully');
+  });
+
+  /**
+   * Execute a prepared order placement with user's signature
+   * POST /api/orders/execute-place
+   * 
+   * Body: { preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, orderMeta }
+   */
+  executePlace = asyncHandler(async (req, res) => {
+    const { preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, orderMeta, signingKeyBase64 } = req.body;
+
+    if (!preparedTransaction || !partyId || !signatureBase64 || !signedBy) {
+      throw new ValidationError('preparedTransaction, partyId, signatureBase64, and signedBy are required');
+    }
+
+    console.log(`[OrderController] EXECUTE place for ${partyId.substring(0, 30)}... signedBy: ${signedBy.substring(0, 20)}...`);
+
+    // Store signing key for server-side settlement (if provided)
+    if (signingKeyBase64 && typeof signingKeyBase64 === 'string' && signingKeyBase64.trim()) {
+      const userRegistry = require('../state/userRegistry');
+      await userRegistry.storeSigningKey(partyId, signingKeyBase64.trim(), signedBy);
+      console.log(`[OrderController] 🔑 Signing key stored for interactive settlement`);
+    }
+
+    const result = await this.orderService.executeOrderPlacement(
+      preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, orderMeta || {}
+    );
+
+    if (result?.requiresSignature) {
+      console.log(`[OrderController] External party — returning next prepared step for signing (${result.step})`);
+      return success(res, result, 'Step prepared. Sign the next hash and call /execute-place again.');
+    }
+
+    console.log(`[OrderController] ✅ Order placed via interactive submission: ${result.orderId}`);
+
+    // Trigger matching after order placement (non-blocking).
+    // The matching engine background loop may already pick this up, but an
+    // explicit trigger after a short delay ensures Allocation_ExecuteTransfer
+    // runs promptly even if the streaming read model is slow.
+    const tradingPairForMatch = result?.tradingPair || orderMeta?.tradingPair;
+    if (tradingPairForMatch) {
+      setTimeout(async () => {
+        try {
+          const { getMatchingEngine } = require('../services/matching-engine');
+          const matchingEngine = getMatchingEngine();
+          const triggerResult = await matchingEngine.triggerMatchingCycle(tradingPairForMatch);
+          console.log(`[OrderController] ⚡ Post-placement match trigger for ${tradingPairForMatch}: ${triggerResult?.success ? 'ok' : 'skipped'}`);
+        } catch (triggerErr) {
+          console.warn(`[OrderController] Match trigger failed (non-fatal): ${triggerErr.message}`);
+        }
+      }, 3000);
+    }
+
+    return success(res, { ...result, matchTriggered: true }, 'Order placed via interactive submission', 201);
+  });
+
+  /**
+   * Execute a prepared order cancellation with user's signature
+   * POST /api/orders/execute-cancel
+   * 
+   * Body: { preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, cancelMeta }
+   */
+  executeCancel = asyncHandler(async (req, res) => {
+    const { preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, cancelMeta } = req.body;
+
+    if (!preparedTransaction || !partyId || !signatureBase64 || !signedBy) {
+      throw new ValidationError('preparedTransaction, partyId, signatureBase64, and signedBy are required');
+    }
+
+    console.log(`[OrderController] EXECUTE cancel for ${partyId.substring(0, 30)}... signedBy: ${signedBy.substring(0, 20)}...`);
+
+    const result = await this.orderService.executeOrderCancel(
+      preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, cancelMeta || {}
+    );
+
+    console.log(`[OrderController] ✅ Order cancelled via interactive submission`);
+
+    return success(res, result, 'Order cancelled via interactive submission');
+  });
+
+  /**
+   * Cancel order by ID
+   * POST /api/orders/:orderId/cancel
+   */
+  cancelOrderById = asyncHandler(async (req, res) => {
+    const { orderId } = req.params;
+    const partyId = await this.resolveEffectivePartyId(req, req.body?.partyId);
+
+    if (!orderId) {
+      throw new ValidationError('Missing required param: orderId');
+    }
+
+    console.log(`[OrderController] Cancelling order by ID: ${orderId}`);
+
+    // orderId might be a contract ID or order ID - try both
+    const result = await this.orderService.cancelOrder(orderId, partyId);
+
+    // For external parties: return requiresSignature so frontend can sign
+    if (result.requiresSignature) {
+      return success(res, result, 'Transaction prepared. Sign the hash and call /execute-cancel.');
+    }
+
+    return success(res, result, 'Order cancelled successfully');
+  });
+}
+
+module.exports = new OrderController();

@@ -1,0 +1,352 @@
+-- | MasterOrderBook - Global Order Book using Splice Allocation model
+-- | This is the single source of truth for all trading on the exchange.
+-- | Based on Splice OTC Trading pattern from TradingApp.daml
+module MasterOrderBook where
+
+import qualified Order
+import Trade
+-- NOTE: Splice imports commented out until packages are installed
+-- import Splice.Api.Token.AllocationV1 as Api.Token.AllocationV1
+-- import Splice.Api.Token.MetadataV1 as Api.Token.MetadataV1
+import qualified DA.Map as Map
+import DA.List
+import DA.Optional
+import DA.Time
+import DA.Text
+
+-- =============================================================================
+-- HELPER FUNCTIONS
+-- =============================================================================
+
+-- Helper function to fetch orders with their contract IDs
+fetchOrderPairs : [ContractId Order.Order] -> Update [(ContractId Order.Order, Order.Order)]
+fetchOrderPairs cids = if null cids then
+  return []
+  else do
+    let cid = head cids
+    let rest = tail cids
+    order <- fetch cid
+    restPairs <- fetchOrderPairs rest
+    let pair = (cid, order)
+    return ([pair] ++ restPairs)
+
+-- Helper function to compare buy orders (PRICE-TIME PRIORITY)
+compareBuyOrders : (ContractId Order.Order, Order.Order) -> (ContractId Order.Order, Order.Order) -> Ordering
+compareBuyOrders (_, a) (_, b) = case (a.price, b.price) of
+  (None, Some _) -> GT  -- Market orders have highest priority
+  (Some _, None) -> LT
+  (None, None) -> 
+    if a.timestamp < b.timestamp then GT else if a.timestamp > b.timestamp then LT else EQ
+  (Some pa, Some pb) -> 
+    if pa > pb then GT 
+    else if pa < pb then LT 
+    else if a.timestamp < b.timestamp then GT
+    else if a.timestamp > b.timestamp then LT
+    else EQ
+
+-- Helper function to compare sell orders (PRICE-TIME PRIORITY)
+compareSellOrders : (ContractId Order.Order, Order.Order) -> (ContractId Order.Order, Order.Order) -> Ordering
+compareSellOrders (_, a) (_, b) = case (a.price, b.price) of
+  (None, Some _) -> GT
+  (Some _, None) -> LT
+  (None, None) -> 
+    if a.timestamp < b.timestamp then GT else if a.timestamp > b.timestamp then LT else EQ
+  (Some pa, Some pb) -> 
+    if pa < pb then GT 
+    else if pa > pb then LT 
+    else if a.timestamp < b.timestamp then GT
+    else if a.timestamp > b.timestamp then LT
+    else EQ
+
+-- Helper function to check if two orders can match
+canOrdersMatch : Order.Order -> Order.Order -> Bool
+canOrdersMatch buyOrder sellOrder = case buyOrder.price of
+  Some buyPrice -> case sellOrder.price of
+    Some sellPrice -> buyPrice >= sellPrice
+    None -> True
+  None -> True
+
+-- Helper function to determine trade price
+determineTradePrice : Order.Order -> Order.Order -> Decimal
+determineTradePrice buyOrder sellOrder = case buyOrder.price of
+  Some bp -> case sellOrder.price of
+    Some sp -> (bp + sp) / 2.0
+    None -> bp
+  None -> case sellOrder.price of
+    Some sp -> sp
+    None -> 0.0
+
+-- Helper function to parse trading pair
+parseTradingPair : Text -> (Text, Text)
+parseTradingPair pair = 
+  if pair == "BTC/USDT" || pair == "BTC-USDT" then ("BTC", "USDT")
+  else if pair == "ETH/USDT" || pair == "ETH-USDT" then ("ETH", "USDT")
+  else if pair == "SOL/USDT" || pair == "SOL-USDT" then ("SOL", "USDT")
+  else ("UNKNOWN", "UNKNOWN")
+
+-- Helper function to execute a match between buy and sell orders using Splice Allocations
+-- This handles PARTIAL FILLS: creates remainder orders when quantities don't match exactly
+-- This is the critical function that follows OTCTrade_Settle pattern
+executeMatch : ContractId Order.Order -> Order.Order -> ContractId Order.Order -> Order.Order -> Update (Bool, Bool)
+executeMatch buyCid buyOrder sellCid sellOrder = do
+  -- NOTE: Allocation execution commented out until Splice packages are installed
+  -- When Splice is installed, uncomment the following:
+  -- buyAllocation <- fetch buyOrder.allocationCid
+  -- sellAllocation <- fetch sellOrder.allocationCid
+  -- _ <- exercise buyOrder.allocationCid Api.Token.AllocationV1.Allocation_ExecuteTransfer with extraArgs = ()
+  -- _ <- exercise sellOrder.allocationCid Api.Token.AllocationV1.Allocation_ExecuteTransfer with extraArgs = ()
+  
+  -- Calculate remaining quantities and trade quantity
+  let buyRemaining = buyOrder.quantity - buyOrder.filled
+  let sellRemaining = sellOrder.quantity - sellOrder.filled
+  let tradeQuantity = min buyRemaining sellRemaining
+  let tradePrice = determineTradePrice buyOrder sellOrder
+  
+  -- Parse trading pair to get token types
+  let (baseToken, quoteToken) = parseTradingPair buyOrder.tradingPair
+  
+  -- Execute the Allocation transfers for the matched quantity
+  -- NOTE: In Splice, you would split the allocation first if partial fill
+  -- For now, we execute for minQty and handle remainders by creating new orders
+  
+  -- Update order fill status (this will mark orders as FILLED if tradeQuantity equals remaining)
+  _ <- exercise buyCid Order.FillOrder with fillQuantity = tradeQuantity; newAllocationCid = None
+  _ <- exercise sellCid Order.FillOrder with fillQuantity = tradeQuantity; newAllocationCid = None
+  
+  -- Create trade record
+  now <- getTime
+  let tradeIdText = buyOrder.orderId <> "-" <> sellOrder.orderId <> "-" <> show now
+  _ <- create Trade with
+    tradeId = tradeIdText
+    buyer = buyOrder.owner
+    seller = sellOrder.owner
+    tradingPair = buyOrder.tradingPair
+    price = tradePrice
+    quantity = tradeQuantity
+    timestamp = now
+    buyOrderId = buyOrder.orderId
+    sellOrderId = sellOrder.orderId
+  
+  -- Fetch updated orders to check remaining quantities after fill
+  updatedBuy <- fetch buyCid
+  updatedSell <- fetch sellCid
+  
+  let buyFullyFilled = updatedBuy.status == "FILLED"
+  let sellFullyFilled = updatedSell.status == "FILLED"
+  let buyRemainder = updatedBuy.quantity - updatedBuy.filled
+  let sellRemainder = updatedSell.quantity - updatedSell.filled
+  
+  -- Handle partial fills: Create remainder orders when one order is larger
+  -- If Buy Qty > Sell Qty: Create new Order for buyer with remainder
+  if buyRemainder > 0.0 && not buyFullyFilled then do
+    now2 <- getTime
+    let remainderOrderId = buyOrder.orderId <> "-PARTIAL-" <> show now2
+    _ <- create Order.Order with
+      orderId = remainderOrderId
+      owner = buyOrder.owner
+      orderType = "BUY"
+      orderMode = buyOrder.orderMode
+      tradingPair = buyOrder.tradingPair
+      price = buyOrder.price
+      quantity = buyRemainder
+      filled = 0.0 : Decimal
+      status = "OPEN"
+      timestamp = now2
+      operator = buyOrder.operator
+      stopPrice = buyOrder.stopPrice
+      allocationCid = buyOrder.allocationCid  -- Reuse same allocation (in Splice, you'd split it)
+    return (False, sellFullyFilled)  -- Buy order not fully filled, remainder created
+  else if sellRemainder > 0.0 && not sellFullyFilled then do
+    now2 <- getTime
+    let remainderOrderId = sellOrder.orderId <> "-PARTIAL-" <> show now2
+    _ <- create Order.Order with
+      orderId = remainderOrderId
+      owner = sellOrder.owner
+      orderType = "SELL"
+      orderMode = sellOrder.orderMode
+      tradingPair = sellOrder.tradingPair
+      price = sellOrder.price
+      quantity = sellRemainder
+      filled = 0.0 : Decimal
+      status = "OPEN"
+      timestamp = now2
+      operator = sellOrder.operator
+      stopPrice = sellOrder.stopPrice
+      allocationCid = sellOrder.allocationCid  -- Reuse same allocation (in Splice, you'd split it)
+    return (buyFullyFilled, False)  -- Sell order not fully filled, remainder created
+  else
+    return (True, True)  -- Both orders fully filled
+
+-- =============================================================================
+-- MASTER ORDER BOOK TEMPLATE
+-- =============================================================================
+
+template MasterOrderBook
+  with
+    tradingPair : Text
+    buyOrders : [ContractId Order.Order]
+    sellOrders : [ContractId Order.Order]
+    lastPrice : Optional Decimal
+    operator : Party  -- The Venue/Operator who executes trades
+    publicObserver : Party  -- Public observer for global visibility
+    activeUsers : [Party]
+  where
+    signatory operator
+    observer publicObserver, activeUsers
+
+    -- | Add an order to the book
+    -- | CRITICAL: Accepts a ContractId Allocation that must be locked to the Operator
+    choice AddOrder : ContractId Order.Order
+      with
+        orderId : Text
+        owner : Party
+        orderType : Text  -- "BUY" or "SELL"
+        orderMode : Text  -- "LIMIT" or "MARKET" or "STOP_LOSS"
+        price : Optional Decimal
+        quantity : Decimal
+        allocationCid : Text  -- The locked Allocation (placeholder: will be ContractId Allocation when Splice is installed)
+        stopPrice : Optional Decimal  -- Trigger price for STOP_LOSS orders (must be at end for upgrade compat)
+      controller owner
+      do
+        -- NOTE: Allocation verification commented out until Splice packages are installed
+        -- When Splice is installed, uncomment:
+        -- allocation <- fetch allocationCid
+        -- let allocationView = view @Api.Token.AllocationV1.Allocation allocation
+        -- Verify the Allocation is locked to the Operator (venue)
+        
+        -- Verify the Allocation matches the order requirements
+        -- For BUY orders: Allocation should be for quote token (USDT)
+        -- For SELL orders: Allocation should be for base token (BTC/ETH/SOL)
+        let (baseToken, quoteToken) = parseTradingPair tradingPair
+        
+        -- Create the Order contract
+        now <- getTime
+        orderCid <- create Order.Order with
+            orderId = orderId
+            owner = owner
+            orderType = orderType
+            orderMode = orderMode
+            tradingPair = tradingPair
+            price = price
+            quantity = quantity
+            filled = 0.0 : Decimal
+            status = "OPEN"
+            timestamp = now
+            operator = operator
+            stopPrice = stopPrice
+            allocationCid = allocationCid
+        
+        -- Add to appropriate list
+        let updatedBuyOrders = if orderType == "BUY" then buyOrders ++ [orderCid] else buyOrders
+        let updatedSellOrders = if orderType == "SELL" then sellOrders ++ [orderCid] else sellOrders
+        let updatedActiveUsers = if owner `elem` activeUsers then activeUsers else activeUsers ++ [owner]
+        
+        -- Update the order book (creates new contract, archives old one)
+        newBookCid <- create this with
+          buyOrders = updatedBuyOrders
+          sellOrders = updatedSellOrders
+          lastPrice = None
+          activeUsers = updatedActiveUsers
+        
+        -- Try to match immediately using the NEW contract
+        -- Note: MatchOrders is controlled by operator, so this must be done externally
+        -- For now, skip auto-match (matching engine should call MatchOrders separately)
+        -- exercise newBookCid MatchOrders -- Cannot do this since controller is operator, not owner
+        
+        return orderCid
+
+    -- | Match two orders and execute the trade using Splice Allocation execution
+    -- | This handles PARTIAL FILLS: creates remainder orders when quantities don't match
+    -- | This follows the OTCTrade_Settle pattern from TradingApp.daml
+    choice MatchOrders : ()
+      controller operator
+      do
+        -- Fetch all active orders
+        buyOrderPairs <- fetchOrderPairs buyOrders
+        sellOrderPairs <- fetchOrderPairs sellOrders
+        
+        let activeBuys = filter (\(_, o) -> o.status == "OPEN") buyOrderPairs
+        let activeSells = filter (\(_, o) -> o.status == "OPEN") sellOrderPairs
+        
+        let sortedBuys = sortBy compareBuyOrders activeBuys
+        let sortedSells = sortBy compareSellOrders activeSells
+        
+        -- Try to match first compatible pair
+        if not (null sortedBuys) && not (null sortedSells) then do
+          let (buyCid, buyOrder) = head sortedBuys
+          let (sellCid, sellOrder) = head sortedSells
+          
+          if canOrdersMatch buyOrder sellOrder then do
+            -- Execute the match (returns whether buy and sell are fully filled)
+            (buyFilled, sellFilled) <- executeMatch buyCid buyOrder sellCid sellOrder
+            
+            -- Update order book state
+            -- Remove fully filled orders, keep partially filled ones (they're archived and replaced by remainders)
+            let remainingBuys = if buyFilled then filter (\cid -> cid /= buyCid) buyOrders else buyOrders
+            let remainingSells = if sellFilled then filter (\cid -> cid /= sellCid) sellOrders else sellOrders
+            
+            -- Archive the original orders (they're either fully filled or replaced by remainders)
+            -- Note: In DAML, we archive by creating a new version with status FILLED/CANCELLED
+            -- The executeMatch function already updated the orders, so we just remove them from the lists
+            let finalBuys = if buyFilled then remainingBuys else buyOrders
+            let finalSells = if sellFilled then remainingSells else sellOrders
+            
+            let tradePrice = determineTradePrice buyOrder sellOrder
+            
+            _ <- create this with
+              buyOrders = finalBuys
+              sellOrders = finalSells
+              lastPrice = Some tradePrice
+              activeUsers = activeUsers
+            
+            -- If partial fills occurred, try to match again (the remainder orders might match)
+            if not buyFilled || not sellFilled then
+              exercise self MatchOrders
+            else
+              return ()
+          else
+            return ()
+        else
+          return ()
+
+    -- | Remove a filled/cancelled order from the book
+    choice RemoveOrder : ()
+      with
+        orderCid : ContractId Order.Order
+      controller operator
+      do
+        order <- fetch orderCid
+        assert (order.status == "FILLED" || order.status == "CANCELLED")
+        
+        let updatedBuyOrders = filter (\cid -> cid /= orderCid) buyOrders
+        let updatedSellOrders = filter (\cid -> cid /= orderCid) sellOrders
+        
+        _ <- create this with
+          buyOrders = updatedBuyOrders
+          sellOrders = updatedSellOrders
+          activeUsers = activeUsers
+        return ()
+
+    -- | Cancel an order from the book (releases the Allocation)
+    choice CancelOrderFromBook : ()
+      with
+        orderCid : ContractId Order.Order
+        orderOwner : Party
+      controller orderOwner
+      do
+        order <- fetch orderCid
+        assert (order.owner == orderOwner)
+        assert (order.status == "OPEN")
+        
+        -- Cancel the order (which will cancel the Allocation)
+        _ <- exercise orderCid Order.CancelOrder
+        
+        -- Remove from book
+        let updatedBuyOrders = filter (\cid -> cid /= orderCid) buyOrders
+        let updatedSellOrders = filter (\cid -> cid /= orderCid) sellOrders
+        
+        _ <- create this with
+          buyOrders = updatedBuyOrders
+          sellOrders = updatedSellOrders
+          activeUsers = activeUsers
+        return ()

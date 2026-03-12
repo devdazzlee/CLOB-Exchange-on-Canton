@@ -1,0 +1,411 @@
+module OrderTest where
+
+import Daml.Script
+import Order
+import DA.Time()
+import DA.List (head)
+
+-- Test: Create buy order
+testCreateBuyOrder : Script ()
+testCreateBuyOrder = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+  
+  -- Owner (alice) creates the order, not operator
+  orderCid <- submit alice do
+    createCmd Order with
+      orderId = "order_001"
+      owner = alice
+      orderType = "BUY"
+      orderMode = "LIMIT"
+      tradingPair = "BTC/USDT"
+      price = Some 42000.0
+      quantity = 0.5
+      filled = 0.0
+      status = "OPEN"
+      timestamp = now
+      operator = operator
+      stopPrice = None
+      allocationCid = "placeholder_allocation_cid_001"
+  
+  order <- query @Order alice
+  assert (length order == 1)
+
+-- Test: Create sell order
+testCreateSellOrder : Script ()
+testCreateSellOrder = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+  
+  -- Owner (alice) creates the order
+  orderCid <- submit alice do
+    createCmd Order with
+      orderId = "order_002"
+      owner = alice
+      orderType = "SELL"
+      orderMode = "LIMIT"
+      tradingPair = "BTC/USDT"
+      price = Some 43000.0
+      quantity = 1.0
+      filled = 0.0
+      status = "OPEN"
+      timestamp = now
+      operator = operator
+      stopPrice = None
+      allocationCid = "placeholder_allocation_cid_002"
+  
+  order <- query @Order alice
+  assert (length order == 1)
+
+-- Test: Cancel order
+testCancelOrder : Script ()
+testCancelOrder = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+  
+  -- Owner (alice) creates the order
+  orderCid <- submit alice do
+    createCmd Order with
+      orderId = "order_003"
+      owner = alice
+      orderType = "SELL"
+      orderMode = "LIMIT"
+      tradingPair = "BTC/USDT"
+      price = Some 43000.0
+      quantity = 1.0
+      filled = 0.0
+      status = "OPEN"
+      timestamp = now
+      operator = operator
+      stopPrice = None
+      allocationCid = "placeholder_allocation_cid_003"
+  
+  -- Cancel the order (returns the cancelled order contract ID)
+  cancelledOrderCid <- submit alice do
+    exerciseCmd orderCid CancelOrder
+  
+  -- Query cancelled order
+  order <- query @Order alice
+  assert (length order == 1)
+
+-- Test: Fill order partially
+testPartialFill : Script ()
+testPartialFill = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+  
+  -- Owner (alice) creates the order
+  orderCid <- submit alice do
+    createCmd Order with
+      orderId = "order_004"
+      owner = alice
+      orderType = "BUY"
+      orderMode = "LIMIT"
+      tradingPair = "ETH/USDT"
+      price = Some 2500.0
+      quantity = 2.0
+      filled = 0.0
+      status = "OPEN"
+      timestamp = now
+      operator = operator
+      stopPrice = None
+      allocationCid = "placeholder_allocation_cid_004"
+  
+  -- Operator fills the order
+  _ <- submit operator do
+    exerciseCmd orderCid FillOrder with
+      fillQuantity = 1.0
+      newAllocationCid = None
+  
+  order <- query @Order alice
+  assert (length order == 1)
+
+-- Test: Fill order completely
+testCompleteFill : Script ()
+testCompleteFill = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+  
+  -- Owner (alice) creates the order
+  orderCid <- submit alice do
+    createCmd Order with
+      orderId = "order_005"
+      owner = alice
+      orderType = "BUY"
+      orderMode = "LIMIT"
+      tradingPair = "BTC/USDT"
+      price = Some 42000.0
+      quantity = 0.5
+      filled = 0.0
+      status = "OPEN"
+      timestamp = now
+      operator = operator
+      stopPrice = None
+      allocationCid = "placeholder_allocation_cid_005"
+  
+  -- Operator fills the order
+  _ <- submit operator do
+    exerciseCmd orderCid FillOrder with
+      fillQuantity = 0.5
+      newAllocationCid = None
+  
+  order <- query @Order alice
+  assert (length order == 1)
+
+-- Test: Get remaining quantity
+testGetRemainingQuantity : Script ()
+testGetRemainingQuantity = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+  
+  orderCid <- submit alice do
+    createCmd Order with
+      orderId = "order_006"
+      owner = alice
+      orderType = "BUY"
+      orderMode = "LIMIT"
+      tradingPair = "BTC/USDT"
+      price = Some 42000.0
+      quantity = 1.0
+      filled = 0.3
+      status = "OPEN"
+      timestamp = now
+      operator = operator
+      stopPrice = None
+      allocationCid = "placeholder_allocation_cid_006"
+  
+  remaining <- submit alice do
+    exerciseCmd orderCid GetRemainingQuantity
+  
+  assert (remaining == 0.7)
+
+-- Test: Cannot cancel filled order
+testCannotCancelFilledOrder : Script ()
+testCannotCancelFilledOrder = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+  
+  orderCid <- submit alice do
+    createCmd Order with
+      orderId = "order_007"
+      owner = alice
+      orderType = "BUY"
+      orderMode = "LIMIT"
+      tradingPair = "BTC/USDT"
+      price = Some 42000.0
+      quantity = 0.5
+      filled = 0.5
+      status = "FILLED"
+      timestamp = now
+      operator = operator
+      stopPrice = None
+      allocationCid = "placeholder_allocation_cid_007"
+  
+  -- Should fail to cancel filled order (assertion fails)
+  submitMustFail alice do
+    exerciseCmd orderCid CancelOrder
+  
+  return ()
+
+-- Test: Market order (no price)
+testMarketOrder : Script ()
+testMarketOrder = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+  
+  -- Market order has no price (None)
+  orderCid <- submit alice do
+    createCmd Order with
+      orderId = "order_008"
+      owner = alice
+      orderType = "BUY"
+      orderMode = "MARKET"
+      tradingPair = "BTC/USDT"
+      price = None
+      quantity = 0.1
+      filled = 0.0
+      status = "OPEN"
+      timestamp = now
+      operator = operator
+      stopPrice = None
+      allocationCid = "placeholder_allocation_cid_008"
+  
+  order <- query @Order alice
+  assert (length order == 1)
+
+-- =============================================================================
+-- STOP-LOSS ORDER TESTS
+-- =============================================================================
+
+-- Test: Create stop-loss sell order (PENDING_TRIGGER)
+testCreateStopLossSellOrder : Script ()
+testCreateStopLossSellOrder = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+  
+  -- Stop-loss sell: trigger when price drops to 40000
+  orderCid <- submit alice do
+    createCmd Order with
+      orderId = "order_sl_001"
+      owner = alice
+      orderType = "SELL"
+      orderMode = "STOP_LOSS"
+      tradingPair = "BTC/USDT"
+      price = None  -- No limit price; becomes market order when triggered
+      quantity = 0.5
+      filled = 0.0
+      status = "PENDING_TRIGGER"
+      timestamp = now
+      operator = operator
+      stopPrice = Some 40000.0
+      allocationCid = "placeholder_allocation_sl_001"
+  
+  orders <- query @Order alice
+  assert (length orders == 1)
+  let (_, order) = head orders
+  assert (order.status == "PENDING_TRIGGER")
+  assert (order.orderMode == "STOP_LOSS")
+  assert (order.stopPrice == Some 40000.0)
+
+-- Test: Trigger stop-loss order (PENDING_TRIGGER → OPEN market order)
+testTriggerStopLoss : Script ()
+testTriggerStopLoss = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+  
+  -- Create PENDING_TRIGGER stop-loss order
+  orderCid <- submit alice do
+    createCmd Order with
+      orderId = "order_sl_002"
+      owner = alice
+      orderType = "SELL"
+      orderMode = "STOP_LOSS"
+      tradingPair = "BTC/USDT"
+      price = None
+      quantity = 1.0
+      filled = 0.0
+      status = "PENDING_TRIGGER"
+      timestamp = now
+      operator = operator
+      stopPrice = Some 40000.0
+      allocationCid = "placeholder_allocation_sl_002"
+  
+  -- Operator triggers the stop-loss (price dropped to 39500)
+  triggeredOrderCid <- submit operator do
+    exerciseCmd orderCid TriggerStopLoss with
+      triggeredAt = "2026-02-17T12:00:00Z"
+      triggerPrice = "39500.0"
+  
+  -- Verify: order should now be OPEN MARKET order
+  orders <- query @Order alice
+  assert (length orders == 1)
+  let (_, triggeredOrder) = head orders
+  assert (triggeredOrder.status == "OPEN")
+  assert (triggeredOrder.orderMode == "MARKET")
+  assert (triggeredOrder.price == None)
+
+-- Test: Cannot trigger an already-OPEN order
+testCannotTriggerOpenOrder : Script ()
+testCannotTriggerOpenOrder = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+  
+  -- Create a regular OPEN limit order (NOT stop-loss)
+  orderCid <- submit alice do
+    createCmd Order with
+      orderId = "order_sl_003"
+      owner = alice
+      orderType = "BUY"
+      orderMode = "LIMIT"
+      tradingPair = "BTC/USDT"
+      price = Some 42000.0
+      quantity = 0.5
+      filled = 0.0
+      status = "OPEN"
+      timestamp = now
+      operator = operator
+      stopPrice = None
+      allocationCid = "placeholder_allocation_sl_003"
+  
+  -- Should fail: TriggerStopLoss requires status == "PENDING_TRIGGER"
+  submitMustFail operator do
+    exerciseCmd orderCid TriggerStopLoss with
+      triggeredAt = "2026-02-17T12:00:00Z"
+      triggerPrice = "42000.0"
+  
+  return ()
+
+-- Test: Cancel a PENDING_TRIGGER stop-loss order
+testCancelPendingStopLoss : Script ()
+testCancelPendingStopLoss = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+  
+  -- Create PENDING_TRIGGER stop-loss order
+  orderCid <- submit alice do
+    createCmd Order with
+      orderId = "order_sl_004"
+      owner = alice
+      orderType = "SELL"
+      orderMode = "STOP_LOSS"
+      tradingPair = "BTC/USDT"
+      price = None
+      quantity = 0.5
+      filled = 0.0
+      status = "PENDING_TRIGGER"
+      timestamp = now
+      operator = operator
+      stopPrice = Some 38000.0
+      allocationCid = "placeholder_allocation_sl_004"
+  
+  -- Owner cancels the stop-loss order
+  cancelledCid <- submit alice do
+    exerciseCmd orderCid CancelOrder
+  
+  -- Verify: order should be CANCELLED
+  orders <- query @Order alice
+  assert (length orders == 1)
+  let (_, cancelledOrder) = head orders
+  assert (cancelledOrder.status == "CANCELLED")
+
+-- Test: Create stop-loss buy order
+testCreateStopLossBuyOrder : Script ()
+testCreateStopLossBuyOrder = script do
+  operator <- allocateParty "Operator"
+  alice <- allocateParty "Alice"
+  now <- getTime
+  
+  -- Stop-loss buy: trigger when price rises to 50000
+  orderCid <- submit alice do
+    createCmd Order with
+      orderId = "order_sl_005"
+      owner = alice
+      orderType = "BUY"
+      orderMode = "STOP_LOSS"
+      tradingPair = "BTC/USDT"
+      price = None
+      quantity = 0.3
+      filled = 0.0
+      status = "PENDING_TRIGGER"
+      timestamp = now
+      operator = operator
+      stopPrice = Some 50000.0
+      allocationCid = "placeholder_allocation_sl_005"
+  
+  orders <- query @Order alice
+  assert (length orders == 1)
+  let (_, order) = head orders
+  assert (order.stopPrice == Some 50000.0)
+  assert (order.orderType == "BUY")

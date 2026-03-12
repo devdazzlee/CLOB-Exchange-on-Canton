@@ -1,0 +1,285 @@
+-- | Balance Template Tests
+-- | Tests for the simplified balance management (replaces UTXO handling)
+module BalanceTest where
+
+import Daml.Script
+import Balance
+
+-- Test: Create a balance and verify initial state
+testCreateBalance : Script ()
+testCreateBalance = script do
+  operator <- allocateParty "Operator"
+  trader <- allocateParty "Trader"
+  now <- getTime
+  
+  -- Create initial balance
+  balanceCid <- submit trader do
+    createCmd Balance with
+      owner = trader
+      asset = "USDT"
+      available = 10000.0
+      locked = 0.0
+      operator = operator
+      lastUpdated = now
+  
+  -- Verify balance exists
+  balance <- queryContractId trader balanceCid
+  case balance of
+    Some b -> do
+      assert (b.available == 10000.0)
+      assert (b.locked == 0.0)
+      assert (b.asset == "USDT")
+    None -> abort "Balance not found"
+  
+  return ()
+
+-- Test: Reserve funds for an order
+testReserveFunds : Script ()
+testReserveFunds = script do
+  operator <- allocateParty "Operator"
+  trader <- allocateParty "Trader"
+  now <- getTime
+  
+  -- Create initial balance
+  balanceCid <- submit trader do
+    createCmd Balance with
+      owner = trader
+      asset = "USDT"
+      available = 10000.0
+      locked = 0.0
+      operator = operator
+      lastUpdated = now
+  
+  -- Reserve funds
+  newBalanceCid <- submit trader do
+    exerciseCmd balanceCid Reserve with
+      amount = 4200.0
+      orderId = "ORDER-001"
+  
+  -- Verify
+  balance <- queryContractId trader newBalanceCid
+  case balance of
+    Some b -> do
+      assert (b.available == 5800.0)
+      assert (b.locked == 4200.0)
+    None -> abort "Balance not found after reserve"
+  
+  return ()
+
+-- Test: Release funds when order is cancelled
+testReleaseFunds : Script ()
+testReleaseFunds = script do
+  operator <- allocateParty "Operator"
+  trader <- allocateParty "Trader"
+  now <- getTime
+  
+  -- Create balance with locked funds
+  balanceCid <- submit trader do
+    createCmd Balance with
+      owner = trader
+      asset = "USDT"
+      available = 5800.0
+      locked = 4200.0
+      operator = operator
+      lastUpdated = now
+  
+  -- Release locked funds
+  newBalanceCid <- submit trader do
+    exerciseCmd balanceCid Release with
+      amount = 4200.0
+      orderId = "ORDER-001"
+  
+  -- Verify
+  balance <- queryContractId trader newBalanceCid
+  case balance of
+    Some b -> do
+      assert (b.available == 10000.0)
+      assert (b.locked == 0.0)
+    None -> abort "Balance not found after release"
+  
+  return ()
+
+-- Test: Cannot reserve more than available
+testCannotOverReserve : Script ()
+testCannotOverReserve = script do
+  operator <- allocateParty "Operator"
+  trader <- allocateParty "Trader"
+  now <- getTime
+  
+  -- Create balance
+  balanceCid <- submit trader do
+    createCmd Balance with
+      owner = trader
+      asset = "BTC"
+      available = 1.0
+      locked = 0.0
+      operator = operator
+      lastUpdated = now
+  
+  -- Try to reserve more than available - should fail
+  submitMustFail trader do
+    exerciseCmd balanceCid Reserve with
+      amount = 2.0
+      orderId = "ORDER-002"
+  
+  return ()
+
+-- Test: Deposit funds
+testDeposit : Script ()
+testDeposit = script do
+  operator <- allocateParty "Operator"
+  trader <- allocateParty "Trader"
+  now <- getTime
+  
+  -- Create initial balance
+  balanceCid <- submit trader do
+    createCmd Balance with
+      owner = trader
+      asset = "ETH"
+      available = 5.0
+      locked = 0.0
+      operator = operator
+      lastUpdated = now
+  
+  -- Operator deposits funds
+  newBalanceCid <- submit operator do
+    exerciseCmd balanceCid Deposit with
+      amount = 3.0
+      depositId = "DEPOSIT-001"
+  
+  -- Verify
+  balance <- queryContractId trader newBalanceCid
+  case balance of
+    Some b -> do
+      assert (b.available == 8.0)
+    None -> abort "Balance not found after deposit"
+  
+  return ()
+
+-- Test: Withdraw funds
+testWithdraw : Script ()
+testWithdraw = script do
+  operator <- allocateParty "Operator"
+  trader <- allocateParty "Trader"
+  now <- getTime
+  
+  -- Create balance
+  balanceCid <- submit trader do
+    createCmd Balance with
+      owner = trader
+      asset = "BTC"
+      available = 2.5
+      locked = 0.0
+      operator = operator
+      lastUpdated = now
+  
+  -- Withdraw funds
+  newBalanceCid <- submit trader do
+    exerciseCmd balanceCid Withdraw with
+      amount = 1.0
+      withdrawalId = "WITHDRAW-001"
+  
+  -- Verify
+  balance <- queryContractId trader newBalanceCid
+  case balance of
+    Some b -> do
+      assert (b.available == 1.5)
+    None -> abort "Balance not found after withdraw"
+  
+  return ()
+
+-- Test: Complete trade settlement flow
+testTradeSettlementFlow : Script ()
+testTradeSettlementFlow = script do
+  operator <- allocateParty "Operator"
+  buyer <- allocateParty "Buyer"
+  seller <- allocateParty "Seller"
+  now <- getTime
+  
+  -- Setup: Buyer has USDT, Seller has BTC
+  buyerUsdtCid <- submit buyer do
+    createCmd Balance with
+      owner = buyer
+      asset = "USDT"
+      available = 50000.0
+      locked = 0.0
+      operator = operator
+      lastUpdated = now
+  
+  sellerBtcCid <- submit seller do
+    createCmd Balance with
+      owner = seller
+      asset = "BTC"
+      available = 1.0
+      locked = 0.0
+      operator = operator
+      lastUpdated = now
+  
+  -- Step 1: Buyer reserves USDT for order
+  buyerUsdtCid2 <- submit buyer do
+    exerciseCmd buyerUsdtCid Reserve with
+      amount = 42000.0
+      orderId = "BUY-001"
+  
+  -- Step 2: Seller reserves BTC for order
+  sellerBtcCid2 <- submit seller do
+    exerciseCmd sellerBtcCid Reserve with
+      amount = 1.0
+      orderId = "SELL-001"
+  
+  -- Step 3: Trade matched - Seller sends BTC
+  sellerBtcCid3 <- submit operator do
+    exerciseCmd sellerBtcCid2 SettleTrade with
+      amount = 1.0
+      recipient = buyer
+      tradeId = "TRADE-001"
+  
+  -- Step 4: Buyer sends USDT
+  buyerUsdtCid3 <- submit operator do
+    exerciseCmd buyerUsdtCid2 SettleTrade with
+      amount = 42000.0
+      recipient = seller
+      tradeId = "TRADE-001"
+  
+  -- Verify final states
+  sellerBtc <- queryContractId seller sellerBtcCid3
+  case sellerBtc of
+    Some b -> do
+      assert (b.locked == 0.0)  -- All BTC sent
+    None -> abort "Seller BTC balance not found"
+  
+  buyerUsdt <- queryContractId buyer buyerUsdtCid3
+  case buyerUsdt of
+    Some b -> do
+      assert (b.locked == 0.0)  -- All locked USDT sent
+    None -> abort "Buyer USDT balance not found"
+  
+  return ()
+
+-- Test: Balance request and approval flow
+testBalanceRequest : Script ()
+testBalanceRequest = script do
+  operator <- allocateParty "Operator"
+  newUser <- allocateParty "NewUser"
+  
+  -- User requests balance
+  requestCid <- submit newUser do
+    createCmd BalanceRequest with
+      requester = newUser
+      asset = "USDT"
+      initialAmount = 1000.0
+      operator = operator
+  
+  -- Operator approves
+  balanceCid <- submit operator do
+    exerciseCmd requestCid ApproveBalance
+  
+  -- Verify
+  balance <- queryContractId newUser balanceCid
+  case balance of
+    Some b -> do
+      assert (b.available == 1000.0)
+      assert (b.owner == newUser)
+    None -> abort "Balance not created"
+  
+  return ()

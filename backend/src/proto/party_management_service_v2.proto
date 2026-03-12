@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package com.daml.ledger.api.v2.admin;
+
+service PartyManagementService {
+  rpc AllocateParty(AllocatePartyRequest) returns (AllocatePartyResponse);
+}
+
+message AllocatePartyRequest {
+  string party_id_hint = 1;
+  string display_name = 2;
+  string identity_provider_id = 3;
+}
+
+message AllocatePartyResponse {
+  PartyDetails party_details = 1;
+}
+
+message PartyDetails {
+  string party = 1;
+  string display_name = 2;
+  bool is_local = 3;
+}
+
+

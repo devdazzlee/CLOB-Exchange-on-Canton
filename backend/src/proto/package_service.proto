@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package com.daml.ledger.api.v1.admin;
+
+service PackageManagementService {
+  // Upload a DAR file to the ledger.
+  rpc UploadDarFile (UploadDarFileRequest) returns (UploadDarFileResponse);
+}
+
+message UploadDarFileRequest {
+  // The DAR file to upload.
+  bytes dar_file = 1;
+  
+  // Unique submission identifier.
+  string submission_id = 2;
+}
+
+message UploadDarFileResponse {
+  // Empty response
+}
