@@ -61,6 +61,16 @@ export const API_ROUTES = {
     EXECUTE: (settlementId) => `/settlements/${encodeURIComponent(settlementId)}/execute`,
     CANCEL: (settlementId) => `/settlements/${encodeURIComponent(settlementId)}/cancel`,
   },
+
+  // TradingApp Settlement (USE_TRADING_APP_PATTERN=true)
+  // Tokens flow only between users — both parties sign withdraw + multi-leg
+  SETTLEMENT_TRADING_APP: {
+    PENDING: '/settlement/pending',
+    PREPARE_WITHDRAW: (matchId) => `/settlement/${encodeURIComponent(matchId)}/prepare-withdraw`,
+    SUBMIT_WITHDRAW: (matchId) => `/settlement/${encodeURIComponent(matchId)}/submit-withdraw`,
+    PREPARE_MULTILEG: (matchId) => `/settlement/${encodeURIComponent(matchId)}/prepare-multileg`,
+    SUBMIT_MULTILEG_SIGNATURE: (matchId) => `/settlement/${encodeURIComponent(matchId)}/submit-multileg-signature`,
+  },
   
   // Orders (Legacy)
   ORDERS: {

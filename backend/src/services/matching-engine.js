@@ -854,6 +854,41 @@ class MatchingEngine {
 
     const tradeId = `trade-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
 
+    // TradingApp pattern: create pending settlement, both parties sign at match time
+    // No fallback — client requirement: tokens flow only between users, no operator custody.
+    if (config.useTradingAppPattern) {
+      const tradingAppSettlement = require('./tradingAppSettlementService');
+      await tradingAppSettlement.createPendingSettlement({
+        tradeId,
+        tradingPair,
+        sellerPartyId: sellOrder.owner,
+        buyerPartyId: buyOrder.owner,
+        sellOrderId: sellOrder.orderId,
+        buyOrderId: buyOrder.orderId,
+        sellOrderContractId: sellOrder.contractId,
+        buyOrderContractId: buyOrder.contractId,
+        sellOrderTemplateId: sellOrder.templateId,
+        buyOrderTemplateId: buyOrder.templateId,
+        sellOrderRemaining: sellOrder.remaining != null ? String(sellOrder.remaining) : null,
+        buyOrderRemaining: buyOrder.remaining != null ? String(buyOrder.remaining) : null,
+        sellIsPartial,
+        buyIsPartial,
+        matchPrice: matchPrice.toString(),
+        sellAllocCid: sellOrder.allocationContractId,
+        buyAllocCid: buyOrder.allocationContractId,
+        baseSymbol,
+        quoteSymbol,
+        matchQty: matchQtyStr,
+        quoteAmount: quoteAmountStr,
+      });
+      console.log(`[MatchingEngine] ═══ TradingApp: Pending settlement ${tradeId} — both parties must sign ═══`);
+      if (global.broadcastWebSocket) {
+        global.broadcastWebSocket(`settlement:${sellOrder.owner}`, { type: 'PENDING_SIGNATURE', matchId: tradeId, role: 'seller' });
+        global.broadcastWebSocket(`settlement:${buyOrder.owner}`, { type: 'PENDING_SIGNATURE', matchId: tradeId, role: 'buyer' });
+      }
+      return { tradeId, status: 'PENDING_SIGNATURE', message: 'Both parties must sign to complete settlement' };
+    }
+
     // Remaining amounts for partial fills (return to parties after settlement)
     const remainingBaseSeller = sellIsPartial ? new Decimal(sellOrder.remaining).minus(matchQty).toFixed(10) : '0';
     const remainingQuoteBuyer = buyIsPartial ? new Decimal(buyOrder.remaining).minus(matchQty).times(matchPrice).toFixed(10) : '0';

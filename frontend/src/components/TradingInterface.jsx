@@ -17,6 +17,7 @@ import TransactionHistory from './trading/TransactionHistory';
 import PortfolioView from './trading/PortfolioView';
 import MarketData from './trading/MarketData';
 import TransferOffers from './trading/TransferOffers';
+import PendingSettlements from './trading/PendingSettlements';
 import BalanceCard from './trading/BalanceCard';
 
 // Import skeleton components
@@ -1277,6 +1278,22 @@ export default function TradingInterface({ partyId }) {
             }}
           />
           
+          {/* Pending Settlements - TradingApp: sign withdraw + multi-leg (tokens flow only between users) */}
+          <PendingSettlements
+            partyId={partyId}
+            onSettlementComplete={async () => {
+              try {
+                const b = await balanceService.getBalances(partyId);
+                if (b?.available) {
+                  const dynamicBalance = {};
+                  Object.keys(b.available).forEach((token) => {
+                    dynamicBalance[token] = b.available[token]?.toString() || '0.0';
+                  });
+                  setBalance(dynamicBalance);
+                }
+              } catch (_) {}
+            }}
+          />
           {/* Transfer Offers - Accept incoming tokens (CBTC from faucet, etc.) */}
           <TransferOffers
             partyId={partyId}

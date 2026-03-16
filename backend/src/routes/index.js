@@ -30,6 +30,7 @@ const simpleWalletRoutes = require('./walletRoutes'); // Simplified wallet creat
 // TOKEN STANDARD V2 routes (Holdings + DvP Settlement)
 const orderRoutesV2 = require('./orderRoutesV2');
 const tradeRoutesV2 = require('./tradeRoutesV2');
+const settlementRoutes = require('./settlementRoutes');
 
 // Mount routes (matching existing API structure)
 router.use('/orderbooks', orderBookRoutes);
@@ -62,6 +63,7 @@ router.use('/v1', exchangeRoutes); // Exchange API (orders, trades, etc.)
 // TOKEN STANDARD V2 API (Holdings + DvP Settlement)
 router.use('/orders/v2', orderRoutesV2); // POST /api/orders/v2 (Token Standard orders)
 router.use('/trades/v2', tradeRoutesV2); // GET /api/trades/v2 (DvP trades)
+router.use('/settlement', settlementRoutes); // TradingApp: /api/settlement/pending, prepare-withdraw, etc.
 
 // Matching Engine: On-demand trigger (CRITICAL for serverless/Vercel where background matching can't run)
 // Supports both POST (from frontend) and GET (from Vercel Cron)

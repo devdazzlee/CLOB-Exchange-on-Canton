@@ -124,6 +124,11 @@ const config = {
     intervalMs: parseInt(process.env.MATCHING_ENGINE_INTERVAL_MS || '5000', 10),
   },
 
+  // TradingApp pattern: tokens flow only between users (no operator custody).
+  // When true: self-allocation at order placement, both parties sign at match.
+  // Default true for client compliance (no app provider jurisdiction).
+  useTradingAppPattern: process.env.USE_TRADING_APP_PATTERN !== 'false',
+
   // Logging
   logging: {
     level: process.env.LOG_LEVEL || 'info',

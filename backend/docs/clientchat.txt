@@ -5984,3 +5984,327 @@ We’re now trying a different pattern: create allocations at order placement wi
 We’ll also review the competito
 @AHMED I don’t have the complete implementation worked out, but this probably needs a DAML design pattern where the app provider exercises the daml choice to sign on the user’s behalf. Please read the docs carefully and do proper research before proceeding.
 [7:52 PM, 3/14/2026] AHMED: I looked into the DAML delegation pattern. The Splice Allocation_Withdraw choice is controlled by the sender, so we can't change that. We're trying the operator-as-receiver pattern (receiver = operator at order placement, executor-only at match) since it avoids withdraw entirely. I'll keep checking the Splice docs and competitor setup for any other patterns. If you have any pointers from the docs or patterns you've seen, that would help.
+
+
+
+
+@AHMED
+As mentioned earlier, we do not have a complete implementation worked out. You will need to go through the documentation, research possible approaches, and implement a DAML pattern that fulfills this requirement.
+
+The Allocation_ExecuteTransfer choice does consumes the Lock contract. Did you try running the example we shared above ? (https://github.com/hyperledger-labs/splice/blob/bca52d362f8243369381b32aa16279e5b0ebafdf/token-standard/examples/splice-token-test-trading-app/daml/Splice/Testing/Apps/TradingApp.daml#L20)
+
+
+
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | An example of how to build an OTC trading app for multi-leg standard token trades.
+--
+-- Used as part of the testing infrastructure to test the DvP workflows based on the token standard.
+module Splice.Testing.Apps.TradingApp where
+
+import DA.Foldable qualified as F
+import DA.Optional (fromOptional, fromSomeNote)
+import DA.Set as Set
+import DA.TextMap as TextMap
+import DA.Traversable qualified as Traversable
+
+import Splice.Api.Token.MetadataV1 as Api.Token.MetadataV1
+import Splice.Api.Token.AllocationV1 as Api.Token.AllocationV1
+import Splice.Api.Token.AllocationRequestV1
+
+
+template OTCTradeProposal with
+    venue : Party
+    tradeCid : Optional (ContractId OTCTradeProposal) -- Tracking-id for the trade being proposed. Set to None for new trades.
+    transferLegs : TextMap Api.Token.AllocationV1.TransferLeg
+    approvers : [Party] -- ^ Parties that have approved the proposal
+  where
+    signatory approvers
+    observer venue, tradingParties transferLegs
+
+    -- This is test code, so we don't care about the contention here.
+    -- Moreover, likely the number of trading parties is going to be low anyways.
+    choice OTCTradeProposal_Accept : ContractId OTCTradeProposal
+      with
+        approver : Party
+      controller approver
+      do
+        let newApprovers = approver :: approvers
+        let traders = tradingParties transferLegs
+        require "Approver is a trading party" (approver `Set.member` traders)
+        require "Approver is new" (approver `notElem` approvers)
+        create this with
+          approvers = newApprovers
+          tradeCid = Some (fromOptional self tradeCid)
+
+    choice OTCTradeProposal_Reject : ()
+      with
+        trader : Party
+      controller trader
+      do require "Trader is a trading party" (trader `Set.member` tradingParties transferLegs)
+
+    choice OTCTradeProposal_InitiateSettlement : ContractId OTCTrade
+      with
+        prepareUntil : Time
+        settleBefore : Time
+      controller venue
+      do
+        require "All trading parties have approved" (Set.fromList approvers == tradingParties transferLegs)
+        now <- getTime
+        require "Preparation time has not passed" (now < prepareUntil)
+        require "Preparation time before settlement time" (prepareUntil < settleBefore)
+        create OTCTrade with
+          venue
+          transferLegs
+          tradeCid = fromOptional self tradeCid
+          createdAt = now
+          prepareUntil
+          settleBefore
+
+tradeAllocations
+  : SettlementInfo -> TextMap Api.Token.AllocationV1.TransferLeg
+  -> TextMap AllocationSpecification
+tradeAllocations settlementInfo transferLegs =
+  TextMap.fromList $ do
+    (transferLegId, transferLeg) <- TextMap.toList transferLegs
+    let spec = AllocationSpecification with
+          settlement = settlementInfo
+          transferLegId
+          transferLeg
+    pure (transferLegId, spec)
+
+template OTCTrade
+  with
+    venue : Party
+    transferLegs : TextMap Api.Token.AllocationV1.TransferLeg
+    tradeCid : ContractId OTCTradeProposal
+    createdAt : Time
+    prepareUntil : Time
+    settleBefore : Time
+  where
+    signatory venue, tradingParties transferLegs
+
+    choice OTCTrade_Settle : TextMap Allocation_ExecuteTransferResult
+      with
+        allocationsWithContext : TextMap (ContractId Allocation, ExtraArgs)
+      controller venue
+      do
+        -- check timing constraints
+        now <- getTime
+        require "Settlement deadline has not passed" (now < settleBefore)
+        -- validate and execute transferLegs
+        let settlementInfo = SettlementInfo with
+              executor = venue
+              requestedAt = createdAt
+              settlementRef = makeTradeRef tradeCid
+              allocateBefore = prepareUntil
+              settleBefore
+              meta = emptyMetadata
+        let expectedAllocations = tradeAllocations settlementInfo transferLegs
+        let mergedMaps = zipTextMaps allocationsWithContext expectedAllocations
+        forTextMapWithKey mergedMaps \legId (optAllocWithContext,  optExpectedAlloc) -> do
+          let (allocCid, extraArgs) = fromSomeNote ("Allocation cid and extra arg is missing for leg " <> legId) optAllocWithContext
+          let expectedAlloc = fromSomeNote ("Allocation with context provided for unexpected leg " <> legId) optExpectedAlloc
+          -- fetch and validate the allocation instruction
+          instr <- fetch @Allocation allocCid
+          let instrView = view @Allocation instr
+          require "Allocation matches expected allocation" (instrView.allocation == expectedAlloc)
+          exercise allocCid (Allocation_ExecuteTransfer extraArgs)
+
+
+    -- NOTE: this choice is an approximation to what a real app would do.
+    -- As it stands, the venue can't cancel allocations that come right after
+    -- the first cancellation.  A better approach would be to leave a marker
+    -- contract in place until the `settleBefore` time, so that the venue
+    -- retains the ability to cancel the allocations that are created.
+    choice OTCTrade_Cancel : TextMap (Optional Allocation_CancelResult)
+      with
+        allocationsWithContext : TextMap (ContractId Allocation, ExtraArgs)
+      controller venue
+      do
+        -- validate and cancel transferLegs
+        let settlementInfo = SettlementInfo with
+              executor = venue
+              requestedAt = createdAt
+              settlementRef = makeTradeRef tradeCid
+              allocateBefore = prepareUntil
+              settleBefore
+              meta = emptyMetadata
+        let expectedAllocations = tradeAllocations settlementInfo transferLegs
+        let mergedMaps = zipTextMaps allocationsWithContext expectedAllocations
+          -- fetch and validate the allocation instruction
+        forTextMapWithKey mergedMaps \legId (optAllocWithContext,  optExpectedAlloc) ->
+          -- skip the leg if there is no matching allocation to cancel
+          Traversable.forA optAllocWithContext $ \(allocCid, extraArgs) -> do
+            -- fetch and validate the allocation instruction
+            let expectedAlloc = fromSomeNote ("Allocation with context provided for unexpected leg " <> legId) optExpectedAlloc
+            instr <- fetch @Allocation allocCid
+            let instrView = view @Allocation instr
+            require "Allocation matches expected allocation" (instrView.allocation == expectedAlloc)
+            exercise allocCid (Allocation_Cancel extraArgs)
+
+
+    interface instance AllocationRequest for OTCTrade where
+      view = AllocationRequestView with
+        settlement = SettlementInfo with
+          executor = venue
+          requestedAt = createdAt
+          settlementRef = makeTradeRef tradeCid
+          allocateBefore = prepareUntil
+          settleBefore
+          meta = emptyMetadata
+        transferLegs
+        meta = emptyMetadata
+
+      allocationRequest_RejectImpl _self AllocationRequest_Reject{..} = do
+        -- Note: this corresponds to signalling early that one is going to fail to deliver one's assets.
+        -- A real trading app will likely demand punitive charges for this.
+        require "Actor is a sender" (F.any (\leg -> actor == leg.sender) transferLegs)
+        pure ChoiceExecutionMetadata with meta = emptyMetadata
+
+      allocationRequest_WithdrawImpl _self _extraArgs =
+        -- just archiving the trade is enough
+        pure ChoiceExecutionMetadata with meta = emptyMetadata
+
+
+tradingParties : TextMap Api.Token.AllocationV1.TransferLeg -> Set.Set Party
+tradingParties = F.foldl (\acc t -> Set.insert t.sender (Set.insert t.receiver acc)) Set.empty
+
+-- | Check whether a required condition is true. If it's not, abort the
+-- transaction with a message saying that the requirement was not met.
+require : CanAssert m => Text -> Bool -> m ()
+require msg invariant =
+  assertMsg ("The requirement '" <> msg <> "' was not met.") invariant
+
+makeTradeRef : ContractId OTCTradeProposal -> Api.Token.AllocationV1.Reference
+makeTradeRef tradeCid = Api.Token.AllocationV1.Reference with
+  id = "OTCTradeProposal" -- set to the name of the template to simplify debugging
+  cid = Some (coerceContractId tradeCid)
+
+
+-- Additional text map utilities
+--------------------------------
+
+zipTextMaps : TextMap a -> TextMap b -> TextMap (Optional a, Optional b)
+zipTextMaps m1 m2 =
+  TextMap.merge
+    (\_ v1 -> Some (Some v1, None))
+    (\_ v2 -> Some (None, Some v2))
+    (\_ v1 v2 -> Some (Some v1, Some v2))
+    m1
+    m2
+
+forTextMapWithKey : Applicative f => TextMap a -> (Text -> a -> f b) -> f (TextMap b)
+forTextMapWithKey m f =
+    TextMap.fromList <$> mapA f' (TextMap.toList m)
+  where
+    f' (k, v) = (k,) <$> f k v
+
+
+    [9:19 PM, 3/12/2026] +91 79903 24401: All operator signing key logic has been removed. No more orphaned allocation cleanup or scripts that use it. The operator key is no longer used anywhere.
+
+Lock after settlement
+
+We’ve looked into why a lock holding contract can still appear after settlement. The Splice Token Standard expects Allocation_ExecuteTransfer to consume the allocation and release the lock, but in some setups this doesn’t fully happen.
+
+Possible reasons:
+
+Splice may use separate Lock contracts (e.g. LockedAmulet) that aren’t consumed when Allocation_ExecuteTransfer runs.
+If the operator is configured as an external party, the participant may not auto-sign allocation consumption, so the allocation and lock might not be fully consumed.
+
+Please review your Canton/Splice configuration an
+Allocation will only use those contracts which are mentioned in the transferlegs, on executing the allocation it should unlock and transfer the tokens
+
+Please try this for better understanding, create an AllocationRequest with 2 transfer-legs partyA->partyB and partyB->partyA and execute this allocation, you can see there will be no net locked holding contracts either in partyA or partyB
+
+Or can try running this example as mentioned which illustrates this very clearly https://github.com/hyperledger-labs/splice/blob/bca52d362f8243369381b32aa16279e5b0ebafdf/token-standard/examples/splice-token-test-trading-app/daml/Splice/Testing/Apps/TradingApp.daml#L20
+[7:13 AM, 3/13/2026] AHMED: @~huz 
+We implemented the multi-leg settlement the way you described (TradingApp pattern: withdraw, then create allocations with legs seller to buyer and buyer to seller, then execute both). It’s failing with the errors below and we need your input on how to proceed.
+
+What We Implemented
+
+1. Withdraw seller's allocation (unlock base)
+2. Withdraw buyer's allocation (unlock quote)
+3. Create allocation seller to buyer (base)
+4. Create allocation buyer to seller (quote)
+5. Execute both allocations (direct transfer, no net locked)
+
+Error 1: NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT
+
+We get: "This participant cannot submit as the given submitter on any connected synchronizer"
+
+This happens on steps 1–4 (withdraw and create). We’re using actAs: [ext-cc4ea…
+[2:16 PM, 3/14/2026] +971 58 590 3850: Can you add 27srishti to the repo
+[5:33 PM, 3/14/2026] AHMED: sure
+[5:36 PM, 3/14/2026] +971 58 590 3850: @~huz 
+We implemented the multi-leg settlement the way you described (TradingApp pattern: withdraw, then create allocations with legs seller to buyer and buyer to seller, then execute both). It’s failing with the errors below and we need your input on how to proceed.
+
+What We Implemented
+
+Withdraw seller's allocation (unlock base)
+Withdraw buyer's allocation (unlock quote)
+Create allocation seller to buyer (base)
+Create allocation buyer to seller (quote)
+Execute both allocations (direct transfer, no net locked)
+
+Error 1: NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT
+
+We get: "This participant cannot submit as the given submitter on any connected synchronizer"
+
+This happens on steps 1–4 (withdraw and create). We’re using actAs: [ext-cc4ea
+I’ll wait for for huzefa to reply to this. 
+Please try to resolve this by yourself. Think that you are building this on mainnet and only ask for the permissions that would be granted on mainnet (from security pov). We have already connected multiple times and the example architectures, even live competitor on mainnet.
+[5:45 PM, 3/14/2026] AHMED: I’ll wait for for huzefa to reply to this. 
+Please try to resolve this by yourself. Think that you are building this on mainnet and only ask for the permissions that would be granted on mainnet (from security pov). We have already connected multiple times and the example architectures, even live competitor on mainnet.
+Thanks. Huzaifa suggested the multi-leg flow (withdraw, create direct legs, execute). We tried that, but withdraw and create both need the user to authorize, and we can’t submit as external parties on the participant.
+
+We also tried the direct withdraw path with synthetic context and hit the "key not found: tag" error (HTTP 500). We switched to the registry API format but still hit the synchronizer issue.
+
+We’re now trying a different pattern: create allocations at order placement with receiver = operator instead of self. At match time we’d execute those allocations (executor-only), then create and execute operator to buyer and operator to seller legs. All match-time steps would be operator-only, no external party submission.
+
+We’ll also review the competito…
+[5:47 PM, 3/14/2026] AHMED: @~Mohak  Please also give me the UI changes in the meantime. My teammate will work on the UI changes while I work on this, so we can move faster. My main focus will be this, and my teammate will focus on the UI changes.
+[5:56 PM, 3/14/2026] +91 79903 24401: Thanks. Huzaifa suggested the multi-leg flow (withdraw, create direct legs, execute). We tried that, but withdraw and create both need the user to authorize, and we can’t submit as external parties on the participant.
+
+We also tried the direct withdraw path with synthetic context and hit the "key not found: tag" error (HTTP 500). We switched to the registry API format but still hit the synchronizer issue.
+
+We’re now trying a different pattern: create allocations at order placement with receiver = operator instead of self. At match time we’d execute those allocations (executor-only), then create and execute operator to buyer and operator to seller legs. All match-time steps would be operator-only, no external party submission.
+
+We’ll also review the competito
+@AHMED I don’t have the complete implementation worked out, but this probably needs a DAML design pattern where the app provider exercises the daml choice to sign on the user’s behalf. Please read the docs carefully and do proper research before proceeding.
+[7:52 PM, 3/14/2026] AHMED: I looked into the DAML delegation pattern. The Splice Allocation_Withdraw choice is controlled by the sender, so we can't change that. We're trying the operator-as-receiver pattern (receiver = operator at order placement, executor-only at match) since it avoids withdraw entirely. I'll keep checking the Splice docs and competitor setup for any other patterns. If you have any pointers from the docs or patterns you've seen, that would help.
+[9:55 PM, 3/14/2026] +91 79903 24401: I looked into the DAML delegation pattern. The Splice Allocation_Withdraw choice is controlled by the sender, so we can't change that. We're trying the operator-as-receiver pattern (receiver = operator at order placement, executor-only at match) since it avoids withdraw entirely. I'll keep checking the Splice docs and competitor setup for any other patterns. If you have any pointers from the docs or patterns you've seen, that would help.
+Please keep in mind, the app provider should not have jurisdiction of user’s asset in anyway. The flow of token should only be between users parties and not to the app providers party.
+[9:57 PM, 3/14/2026] +91 79903 24401: https://docs.google.com/document/d/1aD_Gt63xW77LuT3RXGzIMPHNqJrb4varXaQiEKKLjgY/edit?usp=sharing
+Please refer to this doc, we have clearly mentioned how the flow should work
+[10:06 PM, 3/14/2026] AHMED: Please refer to this doc, we have clearly mentioned how the flow should work
+We’ve reviewed the flow in your doc and the ccview links. We’ve implemented the same pattern (self-allocation at order placement, then withdraw + 2-leg allocation + execute at settlement) so tokens flow only between users and the app provider never holds them.
+
+However, with our current setup (external parties, ext-), settlement fails with NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT. Withdraw and Create both need the sender to authorize, and our participant cannot submit as ext- parties on any synchronizer. Because of that, we’re using the operator-as-receiver pattern for now, which works but does not meet your “no app provider jurisdiction” requirement.
+
+Also, with this pattern we see that lock holding contracts (LockedAmulet) are not fully consumed …
+[11:27 PM, 3/14/2026] +91 73530 98307: @AHMED can you add 27srishti to the repo please.
+[12:26 AM, 3/15/2026] AHMED: I don’t have access to add contributors
+[12:27 AM, 3/15/2026] +971 58 590 3850: Who added previously?
+[12:27 AM, 3/15/2026] AHMED: Admins have access.
+[12:30 AM, 3/15/2026] AHMED: Who added previously?
+I think either you or Huzaifa added me as a contributor in WolfEdgeLabs.
+[12:35 AM, 3/15/2026] +971 58 590 3850: Ah okay, the repo is in WolfEdge. I’ll add it. No worries
+[12:36 AM, 3/15/2026] AHMED: Ah okay, the repo is in WolfEdge. I’ll add it. No worries
+Yes
+[11:42 PM, 3/15/2026] AHMED: We’ve reviewed the flow in your doc and the ccview links. We’ve implemented the same pattern (self-allocation at order placement, then withdraw + 2-leg allocation + execute at settlement) so tokens flow only between users and the app provider never holds them.
+
+However, with our current setup (external parties, ext-), settlement fails with NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT. Withdraw and Create both need the sender to authorize, and our participant cannot submit as ext- parties on any synchronizer. Because of that, we’re using the operator-as-receiver pattern for now, which works but does not meet your “no app provider jurisdiction” requirement.
+
+Also, with this pattern we see that lock holding contracts (LockedAmulet) are not fully consumed 
+?
+[3:35 PM, 3/16/2026] +91 79903 24401: We’ve reviewed the flow in your doc and the ccview links. We’ve implemented the same pattern (self-allocation at order placement, then withdraw + 2-leg allocation + execute at settlement) so tokens flow only between users and the app provider never holds them.
+
+However, with our current setup (external parties, ext-), settlement fails with NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT. Withdraw and Create both need the sender to authorize, and our participant cannot submit as ext- parties on any synchronizer. Because of that, we’re using the operator-as-receiver pattern for now, which works but does not meet your “no app provider jurisdiction” requirement.
+
+Also, with this pattern we see that lock holding contracts (LockedAmulet) are not fully consumed 
+@AHMED
+As mentioned earlier, we do not have a complete implementation worked out. You will need to go through the documentation, research possible approaches, and implement a DAML pattern that fulfills this requirement.
+
+The Allocation_ExecuteTransfer choice does consumes the Lock contract. Did you try running the example we shared above ? (https://github.com/hyperledger-labs/splice/blob/bca52d362f8243369381b32aa16279e5b0ebafdf/token-standard/examples/splice-token-test-trading-app/daml/Splice/Testing/Apps/TradingApp.daml#L20)

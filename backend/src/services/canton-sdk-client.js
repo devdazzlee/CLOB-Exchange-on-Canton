@@ -2964,6 +2964,111 @@ class CantonSDKClient {
   }
 
   /**
+   * Prepare Allocation_Withdraw for interactive submission (TradingApp pattern).
+   * Returns prepared transaction for the owner to sign — user submits via frontend.
+   *
+   * @param {string} allocationContractId - Allocation to withdraw
+   * @param {string} ownerPartyId - Owner (sender) — must sign
+   * @param {string} symbol - Token symbol for routing
+   * @param {string} token - User's bearer token
+   * @returns {Promise<{preparedTransaction, preparedTransactionHash, hashingSchemeVersion, ...}>}
+   */
+  async prepareWithdrawInteractive(allocationContractId, ownerPartyId, symbol, token) {
+    if (!allocationContractId) throw new Error('allocationContractId required');
+    const adminToken = await tokenProvider.getServiceToken();
+    const configRef = require('../config');
+    const synchronizerId = configRef.canton.synchronizerId;
+    const registryUrl = CANTON_SDK_CONFIG.REGISTRY_API_URL;
+    const encodedCid = encodeURIComponent(allocationContractId);
+    const withdrawContextUrl = `${registryUrl}/registry/allocations/v1/${encodedCid}/choice-contexts/withdraw`;
+
+    let contextData = { values: {} };
+    let disclosed = [];
+
+    try {
+      const { data: context } = await getRegistryApi().post(withdrawContextUrl, { excludeDebugFields: true }, {
+        headers: { Authorization: `Bearer ${adminToken}`, Accept: 'application/json' },
+      });
+      contextData = context.choiceContextData || { values: {} };
+      disclosed = (context.disclosedContracts || []).map(dc => ({
+        templateId: dc.templateId,
+        contractId: dc.contractId,
+        createdEventBlob: dc.createdEventBlob,
+        synchronizerId: dc.synchronizerId || synchronizerId,
+      }));
+    } catch (registryErr) {
+      console.warn(`[CantonSDK] Registry withdraw choice-context 404/error — using synthetic expire-lock context: ${registryErr.message}`);
+      const nowMs = Date.now();
+      const expireLockIso = new Date(nowMs + 600_000).toISOString();
+      contextData = {
+        values: {
+          'expire-lock': { tag: 'AV_Text', value: expireLockIso },
+        },
+      };
+    }
+
+    const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
+    const withdrawCommand = {
+      ExerciseCommand: {
+        templateId: ALLOCATION_INTERFACE,
+        contractId: allocationContractId,
+        choice: 'Allocation_Withdraw',
+        choiceArgument: {
+          extraArgs: {
+            context: contextData,
+            meta: { values: {} },
+          },
+        },
+      },
+    };
+
+    const readAs = [ownerPartyId, configRef.canton.operatorPartyId].filter(Boolean);
+    // Use admin token for prepare (same as transferOfferService, autoAcceptService).
+    // User signs the hash afterward; prepare only builds the transaction.
+    return cantonService.prepareInteractiveSubmission({
+      token: adminToken,
+      actAsParty: [ownerPartyId],
+      commands: [withdrawCommand],
+      readAs,
+      synchronizerId,
+      disclosedContracts: disclosed,
+    });
+  }
+
+  /**
+   * Prepare multi-leg allocation for interactive submission (TradingApp pattern).
+   * Both seller and buyer must sign. Returns prepared transaction for both to sign.
+   *
+   * @param {Object} params - { sellerPartyId, buyerPartyId, baseSymbol, quoteSymbol, matchQty, quoteAmount, tradeId, token }
+   * @returns {Promise<{preparedTransaction, preparedTransactionHash, hashingSchemeVersion, ...}>}
+   */
+  async prepareMultiLegAllocationInteractive(params) {
+    const { sellerPartyId, buyerPartyId, baseSymbol, quoteSymbol, matchQty, quoteAmount, tradeId, token } = params;
+    const configRef = require('../config');
+    const operatorPartyId = configRef.canton.operatorPartyId;
+
+    const multiLegResult = await this.buildMultiLegAllocationCommand(
+      operatorPartyId,
+      [
+        { sender: sellerPartyId, receiver: buyerPartyId, amount: String(matchQty), symbol: baseSymbol },
+        { sender: buyerPartyId, receiver: sellerPartyId, amount: String(quoteAmount), symbol: quoteSymbol },
+      ],
+      tradeId,
+      null
+    );
+
+    const readAs = [sellerPartyId, buyerPartyId, operatorPartyId].filter(Boolean);
+    return cantonService.prepareInteractiveSubmission({
+      token,
+      actAsParty: [sellerPartyId, buyerPartyId],
+      commands: [multiLegResult.command],
+      readAs,
+      synchronizerId: multiLegResult.synchronizerId,
+      disclosedContracts: multiLegResult.disclosedContracts || [],
+    });
+  }
+
+  /**
    * Cancel an Allocation, returning locked tokens to the sender.
    *
    * @param {string} allocationContractId - The Allocation contract ID
@@ -3233,13 +3338,14 @@ class CantonSDKClient {
         return null;
       }
 
-      // Allocation: user → operator. The operator (executor) is also the receiver,
-      // so it CAN execute Allocation_ExecuteTransfer at settlement time using only
-      // its own key — no ext-* party authorization needed at settlement.
-      // (Self-allocation would require Allocation_Withdraw at settlement,
-      //  which needs ext-* party as actAs — not supported for non-interactive submissions.)
+      // USE_TRADING_APP_PATTERN: self-allocation (sender=receiver=user) for client flow.
+      // Otherwise: operator-as-receiver (executor can execute at match w/o user sig).
+      const configRef = require('../config');
+      const useTradingApp = configRef.useTradingAppPattern;
+      const receiverPartyId = useTradingApp ? senderPartyId : executorPartyId;
+
       console.log(`[CantonSDK] 🔄 Building allocation for ${amount} ${symbol} (${tokenSystemType})...`);
-      console.log(`[CantonSDK]    sender=${senderPartyId.substring(0, 30)}..., receiver=OPERATOR(${executorPartyId.substring(0, 30)}...), executor=${executorPartyId.substring(0, 30)}...`);
+      console.log(`[CantonSDK]    sender=${senderPartyId.substring(0, 30)}..., receiver=${useTradingApp ? 'SELF' : 'OPERATOR'}(${receiverPartyId.substring(0, 30)}...), executor=${executorPartyId.substring(0, 30)}...`);
 
       const holdingCidsArray = overrideHoldingCids
         ? (Array.isArray(overrideHoldingCids) ? overrideHoldingCids : [overrideHoldingCids])
@@ -3247,7 +3353,7 @@ class CantonSDKClient {
 
       const result = await this.buildAllocationInteractiveCommand(
         senderPartyId,
-        executorPartyId,  // receiver = operator (executor can execute w/o ext-* party auth)
+        receiverPartyId,  // self (TradingApp) or operator (operator-as-receiver)
         amount,
         symbol,
         executorPartyId,
@@ -3261,7 +3367,7 @@ class CantonSDKClient {
       }
 
       const allocationType = tokenSystemType === 'utilities' ? 'UtilitiesAllocation' : 'SpliceAllocation';
-      console.log(`[CantonSDK] ✅ Allocation (user→operator) built for ${orderId}`);
+      console.log(`[CantonSDK] ✅ Allocation (${useTradingApp ? 'self' : 'user→operator'}) built for ${orderId}`);
 
       return {
         ...result,
