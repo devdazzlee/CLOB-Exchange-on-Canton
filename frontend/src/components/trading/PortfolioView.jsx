@@ -1,28 +1,23 @@
 import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
-import { TrendingUp, TrendingDown, Wallet } from 'lucide-react';
+import { TrendingUp, TrendingDown, Wallet, Lock } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { normalizeDamlMap } from '../../utils/daml';
-import { fetchContract } from '../../services/cantonApi';
 import { apiClient, API_ROUTES } from '@/config/config';
+import { getBalances, getHoldings } from '../../services/balanceService';
 
 /**
- * Portfolio View Component - Shows user's positions across all trading pairs
+ * Portfolio View Component - Shows user's positions across all trading pairs.
+ *
+ * Source of truth: Splice Holding contracts via /balance/v2 API, which queries
+ * splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:Holding contracts.
+ *
+ * Trade history enriches the view with P&L calculations.
  */
-const USER_ACCOUNT_STORAGE_KEY = 'user_account_contract_id';
 
-function getUserAccountStorageKey(partyId) {
-  return partyId ? `${USER_ACCOUNT_STORAGE_KEY}:${partyId}` : USER_ACCOUNT_STORAGE_KEY;
-}
-
-function getStoredUserAccountId(partyId) {
-  if (typeof localStorage === 'undefined') return null;
-  return localStorage.getItem(getUserAccountStorageKey(partyId));
-}
-
-export default function PortfolioView({ partyId, cantonApi }) {
+export default function PortfolioView({ partyId }) {
   const [positions, setPositions] = useState([]);
+  const [holdings, setHoldings] = useState([]);
   const [loading, setLoading] = useState(true);
   const [totalValue, setTotalValue] = useState(0);
 
@@ -35,14 +30,18 @@ export default function PortfolioView({ partyId, cantonApi }) {
   const loadPortfolio = async () => {
     setLoading(true);
     try {
-      const accountContractId = getStoredUserAccountId(partyId);
-      let balances = {};
-      if (accountContractId) {
-        const account = await fetchContract(accountContractId, partyId);
-        balances = normalizeDamlMap(account?.payload?.balances);
-      }
+      // ═══ Source of truth: Splice Holdings via Token Standard API ═══
+      const [balanceData, holdingsData, tradesJson] = await Promise.all([
+        getBalances(partyId),
+        getHoldings(partyId),
+        apiClient.get(API_ROUTES.TRADES.GET_USER(partyId, 500)).catch(() => ({ data: {} })),
+      ]);
 
-      const tradesJson = await apiClient.get(API_ROUTES.TRADES.GET_USER(partyId, 500));
+      const balances = balanceData.available || {};
+      const lockedBalances = balanceData.locked || {};
+      const holdingsList = holdingsData?.holdings || [];
+      setHoldings(holdingsList);
+
       const tradesPayload = tradesJson?.data ?? tradesJson;
       const trades = tradesPayload?.trades || [];
       const userTrades = trades.filter(t => {
@@ -51,80 +50,86 @@ export default function PortfolioView({ partyId, cantonApi }) {
         return buyer === partyId || seller === partyId;
       });
 
-        // Calculate positions per trading pair
-        const positionMap = new Map();
-        
-        userTrades.forEach(trade => {
-          const pair = trade.payload?.tradingPair || trade.tradingPair || 'UNKNOWN';
-          const price = parseFloat(trade.payload?.price || trade.price || 0);
-          const quantity = parseFloat(trade.payload?.quantity || trade.quantity || 0);
-          const isBuy = (trade.payload?.buyer || trade.buyer) === partyId;
-          
-          if (!positionMap.has(pair)) {
-            positionMap.set(pair, {
-              tradingPair: pair,
-              baseQuantity: 0,
-              quoteQuantity: 0,
-              avgBuyPrice: 0,
-              avgSellPrice: 0,
-              totalBuyQty: 0,
-              totalSellQty: 0,
-              totalBuyValue: 0,
-              totalSellValue: 0,
-              trades: []
-            });
-          }
-          
-          const position = positionMap.get(pair);
-          position.trades.push(trade);
-          
-          if (isBuy) {
-            position.totalBuyQty += quantity;
-            position.totalBuyValue += price * quantity;
-            position.baseQuantity += quantity;
-            position.quoteQuantity -= price * quantity; // Pay quote
-          } else {
-            position.totalSellQty += quantity;
-            position.totalSellValue += price * quantity;
-            position.baseQuantity -= quantity;
-            position.quoteQuantity += price * quantity; // Receive quote
-          }
-        });
+      // Calculate positions per trading pair from trade history
+      const positionMap = new Map();
 
-        // Calculate averages and P&L
-        const positionsList = Array.from(positionMap.values()).map(pos => {
-          pos.avgBuyPrice = pos.totalBuyQty > 0 ? pos.totalBuyValue / pos.totalBuyQty : 0;
-          pos.avgSellPrice = pos.totalSellQty > 0 ? pos.totalSellValue / pos.totalSellQty : 0;
-          
-          // Get current balance for this pair
-          const [baseToken, quoteToken] = pos.tradingPair.split('/');
-          const baseBalance = balances[baseToken] || 0;
-          const quoteBalance = balances[quoteToken] || 0;
-          
-          pos.currentBaseBalance = parseFloat(baseBalance);
-          pos.currentQuoteBalance = parseFloat(quoteBalance);
-          
-          // Calculate unrealized P&L (if we have current price)
-          // For now, just show realized P&L
-          pos.realizedPnL = pos.totalSellValue - (pos.avgBuyPrice * pos.totalSellQty);
-          pos.realizedPnLPercent = pos.avgBuyPrice > 0 
-            ? (pos.realizedPnL / (pos.avgBuyPrice * pos.totalSellQty)) * 100 
-            : 0;
-          
-          return pos;
-        });
+      userTrades.forEach(trade => {
+        const pair = trade.payload?.tradingPair || trade.tradingPair || 'UNKNOWN';
+        const price = parseFloat(trade.payload?.price || trade.price || 0);
+        const quantity = parseFloat(trade.payload?.quantity || trade.quantity || 0);
+        const isBuy = (trade.payload?.buyer || trade.buyer) === partyId;
 
-        setPositions(positionsList);
-        
-        // Calculate total portfolio value (in USDT)
-        const total = positionsList.reduce((sum, pos) => {
-          const [baseToken, quoteToken] = pos.tradingPair.split('/');
-          const quoteValue = pos.currentQuoteBalance || 0;
-          // If quote is USDT, add directly; otherwise would need price conversion
-          return sum + (quoteToken === 'USDT' ? quoteValue : 0);
-        }, 0);
-        
-        setTotalValue(total);
+        if (!positionMap.has(pair)) {
+          positionMap.set(pair, {
+            tradingPair: pair,
+            baseQuantity: 0,
+            quoteQuantity: 0,
+            avgBuyPrice: 0,
+            avgSellPrice: 0,
+            totalBuyQty: 0,
+            totalSellQty: 0,
+            totalBuyValue: 0,
+            totalSellValue: 0,
+            trades: []
+          });
+        }
+
+        const position = positionMap.get(pair);
+        position.trades.push(trade);
+
+        if (isBuy) {
+          position.totalBuyQty += quantity;
+          position.totalBuyValue += price * quantity;
+          position.baseQuantity += quantity;
+          position.quoteQuantity -= price * quantity;
+        } else {
+          position.totalSellQty += quantity;
+          position.totalSellValue += price * quantity;
+          position.baseQuantity -= quantity;
+          position.quoteQuantity += price * quantity;
+        }
+      });
+
+      // Enrich with real balances from Splice Holdings (source of truth)
+      const positionsList = Array.from(positionMap.values()).map(pos => {
+        pos.avgBuyPrice = pos.totalBuyQty > 0 ? pos.totalBuyValue / pos.totalBuyQty : 0;
+        pos.avgSellPrice = pos.totalSellQty > 0 ? pos.totalSellValue / pos.totalSellQty : 0;
+
+        const [baseToken, quoteToken] = pos.tradingPair.split('/');
+        pos.currentBaseBalance = parseFloat(balances[baseToken] || 0);
+        pos.currentQuoteBalance = parseFloat(balances[quoteToken] || 0);
+        pos.lockedBase = parseFloat(lockedBalances[baseToken] || 0);
+        pos.lockedQuote = parseFloat(lockedBalances[quoteToken] || 0);
+
+        pos.realizedPnL = pos.totalSellValue - (pos.avgBuyPrice * pos.totalSellQty);
+        pos.realizedPnLPercent = pos.avgBuyPrice > 0
+          ? (pos.realizedPnL / (pos.avgBuyPrice * pos.totalSellQty)) * 100
+          : 0;
+
+        return pos;
+      });
+
+      // Add tokens that have a holding balance but no trades yet
+      const tradedTokens = new Set();
+      positionsList.forEach(p => {
+        const [base, quote] = p.tradingPair.split('/');
+        tradedTokens.add(base);
+        tradedTokens.add(quote);
+      });
+
+      const untradedTokens = Object.entries(balances)
+        .filter(([symbol, amount]) => !tradedTokens.has(symbol) && parseFloat(amount) > 0);
+
+      setPositions(positionsList);
+
+      // Calculate total portfolio value (in USDT or base unit)
+      const total = positionsList.reduce((sum, pos) => {
+        const [, quoteToken] = pos.tradingPair.split('/');
+        const quoteValue = pos.currentQuoteBalance || 0;
+        return sum + (quoteToken === 'USDT' ? quoteValue : 0);
+      }, 0);
+
+      setTotalValue(total);
     } catch (error) {
       console.error('[PortfolioView] Error loading portfolio:', error);
       setPositions([]);
@@ -154,12 +159,32 @@ export default function PortfolioView({ partyId, cantonApi }) {
           <div className="flex items-center justify-center py-8">
             <div className="animate-pulse text-muted-foreground text-sm">Loading portfolio...</div>
           </div>
-        ) : positions.length === 0 ? (
+        ) : positions.length === 0 && holdings.length === 0 ? (
           <div className="flex items-center justify-center py-8 text-muted-foreground text-sm">
             No positions found
           </div>
         ) : (
           <div className="space-y-4">
+            {/* Holdings summary from Splice Token Standard */}
+            {holdings.length > 0 && (
+              <div className="border border-border rounded-lg p-3 mb-2">
+                <h5 className="text-xs text-muted-foreground uppercase tracking-wide mb-2">
+                  On-Chain Holdings (Token Standard)
+                </h5>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                  {holdings.map((h, i) => (
+                    <div key={i} className="text-xs font-mono">
+                      <span className="text-foreground">{parseFloat(h.amount || 0).toFixed(4)}</span>
+                      <span className="text-muted-foreground ml-1">{h.symbol || h.exchangeSymbol || '?'}</span>
+                      {h.lock && (
+                        <Lock className="inline w-3 h-3 text-yellow-500 ml-1" />
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {positions.map((position, idx) => (
               <motion.div
                 key={position.tradingPair}
@@ -190,19 +215,35 @@ export default function PortfolioView({ partyId, cantonApi }) {
                     </div>
                   </div>
                 </div>
-                
+
                 <div className="grid grid-cols-2 gap-4 text-sm">
                   <div>
-                    <div className="text-xs text-muted-foreground mb-1">Base Balance</div>
+                    <div className="text-xs text-muted-foreground mb-1">Available Base</div>
                     <div className="font-mono text-foreground">
                       {position.currentBaseBalance.toFixed(8)}
                     </div>
+                    {position.lockedBase > 0 && (
+                      <div className="flex items-center gap-1 mt-0.5">
+                        <Lock className="w-2.5 h-2.5 text-yellow-500" />
+                        <span className="text-[10px] text-yellow-500/80">
+                          {position.lockedBase.toFixed(4)} locked
+                        </span>
+                      </div>
+                    )}
                   </div>
                   <div>
-                    <div className="text-xs text-muted-foreground mb-1">Quote Balance</div>
+                    <div className="text-xs text-muted-foreground mb-1">Available Quote</div>
                     <div className="font-mono text-foreground">
-                      {position.currentQuoteBalance.toFixed(2)} USDT
+                      {position.currentQuoteBalance.toFixed(2)}
                     </div>
+                    {position.lockedQuote > 0 && (
+                      <div className="flex items-center gap-1 mt-0.5">
+                        <Lock className="w-2.5 h-2.5 text-yellow-500" />
+                        <span className="text-[10px] text-yellow-500/80">
+                          {position.lockedQuote.toFixed(4)} locked
+                        </span>
+                      </div>
+                    )}
                   </div>
                   <div>
                     <div className="text-xs text-muted-foreground mb-1">Avg Buy Price</div>
@@ -225,4 +266,3 @@ export default function PortfolioView({ partyId, cantonApi }) {
     </Card>
   );
 }
-

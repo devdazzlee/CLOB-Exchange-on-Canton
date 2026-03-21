@@ -401,10 +401,32 @@ class MatchingEngine {
       if (!streaming || !streaming.isReady()) return false;
       
       if (!rawOrders || rawOrders.length === 0) return false;
-      
+
+      // ═══ ROOT CAUSE FIX: DB-backed pending settlement filter ═══
+      // Load all order IDs that already have an active PendingSettlement.
+      // This survives backend restarts (unlike in-memory eviction).
+      // Orders with active settlements are excluded from matching entirely.
+      const { getDb } = require('./db');
+      let pendingOrderIds = new Set();
+      try {
+        const activeSettlements = await getDb().pendingSettlement.findMany({
+          where: { status: { in: ['PENDING_WITHDRAW', 'PENDING_MULTILEG', 'PENDING_EXECUTE'] } },
+          select: { sellOrderId: true, buyOrderId: true },
+        });
+        for (const s of activeSettlements) {
+          if (s.sellOrderId) pendingOrderIds.add(s.sellOrderId);
+          if (s.buyOrderId) pendingOrderIds.add(s.buyOrderId);
+        }
+        if (pendingOrderIds.size > 0) {
+          console.log(`[MatchingEngine] Excluding ${pendingOrderIds.size} order(s) with active pending settlements`);
+        }
+      } catch (dbErr) {
+        console.warn(`[MatchingEngine] PendingSettlement lookup failed (proceeding without filter): ${dbErr.message}`);
+      }
+
       const buyOrders = [];
       const sellOrders = [];
-      
+
       const now = Date.now();
       const MAX_UTILITY_ALLOCATION_AGE_MS = 24 * 60 * 60 * 1000;
       const MAX_SPLICE_ALLOCATION_AGE_MS = 15 * 60 * 1000;
@@ -412,6 +434,8 @@ class MatchingEngine {
       for (const payload of rawOrders) {
         if (payload.status !== 'OPEN') continue;
         if (this.invalidSettlementContracts.has(payload.contractId)) continue;
+        // Skip orders already in active settlement (DB-backed, survives restarts)
+        if (payload.orderId && pendingOrderIds.has(payload.orderId)) continue;
 
         // Pre-filter: evict orders whose allocations are guaranteed to be expired.
         // BUY locks quote asset; SELL locks base asset.
@@ -537,8 +561,27 @@ class MatchingEngine {
         return new Date(a.timestamp) - new Date(b.timestamp);
       });
 
-      const matched = await this.findAndExecuteOneMatch(tradingPair, buyOrders, sellOrders, token);
-      return matched;
+      // ═══ BATCH EXECUTION: Execute multiple crossing matches per cycle ═══
+      // Instead of returning after a single match, continue matching until no
+      // more crossing orders exist or MAX_BATCH_SIZE is reached. This reduces
+      // settlement latency when multiple orders cross simultaneously.
+      const MAX_BATCH_SIZE = parseInt(process.env.MATCH_BATCH_SIZE || '5', 10);
+      let batchCount = 0;
+      let anyMatched = false;
+
+      for (let i = 0; i < MAX_BATCH_SIZE; i++) {
+        const matched = await this.findAndExecuteOneMatch(tradingPair, buyOrders, sellOrders, token);
+        if (!matched) break;
+        anyMatched = true;
+        batchCount++;
+        // After each match, remaining quantities are updated in-place by
+        // findAndExecuteOneMatch, so re-sorting is not needed — price-time
+        // priority is preserved and exhausted orders have remaining <= 0.
+      }
+      if (batchCount > 1) {
+        console.log(`[MatchingEngine] ═══ Batch complete: ${batchCount} matches executed for ${tradingPair} ═══`);
+      }
+      return anyMatched;
       
           } catch (error) {
       if (error.message?.includes('401') || error.message?.includes('security-sensitive')) {
@@ -633,6 +676,13 @@ class MatchingEngine {
           console.log(`[MatchingEngine] ✅ Match executed successfully via Allocation API`);
           // Reset circuit breaker on success
           this._consecutiveSettlementFailures = 0;
+          // Update remaining quantities in-place for batch execution.
+          // After a match, reduce both orders' remaining so the batch loop
+          // can find the next crossing pair without re-querying Canton.
+          buyOrder.remaining = buyOrder.remainingDecimal.minus(matchQty).toNumber();
+          buyOrder.remainingDecimal = buyOrder.remainingDecimal.minus(matchQty);
+          sellOrder.remaining = sellOrder.remainingDecimal.minus(matchQty).toNumber();
+          sellOrder.remainingDecimal = sellOrder.remainingDecimal.minus(matchQty);
           return true;
         } catch (error) {
           this._consecutiveSettlementFailures++;
@@ -831,19 +881,16 @@ class MatchingEngine {
     const matchQtyStr = matchQty.toFixed(10);
     const quoteAmountStr = quoteAmount.toFixed(10);
 
-    let tradeContractId = null;
     const buyIsPartial = new Decimal(buyOrder.remaining).gt(matchQty);
     const sellIsPartial = new Decimal(sellOrder.remaining).gt(matchQty);
 
-    const sdkClient = getCantonSDKClient();
-
     // ═══════════════════════════════════════════════════════════════════
-    // SETTLEMENT — Operator-as-receiver (client requirement, mainnet-safe)
-    // Allocations at order placement use receiver=operator. At match:
-    // Execute allocations (executor-only), then create operator legs.
-    // No withdraw, no ext-* submission. See backend/docs/clientchat.txt
+    // SETTLEMENT — TradingApp pattern (client requirement)
+    // Self-allocations at order placement (sender=receiver=user). At match:
+    // Withdraw self-allocations → create 2-leg (seller→buyer, buyer→seller) → execute.
+    // Tokens flow user-to-user ONLY. Operator NEVER holds tokens.
     // ═══════════════════════════════════════════════════════════════════
-    console.log(`[MatchingEngine] ═══ Settlement (operator-as-receiver, app provider only) ═══`);
+    console.log(`[MatchingEngine] ═══ Settlement (TradingApp — user-to-user, no operator custody) ═══`);
     console.log(`[MatchingEngine]    Trade: ${matchQtyStr} ${baseSymbol} @ ${matchPrice} ${quoteSymbol}`);
     console.log(`[MatchingEngine]    Seller alloc: ${sellOrder.allocationContractId?.substring(0, 24) || 'MISSING'}... (${baseSymbol})`);
     console.log(`[MatchingEngine]    Buyer alloc:  ${buyOrder.allocationContractId?.substring(0, 24) || 'MISSING'}... (${quoteSymbol})`);
@@ -854,257 +901,55 @@ class MatchingEngine {
 
     const tradeId = `trade-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
 
-    // TradingApp pattern: create pending settlement, both parties sign at match time
-    // No fallback — client requirement: tokens flow only between users, no operator custody.
-    if (config.useTradingAppPattern) {
-      const tradingAppSettlement = require('./tradingAppSettlementService');
-      await tradingAppSettlement.createPendingSettlement({
-        tradeId,
-        tradingPair,
-        sellerPartyId: sellOrder.owner,
-        buyerPartyId: buyOrder.owner,
-        sellOrderId: sellOrder.orderId,
-        buyOrderId: buyOrder.orderId,
-        sellOrderContractId: sellOrder.contractId,
-        buyOrderContractId: buyOrder.contractId,
-        sellOrderTemplateId: sellOrder.templateId,
-        buyOrderTemplateId: buyOrder.templateId,
-        sellOrderRemaining: sellOrder.remaining != null ? String(sellOrder.remaining) : null,
-        buyOrderRemaining: buyOrder.remaining != null ? String(buyOrder.remaining) : null,
-        sellIsPartial,
-        buyIsPartial,
-        matchPrice: matchPrice.toString(),
-        sellAllocCid: sellOrder.allocationContractId,
-        buyAllocCid: buyOrder.allocationContractId,
-        baseSymbol,
-        quoteSymbol,
-        matchQty: matchQtyStr,
-        quoteAmount: quoteAmountStr,
-      });
-      console.log(`[MatchingEngine] ═══ TradingApp: Pending settlement ${tradeId} — both parties must sign ═══`);
-      if (global.broadcastWebSocket) {
-        global.broadcastWebSocket(`settlement:${sellOrder.owner}`, { type: 'PENDING_SIGNATURE', matchId: tradeId, role: 'seller' });
-        global.broadcastWebSocket(`settlement:${buyOrder.owner}`, { type: 'PENDING_SIGNATURE', matchId: tradeId, role: 'buyer' });
-      }
-      return { tradeId, status: 'PENDING_SIGNATURE', message: 'Both parties must sign to complete settlement' };
-    }
-
-    // Remaining amounts for partial fills (return to parties after settlement)
-    const remainingBaseSeller = sellIsPartial ? new Decimal(sellOrder.remaining).minus(matchQty).toFixed(10) : '0';
-    const remainingQuoteBuyer = buyIsPartial ? new Decimal(buyOrder.remaining).minus(matchQty).times(matchPrice).toFixed(10) : '0';
-
-    const settlementResult = await sdkClient.executeOperatorAsReceiverSettlement({
-      sellAllocCid: sellOrder.allocationContractId,
-      buyAllocCid: buyOrder.allocationContractId,
+    // TradingApp pattern: create pending settlement, both parties sign at match time.
+    // This is the ONLY settlement path — no fallback to operator-as-receiver.
+    // Client requirement: tokens flow only between users, operator never holds tokens.
+    const tradingAppSettlement = require('./tradingAppSettlementService');
+    await tradingAppSettlement.createPendingSettlement({
+      tradeId,
+      tradingPair,
       sellerPartyId: sellOrder.owner,
       buyerPartyId: buyOrder.owner,
+      sellOrderId: sellOrder.orderId,
+      buyOrderId: buyOrder.orderId,
+      sellOrderContractId: sellOrder.contractId,
+      buyOrderContractId: buyOrder.contractId,
+      sellOrderTemplateId: sellOrder.templateId,
+      buyOrderTemplateId: buyOrder.templateId,
+      sellOrderRemaining: sellOrder.remaining != null ? String(sellOrder.remaining) : null,
+      buyOrderRemaining: buyOrder.remaining != null ? String(buyOrder.remaining) : null,
+      sellIsPartial,
+      buyIsPartial,
+      matchPrice: matchPrice.toString(),
+      sellAllocCid: sellOrder.allocationContractId,
+      buyAllocCid: buyOrder.allocationContractId,
       baseSymbol,
       quoteSymbol,
       matchQty: matchQtyStr,
       quoteAmount: quoteAmountStr,
-      operatorPartyId,
-      tradeId,
-      remainingBaseSeller,
-      remainingQuoteBuyer,
     });
+    console.log(`[MatchingEngine] ═══ TradingApp: Pending settlement ${tradeId} — both parties must sign ═══`);
 
-    if (!settlementResult.success) {
-      throw new Error(`SETTLEMENT_FAILED: ${settlementResult.fallback || 'Unknown'}. See backend/docs/HUZAIFA_QUESTIONS.md`);
-    }
-
-    const updateIds = settlementResult.updateIds || [];
-    console.log(`[MatchingEngine] ✅ Settlement Complete (operator-as-receiver — no net locked holdings)`);
-    console.log(`[MatchingEngine]    Flow: Execute allocations, create operator legs, execute`);
-    console.log(`[MatchingEngine]    Auto-accept service will finalize delivery to ext-* parties`);
-    if (updateIds.length > 0) {
-      console.log(`[MatchingEngine]    UpdateIds for ccview.io explorer verification:`);
-      for (const u of updateIds) {
-        console.log(`[MatchingEngine]      ${u.step}: ${u.updateId}`);
-      }
-    }
-
-    // ═══ Verify holdings reflect execution ═══
-    try {
-      const sellerHoldings = await sdkClient.verifyHoldingState(sellOrder.owner);
-      const buyerHoldings = await sdkClient.verifyHoldingState(buyOrder.owner);
-      console.log(`[MatchingEngine]    Seller: ${sellerHoldings.totalAvailable} available, ${sellerHoldings.totalLocked} locked, exec=${sellerHoldings.executionVisible ? 'YES' : 'NO'}`);
-      console.log(`[MatchingEngine]    Buyer:  ${buyerHoldings.totalAvailable} available, ${buyerHoldings.totalLocked} locked, exec=${buyerHoldings.executionVisible ? 'YES' : 'NO'}`);
-      if (sellerHoldings.totalLocked !== '0' || buyerHoldings.totalLocked !== '0') {
-        console.warn(`[MatchingEngine]    ⚠️ Lock holding after settlement — see ORDER_LIFECYCLE_FLOW.md §6`);
-        if (sellerHoldings.locked?.length) sellerHoldings.locked.forEach(h => console.warn(`[MatchingEngine]      Seller locked: ${h.contractId?.substring(0, 24)}... ${h.amount} ${h.exchangeSymbol}`));
-        if (buyerHoldings.locked?.length) buyerHoldings.locked.forEach(h => console.warn(`[MatchingEngine]      Buyer locked:  ${h.contractId?.substring(0, 24)}... ${h.amount} ${h.exchangeSymbol}`));
-      }
-    } catch (verifyErr) {
-      console.warn(`[MatchingEngine]    ⚠️ Holding verification skipped: ${verifyErr.message}`);
-    }
-
-    let replacementSellAllocationCid = null;
-    let replacementBuyAllocationCid = null;
-
-    // ═══════════════════════════════════════════════════════════════════
-    // FillOrder on BOTH Canton order contracts AFTER settlement
-    //
-    // Senior/idempotent handling for LOCKED_CONTRACTS:
-    // - Submit FillOrder once
-    // - If Canton returns transient lock/uncertain verdict, reconcile by
-    //   checking whether the order contract is still active on-ledger.
-    // - If archived, treat as already finalized (success path).
-    // - If still active, leave it for next matching cycle instead of blind retries.
-    // ═══════════════════════════════════════════════════════════════════
-    console.log(`[MatchingEngine] 📝 Step 2: Filling orders on-chain (operator-only submission)...`);
-
+    // ═══ CRITICAL: Evict matched orders from streaming read model ═══
+    // Without this, the 30s recentlyMatchedOrders TTL expires and the
+    // engine re-matches the same orders, creating duplicate PendingSettlements.
+    // For full fills: evict entirely. For partial fills: update remaining in-place
+    // (the streaming model will reflect the new remaining on next refresh).
     const streaming = this._getStreamingModel();
-    const FILL_ORDER_RETRIES = 3;
-    const FILL_ORDER_RETRY_DELAY_MS = 500;
-    const FILL_ORDER_INTER_DELAY_MS = 400; // Delay between buy and sell to avoid SEQUENCER_REQUEST_FAILED
-
-    const fillOrderWithReconciliation = async (order, side, isPartial, replacementAllocationCid) => {
-      const doFill = async () => cantonService.exerciseChoice({
-        token,
-        actAsParty: [operatorPartyId],
-        templateId: order.templateId || `${packageId}:Order:Order`,
-        contractId: order.contractId,
-        choice: 'FillOrder',
-        choiceArgument: {
-          fillQuantity: matchQtyStr,
-          newAllocationCid: isPartial && replacementAllocationCid ? replacementAllocationCid : null,
-        },
-        readAs: [operatorPartyId, order.owner],
-      });
-
-      for (let attempt = 1; attempt <= FILL_ORDER_RETRIES; attempt++) {
-        try {
-          await doFill();
-          console.log(`[MatchingEngine] ${side} order filled: ${order.orderId}`);
-          if (streaming) streaming.evictOrder(order.contractId);
-          return;
-        } catch (fillError) {
-          const msg = fillError.message || '';
-          const isTransientLock = msg.includes('LOCKED_CONTRACTS');
-          const isStale = msg.includes('already filled') ||
-            msg.includes('CONTRACT_NOT_FOUND') ||
-            msg.includes('INACTIVE_CONTRACTS');
-          const isTransientCanton = msg.includes('SEQUENCER_REQUEST_FAILED') ||
-            msg.includes('SUBMISSION_ALREADY_IN_FLIGHT');
-
-          if (isStale) {
-            console.warn(`[MatchingEngine] ${side} FillOrder skipped (contract stale): ${msg.substring(0, 100)}`);
-            if (streaming) streaming.evictOrder(order.contractId);
-            return;
-          }
-
-          if (isTransientLock) {
-            await new Promise(r => setTimeout(r, 2000));
-            const stillInCache = streaming && streaming.orders.has(order.contractId);
-            if (!stillInCache) {
-              console.warn(`[MatchingEngine] ${side} FillOrder reconciliation: order evicted from streaming cache — treating as finalized`);
-              if (streaming) streaming.evictOrder(order.contractId);
-              return;
-            }
-            console.warn(`[MatchingEngine] ${side} FillOrder deferred: order still in cache after transient lock; next cycle will retry`);
-            return;
-          }
-
-          if (isTransientCanton && attempt < FILL_ORDER_RETRIES) {
-            console.warn(`[MatchingEngine] ${side} FillOrder attempt ${attempt}/${FILL_ORDER_RETRIES} failed (transient): ${msg.substring(0, 80)} — retrying in ${FILL_ORDER_RETRY_DELAY_MS}ms`);
-            await new Promise(r => setTimeout(r, FILL_ORDER_RETRY_DELAY_MS));
-            continue;
-          }
-
-          throw new Error(`${side} FillOrder failed: ${msg}`);
-        }
-      }
-    };
-
-    await fillOrderWithReconciliation(buyOrder, 'Buy', buyIsPartial, replacementBuyAllocationCid);
-    await new Promise(r => setTimeout(r, FILL_ORDER_INTER_DELAY_MS));
-    await fillOrderWithReconciliation(sellOrder, 'Sell', sellIsPartial, replacementSellAllocationCid);
-
-    // ═══════════════════════════════════════════════════════════════════
-    // STEP 2b: Record trade balance effects in PostgreSQL
-    //
-    // Allocation_ExecuteTransfer moved real tokens on-chain.
-    // We also record credits/debits so the balance API can compute:
-    //   available = Splice holdings + trade credits - trade debits - reservations
-    // ═══════════════════════════════════════════════════════════════════
-    try {
-      const { recordTradeSettlement, isTradeRecorded } = require('./tradeSettlementService');
-      const alreadyRecorded = await isTradeRecorded(tradeId);
-      if (!alreadyRecorded) {
-        await recordTradeSettlement({
-          tradeId,
-          buyer: buyOrder.owner,
-          seller: sellOrder.owner,
-          baseSymbol,
-          quoteSymbol,
-          baseAmount: matchQtyStr,
-          quoteAmount: quoteAmountStr,
-          price: matchPrice,
-          tradingPair,
-          buyOrderId: buyOrder.orderId,
-          sellOrderId: sellOrder.orderId,
-          sellerUsedRealTransfer: true,
-          buyerUsedRealTransfer: true,
-        });
-      }
-    } catch (tsErr) {
-      console.warn(`[MatchingEngine] ⚠️ TradeSettlement recording failed (non-critical): ${tsErr.message}`);
+    if (!buyIsPartial) {
+      if (streaming) streaming.evictOrder(buyOrder.contractId);
+      if (buyOrder.allocationContractId) this._archivedAllocationCids.add(buyOrder.allocationContractId);
+      console.log(`[MatchingEngine]    Evicted fully-matched BUY order from read model`);
+    }
+    if (!sellIsPartial) {
+      if (streaming) streaming.evictOrder(sellOrder.contractId);
+      if (sellOrder.allocationContractId) this._archivedAllocationCids.add(sellOrder.allocationContractId);
+      console.log(`[MatchingEngine]    Evicted fully-matched SELL order from read model`);
     }
 
-    // Release balance reservations for filled quantities
-    try {
-      const { releasePartialReservation } = require('./order-service');
-      await releasePartialReservation(sellOrder.orderId, matchQtyStr);
-      await releasePartialReservation(buyOrder.orderId, quoteAmountStr);
-    } catch (_) { /* non-critical */ }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // STEP 3: Create Trade record on Canton for history
-    // ═══════════════════════════════════════════════════════════════════
-    try {
-      const tradeTemplateId = `${packageId}:Settlement:Trade`;
-      // Use the tradeId generated for this settlement
-      const tradeResult = await cantonService.createContractWithTransaction({
-          token,
-        actAsParty: operatorPartyId,
-        templateId: tradeTemplateId,
-          createArguments: {
-            tradeId: tradeId,
-            operator: operatorPartyId,
-            buyer: buyOrder.owner,
-            seller: sellOrder.owner,
-            baseInstrumentId: {
-              issuer: operatorPartyId,
-              symbol: baseSymbol,
-              version: '1.0',
-            },
-            quoteInstrumentId: {
-              issuer: operatorPartyId,
-              symbol: quoteSymbol,
-              version: '1.0',
-            },
-          baseAmount: matchQtyStr,
-          quoteAmount: quoteAmountStr,
-            price: matchPrice.toString(),
-            buyOrderId: buyOrder.orderId,
-            sellOrderId: sellOrder.orderId,
-            timestamp: new Date().toISOString(),
-          },
-          readAs: [operatorPartyId, buyOrder.owner, sellOrder.owner],
-        synchronizerId,
-      });
-      const events = tradeResult?.transaction?.events || [];
-            for (const event of events) {
-              const created = event.created || event.CreatedEvent;
-        if (created?.contractId) {
-          tradeContractId = created.contractId;
-                break;
-              }
-            }
-      console.log(`[MatchingEngine] ✅ Trade record created: ${tradeContractId?.substring(0, 25)}...`);
-    } catch (tradeErr) {
-      console.warn(`[MatchingEngine] ⚠️ Trade record creation failed (non-critical): ${tradeErr.message}`);
-      tradeContractId = `trade-${Date.now()}`;
+    if (global.broadcastWebSocket) {
+      global.broadcastWebSocket(`settlement:${sellOrder.owner}`, { type: 'PENDING_SIGNATURE', matchId: tradeId, role: 'seller' });
+      global.broadcastWebSocket(`settlement:${buyOrder.owner}`, { type: 'PENDING_SIGNATURE', matchId: tradeId, role: 'buyer' });
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1121,10 +966,11 @@ class MatchingEngine {
     }
 
     // ═══════════════════════════════════════════════════
-    // FINAL: Record trade and broadcast via WebSocket
+    // FINAL: Broadcast match via WebSocket
+    // Trade record + FillOrder happen after both parties sign (in tradingAppSettlementService)
     // ═══════════════════════════════════════════════════
     const tradeRecord = {
-      tradeId: tradeContractId || `trade-${Date.now()}`,
+      tradeId,
       tradingPair,
       buyer: buyOrder.owner,
       seller: sellOrder.owner,
@@ -1133,37 +979,27 @@ class MatchingEngine {
       buyOrderId: buyOrder.orderId,
       sellOrderId: sellOrder.orderId,
       timestamp: new Date().toISOString(),
-      settlementType: 'OperatorAsReceiver',
+      settlementType: 'TradingApp',
+      status: 'PENDING_SIGNATURE',
       instrumentAllocationId: sellOrder.allocationContractId || null,
       paymentAllocationId: buyOrder.allocationContractId || null,
-      updateIds: updateIds.map(u => u.updateId),
     };
 
-    // Broadcast via WebSocket
     if (global.broadcastWebSocket) {
-      global.broadcastWebSocket(`trades:${tradingPair}`, { type: 'NEW_TRADE', ...tradeRecord });
-      global.broadcastWebSocket('trades:all', { type: 'NEW_TRADE', ...tradeRecord });
+      global.broadcastWebSocket(`trades:${tradingPair}`, { type: 'MATCH_PENDING', ...tradeRecord });
+      global.broadcastWebSocket('trades:all', { type: 'MATCH_PENDING', ...tradeRecord });
       global.broadcastWebSocket(`orderbook:${tradingPair}`, {
-        type: 'TRADE_EXECUTED',
+        type: 'TRADE_MATCHED',
         buyOrderId: buyOrder.orderId,
         sellOrderId: sellOrder.orderId,
         fillQuantity: matchQtyStr,
         fillPrice: matchPrice,
-      });
-
-      global.broadcastWebSocket(`balance:${buyOrder.owner}`, {
-        type: 'BALANCE_UPDATE',
-        partyId: buyOrder.owner,
-        timestamp: Date.now()
-      });
-      global.broadcastWebSocket(`balance:${sellOrder.owner}`, {
-        type: 'BALANCE_UPDATE',
-        partyId: sellOrder.owner,
-        timestamp: Date.now()
+        status: 'PENDING_SIGNATURE',
       });
     }
 
-    console.log(`[MatchingEngine] ═══ Match complete: ${matchQtyStr} ${baseSymbol} @ ${matchPrice} ${quoteSymbol} (Allocation) ═══`);
+    console.log(`[MatchingEngine] ═══ Match complete (pending signature): ${matchQtyStr} ${baseSymbol} @ ${matchPrice} ${quoteSymbol} (TradingApp) ═══`);
+    return { tradeId, status: 'PENDING_SIGNATURE', message: 'Both parties must sign to complete settlement' };
   }
 
   setPollingInterval(ms) {

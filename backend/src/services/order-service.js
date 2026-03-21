@@ -629,16 +629,16 @@ class OrderService {
     const timestamp = new Date().toISOString();
 
     // ═══════════════════════════════════════════════════════════════════
-    // OPERATOR-AS-RECEIVER — Transaction 1: Allocation (user signs)
+    // SELF-ALLOCATION — Transaction 1: Allocation (user signs)
     //
-    // Allocation: sender=user, receiver=operator, executor=operator
+    // Allocation: sender=user, receiver=user (self-allocation per client req)
     // Purpose: Lock tokens; user consent embedded at creation.
     //
-    // Settlement (Transaction 2, app provider only):
-    //   - Execute allocations (executor-only)
-    //   - Create operator legs (base to buyer, quote to seller)
-    //   - Execute operator legs
-    // No withdraw, no ext-* submission at match time.
+    // Settlement at match time (TradingApp pattern):
+    //   - Withdraw self-allocations
+    //   - Create 2-leg allocations (seller→buyer, buyer→seller)
+    //   - Execute both legs — tokens flow user-to-user only
+    // Operator NEVER holds tokens, even temporarily.
     // ═══════════════════════════════════════════════════════════════════
 
     const sdkClient = getCantonSDKClient();
@@ -649,18 +649,14 @@ class OrderService {
     let allocationType = null;
     let exactAmountHoldingCid = null;
 
-    // ═══ TEMPLE PATTERN STEP 1: Self-transfer for exact-amount holding ═══
-    // NOTE: Self-transfer must be interactive for external parties.
-    // However, Canton doesn't support multiple commands in one interactive submission.
-    // So we skip self-transfer for now and use existing holdings.
-    // The exact-amount requirement is an optimization; existing holdings work fine.
-    console.log(`[OrderService] 🔄 Temple Pattern: Using existing holdings (self-transfer skipped due to Canton limitation)`);
-    console.log(`[OrderService]    Note: Self-transfer requires interactive signature but cannot be combined with allocation`);
-    console.log(`[OrderService]    Using existing holdings for allocation (exact-amount optimization skipped)`);
+    // ═══ Self-allocation uses existing holdings (exact-amount self-transfer skipped) ═══
+    // Canton doesn't support multiple commands in one interactive submission,
+    // so we use existing holdings directly for the self-allocation.
+    console.log(`[OrderService] 🔄 Self-allocation: Using existing holdings for ${lockInfo.amount} ${lockInfo.asset}`);
 
-    // ═══ OPERATOR-AS-RECEIVER: allocation sender=user, receiver=operator ═══
-    // User signs at order placement. At match, operator executes alone (no user sig).
-    console.log(`[OrderService] 🔄 Creating allocation (sender=user, receiver=operator, NOT executed)...`);
+    // ═══ SELF-ALLOCATION: sender=receiver=user (client requirement) ═══
+    // User signs at order placement. At match, TradingApp pattern withdraws + creates 2-leg.
+    console.log(`[OrderService] 🔄 Creating self-allocation (sender=receiver=user, NOT executed)...`);
     const realAlloc = await sdkClient.tryBuildRealAllocationCommand(
       partyId,
       operatorPartyId,
@@ -679,7 +675,7 @@ class OrderService {
     disclosedContracts = realAlloc.disclosedContracts || [];
     synchronizerId = realAlloc.synchronizerId || config.canton.synchronizerId;
     allocationType = realAlloc.allocationType;
-    console.log(`[OrderService] ✅ Allocation prepared (sender=user, receiver=operator, NOT executed) for ${orderId}`);
+    console.log(`[OrderService] ✅ Self-allocation prepared (sender=receiver=user, NOT executed) for ${orderId}`);
 
     // Store the allocation type with the reservation
     await setAllocationContractIdForOrder(orderId, null, allocationType);
@@ -873,7 +869,13 @@ class OrderService {
         }
         // Fall through to success path
       } else if (stage === 'ALLOCATION_PREPARED') {
-        // LEGACY TWO-STEP: Allocation executed; prepare order create for second signature.
+        // ═══════════════════════════════════════════════════════════════════
+        // SINGLE-SIGN: Allocation executed → auto-sign Order Create on the
+        // backend using the signing key the user sent with step 1.
+        // The user only enters their password ONCE (to sign the allocation).
+        // The backend signs step 2 (Order Create) server-side, eliminating
+        // the round-trip back to the frontend.
+        // ═══════════════════════════════════════════════════════════════════
         const packageId = config.canton.packageIds.clobExchange;
         let effectiveAllocationCid = orderMeta.allocationContractId || allocationContractId;
         if (!effectiveAllocationCid) {
@@ -920,21 +922,95 @@ class OrderService {
           throw new Error('Order create prepare returned incomplete result');
         }
 
-        console.log(`[OrderService] ✅ Order create prepared (step 2/2) for ${orderMeta.orderId}`);
-        return {
-          requiresSignature: true,
-          step: 'ORDER_CREATE_PREPARED',
-          orderId: orderMeta.orderId,
-          preparedTransaction: orderPrepareResult.preparedTransaction,
-          preparedTransactionHash: orderPrepareResult.preparedTransactionHash,
-          hashingSchemeVersion: orderPrepareResult.hashingSchemeVersion,
-          partyId,
-          orderMeta: {
-            ...orderMeta,
-            stage: 'ORDER_CREATE_PREPARED',
-            allocationContractId: effectiveAllocationCid,
-          },
-        };
+        // ═══ Server-side auto-sign: use stored signing key from step 1 ═══
+        const userReg = require('../state/userRegistry');
+        const storedKey = await userReg.getSigningKey(partyId);
+        if (storedKey && storedKey.keyBase64 && storedKey.fingerprint) {
+          console.log(`[OrderService] 🔑 Auto-signing Order Create server-side (single-sign flow)`);
+          try {
+            const { signHash } = require('./serverSigner');
+            const sig2 = await signHash(storedKey.keyBase64, orderPrepareResult.preparedTransactionHash);
+            const step2Signatures = {
+              signatures: [{
+                party: partyId,
+                signatures: [{
+                  format: 'SIGNATURE_FORMAT_RAW',
+                  signature: sig2,
+                  signedBy: storedKey.fingerprint,
+                  signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519'
+                }]
+              }]
+            };
+            const step2Result = await cantonService.executeInteractiveSubmission({
+              preparedTransaction: orderPrepareResult.preparedTransaction,
+              partySignatures: step2Signatures,
+              hashingSchemeVersion: orderPrepareResult.hashingSchemeVersion,
+            }, token);
+
+            // Extract Order contract ID from step 2
+            let orderContractId = null;
+            if (step2Result.transaction?.events) {
+              for (const event of step2Result.transaction.events) {
+                const created = event.created || event.CreatedEvent;
+                const tmplId = this._templateIdToString(created?.templateId);
+                if (created?.contractId && tmplId.includes(':Order:Order')) {
+                  orderContractId = created.contractId;
+                  break;
+                }
+              }
+            }
+            if (!orderContractId) {
+              const txUpdateId = step2Result.transaction?.updateId || step2Result.updateId;
+              if (txUpdateId && /^[0-9a-f]{40,}$/i.test(txUpdateId)) {
+                orderContractId = txUpdateId;
+              }
+            }
+
+            console.log(`[OrderService] ✅ Single-sign complete: Allocation + Order created in one user interaction for ${orderMeta.orderId}`);
+            // Fall through to success path below with merged data
+            contractId = orderContractId || contractId;
+            allocationContractId = effectiveAllocationCid;
+            if (allocationContractId && orderMeta.orderId) {
+              const allocType = orderMeta.allocationType || null;
+              await setAllocationContractIdForOrder(orderMeta.orderId, allocationContractId, allocType);
+            }
+            // Skip returning requiresSignature — fall through to final success
+          } catch (autoSignErr) {
+            console.warn(`[OrderService] ⚠️ Server-side auto-sign failed: ${autoSignErr.message}. Falling back to two-step.`);
+            // Fallback: return to frontend for manual second sign
+            return {
+              requiresSignature: true,
+              step: 'ORDER_CREATE_PREPARED',
+              orderId: orderMeta.orderId,
+              preparedTransaction: orderPrepareResult.preparedTransaction,
+              preparedTransactionHash: orderPrepareResult.preparedTransactionHash,
+              hashingSchemeVersion: orderPrepareResult.hashingSchemeVersion,
+              partyId,
+              orderMeta: {
+                ...orderMeta,
+                stage: 'ORDER_CREATE_PREPARED',
+                allocationContractId: effectiveAllocationCid,
+              },
+            };
+          }
+        } else {
+          // No stored signing key — fall back to two-step
+          console.log(`[OrderService] ⚠️ No stored signing key — falling back to two-step signing`);
+          return {
+            requiresSignature: true,
+            step: 'ORDER_CREATE_PREPARED',
+            orderId: orderMeta.orderId,
+            preparedTransaction: orderPrepareResult.preparedTransaction,
+            preparedTransactionHash: orderPrepareResult.preparedTransactionHash,
+            hashingSchemeVersion: orderPrepareResult.hashingSchemeVersion,
+            partyId,
+            orderMeta: {
+              ...orderMeta,
+              stage: 'ORDER_CREATE_PREPARED',
+              allocationContractId: effectiveAllocationCid,
+            },
+          };
+        }
       }
 
       // Canton interactive execute may not return created contract IDs.

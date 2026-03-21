@@ -3338,14 +3338,13 @@ class CantonSDKClient {
         return null;
       }
 
-      // USE_TRADING_APP_PATTERN: self-allocation (sender=receiver=user) for client flow.
-      // Otherwise: operator-as-receiver (executor can execute at match w/o user sig).
-      const configRef = require('../config');
-      const useTradingApp = configRef.useTradingAppPattern;
-      const receiverPartyId = useTradingApp ? senderPartyId : executorPartyId;
+      // SELF-ALLOCATION: sender=receiver=user (client requirement).
+      // Tokens are locked under user's own name. At match, TradingApp pattern
+      // withdraws and creates direct user-to-user legs. Operator never holds tokens.
+      const receiverPartyId = senderPartyId;
 
-      console.log(`[CantonSDK] 🔄 Building allocation for ${amount} ${symbol} (${tokenSystemType})...`);
-      console.log(`[CantonSDK]    sender=${senderPartyId.substring(0, 30)}..., receiver=${useTradingApp ? 'SELF' : 'OPERATOR'}(${receiverPartyId.substring(0, 30)}...), executor=${executorPartyId.substring(0, 30)}...`);
+      console.log(`[CantonSDK] 🔄 Building self-allocation for ${amount} ${symbol} (${tokenSystemType})...`);
+      console.log(`[CantonSDK]    sender=receiver=${senderPartyId.substring(0, 30)}... (SELF), executor=${executorPartyId.substring(0, 30)}...`);
 
       const holdingCidsArray = overrideHoldingCids
         ? (Array.isArray(overrideHoldingCids) ? overrideHoldingCids : [overrideHoldingCids])
@@ -3353,7 +3352,7 @@ class CantonSDKClient {
 
       const result = await this.buildAllocationInteractiveCommand(
         senderPartyId,
-        receiverPartyId,  // self (TradingApp) or operator (operator-as-receiver)
+        receiverPartyId,  // always self (sender=receiver=user)
         amount,
         symbol,
         executorPartyId,
@@ -3367,7 +3366,7 @@ class CantonSDKClient {
       }
 
       const allocationType = tokenSystemType === 'utilities' ? 'UtilitiesAllocation' : 'SpliceAllocation';
-      console.log(`[CantonSDK] ✅ Allocation (${useTradingApp ? 'self' : 'user→operator'}) built for ${orderId}`);
+      console.log(`[CantonSDK] ✅ Self-allocation built for ${orderId}`);
 
       return {
         ...result,

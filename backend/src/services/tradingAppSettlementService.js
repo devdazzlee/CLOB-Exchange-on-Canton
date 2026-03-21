@@ -100,6 +100,22 @@ async function createPendingSettlement(match) {
   if (matchPrice != null) data.matchPrice = String(matchPrice);
 
   try {
+    // ═══ Deduplication: prevent duplicate settlements for the same order pair ═══
+    // If a PendingSettlement already exists for this buy+sell order pair
+    // (regardless of tradeId), skip creation. This guards against the matching
+    // engine re-matching orders before they are evicted from the read model.
+    const existing = await prisma.pendingSettlement.findFirst({
+      where: {
+        sellOrderId,
+        buyOrderId,
+        status: { in: ['PENDING_WITHDRAW', 'PENDING_MULTILEG', 'PENDING_EXECUTE'] },
+      },
+    });
+    if (existing) {
+      console.warn(`[TradingAppSettlement] Duplicate settlement skipped: ${sellOrderId} ↔ ${buyOrderId} already has pending settlement ${existing.id}`);
+      return existing.id;
+    }
+
     await prisma.pendingSettlement.create({ data });
     return tradeId;
   } catch (err) {

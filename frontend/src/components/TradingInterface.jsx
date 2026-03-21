@@ -507,23 +507,8 @@ export default function TradingInterface({ partyId }) {
           signingKeyBase64: privateKeyBase64,
         });
 
-        if (response?.data?.requiresSignature) {
-          // Step 2: Order Create prepared — auto-sign with the same private key
-          // (still in memory) so the user does NOT need to enter password again.
-          console.log('[SignOrder] Step 1 done. Auto-signing step 2 (order create)...');
-          const sig2 = await signMessage(privateKey, response.data.preparedTransactionHash);
-          const response2 = await apiClient.post('/orders/execute-place', {
-            preparedTransaction: response.data.preparedTransaction,
-            partyId,
-            signatureBase64: sig2,
-            signedBy,
-            hashingSchemeVersion: response.data.hashingSchemeVersion,
-            orderMeta: response.data.orderMeta || signingState.orderMeta,
-            signingKeyBase64: privateKeyBase64,
-          });
-          // Use the second response as the final response
-          response = response2;
-        }
+        // Single signature flow: backend auto-signs Order Create (step 2) server-side.
+        // No client-side fallback — signing key is stored at step 1 execution.
 
         if (response.success) {
           const od = signingState.orderData;
