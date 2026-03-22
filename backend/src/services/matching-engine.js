@@ -1,25 +1,27 @@
 /**
- * Matching Engine Bot — Allocation-Based Settlement
+ * Matching Engine Bot — Server-Side Auto-Settlement
  *
  * Core exchange functionality — matches buy/sell orders and settles trades
- * using the Allocation API (operator-as-receiver pattern, mainnet-safe).
+ * instantly using stored signing keys (same pattern as autoAcceptService).
  *
- * Settlement Flow (Operator-as-Receiver):
- * 1. Poll Canton for OPEN Order contracts every N seconds
+ * Settlement Flow (User-to-User, Server-Signed):
+ * 1. Poll Canton for OPEN Order contracts via WebSocket streaming read model
  * 2. Separate into buys/sells per trading pair
  * 3. Sort by price-time priority (FIFO)
  * 4. Find crossing orders (buy price >= sell price)
  * 5. For each match:
- *    a. Execute seller's allocation (seller to operator) — executor only
- *    b. Execute buyer's allocation (buyer to operator) — executor only
- *    c. Create allocation operator to buyer (base)
- *    d. Create allocation operator to seller (quote)
- *    e. Execute both operator legs
+ *    a. Retrieve stored signing keys for both parties
+ *    b. Withdraw seller's self-allocation (server signs as seller)
+ *    c. Withdraw buyer's self-allocation (server signs as buyer)
+ *    d. Create 2-leg allocation: seller→buyer (base), buyer→seller (quote)
+ *       (server signs for both parties)
+ *    e. Execute allocation (operator as executor — no user key needed)
  *    f. FillOrder on both Canton contracts
  *    g. Create Trade record, trigger stop-loss, broadcast via WebSocket
  *
- * Order placement: allocation sender=user, receiver=operator, executor=operator
- * Settlement: operator-only (no user signature, no ext-* submission)
+ * Order placement: self-allocation (sender=receiver=user)
+ * Settlement: server signs using stored keys — instant, no manual interaction
+ * Token flow: user-to-user ONLY — operator NEVER holds tokens
  *
  * @see backend/docs/clientchat.txt
  * @see https://docs.sync.global/app_dev/api/splice-api-token-allocation-v1/
@@ -83,6 +85,16 @@ class MatchingEngine {
     // ═══ Global CONTRACT_NOT_FOUND blacklist ═══
     // Track allocation CIDs that returned CONTRACT_NOT_FOUND — never retry them.
     this._archivedAllocationCids = new Set();
+
+    // ═══ Settled order IDs — prevents post-settlement re-match race ═══
+    // After FillOrder, Canton archives the old contract and creates a new one with a
+    // different contractId. The streaming model may briefly show the new contract as
+    // an OPEN order. The matchKey guard (which uses contractId) won't catch it because
+    // the contractId changed. This set tracks orderIds that have been successfully
+    // settled, so they are excluded from matching even if the streaming model still
+    // shows them.  Entries expire after 60s (more than enough for Canton to propagate).
+    this._settledOrderIds = new Map(); // orderId → timestamp
+    this._SETTLED_ORDER_TTL = 60000;
   }
 
   async getAdminToken() {
@@ -402,28 +414,6 @@ class MatchingEngine {
       
       if (!rawOrders || rawOrders.length === 0) return false;
 
-      // ═══ ROOT CAUSE FIX: DB-backed pending settlement filter ═══
-      // Load all order IDs that already have an active PendingSettlement.
-      // This survives backend restarts (unlike in-memory eviction).
-      // Orders with active settlements are excluded from matching entirely.
-      const { getDb } = require('./db');
-      let pendingOrderIds = new Set();
-      try {
-        const activeSettlements = await getDb().pendingSettlement.findMany({
-          where: { status: { in: ['PENDING_WITHDRAW', 'PENDING_MULTILEG', 'PENDING_EXECUTE'] } },
-          select: { sellOrderId: true, buyOrderId: true },
-        });
-        for (const s of activeSettlements) {
-          if (s.sellOrderId) pendingOrderIds.add(s.sellOrderId);
-          if (s.buyOrderId) pendingOrderIds.add(s.buyOrderId);
-        }
-        if (pendingOrderIds.size > 0) {
-          console.log(`[MatchingEngine] Excluding ${pendingOrderIds.size} order(s) with active pending settlements`);
-        }
-      } catch (dbErr) {
-        console.warn(`[MatchingEngine] PendingSettlement lookup failed (proceeding without filter): ${dbErr.message}`);
-      }
-
       const buyOrders = [];
       const sellOrders = [];
 
@@ -434,8 +424,6 @@ class MatchingEngine {
       for (const payload of rawOrders) {
         if (payload.status !== 'OPEN') continue;
         if (this.invalidSettlementContracts.has(payload.contractId)) continue;
-        // Skip orders already in active settlement (DB-backed, survives restarts)
-        if (payload.orderId && pendingOrderIds.has(payload.orderId)) continue;
 
         // Pre-filter: evict orders whose allocations are guaranteed to be expired.
         // BUY locks quote asset; SELL locks base asset.
@@ -612,13 +600,24 @@ class MatchingEngine {
         this.recentlyMatchedOrders.delete(key);
       }
     }
-    
+    // Clear expired entries from settledOrderIds
+    for (const [oid, ts] of this._settledOrderIds) {
+      if (now - ts > this._SETTLED_ORDER_TTL) {
+        this._settledOrderIds.delete(oid);
+      }
+    }
+
     for (const buyOrder of buyOrders) {
       for (const sellOrder of sellOrders) {
         if (buyOrder.remaining <= 0 || sellOrder.remaining <= 0) continue;
 
         // Self-trade: allowed — market handles it
         // No blocking — same-owner orders can match normally
+
+        // Skip orders that were already settled (prevents post-FillOrder re-match race)
+        if (this._settledOrderIds.has(buyOrder.orderId) || this._settledOrderIds.has(sellOrder.orderId)) {
+          continue;
+        }
 
         // Skip recently matched order pairs
         const matchKey = `${buyOrder.contractId}::${sellOrder.contractId}`;
@@ -674,6 +673,13 @@ class MatchingEngine {
         try {
           await this.executeMatch(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, token);
           console.log(`[MatchingEngine] ✅ Match executed successfully via Allocation API`);
+          // Mark both order IDs as settled — prevents re-match even if streaming
+          // model briefly shows them with a new contractId after FillOrder.
+          this._settledOrderIds.set(buyOrder.orderId, Date.now());
+          this._settledOrderIds.set(sellOrder.orderId, Date.now());
+          // Also blacklist their allocation CIDs
+          if (buyOrder.allocationContractId) this._archivedAllocationCids.add(buyOrder.allocationContractId);
+          if (sellOrder.allocationContractId) this._archivedAllocationCids.add(sellOrder.allocationContractId);
           // Reset circuit breaker on success
           this._consecutiveSettlementFailures = 0;
           // Update remaining quantities in-place for batch execution.
@@ -885,78 +891,322 @@ class MatchingEngine {
     const sellIsPartial = new Decimal(sellOrder.remaining).gt(matchQty);
 
     // ═══════════════════════════════════════════════════════════════════
-    // SETTLEMENT — TradingApp pattern (client requirement)
-    // Self-allocations at order placement (sender=receiver=user). At match:
-    // Withdraw self-allocations → create 2-leg (seller→buyer, buyer→seller) → execute.
+    // SETTLEMENT — Server-side auto-settlement (client requirement)
+    //
+    // Architecture: Self-allocations at order placement (sender=receiver=user).
+    // At match time, SERVER settles instantly using stored signing keys:
+    //   Step 1: Withdraw seller's self-allocation (server signs with seller's key)
+    //   Step 2: Withdraw buyer's self-allocation (server signs with buyer's key)
+    //   Step 3: Create 2-leg allocation (seller→buyer base, buyer→seller quote)
+    //           Server signs for BOTH parties using stored keys
+    //   Step 4: Execute both allocation legs (operator-only, no user key needed)
+    //   Step 5: FillOrder on Canton + record trade
+    //
     // Tokens flow user-to-user ONLY. Operator NEVER holds tokens.
+    // User signs ONCE at order placement. Server reuses stored key for settlement.
+    // Same proven pattern as autoAcceptService._autoAcceptTransfer().
     // ═══════════════════════════════════════════════════════════════════
-    console.log(`[MatchingEngine] ═══ Settlement (TradingApp — user-to-user, no operator custody) ═══`);
+    console.log(`[MatchingEngine] ═══ Settlement (server-side auto-settle — user-to-user) ═══`);
     console.log(`[MatchingEngine]    Trade: ${matchQtyStr} ${baseSymbol} @ ${matchPrice} ${quoteSymbol}`);
-    console.log(`[MatchingEngine]    Seller alloc: ${sellOrder.allocationContractId?.substring(0, 24) || 'MISSING'}... (${baseSymbol})`);
-    console.log(`[MatchingEngine]    Buyer alloc:  ${buyOrder.allocationContractId?.substring(0, 24) || 'MISSING'}... (${quoteSymbol})`);
+    console.log(`[MatchingEngine]    Seller: ${sellOrder.owner.substring(0, 30)}... alloc: ${sellOrder.allocationContractId?.substring(0, 24) || 'MISSING'}...`);
+    console.log(`[MatchingEngine]    Buyer:  ${buyOrder.owner.substring(0, 30)}... alloc: ${buyOrder.allocationContractId?.substring(0, 24) || 'MISSING'}...`);
 
     if (!sellOrder.allocationContractId || !buyOrder.allocationContractId) {
       throw new Error('Settlement aborted: missing allocation on one or both orders');
     }
 
     const tradeId = `trade-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
+    const sdkClient = getCantonSDKClient();
+    const userRegistry = require('../state/userRegistry');
+    const { signHash } = require('./serverSigner');
 
-    // TradingApp pattern: create pending settlement, both parties sign at match time.
-    // This is the ONLY settlement path — no fallback to operator-as-receiver.
-    // Client requirement: tokens flow only between users, operator never holds tokens.
-    const tradingAppSettlement = require('./tradingAppSettlementService');
-    await tradingAppSettlement.createPendingSettlement({
-      tradeId,
-      tradingPair,
-      sellerPartyId: sellOrder.owner,
-      buyerPartyId: buyOrder.owner,
-      sellOrderId: sellOrder.orderId,
-      buyOrderId: buyOrder.orderId,
-      sellOrderContractId: sellOrder.contractId,
-      buyOrderContractId: buyOrder.contractId,
-      sellOrderTemplateId: sellOrder.templateId,
-      buyOrderTemplateId: buyOrder.templateId,
-      sellOrderRemaining: sellOrder.remaining != null ? String(sellOrder.remaining) : null,
-      buyOrderRemaining: buyOrder.remaining != null ? String(buyOrder.remaining) : null,
-      sellIsPartial,
-      buyIsPartial,
-      matchPrice: matchPrice.toString(),
-      sellAllocCid: sellOrder.allocationContractId,
-      buyAllocCid: buyOrder.allocationContractId,
+    // ═══ Step 0: Retrieve stored signing keys for both parties ═══
+    const sellerKey = await userRegistry.getSigningKey(sellOrder.owner);
+    const buyerKey = await userRegistry.getSigningKey(buyOrder.owner);
+    if (!sellerKey?.keyBase64 || !sellerKey?.fingerprint) {
+      throw new Error(`SIGNING_KEY_MISSING: No stored signing key for seller ${sellOrder.owner.substring(0, 30)}...`);
+    }
+    if (!buyerKey?.keyBase64 || !buyerKey?.fingerprint) {
+      throw new Error(`SIGNING_KEY_MISSING: No stored signing key for buyer ${buyOrder.owner.substring(0, 30)}...`);
+    }
+    console.log(`[MatchingEngine]    ✅ Signing keys retrieved for both parties`);
+
+    const adminToken = await tokenProvider.getServiceToken();
+    const updateIds = [];
+
+    // ═══ Step 1: Withdraw seller's self-allocation (server signs as seller) ═══
+    console.log(`[MatchingEngine]    Step 1: Withdrawing seller's self-allocation (${baseSymbol})...`);
+    const sellerWithdrawPrep = await sdkClient.prepareWithdrawInteractive(
+      sellOrder.allocationContractId, sellOrder.owner, baseSymbol, adminToken
+    );
+    const sellerWithdrawSig = await signHash(sellerKey.keyBase64, sellerWithdrawPrep.preparedTransactionHash);
+    const sellerWithdrawResult = await cantonService.executeInteractiveSubmission({
+      preparedTransaction: sellerWithdrawPrep.preparedTransaction,
+      partySignatures: {
+        signatures: [{
+          party: sellOrder.owner,
+          signatures: [{
+            format: 'SIGNATURE_FORMAT_RAW',
+            signature: sellerWithdrawSig,
+            signedBy: sellerKey.fingerprint,
+            signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
+          }],
+        }],
+      },
+      hashingSchemeVersion: sellerWithdrawPrep.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
+    }, adminToken);
+    const uid1 = sellerWithdrawResult?.transaction?.updateId || sellerWithdrawResult?.updateId;
+    if (uid1) updateIds.push({ step: 'seller-withdraw', updateId: uid1 });
+    console.log(`[MatchingEngine]    ✅ Seller allocation withdrawn`);
+
+    // ═══ Step 2: Withdraw buyer's self-allocation (server signs as buyer) ═══
+    console.log(`[MatchingEngine]    Step 2: Withdrawing buyer's self-allocation (${quoteSymbol})...`);
+    const buyerWithdrawPrep = await sdkClient.prepareWithdrawInteractive(
+      buyOrder.allocationContractId, buyOrder.owner, quoteSymbol, adminToken
+    );
+    const buyerWithdrawSig = await signHash(buyerKey.keyBase64, buyerWithdrawPrep.preparedTransactionHash);
+    const buyerWithdrawResult = await cantonService.executeInteractiveSubmission({
+      preparedTransaction: buyerWithdrawPrep.preparedTransaction,
+      partySignatures: {
+        signatures: [{
+          party: buyOrder.owner,
+          signatures: [{
+            format: 'SIGNATURE_FORMAT_RAW',
+            signature: buyerWithdrawSig,
+            signedBy: buyerKey.fingerprint,
+            signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
+          }],
+        }],
+      },
+      hashingSchemeVersion: buyerWithdrawPrep.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
+    }, adminToken);
+    const uid2 = buyerWithdrawResult?.transaction?.updateId || buyerWithdrawResult?.updateId;
+    if (uid2) updateIds.push({ step: 'buyer-withdraw', updateId: uid2 });
+    console.log(`[MatchingEngine]    ✅ Buyer allocation withdrawn`);
+
+    // ═══ Step 3: Create two separate allocations (Splice supports 1 leg per allocation) ═══
+    // Leg A: seller→buyer (base token) — seller signs
+    // Leg B: buyer→seller (quote token) — buyer signs
+    console.log(`[MatchingEngine]    Step 3a: Creating allocation seller→buyer (${matchQtyStr} ${baseSymbol})...`);
+    const legABuild = await sdkClient.buildAllocationInteractiveCommand(
+      sellOrder.owner,   // sender = seller
+      buyOrder.owner,    // receiver = buyer
+      matchQtyStr,
       baseSymbol,
-      quoteSymbol,
-      matchQty: matchQtyStr,
-      quoteAmount: quoteAmountStr,
+      operatorPartyId,   // executor = operator
+      `${tradeId}-leg-base`
+    );
+    if (!legABuild?.command) throw new Error('Failed to build seller→buyer allocation command');
+    const legAPrep = await cantonService.prepareInteractiveSubmission({
+      token: adminToken,
+      actAsParty: [sellOrder.owner],
+      commands: [legABuild.command],
+      readAs: [...new Set([sellOrder.owner, buyOrder.owner, operatorPartyId])],
+      synchronizerId: legABuild.synchronizerId || synchronizerId,
+      disclosedContracts: legABuild.disclosedContracts || [],
     });
-    console.log(`[MatchingEngine] ═══ TradingApp: Pending settlement ${tradeId} — both parties must sign ═══`);
+    const legASig = await signHash(sellerKey.keyBase64, legAPrep.preparedTransactionHash);
+    const legAResult = await cantonService.executeInteractiveSubmission({
+      preparedTransaction: legAPrep.preparedTransaction,
+      partySignatures: {
+        signatures: [{
+          party: sellOrder.owner,
+          signatures: [{
+            format: 'SIGNATURE_FORMAT_RAW',
+            signature: legASig,
+            signedBy: sellerKey.fingerprint,
+            signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
+          }],
+        }],
+      },
+      hashingSchemeVersion: legAPrep.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
+    }, adminToken);
+    // Extract allocation CID from leg A — try response events first, then ACS query
+    let legAAllocCid = this._extractAllocCidFromResult(legAResult);
+    const uid3a = legAResult?.transaction?.updateId || legAResult?.updateId;
+    if (uid3a) updateIds.push({ step: 'alloc-seller-to-buyer', updateId: uid3a });
+    if (!legAAllocCid) {
+      console.log(`[MatchingEngine]    ⏳ CID not in execute response — querying ACS for seller→buyer allocation...`);
+      legAAllocCid = await this._findAllocationByACS(operatorPartyId, sellOrder.owner, buyOrder.owner, adminToken);
+    }
+    if (!legAAllocCid) throw new Error('SELLER_ALLOCATION_FAILED: Could not find seller→buyer allocation CID after creation');
+    console.log(`[MatchingEngine]    ✅ Seller→Buyer allocation created: ${legAAllocCid.substring(0, 24)}...`);
 
-    // ═══ CRITICAL: Evict matched orders from streaming read model ═══
-    // Without this, the 30s recentlyMatchedOrders TTL expires and the
-    // engine re-matches the same orders, creating duplicate PendingSettlements.
-    // For full fills: evict entirely. For partial fills: update remaining in-place
-    // (the streaming model will reflect the new remaining on next refresh).
+    console.log(`[MatchingEngine]    Step 3b: Creating allocation buyer→seller (${quoteAmountStr} ${quoteSymbol})...`);
+    const legBBuild = await sdkClient.buildAllocationInteractiveCommand(
+      buyOrder.owner,    // sender = buyer
+      sellOrder.owner,   // receiver = seller
+      quoteAmountStr,
+      quoteSymbol,
+      operatorPartyId,   // executor = operator
+      `${tradeId}-leg-quote`
+    );
+    if (!legBBuild?.command) throw new Error('Failed to build buyer→seller allocation command');
+    const legBPrep = await cantonService.prepareInteractiveSubmission({
+      token: adminToken,
+      actAsParty: [buyOrder.owner],
+      commands: [legBBuild.command],
+      readAs: [...new Set([sellOrder.owner, buyOrder.owner, operatorPartyId])],
+      synchronizerId: legBBuild.synchronizerId || synchronizerId,
+      disclosedContracts: legBBuild.disclosedContracts || [],
+    });
+    const legBSig = await signHash(buyerKey.keyBase64, legBPrep.preparedTransactionHash);
+    const legBResult = await cantonService.executeInteractiveSubmission({
+      preparedTransaction: legBPrep.preparedTransaction,
+      partySignatures: {
+        signatures: [{
+          party: buyOrder.owner,
+          signatures: [{
+            format: 'SIGNATURE_FORMAT_RAW',
+            signature: legBSig,
+            signedBy: buyerKey.fingerprint,
+            signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
+          }],
+        }],
+      },
+      hashingSchemeVersion: legBPrep.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
+    }, adminToken);
+    // Extract allocation CID from leg B — try response events first, then ACS query
+    let legBAllocCid = this._extractAllocCidFromResult(legBResult);
+    const uid3b = legBResult?.transaction?.updateId || legBResult?.updateId;
+    if (uid3b) updateIds.push({ step: 'alloc-buyer-to-seller', updateId: uid3b });
+    if (!legBAllocCid) {
+      console.log(`[MatchingEngine]    ⏳ CID not in execute response — querying ACS for buyer→seller allocation...`);
+      const excludeSet = new Set(legAAllocCid ? [legAAllocCid] : []);
+      legBAllocCid = await this._findAllocationByACS(operatorPartyId, buyOrder.owner, sellOrder.owner, adminToken, excludeSet);
+    }
+    if (!legBAllocCid) throw new Error('BUYER_ALLOCATION_FAILED: Could not find buyer→seller allocation CID after creation');
+    console.log(`[MatchingEngine]    ✅ Buyer→Seller allocation created: ${legBAllocCid.substring(0, 24)}...`);
+
+    // ═══ Step 4: Execute both allocations (operator-only, no user key needed) ═══
+    // Both CIDs are guaranteed non-null (Step 3 throws if not found).
+    console.log(`[MatchingEngine]    Step 4: Executing both allocations (operator as executor)...`);
+    const execA = await sdkClient.tryRealAllocationExecution(
+      legAAllocCid, operatorPartyId, baseSymbol, sellOrder.owner, buyOrder.owner
+    );
+    const uid4a = execA?.transaction?.updateId || execA?.updateId;
+    if (uid4a) updateIds.push({ step: 'exec-seller-to-buyer', updateId: uid4a });
+    console.log(`[MatchingEngine]    ✅ ${baseSymbol} transferred: seller → buyer`);
+
+    const execB = await sdkClient.tryRealAllocationExecution(
+      legBAllocCid, operatorPartyId, quoteSymbol, buyOrder.owner, sellOrder.owner
+    );
+    const uid4b = execB?.transaction?.updateId || execB?.updateId;
+    if (uid4b) updateIds.push({ step: 'exec-buyer-to-seller', updateId: uid4b });
+    console.log(`[MatchingEngine]    ✅ ${quoteSymbol} transferred: buyer → seller`);
+
+    // Log settlement verification
+    console.log(`[MatchingEngine] ✅ Settlement complete — tokens flowed user-to-user (no operator custody)`);
+    if (updateIds.length > 0) {
+      console.log(`[MatchingEngine]    UpdateIds for Canton Explorer verification:`);
+      for (const u of updateIds) {
+        console.log(`[MatchingEngine]      ${u.step}: ${u.updateId}`);
+      }
+    }
+
+    // ═══ Step 5: FillOrder on Canton + record trade ═══
     const streaming = this._getStreamingModel();
-    if (!buyIsPartial) {
-      if (streaming) streaming.evictOrder(buyOrder.contractId);
-      if (buyOrder.allocationContractId) this._archivedAllocationCids.add(buyOrder.allocationContractId);
-      console.log(`[MatchingEngine]    Evicted fully-matched BUY order from read model`);
-    }
-    if (!sellIsPartial) {
-      if (streaming) streaming.evictOrder(sellOrder.contractId);
-      if (sellOrder.allocationContractId) this._archivedAllocationCids.add(sellOrder.allocationContractId);
-      console.log(`[MatchingEngine]    Evicted fully-matched SELL order from read model`);
+
+    // FillOrder on both orders
+    console.log(`[MatchingEngine]    Step 5: Filling orders on-chain...`);
+    const fillOrder = async (order, side) => {
+      try {
+        await cantonService.exerciseChoice({
+          token: adminToken,
+          actAsParty: [operatorPartyId],
+          templateId: order.templateId || `${packageId}:Order:Order`,
+          contractId: order.contractId,
+          choice: 'FillOrder',
+          choiceArgument: {
+            fillQuantity: matchQtyStr,
+            newAllocationCid: null,
+          },
+          readAs: [operatorPartyId, order.owner],
+        });
+        console.log(`[MatchingEngine]    ✅ ${side} order filled: ${order.orderId}`);
+        if (streaming) streaming.evictOrder(order.contractId);
+      } catch (fillErr) {
+        const msg = fillErr.message || '';
+        if (msg.includes('CONTRACT_NOT_FOUND') || msg.includes('already filled') || msg.includes('INACTIVE_CONTRACTS')) {
+          console.warn(`[MatchingEngine]    ${side} FillOrder skipped (contract finalized): ${msg.substring(0, 80)}`);
+          if (streaming) streaming.evictOrder(order.contractId);
+        } else {
+          console.warn(`[MatchingEngine]    ⚠️ ${side} FillOrder failed (non-critical): ${msg.substring(0, 100)}`);
+        }
+      }
+    };
+    await fillOrder(buyOrder, 'Buy');
+    await fillOrder(sellOrder, 'Sell');
+
+    // Record trade in PostgreSQL
+    try {
+      const { recordTradeSettlement, isTradeRecorded } = require('./tradeSettlementService');
+      const alreadyRecorded = await isTradeRecorded(tradeId);
+      if (!alreadyRecorded) {
+        await recordTradeSettlement({
+          tradeId,
+          buyer: buyOrder.owner,
+          seller: sellOrder.owner,
+          baseSymbol,
+          quoteSymbol,
+          baseAmount: matchQtyStr,
+          quoteAmount: quoteAmountStr,
+          price: matchPrice,
+          tradingPair,
+          buyOrderId: buyOrder.orderId,
+          sellOrderId: sellOrder.orderId,
+          sellerUsedRealTransfer: true,
+          buyerUsedRealTransfer: true,
+        });
+      }
+    } catch (tsErr) {
+      console.warn(`[MatchingEngine] ⚠️ TradeSettlement recording failed (non-critical): ${tsErr.message}`);
     }
 
-    if (global.broadcastWebSocket) {
-      global.broadcastWebSocket(`settlement:${sellOrder.owner}`, { type: 'PENDING_SIGNATURE', matchId: tradeId, role: 'seller' });
-      global.broadcastWebSocket(`settlement:${buyOrder.owner}`, { type: 'PENDING_SIGNATURE', matchId: tradeId, role: 'buyer' });
+    // Release balance reservations
+    try {
+      const { releasePartialReservation } = require('./order-service');
+      await releasePartialReservation(sellOrder.orderId, matchQtyStr);
+      await releasePartialReservation(buyOrder.orderId, quoteAmountStr);
+    } catch (_) { /* non-critical */ }
+
+    // Create Trade record on Canton
+    let tradeContractId = null;
+    try {
+      const tradeTemplateId = `${packageId}:Settlement:Trade`;
+      const tradeResult = await cantonService.createContractWithTransaction({
+        token: adminToken,
+        actAsParty: operatorPartyId,
+        templateId: tradeTemplateId,
+        createArguments: {
+          tradeId,
+          operator: operatorPartyId,
+          buyer: buyOrder.owner,
+          seller: sellOrder.owner,
+          baseInstrumentId: { issuer: operatorPartyId, symbol: baseSymbol, version: '1.0' },
+          quoteInstrumentId: { issuer: operatorPartyId, symbol: quoteSymbol, version: '1.0' },
+          baseAmount: matchQtyStr,
+          quoteAmount: quoteAmountStr,
+          price: matchPrice.toString(),
+          buyOrderId: buyOrder.orderId,
+          sellOrderId: sellOrder.orderId,
+          timestamp: new Date().toISOString(),
+        },
+        readAs: [operatorPartyId, buyOrder.owner, sellOrder.owner],
+        synchronizerId,
+      });
+      const events = tradeResult?.transaction?.events || [];
+      for (const event of events) {
+        const created = event.created || event.CreatedEvent;
+        if (created?.contractId) { tradeContractId = created.contractId; break; }
+      }
+      console.log(`[MatchingEngine]    ✅ Trade record: ${tradeContractId?.substring(0, 25)}...`);
+    } catch (tradeErr) {
+      console.warn(`[MatchingEngine]    ⚠️ Trade record creation failed (non-critical): ${tradeErr.message}`);
+      tradeContractId = tradeId;
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // STEP 4: Trigger stop-loss checks at the new trade price
-    // After every successful trade, check if any stop-loss orders
-    // should be triggered by the new price.
-    // ═══════════════════════════════════════════════════════════════════
+    // ═══ STEP 6: Trigger stop-loss checks at the new trade price ═══
     try {
       const { getStopLossService } = require('./stopLossService');
       const stopLossService = getStopLossService();
@@ -965,12 +1215,9 @@ class MatchingEngine {
       console.warn(`[MatchingEngine] ⚠️ Stop-loss trigger check failed (non-critical): ${slErr.message}`);
     }
 
-    // ═══════════════════════════════════════════════════
-    // FINAL: Broadcast match via WebSocket
-    // Trade record + FillOrder happen after both parties sign (in tradingAppSettlementService)
-    // ═══════════════════════════════════════════════════
+    // ═══ FINAL: Broadcast completed trade via WebSocket ═══
     const tradeRecord = {
-      tradeId,
+      tradeId: tradeContractId || tradeId,
       tradingPair,
       buyer: buyOrder.owner,
       seller: sellOrder.owner,
@@ -979,27 +1226,143 @@ class MatchingEngine {
       buyOrderId: buyOrder.orderId,
       sellOrderId: sellOrder.orderId,
       timestamp: new Date().toISOString(),
-      settlementType: 'TradingApp',
-      status: 'PENDING_SIGNATURE',
+      settlementType: 'ServerAutoSettle',
       instrumentAllocationId: sellOrder.allocationContractId || null,
       paymentAllocationId: buyOrder.allocationContractId || null,
+      updateIds: updateIds.map(u => u.updateId),
     };
 
     if (global.broadcastWebSocket) {
-      global.broadcastWebSocket(`trades:${tradingPair}`, { type: 'MATCH_PENDING', ...tradeRecord });
-      global.broadcastWebSocket('trades:all', { type: 'MATCH_PENDING', ...tradeRecord });
+      global.broadcastWebSocket(`trades:${tradingPair}`, { type: 'NEW_TRADE', ...tradeRecord });
+      global.broadcastWebSocket('trades:all', { type: 'NEW_TRADE', ...tradeRecord });
       global.broadcastWebSocket(`orderbook:${tradingPair}`, {
-        type: 'TRADE_MATCHED',
+        type: 'TRADE_EXECUTED',
         buyOrderId: buyOrder.orderId,
         sellOrderId: sellOrder.orderId,
         fillQuantity: matchQtyStr,
         fillPrice: matchPrice,
-        status: 'PENDING_SIGNATURE',
       });
+      global.broadcastWebSocket(`balance:${buyOrder.owner}`, { type: 'BALANCE_UPDATE', partyId: buyOrder.owner, timestamp: Date.now() });
+      global.broadcastWebSocket(`balance:${sellOrder.owner}`, { type: 'BALANCE_UPDATE', partyId: sellOrder.owner, timestamp: Date.now() });
     }
 
-    console.log(`[MatchingEngine] ═══ Match complete (pending signature): ${matchQtyStr} ${baseSymbol} @ ${matchPrice} ${quoteSymbol} (TradingApp) ═══`);
-    return { tradeId, status: 'PENDING_SIGNATURE', message: 'Both parties must sign to complete settlement' };
+    console.log(`[MatchingEngine] ═══ Trade complete: ${matchQtyStr} ${baseSymbol} @ ${matchPrice} ${quoteSymbol} (user-to-user, server-signed) ═══`);
+  }
+
+  /**
+   * Extract allocation CID from an executeInteractiveSubmission result.
+   * The Canton v2 execute endpoint may or may not return transaction events.
+   */
+  _extractAllocCidFromResult(result) {
+    if (!result) return null;
+    // Try standard event paths
+    const events = result?.transaction?.events || result?.events || [];
+    for (const event of events) {
+      const created = event.created || event.CreatedEvent?.value || event.CreatedEvent;
+      if (created?.contractId) {
+        const tpl = created.templateId || '';
+        if (tpl.includes('Allocation') && !tpl.includes('AllocationFactory')) {
+          return created.contractId;
+        }
+      }
+    }
+    // Try deep search (Canton may nest events differently)
+    const stack = [result];
+    const visited = new Set();
+    while (stack.length > 0) {
+      const current = stack.pop();
+      if (!current || typeof current !== 'object') continue;
+      if (visited.has(current)) continue;
+      visited.add(current);
+      // Look for allocationCid or allocationContractId fields
+      if (typeof current.allocationCid === 'string' && current.allocationCid.length > 20) return current.allocationCid;
+      if (typeof current.allocationContractId === 'string' && current.allocationContractId.length > 20) return current.allocationContractId;
+      if (Array.isArray(current)) {
+        for (const item of current) stack.push(item);
+      } else {
+        for (const key of Object.keys(current)) stack.push(current[key]);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Find a recently created Allocation contract by querying Canton.
+   * Used when executeInteractiveSubmission doesn't return the CID in its response.
+   *
+   * Strategy:
+   * 1. SDK fetchPendingAllocations (uses proper allocation view, most reliable)
+   * 2. ACS query with Allocation interface as fallback
+   *
+   * @param {string} executorPartyId - The operator party (executor of the allocation)
+   * @param {string} senderPartyId - Sender of the allocation
+   * @param {string} receiverPartyId - Receiver of the allocation
+   * @param {string} adminToken - Admin bearer token
+   * @param {Set<string>} [excludeCids] - CIDs to exclude (already found for other legs)
+   * @returns {Promise<string|null>} Allocation contract ID or null
+   */
+  async _findAllocationByACS(executorPartyId, senderPartyId, receiverPartyId, adminToken, excludeCids = null) {
+    const { getCantonSDKClient } = require('./canton-sdk-client');
+    const sdkClient = getCantonSDKClient();
+
+    // ── Strategy 1: SDK pending allocations for sender ──
+    try {
+      const pending = await sdkClient.fetchPendingAllocations(senderPartyId);
+      if (pending?.length > 0) {
+        for (const row of pending) {
+          const cid = row?.contractId || row?.activeContract?.createdEvent?.contractId;
+          if (!cid) continue;
+          if (excludeCids?.has(cid)) continue;
+          console.log(`[MatchingEngine]    ✅ Found allocation via SDK pending view: ${cid.substring(0, 24)}...`);
+          return cid;
+        }
+      }
+    } catch (err) {
+      console.warn(`[MatchingEngine]    SDK pending allocations failed: ${err.message?.substring(0, 100)}`);
+    }
+
+    // ── Strategy 2: ACS query with Allocation interface ──
+    try {
+      const cantonService = require('./cantonService').getInstance();
+      const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
+      const result = await cantonService.queryActiveContracts({
+        party: executorPartyId,
+        interfaceIds: [ALLOCATION_INTERFACE],
+        verbose: true,
+        pageSize: 50,
+      }, adminToken);
+
+      const contracts = result?.activeContracts || result?.contracts || result || [];
+      // Search through contracts — try to match sender/receiver from payload or interface view
+      for (const contract of contracts) {
+        const created = contract.createdEvent || contract;
+        const cid = created?.contractId;
+        if (!cid || excludeCids?.has(cid)) continue;
+        // Check interface view and create arguments for sender/receiver hints
+        const view = created?.interfaceViews?.[0]?.viewValue || created?.interfaceViewValue || {};
+        const payload = created?.createArguments || created?.createArgument || created?.payload || {};
+        const jsonStr = JSON.stringify({ ...payload, ...view });
+        if (jsonStr.includes(senderPartyId) && jsonStr.includes(receiverPartyId)) {
+          console.log(`[MatchingEngine]    ✅ Found allocation via ACS query: ${cid.substring(0, 24)}...`);
+          return cid;
+        }
+      }
+
+      // Fallback: return most recent allocation that isn't excluded
+      for (let i = contracts.length - 1; i >= 0; i--) {
+        const cid = contracts[i]?.createdEvent?.contractId || contracts[i]?.contractId;
+        if (cid && !excludeCids?.has(cid)) {
+          console.log(`[MatchingEngine]    ✅ Found allocation via ACS (latest): ${cid.substring(0, 24)}...`);
+          return cid;
+        }
+      }
+
+      console.warn(`[MatchingEngine]    ⚠️ ACS query returned ${contracts.length} allocations but none matched`);
+    } catch (err) {
+      console.error(`[MatchingEngine]    ❌ ACS allocation query failed: ${err.message?.substring(0, 150)}`);
+    }
+
+    return null;
   }
 
   setPollingInterval(ms) {
