@@ -3665,6 +3665,99 @@ class CantonSDKClient {
     }
   }
 
+  /**
+   * Execute Allocation_ExecuteTransfer via registry API + non-interactive submission.
+   *
+   * This bypasses the SDK (which silently returns without committing) and goes
+   * directly through the token-type-specific registry to get the choice context,
+   * then uses cantonService.exerciseChoice (submit-and-wait-for-transaction).
+   *
+   * The executor (operator) is the only actAs party — non-interactive works because
+   * the participant holds the operator's keys.
+   *
+   * @param {string} allocationContractId - The Allocation contract to execute
+   * @param {string} executorPartyId - The exchange operator (executor)
+   * @param {string} symbol - Token symbol (CC, CBTC) for registry routing
+   * @param {string[]} readAsParties - Parties for readAs (operator + both users)
+   * @param {string} synchronizerId - Resolved synchronizer ID
+   * @returns {Promise<object>} Transaction result with updateId
+   */
+  async executeAllocationTransferDirect(allocationContractId, executorPartyId, symbol, readAsParties, synchronizerId) {
+    const adminToken = await tokenProvider.getServiceToken();
+    const tokenSystemType = getTokenSystemType(symbol);
+    const adminParty = this.getInstrumentAdminForSymbol(symbol);
+    const encodedCid = encodeURIComponent(allocationContractId);
+
+    // Route to correct registry based on token type
+    const executeContextUrl = tokenSystemType === 'utilities'
+      ? `${UTILITIES_CONFIG.TOKEN_STANDARD_URL}/v0/registrars/${encodeURIComponent(adminParty)}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`
+      : `${CANTON_SDK_CONFIG.REGISTRY_API_URL}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
+
+    console.log(`[CantonSDK] 🔄 ExecuteTransfer via registry for ${symbol} (${tokenSystemType})`);
+    console.log(`[CantonSDK]    Allocation: ${allocationContractId.substring(0, 30)}...`);
+    console.log(`[CantonSDK]    Registry: ${executeContextUrl.substring(0, 100)}...`);
+
+    // Fetch choice context from registry — retry up to 3 times (allocation may take
+    // a moment to appear in the registry after being created on Canton).
+    let context;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const resp = await getRegistryApi().post(executeContextUrl, { excludeDebugFields: true }, {
+          headers: { Authorization: `Bearer ${adminToken}`, Accept: 'application/json' },
+        });
+        context = resp.data;
+        break;
+      } catch (registryErr) {
+        const msg = String(registryErr?.message || '');
+        const status = registryErr?.response?.status;
+        if (status === 404 && attempt < 3) {
+          console.warn(`[CantonSDK]    Registry 404 on attempt ${attempt}/3 — allocation may not be indexed yet, retrying in 2s...`);
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
+        }
+        console.error(`[CantonSDK] ❌ Registry choice-context fetch failed for ${symbol}: ${msg.substring(0, 200)}`);
+        throw new Error(`ExecuteTransfer registry context failed for ${symbol}: ${msg.substring(0, 200)}`);
+      }
+    }
+
+    if (!context) {
+      throw new Error(`ExecuteTransfer registry context not available after 3 attempts for ${symbol}`);
+    }
+
+    const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
+
+    console.log(`[CantonSDK]    Executing Allocation_ExecuteTransfer (non-interactive, operator-only)...`);
+    const result = await cantonService.exerciseChoice({
+      token: adminToken,
+      actAsParty: [executorPartyId],
+      templateId: ALLOCATION_INTERFACE,
+      contractId: allocationContractId,
+      choice: 'Allocation_ExecuteTransfer',
+      choiceArgument: {
+        extraArgs: {
+          context: context.choiceContextData || { values: {} },
+          meta: { values: {} },
+        },
+      },
+      readAs: readAsParties,
+      synchronizerId,
+      disclosedContracts: (context.disclosedContracts || []).map(dc => ({
+        templateId: dc.templateId,
+        contractId: dc.contractId,
+        createdEventBlob: dc.createdEventBlob,
+        synchronizerId: dc.synchronizerId || synchronizerId,
+      })),
+    });
+
+    const updateId = result?.transaction?.updateId || null;
+    if (!updateId) {
+      throw new Error(`Allocation_ExecuteTransfer committed but no updateId — possible silent failure for ${symbol}`);
+    }
+    console.log(`[CantonSDK] ✅ Allocation_ExecuteTransfer committed on-chain (updateId: ${updateId})`);
+    if (result && !result.updateId) result.updateId = updateId;
+    return result;
+  }
+
   // ═══════════════════════════════════════════════════════════════════════════
   // HOLDING CONTRACT VERIFICATION — Source of Truth
   // ═══════════════════════════════════════════════════════════════════════════

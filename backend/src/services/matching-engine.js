@@ -1025,12 +1025,13 @@ class MatchingEngine {
     let legAAllocCid = this._extractAllocCidFromResult(legAResult);
     const uid3a = legAResult?.transaction?.updateId || legAResult?.updateId;
     if (uid3a) updateIds.push({ step: 'alloc-seller-to-buyer', updateId: uid3a });
+    console.log(`[MatchingEngine]    Step 3a result — updateId: ${uid3a || 'N/A'}, extractedCid: ${legAAllocCid?.substring(0, 24) || 'null'}`);
     if (!legAAllocCid) {
       console.log(`[MatchingEngine]    ⏳ CID not in execute response — querying ACS for seller→buyer allocation...`);
       legAAllocCid = await this._findAllocationByACS(operatorPartyId, sellOrder.owner, buyOrder.owner, adminToken);
     }
     if (!legAAllocCid) throw new Error('SELLER_ALLOCATION_FAILED: Could not find seller→buyer allocation CID after creation');
-    console.log(`[MatchingEngine]    ✅ Seller→Buyer allocation created: ${legAAllocCid.substring(0, 24)}...`);
+    console.log(`[MatchingEngine]    ✅ Seller→Buyer allocation created: ${legAAllocCid.substring(0, 24)}... (updateId: ${uid3a || 'N/A'})`);
 
     console.log(`[MatchingEngine]    Step 3b: Creating allocation buyer→seller (${quoteAmountStr} ${quoteSymbol})...`);
     const legBBuild = await sdkClient.buildAllocationInteractiveCommand(
@@ -1070,30 +1071,35 @@ class MatchingEngine {
     let legBAllocCid = this._extractAllocCidFromResult(legBResult);
     const uid3b = legBResult?.transaction?.updateId || legBResult?.updateId;
     if (uid3b) updateIds.push({ step: 'alloc-buyer-to-seller', updateId: uid3b });
+    console.log(`[MatchingEngine]    Step 3b result — updateId: ${uid3b || 'N/A'}, extractedCid: ${legBAllocCid?.substring(0, 24) || 'null'}`);
     if (!legBAllocCid) {
       console.log(`[MatchingEngine]    ⏳ CID not in execute response — querying ACS for buyer→seller allocation...`);
       const excludeSet = new Set(legAAllocCid ? [legAAllocCid] : []);
       legBAllocCid = await this._findAllocationByACS(operatorPartyId, buyOrder.owner, sellOrder.owner, adminToken, excludeSet);
     }
     if (!legBAllocCid) throw new Error('BUYER_ALLOCATION_FAILED: Could not find buyer→seller allocation CID after creation');
-    console.log(`[MatchingEngine]    ✅ Buyer→Seller allocation created: ${legBAllocCid.substring(0, 24)}...`);
+    console.log(`[MatchingEngine]    ✅ Buyer→Seller allocation created: ${legBAllocCid.substring(0, 24)}... (updateId: ${uid3b || 'N/A'})`);
 
-    // ═══ Step 4: Execute both allocations (operator-only, no user key needed) ═══
-    // Both CIDs are guaranteed non-null (Step 3 throws if not found).
+    // ═══ Step 4: Execute both allocations (registry API + non-interactive) ═══
+    // Uses token-type-specific registry to get choice context, then
+    // cantonService.exerciseChoice (submit-and-wait-for-transaction).
+    // Operator is the only actAs party — no user signature needed.
     console.log(`[MatchingEngine]    Step 4: Executing both allocations (operator as executor)...`);
-    const execA = await sdkClient.tryRealAllocationExecution(
-      legAAllocCid, operatorPartyId, baseSymbol, sellOrder.owner, buyOrder.owner
+    const execReadAs = [...new Set([operatorPartyId, sellOrder.owner, buyOrder.owner])];
+
+    const execA = await sdkClient.executeAllocationTransferDirect(
+      legAAllocCid, operatorPartyId, baseSymbol, execReadAs, synchronizerId
     );
     const uid4a = execA?.transaction?.updateId || execA?.updateId;
     if (uid4a) updateIds.push({ step: 'exec-seller-to-buyer', updateId: uid4a });
-    console.log(`[MatchingEngine]    ✅ ${baseSymbol} transferred: seller → buyer`);
+    console.log(`[MatchingEngine]    ✅ ${baseSymbol} transferred: seller → buyer (updateId: ${uid4a})`);
 
-    const execB = await sdkClient.tryRealAllocationExecution(
-      legBAllocCid, operatorPartyId, quoteSymbol, buyOrder.owner, sellOrder.owner
+    const execB = await sdkClient.executeAllocationTransferDirect(
+      legBAllocCid, operatorPartyId, quoteSymbol, execReadAs, synchronizerId
     );
     const uid4b = execB?.transaction?.updateId || execB?.updateId;
     if (uid4b) updateIds.push({ step: 'exec-buyer-to-seller', updateId: uid4b });
-    console.log(`[MatchingEngine]    ✅ ${quoteSymbol} transferred: buyer → seller`);
+    console.log(`[MatchingEngine]    ✅ ${quoteSymbol} transferred: buyer → seller (updateId: ${uid4b})`);
 
     // Log settlement verification
     console.log(`[MatchingEngine] ✅ Settlement complete — tokens flowed user-to-user (no operator custody)`);
