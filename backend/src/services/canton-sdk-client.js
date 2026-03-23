@@ -1484,6 +1484,10 @@ class CantonSDKClient {
         synchronizerId: dc.synchronizerId || synchronizerId,
       })),
       synchronizerId,
+      // Pass through the choiceContextData (contains amulet-rules for CC tokens).
+      // The execute step needs this same context but the registry may not have
+      // indexed the newly created allocation yet — so we capture it here.
+      choiceContextData: factory.choiceContext?.choiceContextData || null,
     };
   }
 
@@ -2353,7 +2357,7 @@ class CantonSDKClient {
    * @param {string} synchronizerId - Resolved synchronizer ID
    * @returns {Object} Execute result with transaction/updateId
    */
-  async executeAllocationInteractive(allocationContractId, executorPartyId, symbol, adminToken, ownerPartyId, receiverPartyId, synchronizerId) {
+  async executeAllocationInteractive(allocationContractId, executorPartyId, symbol, adminToken, ownerPartyId, receiverPartyId, synchronizerId, options = {}) {
     console.log(`[CantonSDK] 🔐 Interactive settlement for external party allocation`);
     console.log(`[CantonSDK]    Allocation: ${allocationContractId.substring(0, 30)}...`);
     console.log(`[CantonSDK]    Owner (ext): ${ownerPartyId?.substring(0, 30)}...`);
@@ -2391,22 +2395,71 @@ class CantonSDKClient {
     const readAsParties = [...new Set([executorPartyId, ownerPartyId, receiverPartyId].filter(Boolean))];
 
     // ── 2. Build the ExerciseCommand for Allocation_ExecuteTransfer ───
+    const { creationDisclosedContracts = null, choiceContextData: passedContextData = null } = options;
     let commands = [];
     let disclosedContracts = [];
 
-    // Try SDK first to build the command (with disclosed contracts)
-    if (this.isReady() && this.sdk.tokenStandard && typeof this.sdk.tokenStandard.exerciseAllocationChoice === 'function') {
+    // PRIMARY PATH: If we have pre-extracted disclosed contracts from the creation tx,
+    // build the command directly — no SDK or registry needed for disclosure.
+    if (creationDisclosedContracts && creationDisclosedContracts.length > 0) {
+      const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
+
+      // Use choiceContextData from allocation creation step if available (contains amulet-rules).
+      // Otherwise try a single quick registry call.
+      let choiceContextData = passedContextData || { values: {} };
+      if (passedContextData) {
+        console.log(`[CantonSDK]    Using choiceContextData from allocation creation (amulet-rules included)`);
+      }
+
+      if (!passedContextData) {
+        // Try a single quick registry call for choice context (round/fee info)
+        try {
+          const tokenSystemType = getTokenSystemType(symbol);
+          const adminParty = this.getInstrumentAdminForSymbol(symbol);
+          const encodedCid = encodeURIComponent(allocationContractId);
+          const executeContextUrl = tokenSystemType === 'utilities'
+            ? `${UTILITIES_CONFIG.TOKEN_STANDARD_URL}/v0/registrars/${encodeURIComponent(adminParty)}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`
+            : `${CANTON_SDK_CONFIG.REGISTRY_API_URL}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
+          const resp = await getRegistryApi().post(executeContextUrl, { excludeDebugFields: true }, { timeout: 5000 });
+          if (resp.data?.choiceContextData) choiceContextData = resp.data.choiceContextData;
+        } catch (_) { /* registry not indexed yet — use passed context or empty */ }
+      }
+
+      commands = [{
+        ExerciseCommand: {
+          templateId: ALLOCATION_INTERFACE,
+          contractId: allocationContractId,
+          choice: 'Allocation_ExecuteTransfer',
+          choiceArgument: {
+            extraArgs: {
+              context: choiceContextData,
+              meta: { values: {} },
+            },
+          },
+        }
+      }];
+      disclosedContracts = creationDisclosedContracts.map(dc => ({
+        templateId: dc.templateId,
+        contractId: dc.contractId,
+        createdEventBlob: dc.createdEventBlob,
+        synchronizerId: dc.synchronizerId || synchronizerId,
+      }));
+      console.log(`[CantonSDK]    Built command with ${disclosedContracts.length} pre-extracted disclosed contract(s) — no registry dependency`);
+    }
+
+    // LEGACY: Try SDK to build the command (with disclosed contracts)
+    if (commands.length === 0 && this.isReady() && this.sdk.tokenStandard && typeof this.sdk.tokenStandard.exerciseAllocationChoice === 'function') {
       try {
         const commandBuilderPartyId = ownerPartyId || executorPartyId;
-        console.log(`[CantonSDK]    Building interactive command in context: ${commandBuilderPartyId.substring(0, 30)}...`);
-        
+        console.log(`[CantonSDK]    Building interactive command via SDK in context: ${commandBuilderPartyId.substring(0, 30)}...`);
+
         const result = await this._withPartyContext(commandBuilderPartyId, async () => {
           return await this.sdk.tokenStandard.exerciseAllocationChoice(
             allocationContractId,
             'ExecuteTransfer'
           );
         });
-        
+
         const [executeCmd, disclosed] = result;
         const rawCommands = Array.isArray(executeCmd) ? executeCmd : [executeCmd];
         commands = rawCommands.map(rawCmd => {
@@ -2437,16 +2490,19 @@ class CantonSDKClient {
       }
     }
 
-    // Fallback: build command from registry API
+    // LEGACY: build command from registry API (token-type-aware routing)
     if (commands.length === 0) {
-      const registryUrl = CANTON_SDK_CONFIG.REGISTRY_API_URL;
+      const tokenSystemType = getTokenSystemType(symbol);
+      const adminParty = this.getInstrumentAdminForSymbol(symbol);
       const encodedCid = encodeURIComponent(allocationContractId);
-      const executeContextUrl = `${registryUrl}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
-      
+      const executeContextUrl = tokenSystemType === 'utilities'
+        ? `${UTILITIES_CONFIG.TOKEN_STANDARD_URL}/v0/registrars/${encodeURIComponent(adminParty)}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`
+        : `${CANTON_SDK_CONFIG.REGISTRY_API_URL}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
+
       console.log(`[CantonSDK]    Fetching choice-context from registry: ${executeContextUrl}`);
       const { data: context } = await getRegistryApi().post(executeContextUrl, { excludeDebugFields: true });
       const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
-      
+
       commands = [{
         ExerciseCommand: {
           templateId: ALLOCATION_INTERFACE,
@@ -2978,9 +3034,14 @@ class CantonSDKClient {
     const adminToken = await tokenProvider.getServiceToken();
     const configRef = require('../config');
     const synchronizerId = configRef.canton.synchronizerId;
-    const registryUrl = CANTON_SDK_CONFIG.REGISTRY_API_URL;
     const encodedCid = encodeURIComponent(allocationContractId);
-    const withdrawContextUrl = `${registryUrl}/registry/allocations/v1/${encodedCid}/choice-contexts/withdraw`;
+
+    // Token-type-aware registry URL: CBTC → Utilities Backend, CC → Scan Proxy
+    const tokenSystemType = getTokenSystemType(symbol);
+    const adminParty = this.getInstrumentAdminForSymbol(symbol);
+    const withdrawContextUrl = tokenSystemType === 'utilities'
+      ? `${UTILITIES_CONFIG.TOKEN_STANDARD_URL}/v0/registrars/${encodeURIComponent(adminParty)}/registry/allocations/v1/${encodedCid}/choice-contexts/withdraw`
+      : `${CANTON_SDK_CONFIG.REGISTRY_API_URL}/registry/allocations/v1/${encodedCid}/choice-contexts/withdraw`;
 
     let contextData = { values: {} };
     let disclosed = [];
@@ -3666,94 +3727,170 @@ class CantonSDKClient {
   }
 
   /**
-   * Execute Allocation_ExecuteTransfer via registry API + non-interactive submission.
+   * Execute Allocation_ExecuteTransfer via non-interactive submission.
    *
-   * This bypasses the SDK (which silently returns without committing) and goes
-   * directly through the token-type-specific registry to get the choice context,
-   * then uses cantonService.exerciseChoice (submit-and-wait-for-transaction).
+   * ROOT CAUSE FIX: The operator is NOT a stakeholder on the LockedAmulet backing
+   * contract created by AllocationFactory_Allocate. Previously, we fetched the
+   * LockedAmulet as a disclosed contract from the Scan Proxy registry, but the
+   * registry has indexing lag for newly created contracts — causing 404 retries
+   * (8x, 24+ seconds) and token expiry.
    *
-   * The executor (operator) is the only actAs party — non-interactive works because
-   * the participant holds the operator's keys.
+   * Solution: The matching engine extracts createdEventBlob from the allocation
+   * creation transaction response and passes it here as creationDisclosedContracts.
+   * This gives Canton direct visibility of the LockedAmulet without registry.
    *
    * @param {string} allocationContractId - The Allocation contract to execute
    * @param {string} executorPartyId - The exchange operator (executor)
    * @param {string} symbol - Token symbol (CC, CBTC) for registry routing
    * @param {string[]} readAsParties - Parties for readAs (operator + both users)
    * @param {string} synchronizerId - Resolved synchronizer ID
+   * @param {object} [options] - Optional configuration
+   * @param {Array<{contractId, templateId, createdEventBlob, synchronizerId}>} [options.creationDisclosedContracts]
+   *   Pre-extracted disclosed contracts from the allocation creation tx (LockedAmulet etc.)
    * @returns {Promise<object>} Transaction result with updateId
    */
-  async executeAllocationTransferDirect(allocationContractId, executorPartyId, symbol, readAsParties, synchronizerId) {
+  async executeAllocationTransferDirect(allocationContractId, executorPartyId, symbol, readAsParties, synchronizerId, options = {}) {
+    const { creationDisclosedContracts = null, choiceContextData: passedContextData = null } = options;
     const adminToken = await tokenProvider.getServiceToken();
-    const tokenSystemType = getTokenSystemType(symbol);
-    const adminParty = this.getInstrumentAdminForSymbol(symbol);
-    const encodedCid = encodeURIComponent(allocationContractId);
-
-    // Route to correct registry based on token type
-    const executeContextUrl = tokenSystemType === 'utilities'
-      ? `${UTILITIES_CONFIG.TOKEN_STANDARD_URL}/v0/registrars/${encodeURIComponent(adminParty)}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`
-      : `${CANTON_SDK_CONFIG.REGISTRY_API_URL}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
-
-    console.log(`[CantonSDK] 🔄 ExecuteTransfer via registry for ${symbol} (${tokenSystemType})`);
-    console.log(`[CantonSDK]    Allocation: ${allocationContractId.substring(0, 30)}...`);
-    console.log(`[CantonSDK]    Registry: ${executeContextUrl.substring(0, 100)}...`);
-
-    // Fetch choice context from registry — retry up to 3 times (allocation may take
-    // a moment to appear in the registry after being created on Canton).
-    let context;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        const resp = await getRegistryApi().post(executeContextUrl, { excludeDebugFields: true }, {
-          headers: { Authorization: `Bearer ${adminToken}`, Accept: 'application/json' },
-        });
-        context = resp.data;
-        break;
-      } catch (registryErr) {
-        const msg = String(registryErr?.message || '');
-        const status = registryErr?.response?.status;
-        if (status === 404 && attempt < 3) {
-          console.warn(`[CantonSDK]    Registry 404 on attempt ${attempt}/3 — allocation may not be indexed yet, retrying in 2s...`);
-          await new Promise(r => setTimeout(r, 2000));
-          continue;
-        }
-        console.error(`[CantonSDK] ❌ Registry choice-context fetch failed for ${symbol}: ${msg.substring(0, 200)}`);
-        throw new Error(`ExecuteTransfer registry context failed for ${symbol}: ${msg.substring(0, 200)}`);
-      }
-    }
-
-    if (!context) {
-      throw new Error(`ExecuteTransfer registry context not available after 3 attempts for ${symbol}`);
-    }
-
     const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
 
-    console.log(`[CantonSDK]    Executing Allocation_ExecuteTransfer (non-interactive, operator-only)...`);
-    const result = await cantonService.exerciseChoice({
-      token: adminToken,
-      actAsParty: [executorPartyId],
-      templateId: ALLOCATION_INTERFACE,
-      contractId: allocationContractId,
-      choice: 'Allocation_ExecuteTransfer',
-      choiceArgument: {
-        extraArgs: {
-          context: context.choiceContextData || { values: {} },
-          meta: { values: {} },
-        },
-      },
-      readAs: readAsParties,
-      synchronizerId,
-      disclosedContracts: (context.disclosedContracts || []).map(dc => ({
-        templateId: dc.templateId,
-        contractId: dc.contractId,
-        createdEventBlob: dc.createdEventBlob,
-        synchronizerId: dc.synchronizerId || synchronizerId,
-      })),
-    });
+    console.log(`[CantonSDK] 🔄 ExecuteTransfer for ${symbol}`);
+    console.log(`[CantonSDK]    Allocation: ${allocationContractId.substring(0, 30)}...`);
 
-    const updateId = result?.transaction?.updateId || null;
-    if (!updateId) {
-      throw new Error(`Allocation_ExecuteTransfer committed but no updateId — possible silent failure for ${symbol}`);
+    let disclosedContracts;
+    let choiceContextData = { values: {} };
+
+    // Use choiceContextData passed from the allocation creation step if available.
+    // This contains amulet-rules for CC tokens — the registry won't have it yet
+    // because the newly created allocation hasn't been indexed.
+    if (passedContextData) {
+      choiceContextData = passedContextData;
+      console.log(`[CantonSDK]    Using choiceContextData from allocation creation (amulet-rules included)`);
     }
-    console.log(`[CantonSDK] ✅ Allocation_ExecuteTransfer committed on-chain (updateId: ${updateId})`);
+
+    if (creationDisclosedContracts && creationDisclosedContracts.length > 0) {
+      // ── PRIMARY PATH: Pre-extracted disclosed contracts from allocation creation tx ──
+      // The LockedAmulet createdEventBlob was captured directly from the
+      // AllocationFactory_Allocate response — no registry dependency.
+      console.log(`[CantonSDK]    Using ${creationDisclosedContracts.length} pre-extracted disclosed contract(s) — registry NOT needed for disclosure`);
+      disclosedContracts = creationDisclosedContracts;
+
+      // If we don't already have choiceContextData from the creation step,
+      // try a single quick registry call for choice context data (round/fee info).
+      if (!passedContextData) {
+        try {
+          const tokenSystemType = getTokenSystemType(symbol);
+          const adminParty = this.getInstrumentAdminForSymbol(symbol);
+          const encodedCid = encodeURIComponent(allocationContractId);
+          const executeContextUrl = tokenSystemType === 'utilities'
+            ? `${UTILITIES_CONFIG.TOKEN_STANDARD_URL}/v0/registrars/${encodeURIComponent(adminParty)}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`
+            : `${CANTON_SDK_CONFIG.REGISTRY_API_URL}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
+
+          const resp = await getRegistryApi().post(executeContextUrl, { excludeDebugFields: true }, {
+            headers: { Authorization: `Bearer ${adminToken}`, Accept: 'application/json' },
+            timeout: 5000,
+          });
+          if (resp.data?.choiceContextData) {
+            choiceContextData = resp.data.choiceContextData;
+            console.log(`[CantonSDK]    ✅ Got choice context from registry`);
+          }
+        } catch (ctxErr) {
+          // Registry may not have indexed yet — this is fine if we don't need amulet-rules
+          console.log(`[CantonSDK]    Registry context unavailable (${ctxErr?.response?.status || 'timeout'}) — proceeding with empty context`);
+        }
+      }
+    } else {
+      // ── LEGACY PATH: No pre-extracted contracts — must fetch everything from registry ──
+      console.log(`[CantonSDK]    No pre-extracted disclosed contracts — fetching from registry`);
+      const tokenSystemType = getTokenSystemType(symbol);
+      const adminParty = this.getInstrumentAdminForSymbol(symbol);
+      const encodedCid = encodeURIComponent(allocationContractId);
+      const executeContextUrl = tokenSystemType === 'utilities'
+        ? `${UTILITIES_CONFIG.TOKEN_STANDARD_URL}/v0/registrars/${encodeURIComponent(adminParty)}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`
+        : `${CANTON_SDK_CONFIG.REGISTRY_API_URL}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
+
+      console.log(`[CantonSDK]    Registry: ${executeContextUrl.substring(0, 100)}...`);
+
+      const registryAttempts = Math.max(3, parseInt(process.env.ALLOCATION_EXECUTE_REGISTRY_ATTEMPTS || '8', 10) || 8);
+      const registryBackoffMs = Math.max(1000, parseInt(process.env.ALLOCATION_EXECUTE_REGISTRY_BACKOFF_MS || '3000', 10) || 3000);
+      let context;
+      for (let attempt = 1; attempt <= registryAttempts; attempt++) {
+        try {
+          const resp = await getRegistryApi().post(executeContextUrl, { excludeDebugFields: true }, {
+            headers: { Authorization: `Bearer ${adminToken}`, Accept: 'application/json' },
+          });
+          context = resp.data;
+          break;
+        } catch (registryErr) {
+          const status = registryErr?.response?.status;
+          if (status === 404 && attempt < registryAttempts) {
+            console.warn(`[CantonSDK]    Registry 404 on attempt ${attempt}/${registryAttempts} — retrying in ${registryBackoffMs / 1000}s...`);
+            await new Promise(r => setTimeout(r, registryBackoffMs));
+            continue;
+          }
+          throw new Error(`Registry choice-context fetch failed for ${symbol}: ${registryErr.message}`);
+        }
+      }
+      if (!context) throw new Error(`Registry did not return context after ${registryAttempts} attempts`);
+      disclosedContracts = context.disclosedContracts || [];
+      choiceContextData = context.choiceContextData || { values: {} };
+    }
+
+    // ── Execute the choice (non-interactive, operator as executor) ──
+    const exerciseAttempts = Math.max(1, parseInt(process.env.ALLOCATION_EXECUTE_EXERCISE_ATTEMPTS || '4', 10) || 4);
+    const exerciseBackoffMs = Math.max(500, parseInt(process.env.ALLOCATION_EXECUTE_EXERCISE_BACKOFF_MS || '2000', 10) || 2000);
+
+    console.log(`[CantonSDK]    Executing Allocation_ExecuteTransfer (non-interactive, operator-only)...`);
+    let result = null;
+    let lastExerciseErr = null;
+    for (let ex = 1; ex <= exerciseAttempts; ex++) {
+      try {
+        result = await cantonService.exerciseChoice({
+          token: adminToken,
+          actAsParty: [executorPartyId],
+          templateId: ALLOCATION_INTERFACE,
+          contractId: allocationContractId,
+          choice: 'Allocation_ExecuteTransfer',
+          choiceArgument: {
+            extraArgs: {
+              context: choiceContextData,
+              meta: { values: {} },
+            },
+          },
+          readAs: readAsParties,
+          synchronizerId,
+          disclosedContracts: (disclosedContracts || []).map(dc => ({
+            templateId: dc.templateId,
+            contractId: dc.contractId,
+            createdEventBlob: dc.createdEventBlob,
+            synchronizerId: dc.synchronizerId || synchronizerId,
+          })),
+        });
+        break;
+      } catch (exErr) {
+        lastExerciseErr = exErr;
+        const m = String(exErr?.message || exErr || '');
+        const retryable =
+          m.includes('CONTRACT_NOT_FOUND') ||
+          m.includes('could not be found') ||
+          m.includes('SUBMISSION_ALREADY_IN_FLIGHT') ||
+          m.includes('deadline');
+        if (retryable && ex < exerciseAttempts) {
+          console.warn(`[CantonSDK]    ExecuteTransfer attempt ${ex}/${exerciseAttempts} failed (${m.substring(0, 120)}) — retrying in ${exerciseBackoffMs / 1000}s...`);
+          await new Promise(r => setTimeout(r, exerciseBackoffMs));
+          continue;
+        }
+        throw exErr;
+      }
+    }
+    if (!result && lastExerciseErr) throw lastExerciseErr;
+
+    const updateId = result?.transaction?.updateId || result?.updateId || null;
+    if (!updateId) {
+      console.warn(`[CantonSDK] ⚠️ Allocation_ExecuteTransfer committed but no updateId for ${symbol}`);
+    } else {
+      console.log(`[CantonSDK] ✅ Allocation_ExecuteTransfer committed on-chain (updateId: ${updateId})`);
+    }
     if (result && !result.updateId) result.updateId = updateId;
     return result;
   }

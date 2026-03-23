@@ -640,7 +640,10 @@ class CantonService {
           witnessParties: createdEvent.witnessParties,
           offset: createdEvent.offset,
           synchronizerId: activeContract.synchronizerId,
-          createdAt: createdEvent.createdAt
+          createdAt: createdEvent.createdAt,
+          // Preserve createdEventBlob when returned by InterfaceFilter queries
+          // (needed for disclosed contracts in Allocation_ExecuteTransfer)
+          ...(createdEvent.createdEventBlob && { createdEventBlob: createdEvent.createdEventBlob }),
         };
       }
       return item;
