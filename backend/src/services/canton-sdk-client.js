@@ -1022,6 +1022,190 @@ class CantonSDKClient {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // TRANSFER INSTRUCTION — Settlement for Utilities (CBTC) external parties
+  //
+  // DvpLegAllocation.Allocation_ExecuteTransfer requires sender + receiver +
+  // executor authorization. Canton external party limitation: "Only transactions
+  // requiring authorization from a single party are supported."
+  //
+  // TransferInstruction pattern bypasses this:
+  //   Step 1: TransferFactory_Transfer — controller: [sender] only (single-party tx)
+  //   Step 2: TransferInstruction_Accept — controller: [receiver] only (single-party tx)
+  // Both are single-party interactive submissions → works with external parties.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Build a TransferFactory_Transfer command for INTERACTIVE submission.
+   * Returns the command + disclosed contracts so the caller can prepare/sign/execute.
+   *
+   * Used by the matching engine for CBTC settlement (Utilities tokens)
+   * where Allocation_ExecuteTransfer fails due to multi-party auth requirements.
+   *
+   * @param {string} senderPartyId - Party sending tokens
+   * @param {string} receiverPartyId - Party receiving tokens
+   * @param {string} amount - Amount to transfer
+   * @param {string} symbol - Token symbol (CBTC)
+   * @param {string} executorPartyId - Exchange operator
+   * @param {string} tradeId - Trade reference
+   * @returns {Object} { command, disclosedContracts, synchronizerId, factoryId, choiceContextData }
+   */
+  async buildTransferInteractiveCommand(senderPartyId, receiverPartyId, amount, symbol, executorPartyId, tradeId) {
+    const instrumentId = toCantonInstrument(symbol);
+    const adminParty = this.getInstrumentAdminForSymbol(symbol);
+    const tokenType = getTokenSystemType(symbol);
+    const adminToken = await tokenProvider.getServiceToken();
+    const configModule = require('../config');
+    const synchronizerId = await cantonService.resolveSubmissionSynchronizerId(
+      adminToken, configModule.canton.synchronizerId
+    );
+
+    console.log(`[CantonSDK] 🔄 Building TransferInstruction for ${amount} ${symbol}`);
+    console.log(`[CantonSDK]    Sender: ${senderPartyId.substring(0, 30)}...`);
+    console.log(`[CantonSDK]    Receiver: ${receiverPartyId.substring(0, 30)}...`);
+
+    // Get sender's holding CIDs (needed for transfer)
+    const holdings = await this._withPartyContext(senderPartyId, async () => {
+      return await this.sdk.tokenStandard?.listHoldingUtxos(false) || [];
+    });
+    const holdingCids = holdings
+      .filter(h => extractInstrumentId(h.interfaceViewValue?.instrumentId) === instrumentId)
+      .map(h => h.contractId);
+    if (holdingCids.length === 0) {
+      throw new Error(`No ${symbol} holdings found for sender ${senderPartyId.substring(0, 30)}...`);
+    }
+    console.log(`[CantonSDK]    Found ${holdingCids.length} ${symbol} UTXOs for transfer`);
+
+    // Get TransferFactory context from registry
+    const registryUrl = this._getTransferFactoryUrl(tokenType);
+    const now = new Date().toISOString();
+    const executeBeforeMs = tokenType === 'splice' ? 10 * 60 * 1000 : 86400000;
+    const executeBefore = new Date(Date.now() + executeBeforeMs).toISOString();
+
+    const { data: factory } = await getRegistryApi().post(registryUrl, {
+      choiceArguments: {
+        expectedAdmin: adminParty,
+        transfer: {
+          sender: senderPartyId,
+          receiver: receiverPartyId,
+          amount: toDamlNumericString(amount),
+          instrumentId: { id: instrumentId, admin: adminParty },
+          requestedAt: now,
+          executeBefore,
+          inputHoldingCids: holdingCids,
+          meta: { values: {} },
+        },
+        extraArgs: { context: { values: {} }, meta: { values: {} } },
+      },
+      excludeDebugFields: true,
+    }, {
+      headers: { Authorization: `Bearer ${adminToken}`, Accept: 'application/json' },
+    });
+
+    console.log(`[CantonSDK]    TransferFactory context received — factoryId: ${factory.factoryId?.substring(0, 30)}...`);
+
+    const TRANSFER_FACTORY_INTERFACE = UTILITIES_CONFIG.TRANSFER_FACTORY_INTERFACE
+      || '#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferFactory';
+
+    const command = {
+      ExerciseCommand: {
+        templateId: TRANSFER_FACTORY_INTERFACE,
+        contractId: factory.factoryId,
+        choice: 'TransferFactory_Transfer',
+        choiceArgument: {
+          expectedAdmin: adminParty,
+          transfer: {
+            sender: senderPartyId,
+            receiver: receiverPartyId,
+            amount: toDamlNumericString(amount),
+            instrumentId: { id: instrumentId, admin: adminParty },
+            requestedAt: now,
+            executeBefore,
+            inputHoldingCids: holdingCids,
+            meta: { values: {} },
+          },
+          extraArgs: {
+            context: factory.choiceContext?.choiceContextData || { values: {} },
+            meta: { values: {} },
+          },
+        },
+      },
+    };
+
+    const disclosedContracts = (factory.choiceContext?.disclosedContracts || []).map(dc => ({
+      templateId: dc.templateId,
+      contractId: dc.contractId,
+      createdEventBlob: dc.createdEventBlob,
+      synchronizerId: dc.synchronizerId || synchronizerId,
+    }));
+
+    return { command, disclosedContracts, synchronizerId, factoryId: factory.factoryId };
+  }
+
+  /**
+   * Accept a TransferInstruction via INTERACTIVE submission (receiver signs).
+   *
+   * @param {string} transferInstructionCid - The TransferInstruction contract ID
+   * @param {string} receiverPartyId - The receiver party
+   * @param {string} symbol - Token symbol for registry routing
+   * @param {string} synchronizerId - Synchronizer ID
+   * @returns {Object} { command, disclosedContracts, synchronizerId }
+   */
+  async buildAcceptTransferInteractiveCommand(transferInstructionCid, receiverPartyId, symbol, synchronizerId) {
+    const tokenType = getTokenSystemType(symbol);
+    const adminToken = await tokenProvider.getServiceToken();
+    const registryBase = this._getRegistryBaseUrl(tokenType);
+    const acceptUrl = `${registryBase}/registry/transfer-instruction/v1/${encodeURIComponent(transferInstructionCid)}/choice-contexts/accept`;
+
+    console.log(`[CantonSDK]    Getting accept context for TransferInstruction: ${transferInstructionCid.substring(0, 30)}...`);
+
+    // Retry for registry indexing lag
+    let acceptCtx;
+    for (let ra = 1; ra <= 6; ra++) {
+      try {
+        const { data } = await getRegistryApi().post(acceptUrl, { excludeDebugFields: true }, {
+          headers: { Authorization: `Bearer ${adminToken}`, Accept: 'application/json' },
+        });
+        acceptCtx = data;
+        if (ra > 1) console.log(`[CantonSDK]    Registry indexed TransferInstruction on attempt ${ra}`);
+        break;
+      } catch (regErr) {
+        if (regErr?.response?.status === 404 && ra < 6) {
+          console.log(`[CantonSDK]    Registry 404 for accept context (attempt ${ra}/6) — waiting 2s...`);
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
+        }
+        throw regErr;
+      }
+    }
+    if (!acceptCtx) throw new Error('Registry did not return accept context after retries');
+
+    const TRANSFER_INSTRUCTION_INTERFACE = '#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction';
+
+    const command = {
+      ExerciseCommand: {
+        templateId: TRANSFER_INSTRUCTION_INTERFACE,
+        contractId: transferInstructionCid,
+        choice: 'TransferInstruction_Accept',
+        choiceArgument: {
+          extraArgs: {
+            context: acceptCtx.choiceContextData || { values: {} },
+            meta: { values: {} },
+          },
+        },
+      },
+    };
+
+    const disclosedContracts = (acceptCtx.disclosedContracts || []).map(dc => ({
+      templateId: dc.templateId,
+      contractId: dc.contractId,
+      createdEventBlob: dc.createdEventBlob,
+      synchronizerId: dc.synchronizerId || synchronizerId,
+    }));
+
+    return { command, disclosedContracts, synchronizerId };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // ALLOCATIONS — Settlement via Allocation API
   //
   // CC (Splice/Amulet): Allocation Factory IS available on Scan Proxy
@@ -2300,14 +2484,36 @@ class CantonSDKClient {
       }
     }
 
-    // Fallback: build command from registry API (returns updateId via submitAndWaitForTransaction)
+    // Fallback: build command from registry API (returns updateId via submitAndWaitForTransaction).
+    // The registry returns DSO delegation contracts in its disclosedContracts — these carry the
+    // DSO authority needed by AmuletAllocation, allowing executor-only actAs to succeed.
+    // Retry on 404: the allocation may not be indexed yet if it was just created.
     const registryUrl = CANTON_SDK_CONFIG.REGISTRY_API_URL;
     const encodedCid = encodeURIComponent(allocationContractId);
     const executeContextUrl = `${registryUrl}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
 
-    const { data: context } = await getRegistryApi().post(executeContextUrl, { excludeDebugFields: true }, {
-      headers: { Authorization: `Bearer ${adminToken}`, Accept: 'application/json' },
-    });
+    const maxRegistryRetries = 6;
+    const registryRetryMs = 2500;
+    let context;
+    for (let ra = 1; ra <= maxRegistryRetries; ra++) {
+      try {
+        const { data } = await getRegistryApi().post(executeContextUrl, { excludeDebugFields: true }, {
+          headers: { Authorization: `Bearer ${adminToken}`, Accept: 'application/json' },
+        });
+        context = data;
+        if (ra > 1) console.log(`[CantonSDK]    Registry indexed allocation on attempt ${ra}/${maxRegistryRetries}`);
+        break;
+      } catch (regErr) {
+        const status = regErr?.response?.status;
+        if (status === 404 && ra < maxRegistryRetries) {
+          console.log(`[CantonSDK]    Registry 404 on attempt ${ra}/${maxRegistryRetries} — allocation not indexed yet, retrying in ${registryRetryMs / 1000}s...`);
+          await new Promise(r => setTimeout(r, registryRetryMs));
+          continue;
+        }
+        throw regErr;
+      }
+    }
+    if (!context) throw new Error(`Registry did not return execute context after ${maxRegistryRetries} attempts`);
     const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
 
     const registryResult = await cantonService.exerciseChoice({
@@ -3836,18 +4042,22 @@ class CantonSDKClient {
       choiceContextData = context.choiceContextData || { values: {} };
     }
 
-    // ── Execute the choice (non-interactive, operator as executor) ──
+    // ── Execute the choice (non-interactive, all parties) ──
+    // AmuletAllocation requires authorization from executor + sender + receiver.
+    // In non-interactive mode, the participant signs for all parties it hosts.
+    // The admin token has actAs rights for all parties on this participant.
+    const allActAs = [...new Set([executorPartyId, ...readAsParties])];
     const exerciseAttempts = Math.max(1, parseInt(process.env.ALLOCATION_EXECUTE_EXERCISE_ATTEMPTS || '4', 10) || 4);
     const exerciseBackoffMs = Math.max(500, parseInt(process.env.ALLOCATION_EXECUTE_EXERCISE_BACKOFF_MS || '2000', 10) || 2000);
 
-    console.log(`[CantonSDK]    Executing Allocation_ExecuteTransfer (non-interactive, operator-only)...`);
+    console.log(`[CantonSDK]    Executing Allocation_ExecuteTransfer (non-interactive, actAs: ${allActAs.length} parties)...`);
     let result = null;
     let lastExerciseErr = null;
     for (let ex = 1; ex <= exerciseAttempts; ex++) {
       try {
         result = await cantonService.exerciseChoice({
           token: adminToken,
-          actAsParty: [executorPartyId],
+          actAsParty: allActAs,
           templateId: ALLOCATION_INTERFACE,
           contractId: allocationContractId,
           choice: 'Allocation_ExecuteTransfer',
@@ -3870,6 +4080,72 @@ class CantonSDKClient {
       } catch (exErr) {
         lastExerciseErr = exErr;
         const m = String(exErr?.message || exErr || '');
+
+        // ── DAML_AUTHORIZATION_ERROR on AmuletAllocation (CC tokens) ──────────
+        // AmuletAllocation requires DSO party authority which only the registry
+        // API can provide (via delegation contracts in its disclosed set).
+        // Fall back to the registry retry path instead of throwing.
+        if (m.includes('DAML_AUTHORIZATION_ERROR') && m.includes('AmuletAllocation')) {
+          console.log(`[CantonSDK]    AmuletAllocation requires DSO authority — falling back to registry API with retry...`);
+          const tokenSystemType = getTokenSystemType(symbol);
+          const adminParty = this.getInstrumentAdminForSymbol(symbol);
+          const encodedCid = encodeURIComponent(allocationContractId);
+          const executeContextUrl = tokenSystemType === 'utilities'
+            ? `${UTILITIES_CONFIG.TOKEN_STANDARD_URL}/v0/registrars/${encodeURIComponent(adminParty)}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`
+            : `${CANTON_SDK_CONFIG.REGISTRY_API_URL}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
+
+          const registryAttempts = Math.max(3, parseInt(process.env.ALLOCATION_EXECUTE_REGISTRY_ATTEMPTS || '8', 10) || 8);
+          const registryBackoffMs = Math.max(1000, parseInt(process.env.ALLOCATION_EXECUTE_REGISTRY_BACKOFF_MS || '3000', 10) || 3000);
+          let registryContext;
+          for (let ra = 1; ra <= registryAttempts; ra++) {
+            try {
+              const resp = await getRegistryApi().post(executeContextUrl, { excludeDebugFields: true }, {
+                headers: { Authorization: `Bearer ${adminToken}`, Accept: 'application/json' },
+              });
+              registryContext = resp.data;
+              console.log(`[CantonSDK]    ✅ Registry indexed allocation on attempt ${ra}/${registryAttempts}`);
+              break;
+            } catch (registryErr) {
+              const status = registryErr?.response?.status;
+              if ((status === 404 || registryErr.code === 'TIMEOUT') && ra < registryAttempts) {
+                console.log(`[CantonSDK]    Registry ${status || 'timeout'} on attempt ${ra}/${registryAttempts} — waiting ${registryBackoffMs / 1000}s...`);
+                await new Promise(r => setTimeout(r, registryBackoffMs));
+                continue;
+              }
+              throw new Error(`Registry choice-context failed for ${symbol} after ${ra} attempts: ${registryErr.message}`);
+            }
+          }
+          if (!registryContext) throw new Error(`Registry did not index allocation after ${registryAttempts} attempts`);
+
+          // Use the FULL registry context (includes DSO delegation contracts)
+          const registryDisclosed = (registryContext.disclosedContracts || []).map(dc => ({
+            templateId: dc.templateId,
+            contractId: dc.contractId,
+            createdEventBlob: dc.createdEventBlob,
+            synchronizerId: dc.synchronizerId || synchronizerId,
+          }));
+          const registryChoiceCtx = registryContext.choiceContextData || choiceContextData;
+
+          console.log(`[CantonSDK]    Retrying ExecuteTransfer with ${registryDisclosed.length} registry disclosed contracts (all ${allActAs.length} parties in actAs)`);
+          result = await cantonService.exerciseChoice({
+            token: adminToken,
+            actAsParty: allActAs,
+            templateId: ALLOCATION_INTERFACE,
+            contractId: allocationContractId,
+            choice: 'Allocation_ExecuteTransfer',
+            choiceArgument: {
+              extraArgs: {
+                context: registryChoiceCtx,
+                meta: { values: {} },
+              },
+            },
+            readAs: readAsParties,
+            synchronizerId,
+            disclosedContracts: registryDisclosed,
+          });
+          break;
+        }
+
         const retryable =
           m.includes('CONTRACT_NOT_FOUND') ||
           m.includes('could not be found') ||

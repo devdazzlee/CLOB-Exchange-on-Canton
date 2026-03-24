@@ -1087,137 +1087,203 @@ class MatchingEngine {
     if (uid3a) updateIds.push({ step: 'alloc-seller-to-buyer', updateId: uid3a });
     console.log(`[MatchingEngine]    Step 3a result — updateId: ${uid3a || 'N/A'}, extractedCid: ${legAAllocCid?.substring(0, 24) || 'null'}`);
     if (!legAAllocCid) {
-      console.log(`[MatchingEngine]    ⏳ CID not in execute response — querying ACS for NEW seller→buyer allocation...`);
-      legAAllocCid = await this._findAllocationByACS(operatorPartyId, sellOrder.owner, buyOrder.owner, adminToken, existingAllocCids);
+      // Canton's ACS is eventually consistent — the allocation may not appear at the
+      // current ledger-end offset if it was just committed. Retry with fresh offsets.
+      for (let attempt = 1; attempt <= 3 && !legAAllocCid; attempt++) {
+        if (attempt > 1) {
+          console.log(`[MatchingEngine]    ⏳ Retry ${attempt}/3 — waiting 2s for ACS to include new allocation...`);
+          await sleep(2000);
+        } else {
+          console.log(`[MatchingEngine]    ⏳ CID not in execute response — querying ACS for NEW seller→buyer allocation...`);
+        }
+        legAAllocCid = await this._findAllocationByACS(operatorPartyId, sellOrder.owner, buyOrder.owner, adminToken, existingAllocCids);
+      }
     }
     if (!legAAllocCid) throw new Error('SELLER_ALLOCATION_FAILED: Could not find seller→buyer allocation CID after creation');
     console.log(`[MatchingEngine]    ✅ Seller→Buyer allocation created: ${legAAllocCid.substring(0, 24)}... (updateId: ${uid3a || 'N/A'})`);
 
-    // Extract disclosed contracts (LockedAmulet etc.) for the execute step.
-    // The operator is NOT a stakeholder on the LockedAmulet — it needs disclosure.
-    // Strategy: try tx events first; if empty (interactive submissions return no events),
-    // query the SENDER's ACS for holdings with createdEventBlob (sender IS a stakeholder).
-    let legADisclosed = this._extractDisclosedContractsFromResult(legAResult, synchronizerId);
-    if (legADisclosed.length === 0) {
-      console.log(`[MatchingEngine]    Querying sender's ACS for holdings with createdEventBlob (sender is stakeholder on LockedAmulet)...`);
-      legADisclosed = await this._fetchSenderHoldingsAsDisclosed(sellOrder.owner, baseSymbol, adminToken, synchronizerId);
-    }
-
-    console.log(`[MatchingEngine]    Step 3a-exec: Executing seller→buyer (${baseSymbol}) BEFORE creating quote allocation...`);
-    const execReadAs = [...new Set([operatorPartyId, sellOrder.owner, buyOrder.owner])];
-
-    // Execute with disclosed contracts from sender's ACS and choiceContextData from
-    // the allocation creation step (contains amulet-rules for CC tokens).
-    const legAExecOpts = {
-      creationDisclosedContracts: legADisclosed.length > 0 ? legADisclosed : null,
-      choiceContextData: legABuild.choiceContextData || null,
-    };
-    if (legABuild.choiceContextData) {
-      console.log(`[MatchingEngine]    Passing choiceContextData from allocation creation to execute (amulet-rules for ${baseSymbol})`);
-    }
-    let execA;
-    try {
-      execA = await sdkClient.executeAllocationTransferDirect(
-        legAAllocCid, operatorPartyId, baseSymbol, execReadAs, synchronizerId,
-        legAExecOpts
-      );
-    } catch (nonInteractiveErr) {
-      console.warn(`[MatchingEngine]    Non-interactive execute failed: ${nonInteractiveErr.message?.substring(0, 120)} — trying interactive...`);
-      execA = await sdkClient.executeAllocationInteractive(
-        legAAllocCid, operatorPartyId, baseSymbol, adminToken, sellOrder.owner, buyOrder.owner, synchronizerId,
-        legAExecOpts
-      );
-    }
+    // ── Execute leg A: use executeAllocation (the comprehensive SDK→registry cascade) ──
+    // executeAllocation handles everything internally:
+    //   1. SDK exerciseAllocationChoice first (handles AmuletAllocation, builds choiceArgument with amulet-rules)
+    //   2. Registry API fallback (returns DSO delegation contracts in disclosedContracts → executor-only works)
+    //   3. Interactive fallback + multi-strategy actAs cascade
+    // No need to manually pass disclosed contracts or choiceContextData.
+    console.log(`[MatchingEngine]    Step 3a-exec: Executing seller→buyer allocation (${baseSymbol}) via executeAllocation...`);
+    const execA = await sdkClient.executeAllocation(
+      legAAllocCid, operatorPartyId, baseSymbol, sellOrder.owner, buyOrder.owner
+    );
     const uid4a = execA?.transaction?.updateId || execA?.updateId;
     if (uid4a) updateIds.push({ step: 'exec-seller-to-buyer', updateId: uid4a });
     console.log(`[MatchingEngine]    ✅ ${baseSymbol} transferred: seller → buyer (updateId: ${uid4a})`);
 
     if (settleMs > 0) await sleep(Math.min(1500, settleMs));
 
-    console.log(`[MatchingEngine]    Step 3b: Creating allocation buyer→seller (${quoteAmountStr} ${quoteSymbol})...`);
-    const legBBuild = await sdkClient.buildAllocationInteractiveCommand(
-      buyOrder.owner,    // sender = buyer
-      sellOrder.owner,   // receiver = seller
-      quoteAmountStr,
-      quoteSymbol,
-      operatorPartyId,   // executor = operator
-      `${tradeId}-leg-quote`
-    );
-    if (!legBBuild?.command) throw new Error('Failed to build buyer→seller allocation command');
-    const legBPrep = await cantonService.prepareInteractiveSubmission({
-      token: adminToken,
-      actAsParty: [buyOrder.owner],
-      commands: [legBBuild.command],
-      readAs: [...new Set([sellOrder.owner, buyOrder.owner, operatorPartyId])],
-      synchronizerId: legBBuild.synchronizerId || synchronizerId,
-      disclosedContracts: legBBuild.disclosedContracts || [],
-    });
-    const legBSig = await signHash(buyerKey.keyBase64, legBPrep.preparedTransactionHash);
-    const legBResult = await cantonService.executeInteractiveSubmission({
-      preparedTransaction: legBPrep.preparedTransaction,
-      partySignatures: {
-        signatures: [{
-          party: buyOrder.owner,
+    // ═══ Step 3b+4: Transfer quote token buyer→seller ═══
+    // Route by token type:
+    //   CC (Splice): Allocation + executeAllocation (SDK handles AmuletAllocation)
+    //   CBTC (Utilities): TransferInstruction pattern (single-party txs)
+    //     DvpLegAllocation.Allocation_ExecuteTransfer requires sender+receiver+executor
+    //     authorization — Canton external party limitation blocks this.
+    //     TransferInstruction bypasses it:
+    //       TransferFactory_Transfer: controller=[sender] (buyer signs)
+    //       TransferInstruction_Accept: controller=[receiver] (seller signs)
+    const quoteTokenType = getTokenSystemType(quoteSymbol);
+
+    if (quoteTokenType === 'utilities') {
+      // ── CBTC: TransferInstruction pattern (no allocation needed) ──
+      console.log(`[MatchingEngine]    Step 3b: ${quoteSymbol} is Utilities — using TransferInstruction (not Allocation)`);
+      console.log(`[MatchingEngine]    Creating TransferInstruction buyer→seller (${quoteAmountStr} ${quoteSymbol})...`);
+
+      // Step A: Build and submit TransferFactory_Transfer (buyer signs)
+      const transferBuild = await sdkClient.buildTransferInteractiveCommand(
+        buyOrder.owner, sellOrder.owner, quoteAmountStr, quoteSymbol, operatorPartyId, `${tradeId}-leg-quote`
+      );
+      if (!transferBuild?.command) throw new Error('Failed to build buyer→seller transfer command');
+
+      const transferPrep = await cantonService.prepareInteractiveSubmission({
+        token: adminToken,
+        actAsParty: [buyOrder.owner],
+        commands: [transferBuild.command],
+        readAs: [...new Set([buyOrder.owner, sellOrder.owner, operatorPartyId])],
+        synchronizerId: transferBuild.synchronizerId || synchronizerId,
+        disclosedContracts: transferBuild.disclosedContracts || [],
+      });
+      const transferSig = await signHash(buyerKey.keyBase64, transferPrep.preparedTransactionHash);
+      const transferResult = await cantonService.executeInteractiveSubmission({
+        preparedTransaction: transferPrep.preparedTransaction,
+        partySignatures: {
           signatures: [{
-            format: 'SIGNATURE_FORMAT_RAW',
-            signature: legBSig,
-            signedBy: buyerKey.fingerprint,
-            signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
+            party: buyOrder.owner,
+            signatures: [{
+              format: 'SIGNATURE_FORMAT_RAW',
+              signature: transferSig,
+              signedBy: buyerKey.fingerprint,
+              signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
+            }],
           }],
-        }],
-      },
-      hashingSchemeVersion: legBPrep.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
-    }, adminToken);
-    // Extract allocation CID from leg B — try response events first, then ACS query
-    let legBAllocCid = this._extractAllocCidFromResult(legBResult);
-    const uid3b = legBResult?.transaction?.updateId || legBResult?.updateId;
-    if (uid3b) updateIds.push({ step: 'alloc-buyer-to-seller', updateId: uid3b });
-    console.log(`[MatchingEngine]    Step 3b result — updateId: ${uid3b || 'N/A'}, extractedCid: ${legBAllocCid?.substring(0, 24) || 'null'}`);
-    if (!legBAllocCid) {
-      console.log(`[MatchingEngine]    ⏳ CID not in execute response — querying ACS for NEW buyer→seller allocation...`);
-      // Exclude all pre-existing CIDs AND the leg A CID
-      const excludeSetB = new Set([...existingAllocCids]);
-      if (legAAllocCid) excludeSetB.add(legAAllocCid);
-      legBAllocCid = await this._findAllocationByACS(operatorPartyId, buyOrder.owner, sellOrder.owner, adminToken, excludeSetB);
-    }
-    if (!legBAllocCid) throw new Error('BUYER_ALLOCATION_FAILED: Could not find buyer→seller allocation CID after creation');
-    console.log(`[MatchingEngine]    ✅ Buyer→Seller allocation created: ${legBAllocCid.substring(0, 24)}... (updateId: ${uid3b || 'N/A'})`);
+        },
+        hashingSchemeVersion: transferPrep.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
+      }, adminToken);
 
-    // Extract disclosed contracts for leg B (same pattern as leg A)
-    let legBDisclosed = this._extractDisclosedContractsFromResult(legBResult, synchronizerId);
-    if (legBDisclosed.length === 0) {
-      console.log(`[MatchingEngine]    Querying buyer's ACS for holdings with createdEventBlob...`);
-      legBDisclosed = await this._fetchSenderHoldingsAsDisclosed(buyOrder.owner, quoteSymbol, adminToken, synchronizerId);
-    }
+      const uid3b = transferResult?.transaction?.updateId || transferResult?.updateId;
+      if (uid3b) updateIds.push({ step: 'transfer-buyer-to-seller', updateId: uid3b });
+      console.log(`[MatchingEngine]    ✅ TransferInstruction created (updateId: ${uid3b || 'N/A'})`);
 
-    // ═══ Step 4: Execute quote leg (base leg already executed above) ═══
-    console.log(`[MatchingEngine]    Step 4: Executing buyer→seller allocation (operator as executor)...`);
+      // Extract TransferInstruction CID from result events
+      let tiCid = null;
+      for (const event of (transferResult?.transaction?.events || [])) {
+        const created = event.created || event.CreatedEvent;
+        if (created?.contractId) {
+          const tpl = typeof created.templateId === 'string' ? created.templateId : '';
+          if (tpl.includes('TransferInstruction') || tpl.includes('Transfer')) {
+            tiCid = created.contractId;
+            break;
+          }
+        }
+      }
+      if (!tiCid) {
+        console.log(`[MatchingEngine]    ℹ️ No TransferInstruction CID in events — transfer may have auto-completed`);
+        // If no instruction was created, the transfer completed directly
+        const uid4b = uid3b;
+        if (uid4b) updateIds.push({ step: 'exec-buyer-to-seller', updateId: uid4b });
+        console.log(`[MatchingEngine]    ✅ ${quoteSymbol} transferred: buyer → seller (direct, updateId: ${uid4b})`);
+      } else {
+        // Step B: Accept TransferInstruction (seller signs)
+        console.log(`[MatchingEngine]    Step 4: Accepting TransferInstruction as seller (${quoteSymbol})...`);
+        console.log(`[MatchingEngine]    TransferInstruction CID: ${tiCid.substring(0, 24)}...`);
 
-    // Execute with disclosed contracts from buyer's ACS and choiceContextData from
-    // the allocation creation step (contains amulet-rules for CC tokens).
-    const legBExecOpts = {
-      creationDisclosedContracts: legBDisclosed.length > 0 ? legBDisclosed : null,
-      choiceContextData: legBBuild.choiceContextData || null,
+        const acceptBuild = await sdkClient.buildAcceptTransferInteractiveCommand(
+          tiCid, sellOrder.owner, quoteSymbol, synchronizerId
+        );
+
+        const acceptPrep = await cantonService.prepareInteractiveSubmission({
+          token: adminToken,
+          actAsParty: [sellOrder.owner],
+          commands: [acceptBuild.command],
+          readAs: [...new Set([sellOrder.owner, buyOrder.owner, operatorPartyId])],
+          synchronizerId: acceptBuild.synchronizerId || synchronizerId,
+          disclosedContracts: acceptBuild.disclosedContracts || [],
+        });
+        const acceptSig = await signHash(sellerKey.keyBase64, acceptPrep.preparedTransactionHash);
+        const acceptResult = await cantonService.executeInteractiveSubmission({
+          preparedTransaction: acceptPrep.preparedTransaction,
+          partySignatures: {
+            signatures: [{
+              party: sellOrder.owner,
+              signatures: [{
+                format: 'SIGNATURE_FORMAT_RAW',
+                signature: acceptSig,
+                signedBy: sellerKey.fingerprint,
+                signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
+              }],
+            }],
+          },
+          hashingSchemeVersion: acceptPrep.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
+        }, adminToken);
+
+        const uid4b = acceptResult?.transaction?.updateId || acceptResult?.updateId;
+        if (uid4b) updateIds.push({ step: 'exec-buyer-to-seller', updateId: uid4b });
+        console.log(`[MatchingEngine]    ✅ ${quoteSymbol} transferred: buyer → seller (updateId: ${uid4b})`);
+      }
+    } else {
+      // ── CC (Splice): Allocation + executeAllocation (SDK handles AmuletAllocation) ──
+      console.log(`[MatchingEngine]    Step 3b: Creating allocation buyer→seller (${quoteAmountStr} ${quoteSymbol})...`);
+      const legBBuild = await sdkClient.buildAllocationInteractiveCommand(
+        buyOrder.owner, sellOrder.owner, quoteAmountStr, quoteSymbol, operatorPartyId, `${tradeId}-leg-quote`
+      );
+      if (!legBBuild?.command) throw new Error('Failed to build buyer→seller allocation command');
+      const legBPrep = await cantonService.prepareInteractiveSubmission({
+        token: adminToken,
+        actAsParty: [buyOrder.owner],
+        commands: [legBBuild.command],
+        readAs: [...new Set([sellOrder.owner, buyOrder.owner, operatorPartyId])],
+        synchronizerId: legBBuild.synchronizerId || synchronizerId,
+        disclosedContracts: legBBuild.disclosedContracts || [],
+      });
+      const legBSig = await signHash(buyerKey.keyBase64, legBPrep.preparedTransactionHash);
+      const legBResult = await cantonService.executeInteractiveSubmission({
+        preparedTransaction: legBPrep.preparedTransaction,
+        partySignatures: {
+          signatures: [{
+            party: buyOrder.owner,
+            signatures: [{
+              format: 'SIGNATURE_FORMAT_RAW',
+              signature: legBSig,
+              signedBy: buyerKey.fingerprint,
+              signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
+            }],
+          }],
+        },
+        hashingSchemeVersion: legBPrep.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
+      }, adminToken);
+      let legBAllocCid = this._extractAllocCidFromResult(legBResult);
+      const uid3b = legBResult?.transaction?.updateId || legBResult?.updateId;
+      if (uid3b) updateIds.push({ step: 'alloc-buyer-to-seller', updateId: uid3b });
+      console.log(`[MatchingEngine]    Step 3b result — updateId: ${uid3b || 'N/A'}, extractedCid: ${legBAllocCid?.substring(0, 24) || 'null'}`);
+      if (!legBAllocCid) {
+        const excludeSetB = new Set([...existingAllocCids]);
+        if (legAAllocCid) excludeSetB.add(legAAllocCid);
+        for (let attempt = 1; attempt <= 3 && !legBAllocCid; attempt++) {
+          if (attempt > 1) {
+            console.log(`[MatchingEngine]    ⏳ Retry ${attempt}/3 — waiting 2s for ACS to include new allocation...`);
+            await sleep(2000);
+          } else {
+            console.log(`[MatchingEngine]    ⏳ CID not in execute response — querying ACS for NEW buyer→seller allocation...`);
+          }
+          legBAllocCid = await this._findAllocationByACS(operatorPartyId, buyOrder.owner, sellOrder.owner, adminToken, excludeSetB);
+        }
+      }
+      if (!legBAllocCid) throw new Error('BUYER_ALLOCATION_FAILED: Could not find buyer→seller allocation CID after creation');
+      console.log(`[MatchingEngine]    ✅ Buyer→Seller allocation created: ${legBAllocCid.substring(0, 24)}... (updateId: ${uid3b || 'N/A'})`);
+
+      console.log(`[MatchingEngine]    Step 4: Executing buyer→seller allocation (${quoteSymbol}) via executeAllocation...`);
+      const execB = await sdkClient.executeAllocation(
+        legBAllocCid, operatorPartyId, quoteSymbol, buyOrder.owner, sellOrder.owner
+      );
+      const uid4b = execB?.transaction?.updateId || execB?.updateId;
+      if (uid4b) updateIds.push({ step: 'exec-buyer-to-seller', updateId: uid4b });
+      console.log(`[MatchingEngine]    ✅ ${quoteSymbol} transferred: buyer → seller (updateId: ${uid4b})`);
     };
-    if (legBBuild.choiceContextData) {
-      console.log(`[MatchingEngine]    Passing choiceContextData from allocation creation to execute (amulet-rules for ${quoteSymbol})`);
-    }
-    let execB;
-    try {
-      execB = await sdkClient.executeAllocationTransferDirect(
-        legBAllocCid, operatorPartyId, quoteSymbol, execReadAs, synchronizerId,
-        legBExecOpts
-      );
-    } catch (nonInteractiveErr) {
-      console.warn(`[MatchingEngine]    Non-interactive execute failed: ${nonInteractiveErr.message?.substring(0, 120)} — trying interactive...`);
-      execB = await sdkClient.executeAllocationInteractive(
-        legBAllocCid, operatorPartyId, quoteSymbol, adminToken, buyOrder.owner, sellOrder.owner, synchronizerId,
-        legBExecOpts
-      );
-    }
-    const uid4b = execB?.transaction?.updateId || execB?.updateId;
-    if (uid4b) updateIds.push({ step: 'exec-buyer-to-seller', updateId: uid4b });
-    console.log(`[MatchingEngine]    ✅ ${quoteSymbol} transferred: buyer → seller (updateId: ${uid4b})`);
 
     // Log settlement verification
     console.log(`[MatchingEngine] ✅ Settlement complete — tokens flowed user-to-user (no operator custody)`);
@@ -1461,6 +1527,30 @@ class MatchingEngine {
       console.warn(`[MatchingEngine]    ⚠️ No createdEventBlob in creation tx events — will query sender ACS`);
     }
     return disclosed;
+  }
+
+  /**
+   * Merge two arrays of disclosed contracts, de-duplicating by contractId.
+   * Used to combine sender's ACS holdings (LockedAmulet) with the allocation
+   * creation step's disclosed contracts (global Splice infra: AmuletRules,
+   * OpenMiningRound, etc.). Both sets are needed for Allocation_ExecuteTransfer.
+   */
+  _mergeDisclosedContracts(acsDisclosed, creationDisclosed) {
+    const seen = new Set();
+    const merged = [];
+    for (const dc of (acsDisclosed || [])) {
+      if (!dc?.contractId || !dc?.createdEventBlob) continue;
+      if (seen.has(dc.contractId)) continue;
+      seen.add(dc.contractId);
+      merged.push(dc);
+    }
+    for (const dc of (creationDisclosed || [])) {
+      if (!dc?.contractId || !dc?.createdEventBlob) continue;
+      if (seen.has(dc.contractId)) continue;
+      seen.add(dc.contractId);
+      merged.push(dc);
+    }
+    return merged;
   }
 
   /**
