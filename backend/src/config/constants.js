@@ -69,7 +69,7 @@ const AMULET_PACKAGE_ID = process.env.AMULET_PACKAGE_ID ||
  * 
  * THIS IS THE ONLY PACKAGE ID USED — all old packages are retired.
  */
-const TOKEN_STANDARD_PACKAGE_ID = process.env.TOKEN_STANDARD_PACKAGE_ID || '0224efbf74e4ecb40083f7090a9f12145c607d76da220a91eedc21ca491d24fa';
+const TOKEN_STANDARD_PACKAGE_ID = process.env.TOKEN_STANDARD_PACKAGE_ID || '65d72bbf1e8e3b12ac97e5a8a2ddfabcf31f0acce212cb75abfaa4d72db7ab31';
 
 /**
  * Splice Token Standard Package ID
