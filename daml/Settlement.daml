@@ -19,6 +19,8 @@ module Settlement where
 import Instrument (InstrumentId)
 import Holding
 import DA.Action (when)
+import Splice.Api.Token.AllocationV1 (Allocation, Allocation_ExecuteTransfer(..), Allocation_ExecuteTransferResult)
+import Splice.Api.Token.MetadataV1 (ExtraArgs)
 
 -- | Settlement status
 data SettlementStatus 
@@ -329,6 +331,107 @@ template ExchangeAllocation
       do
         assertMsg "Allocation not in PENDING status" (status == "PENDING")
         create this with status = "CANCELLED"
+
+    -- ═══════════════════════════════════════════════════════════════════════
+    -- ATOMIC DvP: Execute both Splice allocation transfers in ONE transaction.
+    --
+    -- DAML authorization carry-forward makes this possible:
+    --   1. Operator exercises Execute_DvP on seller's ExchangeAllocation
+    --      Auth = {executor, seller}
+    --   2. Inside, it exercises Execute_Settlement_WithTransfers on buyer's EA
+    --      Auth = {executor, seller, buyer} (accumulated!)
+    --   3. Inside THAT, it exercises Allocation_ExecuteTransfer on both legs
+    --      Each needs {executor, sender, receiver} = {executor, seller, buyer} ✓
+    --
+    -- Single Canton transaction. Single actAs = [executor]. Both legs atomic.
+    -- ═══════════════════════════════════════════════════════════════════════
+
+    -- Inner choice: called from Execute_DvP on the counterparty's EA.
+    -- When called from within Execute_DvP, accumulated auth includes
+    -- both the seller (outer signatory) and buyer (inner signatory),
+    -- plus the executor (controller of both choices).
+    choice Execute_Settlement_WithTransfers : (ContractId ExchangeAllocation, Allocation_ExecuteTransferResult, Allocation_ExecuteTransferResult)
+      with
+        matchPrice : Decimal
+        matchQuantity : Decimal
+        counterparty : Text
+        tradeId : Text
+        baseLegAllocCid : ContractId Allocation   -- CC allocation (seller→buyer)
+        quoteLegAllocCid : ContractId Allocation   -- CBTC allocation (buyer→seller)
+        baseExtraArgs : ExtraArgs                  -- choiceContext from CC registry
+        quoteExtraArgs : ExtraArgs                 -- choiceContext from CBTC registry
+      controller executor
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        assertMsg "Match quantity must be positive" (matchQuantity > 0.0)
+
+        -- Execute BOTH Splice allocation transfers atomically.
+        -- Auth here = {executor, seller, buyer} (accumulated from outer Execute_DvP).
+        -- Allocation_ExecuteTransfer controller = allocationControllers = [executor, sender, receiver]
+        -- For base (CC):  sender=seller, receiver=buyer  → needs {executor, seller, buyer} ✓
+        -- For quote (CBTC): sender=buyer, receiver=seller → needs {executor, buyer, seller} ✓
+        baseResult <- exercise baseLegAllocCid Allocation_ExecuteTransfer with extraArgs = baseExtraArgs
+        quoteResult <- exercise quoteLegAllocCid Allocation_ExecuteTransfer with extraArgs = quoteExtraArgs
+
+        -- Update this ExchangeAllocation (buyer's)
+        let remainingAmount = amount - matchQuantity
+        newCid <- if remainingAmount > 0.0
+          then do
+            _ <- create this with status = "EXECUTED", amount = matchQuantity
+            create this with
+              allocationId = allocationId <> "-remainder-" <> tradeId
+              amount = remainingAmount
+              status = "PENDING"
+          else
+            create this with status = "EXECUTED"
+
+        return (newCid, baseResult, quoteResult)
+
+    -- Outer choice: entry point for atomic DvP.
+    -- Exercises Execute_Settlement_WithTransfers on the counterparty's EA,
+    -- which accumulates both parties' authorization.
+    --
+    -- The operator submits this as a SINGLE non-interactive transaction
+    -- with actAs = [executor]. No external party signatures needed at match time.
+    choice Execute_DvP : (ContractId ExchangeAllocation, ContractId ExchangeAllocation, Allocation_ExecuteTransferResult, Allocation_ExecuteTransferResult)
+      with
+        counterpartyCid : ContractId ExchangeAllocation  -- buyer's EA
+        baseLegAllocCid : ContractId Allocation
+        quoteLegAllocCid : ContractId Allocation
+        matchPrice : Decimal
+        matchQuantity : Decimal
+        tradeId : Text
+        baseExtraArgs : ExtraArgs
+        quoteExtraArgs : ExtraArgs
+      controller executor
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        assertMsg "Match quantity must be positive" (matchQuantity > 0.0)
+
+        -- Exercise buyer's EA → inside: auth = {executor, seller, buyer}
+        (buyerNewCid, baseResult, quoteResult) <- exercise counterpartyCid Execute_Settlement_WithTransfers with
+          matchPrice = matchPrice
+          matchQuantity = matchQuantity
+          counterparty = show owner  -- seller's party ID
+          tradeId = tradeId
+          baseLegAllocCid = baseLegAllocCid
+          quoteLegAllocCid = quoteLegAllocCid
+          baseExtraArgs = baseExtraArgs
+          quoteExtraArgs = quoteExtraArgs
+
+        -- Update seller's ExchangeAllocation (this contract)
+        let remainingAmount = amount - matchQuantity
+        sellerNewCid <- if remainingAmount > 0.0
+          then do
+            _ <- create this with status = "EXECUTED", amount = matchQuantity
+            create this with
+              allocationId = allocationId <> "-remainder-" <> tradeId
+              amount = remainingAmount
+              status = "PENDING"
+          else
+            create this with status = "EXECUTED"
+
+        return (sellerNewCid, buyerNewCid, baseResult, quoteResult)
 
     -- Archive a completed allocation to free ACS space.
     -- Only EXECUTED or CANCELLED allocations can be archived.

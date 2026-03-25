@@ -5,8 +5,8 @@ version: 2.5.0
 dependencies:
   - daml-prim
   - daml-stdlib
+  - daml-script
 data-dependencies:
-  - ./dars/daml-script-2.2.dar
   - ./dars/splice-api-token-allocation-v1-1.0.0.dar
   - ./dars/splice-api-token-holding-v1-1.0.0.dar
   - ./dars/splice-api-token-transfer-instruction-v1-1.0.0.dar
