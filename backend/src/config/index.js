@@ -62,7 +62,8 @@ const config = {
     packageId: process.env.CLOB_EXCHANGE_PACKAGE_ID || TOKEN_STANDARD_PACKAGE_ID,
     
     // Token Standard Package ID (Instrument, Holding, Settlement, OrderV3)
-    // Uses centralized constant from constants.js
+    // Uses centralized constant from constants.js, but template calls should still
+    // be driven by CLOB_EXCHANGE_PACKAGE_ID (see packageIds getter below).
     tokenStandardPackageId: TOKEN_STANDARD_PACKAGE_ID,
 
     // OAuth configuration (SERVICE TOKEN ONLY)
@@ -74,13 +75,14 @@ const config = {
       scope: process.env.OAUTH_SCOPE || 'openid profile email daml_ledger_api',
     },
 
-    // All package IDs now point to the SAME current package (v2.4.0)
+    // All package IDs should point to the SAME current package specified by
+    // CLOB_EXCHANGE_PACKAGE_ID (after DAR upload).
     get packageIds() {
       return {
-        clobExchange: this.tokenStandardPackageId,
-        userAccount: this.tokenStandardPackageId,
-        tokenStandard: this.tokenStandardPackageId,
-        legacy: this.tokenStandardPackageId, // No more old packages
+        clobExchange: this.packageId,
+        userAccount: this.packageId,
+        tokenStandard: this.packageId,
+        legacy: this.packageId, // No more old packages
       };
     },
 

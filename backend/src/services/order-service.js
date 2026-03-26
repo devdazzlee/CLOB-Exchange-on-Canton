@@ -1221,6 +1221,34 @@ class OrderService {
       readAs: [operatorPartyId, partyId],
     });
     } catch (prepErr) {
+      const prepMsg = String(prepErr?.message || prepErr || '');
+      // After uploading a new DAR/package-id, some participant informees may not yet be vetted
+      // on the prescribed synchronizer. In that case Canton rejects interactive prepare with:
+      // INVALID_PRESCRIBED_SYNCHRONIZER_ID ... has not vetted <packageId>.
+      if (
+        prepMsg.includes('INVALID_PRESCRIBED_SYNCHRONIZER_ID') &&
+        prepMsg.toLowerCase().includes('has not vetted')
+      ) {
+        console.warn(
+          `[OrderService] Preparing CancelOrder failed due to package vetting. Will vet package ${packageId.substring(0, 10)}... and retry once...`
+        );
+        const adminToken = await tokenProvider.getServiceToken();
+        const CantonGrpcClient = require('./canton-grpc-client');
+        const grpcClient = new CantonGrpcClient();
+        await grpcClient.vetPackage(packageId, adminToken, config.canton.synchronizerId);
+
+        // Retry interactive prepare once
+        prepareResult = await cantonService.prepareInteractiveSubmission({
+          token,
+          actAsParty: [partyId],
+          templateId: `${packageId}:Order:Order`,
+          contractId: orderContractId,
+          choice: 'CancelOrder',
+          choiceArgument: {},
+          readAs: [operatorPartyId, partyId],
+        });
+      }
+
       if (prepErr.message?.includes('CONTRACT_NOT_FOUND') || prepErr.message?.includes('could not be found')) {
         console.warn(`[OrderService] Order contract already consumed/archived — treating as cancelled`);
         const readModel = getReadModelService();

@@ -1146,72 +1146,65 @@ class MatchingEngine {
     console.log(`[MatchingEngine]    ✅ Quote allocation created: ${legBAllocCid.substring(0, 24)}...`);
 
     // ═══════════════════════════════════════════════════════════════════════
-    // DvP Step 4 — Execute both Allocation_ExecuteTransfer legs
+    // DvP Step 4 — ATOMIC settlement via DvPAgreement
     //
-    // Canton interactive prepare supports only ONE command, and non-interactive
-    // cannot authorize external parties. So we settle each leg separately:
+    // 1) Create ONE DvPAgreement contract co-signed by [seller, buyer]
+    //    (interactive signing tx).
+    // 2) Operator exercises Settle_DvP, and DAML executes BOTH
+    //    Allocation_ExecuteTransfer legs in a single Canton transaction.
     //
-    //   CC leg (AmuletAllocation):  Non-interactive, executor-only.
-    //     DSO delegation (in disclosed contracts) handles authorization.
-    //     Proven path — SDK/registry API handles this.
-    //
-    //   CBTC leg (DvpLegAllocation): Interactive, actAs=[operator, seller, buyer].
-    //     allocationControllers = [executor, sender, receiver] = all 3 in actAs.
-    //     Seller + buyer sign with stored keys. Operator auto-signs (local).
-    //
-    // Both legs settle. Order of execution: CC first (faster), then CBTC.
+    // Note: DvPAgreement creation is separate because interactive prepare
+    // requires external party signatures. The token movements are atomic
+    // inside Settle_DvP.
     // ═══════════════════════════════════════════════════════════════════════
-    console.log(`[MatchingEngine]    Step 4: DvP settlement — execute both allocation transfers...`);
+    console.log(`[MatchingEngine]    Step 4: DvP atomic settlement via Settle_DvP...`);
     console.log(`[MatchingEngine]    Base alloc (${baseSymbol}): ${legAAllocCid.substring(0, 24)}...`);
     console.log(`[MatchingEngine]    Quote alloc (${quoteSymbol}): ${legBAllocCid.substring(0, 24)}...`);
 
-    // ── Step 4a: Execute CC leg — non-interactive, executor-only ──
-    // AmuletAllocation uses DSO delegation. The SDK/registry API handles it.
-    console.log(`[MatchingEngine]    Step 4a: Executing CC leg (executor-only, DSO delegation)...`);
-    const ccResult = await sdkClient.executeAllocation(legAAllocCid, operatorPartyId, baseSymbol, sellOrder.owner, buyOrder.owner);
-    const ccUpdateId = ccResult?.transaction?.updateId || ccResult?.updateId;
-    if (ccUpdateId) updateIds.push({ step: 'execute-cc-leg', updateId: ccUpdateId });
-    console.log(`[MatchingEngine]    ✅ CC leg settled (updateId: ${ccUpdateId || 'N/A'})`);
+    // ── Step 4a: Create DvPAgreement (interactive, seller+buyer sign) ──
+    console.log(`[MatchingEngine]    Step 4a: Fetching ExtraArgs for base + quote legs...`);
+    const baseExtra = await sdkClient.fetchAllocationExtraArgs(legAAllocCid, baseSymbol);
+    const quoteExtra = await sdkClient.fetchAllocationExtraArgs(legBAllocCid, quoteSymbol);
 
-    // ── Step 4b: Execute CBTC leg — interactive, 3-party auth ──
-    // DvpLegAllocation.allocationControllers = [executor, sender, receiver].
-    // For CBTC: executor=operator, sender=buyer, receiver=seller.
-    // All 3 must be in actAs. Interactive submission: seller+buyer sign, operator auto-signs.
-    console.log(`[MatchingEngine]    Step 4b: Executing CBTC leg (interactive, 3-party auth)...`);
+    const dvpAgreementTemplateId = `${packageId}:Settlement:DvPAgreement`;
+    const dvpAgreementCreatedAt = new Date().toISOString();
 
-    const cbtcExtra = await sdkClient.fetchAllocationExtraArgs(legBAllocCid, quoteSymbol);
-    const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
-
-    const cbtcPrep = await cantonService.prepareInteractiveSubmission({
+    console.log(`[MatchingEngine]    Step 4a: Creating DvPAgreement contract (seller+buyer signatures)...`);
+    const dvpAgreementPrep = await cantonService.prepareInteractiveSubmission({
       token: adminToken,
-      actAsParty: [operatorPartyId, sellOrder.owner, buyOrder.owner],
-      templateId: ALLOCATION_INTERFACE,
-      contractId: legBAllocCid,
-      choice: 'Allocation_ExecuteTransfer',
-      choiceArgument: {
-        extraArgs: cbtcExtra.extraArgs,
+      actAsParty: [sellOrder.owner, buyOrder.owner],
+      templateId: dvpAgreementTemplateId,
+      createArguments: {
+        tradeId,
+        seller: sellOrder.owner,
+        buyer: buyOrder.owner,
+        executor: operatorPartyId,
+        baseLegAllocCid: legAAllocCid,
+        quoteLegAllocCid: legBAllocCid,
+        matchPrice: matchPrice.toString(),
+        matchQuantity: matchQtyStr,
+        tradingPair,
+        createdAt: dvpAgreementCreatedAt,
       },
       readAs: [operatorPartyId, sellOrder.owner, buyOrder.owner],
       synchronizerId,
-      disclosedContracts: cbtcExtra.disclosedContracts.length > 0 ? cbtcExtra.disclosedContracts : null,
     });
 
-    const cbtcHash = cbtcPrep.preparedTransactionHash;
-    const [sellerCbtcSig, buyerCbtcSig] = await Promise.all([
-      signHash(sellerKey.keyBase64, cbtcHash),
-      signHash(buyerKey.keyBase64, cbtcHash),
+    const dvpAgreementHash = dvpAgreementPrep.preparedTransactionHash;
+    const [sellerDvpSig, buyerDvpSig] = await Promise.all([
+      signHash(sellerKey.keyBase64, dvpAgreementHash),
+      signHash(buyerKey.keyBase64, dvpAgreementHash),
     ]);
 
-    console.log(`[MatchingEngine]    Executing CBTC transfer (seller + buyer signed, operator auto-signs)...`);
-    const dvpResult = await cantonService.executeInteractiveSubmission({
-      preparedTransaction: cbtcPrep.preparedTransaction,
+    const dvpAgreementCreateResult = await cantonService.executeInteractiveSubmission({
+      preparedTransaction: dvpAgreementPrep.preparedTransaction,
       partySignatures: {
         signatures: [
           {
             party: sellOrder.owner,
             signatures: [{
               format: 'SIGNATURE_FORMAT_RAW',
-              signature: sellerCbtcSig,
+              signature: sellerDvpSig,
               signedBy: sellerKey.fingerprint,
               signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
             }],
@@ -1220,22 +1213,82 @@ class MatchingEngine {
             party: buyOrder.owner,
             signatures: [{
               format: 'SIGNATURE_FORMAT_RAW',
-              signature: buyerCbtcSig,
+              signature: buyerDvpSig,
               signedBy: buyerKey.fingerprint,
               signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
             }],
           },
         ],
       },
-      hashingSchemeVersion: cbtcPrep.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
+      hashingSchemeVersion: dvpAgreementPrep.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
     }, adminToken);
 
-    const cbtcUpdateId = dvpResult?.transaction?.updateId;
-    if (cbtcUpdateId) updateIds.push({ step: 'execute-cbtc-leg', updateId: cbtcUpdateId });
-    console.log(`[MatchingEngine]    ✅ CBTC leg settled (updateId: ${cbtcUpdateId || 'N/A'})`);
+    let dvpAgreementCid = null;
+    const dvpCreateEvents = dvpAgreementCreateResult?.transaction?.events || [];
+    for (const ev of dvpCreateEvents) {
+      const created = ev.created || ev.CreatedEvent;
+      const tplId = created?.templateId;
+      const tplStr = typeof tplId === 'string'
+        ? tplId
+        : `${tplId?.packageId || ''}:${tplId?.moduleName || ''}:${tplId?.entityName || ''}`;
 
-    console.log(`[MatchingEngine] ✅ DvP settlement complete — both legs settled`);
-    console.log(`[MatchingEngine]    CC updateId: ${ccUpdateId || 'N/A'} | CBTC updateId: ${cbtcUpdateId || 'N/A'}`);
+      if (tplStr.includes('DvPAgreement') && created?.contractId) {
+        dvpAgreementCid = created.contractId;
+        break;
+      }
+    }
+    if (!dvpAgreementCid) {
+      console.log(`[MatchingEngine]    ℹ️ DvPAgreement event not in response, polling ledger for tradeId: ${tradeId}...`);
+      for (let attempt = 1; attempt <= 8 && !dvpAgreementCid; attempt++) {
+        // Wait a moment for the ledger to reflect
+        await new Promise(r => setTimeout(r, 3000));
+        try {
+          const queryRes = await cantonService.queryActiveContracts({
+            templateIds: [dvpAgreementTemplateId],
+            party: operatorPartyId
+          }, adminToken);
+          const match = queryRes.find(c => c.payload && c.payload.tradeId === tradeId);
+          if (match) {
+            dvpAgreementCid = match.contractId;
+          } else {
+            console.log(`[MatchingEngine]    ⏳ Waiting for DvPAgreement (attempt ${attempt}/8)...`);
+          }
+        } catch (err) {
+          console.warn(`[MatchingEngine] Fallback ACS query failed: ${err.message}`);
+        }
+      }
+    }
+    
+    if (!dvpAgreementCid) {
+      throw new Error('DvPAgreement creation failed: could not extract contractId from result');
+    }
+    console.log(`[MatchingEngine]    ✅ DvPAgreement created: ${dvpAgreementCid.substring(0, 24)}...`);
+
+    // ── Step 4b: Operator exercises Settle_DvP (atomic both legs) ──
+    console.log(`[MatchingEngine]    Step 4b: Executing Settle_DvP (single Canton TX expected)...`);
+    const settleResult = await cantonService.exerciseChoice({
+      token: adminToken,
+      actAsParty: operatorPartyId,
+      templateId: dvpAgreementTemplateId,
+      contractId: dvpAgreementCid,
+      choice: 'Settle_DvP',
+      choiceArgument: {
+        baseExtraArgs: baseExtra.extraArgs,
+        quoteExtraArgs: quoteExtra.extraArgs,
+      },
+      readAs: [operatorPartyId, sellOrder.owner, buyOrder.owner],
+      synchronizerId,
+      disclosedContracts: [
+        ...(baseExtra.disclosedContracts || []),
+        ...(quoteExtra.disclosedContracts || []),
+      ],
+    });
+
+    const settleUpdateId = settleResult?.transaction?.updateId || settleResult?.updateId;
+    if (settleUpdateId) updateIds.push({ step: 'execute-settle-dvp', updateId: settleUpdateId });
+    console.log(`[MatchingEngine]    ✅ Atomic DvP settled (updateId: ${settleUpdateId || 'N/A'})`);
+
+    console.log(`[MatchingEngine] ✅ DvP settlement complete — both legs settled atomically`);
     if (updateIds.length > 0) {
       console.log(`[MatchingEngine]    All updateIds for Canton Explorer verification:`);
       for (const u of updateIds) {

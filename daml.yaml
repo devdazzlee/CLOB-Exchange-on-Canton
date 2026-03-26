@@ -1,6 +1,6 @@
 sdk-version: 3.4.9
-name: clob-exchange-splice
-version: 1.1.0
+name: clob-exchange-splice-v2
+version: 1.0.0
 source: daml
 exposed-modules:
   - MasterOrderBook

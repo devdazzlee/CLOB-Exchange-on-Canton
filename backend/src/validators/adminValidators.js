@@ -13,9 +13,15 @@ const createOrderBookSchema = Joi.object({
 
 const uploadDarSchema = Joi.object({
   body: Joi.object({
-    darFile: Joi.string().base64().required(),
-  }),
-});
+    // Accept either:
+    // - darFile: base64-encoded DAR contents (current API)
+    // - darPath: server-side filesystem path to the DAR (useful for scripts)
+    darFile: Joi.string().base64(),
+    darPath: Joi.string(),
+  })
+    .xor('darFile', 'darPath')
+    .required(),
+}).required();
 
 module.exports = {
   createOrderBookSchema,

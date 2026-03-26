@@ -6308,3 +6308,106 @@ Also, with this pattern we see that lock holding contracts (LockedAmulet) are no
 As mentioned earlier, we do not have a complete implementation worked out. You will need to go through the documentation, research possible approaches, and implement a DAML pattern that fulfills this requirement.
 
 The Allocation_ExecuteTransfer choice does consumes the Lock contract. Did you try running the example we shared above ? (https://github.com/hyperledger-labs/splice/blob/bca52d362f8243369381b32aa16279e5b0ebafdf/token-standard/examples/splice-token-test-trading-app/daml/Splice/Testing/Apps/TradingApp.daml#L20)
+
+
+[7:53 AM, 3/22/2026] +971 58 590 3850: Order book is still empty
+[7:53 AM, 3/22/2026] +971 58 590 3850: Can you put some read me and commit the code? We can’t do anything with the code with a readme or a guide
+[8:10 AM, 3/22/2026] AHMED: Order book is still empty
+Please do with CC / CBTC
+[8:11 AM, 3/22/2026] AHMED: What’s Railway? We can provide you a paid version of that
+Railway is the platform I’m using to host the backend. I’m currently on a 30-day free trial, which will expire on Monday. If you can provide a paid plan or your own hosting, I can deploy the backend there.
+[8:15 AM, 3/22/2026] AHMED: Please test with CC / CBTC
+[8:21 AM, 3/22/2026] AHMED: Can you put some read me and commit the code? We can’t do anything with the code with a readme or a guide
+We will provide complete documentation (MD files) for both the frontend and backend and share it with you. Everything will be clearly explained. If you face any issues, we will be available to assist. We will also push both MD files to your repository.
+[9:23 AM, 3/22/2026] +91 79903 24401: @AHMED,
+The locked contracts that were being created in order are being unlocked on settlements but still there is no Allocation Execution of buyer -> seller and seller -> buyer.
+
+There should be 2 Allocation buyer->seller and seller->buyer on settlement which should be executed. But at the moment we are just unlocking the locked tokens from both buyer and seller on matchmaking and not executing the allocations for buyer->seller and seller->buyer
+[9:25 AM, 3/22/2026] +91 79903 24401: @AHMED,
+The locked contracts that were being created in order are being unlocked on settlements but still there is no Allocation Execution of buyer -> seller and seller -> buyer.
+
+There should be 2 Allocation buyer->seller and seller->buyer on settlement which should be executed. But at the moment we are just unlocking the locked tokens from both buyer and seller on matchmaking and not executing the allocations for buyer->seller and seller->buyer. Also, there is an Allocation for seller->buyer (which is not executed) but not for buyer->seller
+[9:29 AM, 3/22/2026] +971 58 590 3850: Railway is the platform I’m using to host the backend. I’m currently on a 30-day free trial, which will expire on Monday. If you can provide a paid plan or your own hosting, I can deploy the backend there.
+Let’s use vercel? We already have a paid account there
+[10:16 AM, 3/22/2026] +91 79903 24401: @AHMED,
+The locked contracts that were being created in order are being unlocked on settlements but still there is no Allocation Execution of buyer -> seller and seller -> buyer.
+
+There should be 2 Allocation buyer->seller and seller->buyer on settlement which should be executed. But at the moment we are just unlocking the locked tokens from both buyer and seller on matchmaking and not executing the allocations for buyer->seller and seller->buyer. Also, there is an Allocation for seller->buyer (which is not executed) but not for buyer->seller
+A question, 
+Why arent we creating a sinle allocation with both transfer legs
+[7:11 AM, 3/24/2026] AHMED: Hi @~Mohak @~huz ,
+
+All three points are resolved.
+
+Both allocation legs are now executing on settlement. CC (seller to buyer) goes through the SDK's exerciseAllocationChoice and CBTC (buyer to seller) goes through a TransferInstruction. Both directions complete successfully and 4 settlement rows are recorded per trade.
+
+On your question about a single allocation with both transfer legs, CC and CBTC sit under different instrument admins and registries so Canton doesn't allow mixing them in a single allocation. Each token type uses the pattern suited to its setup, Allocation for CC and TransferInstruction for CBTC. The end result is the same, tokens flow user to user with no operator custody in between.
+
+
+https://clob-exchange-on-canton.vercel.app/
+[7:14 AM, 3/24/2026] AHMED: Let’s use vercel? We already have a paid account there
+Yes, please provide Vercel access.
+[10:42 AM, 3/24/2026] +91 79903 24401: Hi @~Mohak @~huz ,
+
+All three points are resolved.
+
+Both allocation legs are now executing on settlement. CC (seller to buyer) goes through the SDK's exerciseAllocationChoice and CBTC (buyer to seller) goes through a TransferInstruction. Both directions complete successfully and 4 settlement rows are recorded per trade.
+
+On your question about a single allocation with both transfer legs, CC and CBTC sit under different instrument admins and registries so Canton doesn't allow mixing them in a single allocation. Each token type uses the pattern suited to its setup, Allocation for CC and TransferInstruction for CBTC. The end result is the same, tokens flow user to user with no operator custody in between.
+
+
+https://clob-exchange-on-canton.ve
+@AHMED all the activities performed on settlement should be part of the same tx and not individual txs. As using the SDK's exerciseAllocationChoice will result in a single tx for each Allocation…
+[10:43 AM, 3/24/2026] +971 58 590 3850: Yes, please provide Vercel access.
+What’s your email?
+[3:28 PM, 3/24/2026] AHMED: What’s your email?
+ahmedrazagithub@gmail.com
+[4:05 PM, 3/24/2026] +971 58 590 3850: let me try to add it on vercel
+[4:05 PM, 3/24/2026] +971 58 590 3850: Where’s the env file?
+[4:54 PM, 3/24/2026] AHMED: this is .env file :
+# ====================================================================
+# CANTON DEVNET ENVIRONMENT VARIABLES
+# ====================================================================
+
+# Server Configuration
+PORT=3001
+NODE_ENV=development
+LOG_LEVEL=info
+
+# ====================================================================
+# CANTON ENDPOINTS (DEVNET)
+# ====================================================================
+
+# JSON Ledger API (HTTP/WS) - PRIMARY API for all reads/writes
+CANTON_JSON_LEDGER_API_BASE=http://65.108.40.104:31539
+
+# Admin API (gRPC) - for DAR uploads and admin operations
+CANTON_ADMIN_API_GRPC_HOST=65.108.40.104
+CANTON_ADMIN_API_GRPC_PORT=30100
+
+# Ledger API (gRPC) - for ledger operations
+CANTON_LEDGER_API_GRPC_HOST=65
+.
+[4:54 PM, 3/24/2026] AHMED: let me try to add it on vercel
+Ok
+[4:56 PM, 3/24/2026] +971 58 590 3850: .
+I mean for deploying the backend on vercel
+[5:18 PM, 3/24/2026] AHMED: I mean for deploying the backend on vercel
+Could you send me an invite on Vercel or add me as a collaborator so I can deploy the backend on your Vercel?
+[5:22 PM, 3/24/2026] +971 58 590 3850: The challenge is vercel doesn’t allow us any user level permissions and we have many other projects in our organization vercel
+[5:22 PM, 3/24/2026] +971 58 590 3850: Should I deploy i if it’s straight forward and then can provide you a build hook for future deployments
+[5:24 PM, 3/24/2026] AHMED: Okay, I will share the .env file. You just need to add the environment variables and set the root directory to backend. Once it’s deployed, share the URL with me.
+[5:25 PM, 3/24/2026] +971 58 590 3850: Sure
+[7:05 PM, 3/24/2026] AHMED: @AHMED all the activities performed on settlement should be part of the same tx and not individual txs. As using the SDK's exerciseAllocationChoice will result in a single tx for each Allocation…
+Hi @~Mohak⁩ @~huz⁩,
+
+I’ve made the changes and both allocation legs are now executing. Could you please test it on your side first? Once it’s verified, I’ll work on combining the settlement activities into a single transaction as you suggested.
+
+Thanks!
+[9:08 PM, 3/24/2026] +91 79903 24401: Hi @~Mohak⁩ @~huz⁩,
+
+I’ve made the changes and both allocation legs are now executing. Could you please test it on your side first? Once it’s verified, I’ll work on combining the settlement activities into a single transaction as you suggested.
+
+Thanks!
+Hey @AHMED,
+It would be better for us to test once the single-tx implementation is completed as well, so we can validate the final intended flow directly.

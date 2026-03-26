@@ -217,6 +217,7 @@ template BatchSettlement
           return tradeCid
         return results
 
+
 -- =============================================================================
 -- EXCHANGE ALLOCATION — Propose-Accept Pattern for External Parties
 -- =============================================================================
@@ -486,6 +487,8 @@ template DvPAgreement
         quoteExtraArgs : ExtraArgs  -- choiceContext from CBTC registry
       controller executor
       do
+        assertMsg "Seller and buyer must be different" (seller /= buyer)
+        assertMsg "Match quantity must be positive" (matchQuantity > 0.0)
         -- Both exercises run with auth = {executor, seller, buyer}
         -- CC leg:   allocationControllers = [executor, seller, buyer] ✓
         -- CBTC leg: allocationControllers = [executor, buyer, seller] ✓

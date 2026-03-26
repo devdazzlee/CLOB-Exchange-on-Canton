@@ -8,8 +8,8 @@ set -e
 # Configuration
 DAR_FILE="${1:-daml/.daml/dist/clob-exchange-1.0.0.dar}"
 JWT_TOKEN="${JWT_TOKEN:-}"
-PARTICIPANT_HOST="participant.dev.canton.wolfedgelabs.com"
-CANTON_ADMIN_GRPC_PORT=443
+PARTICIPANT_HOST="65.108.40.104"
+CANTON_ADMIN_GRPC_PORT=30100
 DAR_DIRECTORY="./dars"
 
 # Colors for output
@@ -82,8 +82,8 @@ GRPC_UPLOAD_DAR_REQUEST=$(jq -n \
     "dars": [{
       "bytes": $bytes
     }],
-    "vet_all_packages": false,
-    "synchronize_vetting": false
+    "vet_all_packages": true,
+    "synchronize_vetting": true
   }')
 
 echo "Uploading DAR to Canton participant..."

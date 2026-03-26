@@ -225,7 +225,7 @@ class CantonGrpcClient {
    * Vet a package on the participant (required for transactions to work)
    * Uses the PackageService to vet a package for use on connected domains
    */
-  async vetPackage(packageId, token) {
+  async vetPackage(packageId, token, synchronizerId = config?.canton?.synchronizerId) {
     try {
       await this.initialize(token);
       
@@ -249,7 +249,10 @@ class CantonGrpcClient {
       if (!PackageService) {
         console.log('[gRPC] PackageManagementService not available, trying participant admin...');
         // Try via participant admin API on port 30100
-        return this.vetPackageViaAdmin(packageId, token);
+        if (!synchronizerId) {
+          throw new Error('vetPackage: synchronizerId is required when using vetPackageViaAdmin');
+        }
+        return this.vetPackageViaAdmin(packageId, synchronizerId, token);
       }
       
       const packageClient = new PackageService(CANTON_LEDGER_API_URL, grpc.credentials.createInsecure());
@@ -274,8 +277,15 @@ class CantonGrpcClient {
             }
           });
         } else {
-          console.log('[gRPC] VetDar method not available');
-          reject(new Error('VetDar method not available'));
+          // Our locally vendored proto doesn't always expose VetDar.
+          // Fall back to the dynamic participant-admin call.
+          console.warn('[gRPC] VetDar method not available on PackageManagementService proto — falling back to participant admin VetDar');
+          if (!synchronizerId) {
+            return reject(new Error('vetPackage: synchronizerId is required for vetPackageViaAdmin fallback'));
+          }
+          this.vetPackageViaAdmin(packageId, synchronizerId, token)
+            .then(resolve)
+            .catch(reject);
         }
       });
     } catch (error) {
