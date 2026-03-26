@@ -106,8 +106,8 @@ function createHttpClient({
         console.error(`[${name}] TIMEOUT after ${timeout}ms: ${error.config?.url?.substring(0, 100) || 'unknown'}`);
       } else if (error.response) {
         const body = typeof error.response.data === 'string'
-          ? error.response.data.substring(0, 200)
-          : JSON.stringify(error.response.data || {}).substring(0, 200);
+          ? error.response.data.substring(0, 800)
+          : JSON.stringify(error.response.data || {}).substring(0, 800);
         console.error(`[${name}] HTTP ${error.response.status}: ${body}`);
       } else {
         console.error(`[${name}] Network error: ${(error.message || '').substring(0, 150)}`);

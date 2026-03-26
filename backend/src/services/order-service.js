@@ -1227,6 +1227,29 @@ class OrderService {
         if (readModel) readModel.removeOrder(orderContractId);
         _globalOpenOrders.delete(orderContractId);
         if (orderDetails?.orderId) await releaseReservation(orderDetails.orderId);
+
+        // Broadcast eviction via WebSocket so frontend removes the stale order
+        if (global.broadcastWebSocket) {
+          const tp = orderDetails?.tradingPair || tradingPair;
+          if (tp) {
+            global.broadcastWebSocket(`orderbook:${tp}`, {
+              type: 'ORDER_CANCELLED',
+              contractId: orderContractId,
+              orderId: orderDetails?.orderId,
+              tradingPair: tp,
+              timestamp: new Date().toISOString(),
+            });
+          }
+          if (partyId) {
+            global.broadcastWebSocket(`orders:${partyId}`, {
+              type: 'ORDER_ARCHIVED',
+              contractId: orderContractId,
+              orderId: orderDetails?.orderId,
+              timestamp: new Date().toISOString(),
+            });
+          }
+        }
+
         return {
           cancelled: true,
           alreadyArchived: true,
@@ -1331,15 +1354,26 @@ class OrderService {
         _globalOpenOrders.delete(cancelMeta.orderContractId);
       }
       
-      // Broadcast via WebSocket
-      if (global.broadcastWebSocket && cancelMeta.tradingPair) {
-        global.broadcastWebSocket(`orderbook:${cancelMeta.tradingPair}`, {
-          type: 'ORDER_CANCELLED',
-          contractId: cancelMeta.orderContractId,
-          orderId: cancelMeta.orderId,
-          tradingPair: cancelMeta.tradingPair,
-          timestamp: new Date().toISOString()
-        });
+      // Broadcast via WebSocket to both orderbook and user-specific channels
+      if (global.broadcastWebSocket) {
+        const ts = new Date().toISOString();
+        if (cancelMeta.tradingPair) {
+          global.broadcastWebSocket(`orderbook:${cancelMeta.tradingPair}`, {
+            type: 'ORDER_CANCELLED',
+            contractId: cancelMeta.orderContractId,
+            orderId: cancelMeta.orderId,
+            tradingPair: cancelMeta.tradingPair,
+            timestamp: ts,
+          });
+        }
+        if (partyId) {
+          global.broadcastWebSocket(`orders:${partyId}`, {
+            type: 'ORDER_ARCHIVED',
+            contractId: cancelMeta.orderContractId,
+            orderId: cancelMeta.orderId,
+            timestamp: ts,
+          });
+        }
       }
       
       return {

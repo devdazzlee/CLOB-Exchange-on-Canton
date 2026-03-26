@@ -2136,8 +2136,55 @@ class CantonSDKClient {
   }
 
   /**
+   * Fetch ExtraArgs and disclosed contracts for Allocation_ExecuteTransfer.
+   *
+   * Returns the data needed to exercise Allocation_ExecuteTransfer either
+   * directly or from within a DAML choice (e.g., Execute_DvP).
+   *
+   * @param {string} allocationContractId - The Splice Allocation contract ID
+   * @param {string} symbol - Token symbol (e.g., "CC", "CBTC") for API routing
+   * @returns {{ extraArgs: Object, disclosedContracts: Array }} ExtraArgs + disclosed contracts
+   */
+  async fetchAllocationExtraArgs(allocationContractId, symbol) {
+    const tokenSystemType = symbol ? getTokenSystemType(symbol) : null;
+    const adminParty = this.getInstrumentAdminForSymbol(symbol);
+    const encodedCid = encodeURIComponent(allocationContractId);
+
+    const executeContextUrl = tokenSystemType === 'utilities'
+      ? `${UTILITIES_CONFIG.TOKEN_STANDARD_URL}/v0/registrars/${encodeURIComponent(adminParty)}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`
+      : `${CANTON_SDK_CONFIG.REGISTRY_API_URL}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
+
+    const adminToken = await tokenProvider.getServiceToken();
+
+    console.log(`[CantonSDK] Fetching ExtraArgs for ${symbol} allocation ${allocationContractId.substring(0, 24)}...`);
+    const { data: context } = await getRegistryApi().post(executeContextUrl, { meta: {}, excludeDebugFields: true }, {
+      headers: { Authorization: `Bearer ${adminToken}`, Accept: 'application/json' },
+    });
+    const configModule = require('../config');
+    const synchronizerId = await cantonService.resolveSubmissionSynchronizerId(
+      adminToken,
+      configModule.canton.synchronizerId
+    );
+
+    const disclosedContracts = (context.disclosedContracts || []).map(dc => ({
+      templateId: dc.templateId,
+      contractId: dc.contractId,
+      createdEventBlob: dc.createdEventBlob,
+      synchronizerId: dc.synchronizerId || synchronizerId,
+    }));
+
+    const extraArgs = {
+      context: context.choiceContextData || { values: {} },
+      meta: { values: {} },
+    };
+
+    console.log(`[CantonSDK] ✅ ExtraArgs fetched for ${symbol}: ${disclosedContracts.length} disclosed contract(s)`);
+    return { extraArgs, disclosedContracts };
+  }
+
+  /**
    * Execute an Allocation — exchange acts as executor.
-   * 
+   *
    * Called at MATCH TIME. The exchange (executor) settles the allocation,
    * transferring funds from sender to receiver. NO user key needed.
    * 

@@ -18,6 +18,7 @@ import PortfolioView from './trading/PortfolioView';
 import MarketData from './trading/MarketData';
 import TransferOffers from './trading/TransferOffers';
 import BalanceCard from './trading/BalanceCard';
+import PasswordInput from './PasswordInput';
 
 // Import skeleton components
 import OrderBookSkeleton from './trading/OrderBookSkeleton';
@@ -386,32 +387,34 @@ export default function TradingInterface({ partyId }) {
     
     console.log('[Cancel Order] Order cancelled:', result);
     toast.success('Order cancelled successfully! Funds unlocked.');
-    
-    // Wait for Canton to propagate the cancellation
-    await new Promise(r => setTimeout(r, 800));
-    
-    // Refresh orders list - ALWAYS use fresh data
-    try {
-      const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
-          const ordersList = ordersData?.data?.orders || [];
-          setOrders(ordersList.map(order => ({
-            id: order.orderId || order.contractId,
-            contractId: order.contractId,
-            type: order.orderType,
-            mode: order.orderMode,
-            price: order.price,
-            quantity: order.quantity,
-            filled: order.filled || '0',
-            remaining: order.remaining,
-            status: order.status,
-            tradingPair: order.tradingPair,
-            timestamp: order.timestamp,
-            stopPrice: order.stopPrice || null,
-            triggeredAt: order.triggeredAt || null,
-          })));
-    } catch (e) {
-      console.warn('[Cancel Order] Failed to refresh orders:', e);
-    }
+
+    // Immediately remove cancelled order from local state (no flicker)
+    setOrders(prev => prev.filter(o => o.contractId !== contractId));
+
+    // Then refresh from Canton after propagation for consistency
+    setTimeout(async () => {
+      try {
+        const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
+        const ordersList = ordersData?.data?.orders || [];
+        setOrders(ordersList.map(order => ({
+          id: order.orderId || order.contractId,
+          contractId: order.contractId,
+          type: order.orderType,
+          mode: order.orderMode,
+          price: order.price,
+          quantity: order.quantity,
+          filled: order.filled || '0',
+          remaining: order.remaining,
+          status: order.status,
+          tradingPair: order.tradingPair,
+          timestamp: order.timestamp,
+          stopPrice: order.stopPrice || null,
+          triggeredAt: order.triggeredAt || null,
+        })));
+      } catch (e) {
+        console.warn('[Cancel Order] Failed to refresh orders:', e);
+      }
+    }, 2000);
     
     // Refresh order book (cancelled order should be removed)
     try {
@@ -560,31 +563,15 @@ export default function TradingInterface({ partyId }) {
         
         if (response.success) {
           toast.success('Order cancelled successfully! Funds unlocked.');
-          
-          // Refresh orders and balance
-          setTimeout(async () => {
-            try {
-              const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
-              const ordersList = ordersData?.data?.orders || [];
-              setOrders(ordersList.map(order => ({
-                id: order.orderId || order.contractId,
-                contractId: order.contractId,
-                type: order.orderType,
-                mode: order.orderMode,
-                price: order.price,
-                quantity: order.quantity,
-                filled: order.filled || '0',
-                remaining: order.remaining,
-                status: order.status,
-                tradingPair: order.tradingPair,
-                timestamp: order.timestamp,
-              })));
-            } catch (e) {
-              console.warn('[SignOrder] Failed to refresh orders:', e);
-            }
-          }, 800);
-          
-          refreshAllData(tradingPair);
+
+          // Immediately remove cancelled order from local state (no flicker)
+          const cancelledCid = signingState.cancelMeta?.orderContractId;
+          if (cancelledCid) {
+            setOrders(prev => prev.filter(o => o.contractId !== cancelledCid));
+          }
+
+          // Then refresh from Canton after propagation for consistency
+          setTimeout(() => refreshAllData(tradingPair), 2000);
         } else {
           throw new Error(response.error || 'Failed to execute order cancellation');
         }
@@ -1170,8 +1157,7 @@ export default function TradingInterface({ partyId }) {
             {/* Password Input */}
             <div className="space-y-2">
               <label className="text-sm font-medium text-foreground">Wallet Password</label>
-              <input
-                type="password"
+              <PasswordInput
                 className="w-full px-3 py-2 bg-background border border-border rounded-lg text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary"
                 placeholder="Enter wallet password"
                 value={walletPassword}

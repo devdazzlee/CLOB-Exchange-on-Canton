@@ -27,6 +27,7 @@ import { useToast } from '../ui/toast';
 import { apiClient, API_ROUTES } from '../../config/config';
 import { loadWallet, decryptPrivateKey, signMessage } from '../../wallet/keyManager';
 import websocketService from '../../services/websocketService';
+import PasswordInput from '../PasswordInput';
 
 const API = API_ROUTES.SETTLEMENT_TRADING_APP;
 
@@ -389,8 +390,7 @@ export default function PendingSettlements({ partyId, onSettlementComplete }) {
                 {withdrawSigning.pending.tradingPair} — {withdrawSigning.pending.matchQty} {withdrawSigning.pending.baseSymbol}
               </p>
               <p className="text-sm text-muted-foreground">Enter wallet password to sign.</p>
-              <input
-                type="password"
+              <PasswordInput
                 placeholder="Wallet password"
                 value={walletPassword}
                 onChange={(e) => setWalletPassword(e.target.value)}
@@ -416,8 +416,7 @@ export default function PendingSettlements({ partyId, onSettlementComplete }) {
                 {multilegSigning.pending.tradingPair} — Direct transfer (seller→buyer, buyer→seller)
               </p>
               <p className="text-sm text-muted-foreground">Enter wallet password to sign.</p>
-              <input
-                type="password"
+              <PasswordInput
                 placeholder="Wallet password"
                 value={walletPassword}
                 onChange={(e) => setWalletPassword(e.target.value)}

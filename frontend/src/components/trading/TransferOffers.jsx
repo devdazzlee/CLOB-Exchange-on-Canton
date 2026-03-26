@@ -27,6 +27,7 @@ import { useToast } from '../ui/toast';
 import { apiClient } from '../../config/config';
 import { loadWallet, decryptPrivateKey, signMessage } from '../../wallet/keyManager';
 import websocketService from '../../services/websocketService';
+import PasswordInput from '../PasswordInput';
 
 export default function TransferOffers({ partyId, onTransferAccepted }) {
   const [offers, setOffers] = useState([]);
@@ -429,8 +430,7 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
               <label className="block text-sm font-medium text-foreground mb-1.5">
                 Wallet Password
               </label>
-              <input
-                type="password"
+              <PasswordInput
                 value={walletPassword}
                 onChange={(e) => setWalletPassword(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && handleSignAndExecute()}

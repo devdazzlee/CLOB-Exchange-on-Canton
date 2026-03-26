@@ -442,6 +442,59 @@ template ExchangeAllocation
 
 
 -- =============================================================================
+-- DvP AGREEMENT — Both parties co-sign, operator settles atomically
+-- =============================================================================
+--
+-- Solves Canton's authorization limitation for atomic DvP settlement:
+--   - Interactive prepare supports only 1 command
+--   - Non-interactive can't authorize external parties
+--   - Signatory carry-forward across nested exercises doesn't work for ext parties
+--
+-- Solution: ONE contract with BOTH parties as signatories.
+--   Step 1: Create via interactive submission, actAs=[seller, buyer] (1 command ✓)
+--           Both parties sign with their stored Ed25519 keys.
+--   Step 2: Operator exercises Settle_DvP via non-interactive, actAs=[operator]
+--           Consuming the contract gives auth = {seller, buyer} (both signatories)
+--           + {operator} (controller) = {operator, seller, buyer}
+--           Both Allocation_ExecuteTransfer calls run inside with full auth.
+--           Single Canton transaction. Atomic DvP.
+--
+template DvPAgreement
+  with
+    tradeId : Text            -- Unique trade identifier
+    seller : Party            -- Seller (sends base asset, e.g., CC)
+    buyer : Party             -- Buyer (sends quote asset, e.g., CBTC)
+    executor : Party          -- Exchange operator
+    baseLegAllocCid : ContractId Allocation   -- CC allocation (seller→buyer)
+    quoteLegAllocCid : ContractId Allocation  -- CBTC allocation (buyer→seller)
+    matchPrice : Decimal
+    matchQuantity : Decimal
+    tradingPair : Text
+    createdAt : Text          -- ISO timestamp
+  where
+    -- BOTH external parties are signatories.
+    -- Consuming this contract provides {seller, buyer} authorization.
+    signatory [seller, buyer]
+    observer executor
+
+    -- Operator settles both legs atomically.
+    -- Auth = {seller, buyer} (signatories) + {executor} (controller)
+    -- = {executor, seller, buyer} → satisfies allocationControllers for both legs.
+    choice Settle_DvP : (Allocation_ExecuteTransferResult, Allocation_ExecuteTransferResult)
+      with
+        baseExtraArgs : ExtraArgs   -- choiceContext from CC registry
+        quoteExtraArgs : ExtraArgs  -- choiceContext from CBTC registry
+      controller executor
+      do
+        -- Both exercises run with auth = {executor, seller, buyer}
+        -- CC leg:   allocationControllers = [executor, seller, buyer] ✓
+        -- CBTC leg: allocationControllers = [executor, buyer, seller] ✓
+        baseResult <- exercise baseLegAllocCid Allocation_ExecuteTransfer with extraArgs = baseExtraArgs
+        quoteResult <- exercise quoteLegAllocCid Allocation_ExecuteTransfer with extraArgs = quoteExtraArgs
+        return (baseResult, quoteResult)
+
+
+-- =============================================================================
 -- LEGACY: ALLOCATION RECORD (kept for backward compatibility)
 -- =============================================================================
 -- NOTE: New code should use ExchangeAllocation (Propose-Accept) above.
