@@ -289,23 +289,29 @@ class StopLossService extends EventEmitter {
    * Backup periodic check
    */
   async _periodicCheck() {
-    const db = getDb();
-    const distinctPairs = await db.stopLossOrder.findMany({
-      where: { status: 'PENDING_TRIGGER' },
-      select: { tradingPair: true },
-      distinct: ['tradingPair'],
-    });
+    try {
+      const db = getDb();
+      const distinctPairs = await db.stopLossOrder.findMany({
+        where: { status: 'PENDING_TRIGGER' },
+        select: { tradingPair: true },
+        distinct: ['tradingPair'],
+      });
 
-    if (distinctPairs.length === 0) return;
+      if (distinctPairs.length === 0) return;
 
-    for (const { tradingPair } of distinctPairs) {
-      try {
-        const price = await this._getMarketPrice(tradingPair);
-        if (price && price > 0) {
-          await this.checkTriggers(tradingPair, price);
+      for (const { tradingPair } of distinctPairs) {
+        try {
+          const price = await this._getMarketPrice(tradingPair);
+          if (price && price > 0) {
+            await this.checkTriggers(tradingPair, price);
+          }
+        } catch (err) {
+          // Suppress
         }
-      } catch (err) {
-        // Suppress
+      }
+    } catch (dbErr) {
+      if (!dbErr.message?.includes('10054')) {
+        console.warn(`[StopLoss] DB check skipped (transient error):`, dbErr.message);
       }
     }
   }

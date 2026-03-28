@@ -47,8 +47,11 @@ const _globalOpenOrders = new Map();
 
 function registerOpenOrders(orders) {
   if (!Array.isArray(orders)) return;
+  const { getMatchingEngine } = require('./matching-engine');
+  const engine = getMatchingEngine();
+  
   for (const order of orders) {
-    if (order.status === 'OPEN' && order.contractId) {
+    if (order.status === 'OPEN' && order.contractId && !engine.invalidSettlementContracts.has(order.contractId)) {
       _globalOpenOrders.set(order.contractId, {
         contractId: order.contractId,
         orderId: order.orderId,
@@ -1445,6 +1448,9 @@ class OrderService {
         pageSize: limit
       }, token);
 
+      const { getMatchingEngine } = require('./matching-engine');
+      const engine = getMatchingEngine();
+
       const orders = (Array.isArray(contracts) ? contracts : [])
         .filter(c => {
           const templateId = c.templateId;
@@ -1453,11 +1459,25 @@ class OrderService {
           }
           const payload = c.payload || c.createArgument || {};
           if (payload.owner !== partyId) return false;
-          return status === 'ALL' || payload.status === status;
+          
+          let effectiveStatus = payload.status;
+          // If Canton thinks it's OPEN, but our matching engine quarantined it
+          // (because the underlying Splice allocation expired or was missing),
+          // treat it as FAILED/EXPIRED so it drops out of the Active Orders UI.
+          if (effectiveStatus === 'OPEN' && engine.invalidSettlementContracts.has(c.contractId)) {
+            effectiveStatus = 'EXPIRED';
+          }
+          
+          return status === 'ALL' || effectiveStatus === status;
         })
         .map(c => {
           const payload = c.payload || c.createArgument || {};
           const contractId = c.contractId;
+          
+          let effectiveStatus = payload.status;
+          if (effectiveStatus === 'OPEN' && engine.invalidSettlementContracts.has(contractId)) {
+            effectiveStatus = 'EXPIRED';
+          }
           
           let extractedPrice = null;
           if (payload.price) {
@@ -1480,7 +1500,7 @@ class OrderService {
             price: extractedPrice,
             quantity: payload.quantity,
             filled: payload.filled || '0',
-            status: payload.status,
+            status: effectiveStatus,
             timestamp: payload.timestamp,
             allocationCid: payload.allocationCid || null
           };
@@ -1490,7 +1510,7 @@ class OrderService {
       
       // Register OPEN orders in the global registry so the OrderBookService can see them
       // (handles orders placed through other backend instances where operator is not a stakeholder)
-      registerOpenOrders(orders);
+      registerOpenOrders(orders.filter(o => o.status === 'OPEN'));
       
       return orders;
     } catch (error) {
@@ -1504,14 +1524,25 @@ class OrderService {
             pageSize: 50
           }, token);
           
+          const { getMatchingEngine } = require('./matching-engine');
+          const engine = getMatchingEngine();
+          
           const orders = (Array.isArray(contracts) ? contracts : [])
             .filter(c => {
               const payload = c.payload || c.createArgument || {};
-              return payload.owner === partyId && 
-                     (status === 'ALL' || payload.status === status);
+              if (payload.owner !== partyId) return false;
+              let effectiveStatus = payload.status;
+              if (effectiveStatus === 'OPEN' && engine.invalidSettlementContracts.has(c.contractId)) {
+                effectiveStatus = 'EXPIRED';
+              }
+              return status === 'ALL' || effectiveStatus === status;
             })
             .map(c => {
               const payload = c.payload || c.createArgument || {};
+              let effectiveStatus = payload.status;
+              if (effectiveStatus === 'OPEN' && engine.invalidSettlementContracts.has(c.contractId)) {
+                effectiveStatus = 'EXPIRED';
+              }
               return {
                 contractId: c.contractId,
                 orderId: payload.orderId,
@@ -1522,7 +1553,7 @@ class OrderService {
                 price: payload.price?.Some || payload.price,
                 quantity: payload.quantity,
                 filled: payload.filled || '0',
-                status: payload.status,
+                status: effectiveStatus,
                 timestamp: payload.timestamp
               };
             });
@@ -1558,11 +1589,18 @@ class OrderService {
         pageSize: limit
       }, token);
 
+      const { getMatchingEngine } = require('./matching-engine');
+      const engine = getMatchingEngine();
+
       // Filter by trading pair and OPEN status (exclude PENDING_TRIGGER stop-loss orders)
       const orders = (Array.isArray(contracts) ? contracts : [])
         .filter(c => {
           const payload = c.payload || c.createArgument || {};
-          return payload.tradingPair === tradingPair && payload.status === 'OPEN';
+          let effectiveStatus = payload.status;
+          if (effectiveStatus === 'OPEN' && engine.invalidSettlementContracts.has(c.contractId)) {
+            effectiveStatus = 'EXPIRED';
+          }
+          return payload.tradingPair === tradingPair && effectiveStatus === 'OPEN';
         })
         .map(c => {
           const payload = c.payload || c.createArgument || {};
@@ -1577,7 +1615,7 @@ class OrderService {
             quantity: payload.quantity,
             filled: payload.filled || '0',
             remaining: (parseFloat(payload.quantity) - parseFloat(payload.filled || 0)).toString(),
-            status: payload.status,
+            status: 'OPEN',
             timestamp: payload.timestamp,
             allocationCid: payload.allocationCid || null,
           };

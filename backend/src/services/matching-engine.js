@@ -41,8 +41,8 @@ Decimal.set({ precision: 20, rounding: Decimal.ROUND_DOWN });
 
 /** Delay so registry / ACS can index new allocations before Allocation_ExecuteTransfer (client: both legs must execute). */
 function settlementSettleDelayMs() {
-  const n = parseInt(process.env.SETTLEMENT_REGISTRY_SETTLE_MS || '2500', 10);
-  return Number.isFinite(n) && n >= 0 ? n : 2500;
+  const n = parseInt(process.env.SETTLEMENT_REGISTRY_SETTLE_MS || '4500', 10);
+  return Number.isFinite(n) && n >= 0 ? n : 4500;
 }
 
 function sleep(ms) {

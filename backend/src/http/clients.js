@@ -67,9 +67,9 @@ function getRegistryApi() {
   if (!_registryApi) {
     _registryApi = createHttpClient({
       name: 'RegistryAPI',
-      timeout: 12_000,
+      timeout: 35_000,
       retries: 2,
-      retryDelay: 1500,
+      retryDelay: 2000,
     });
   }
   return _registryApi;
