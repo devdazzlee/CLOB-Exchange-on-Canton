@@ -1051,7 +1051,11 @@ class MatchingEngine {
     const existingAllocCids = await this._snapshotAllocationCids(operatorPartyId, adminToken);
     console.log(`[MatchingEngine]    Pre-existing allocation CIDs: ${existingAllocCids.size} (will be excluded from search)`);
 
-    // ═══ Step 3a: Create base allocation seller→buyer ═══
+    let legAAllocCid = null;
+    let legBAllocCid = null;
+
+    try {
+      // ═══ Step 3a: Create base allocation seller→buyer ═══
     console.log(`[MatchingEngine]    Step 3a: Creating allocation seller→buyer (${matchQtyStr} ${baseSymbol})...`);
     const legABuild = await sdkClient.buildAllocationInteractiveCommand(
       sellOrder.owner, buyOrder.owner, matchQtyStr, baseSymbol, operatorPartyId, `${tradeId}-leg-base`
@@ -1082,7 +1086,7 @@ class MatchingEngine {
       hashingSchemeVersion: legAPrep.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
     }, adminToken);
 
-    let legAAllocCid = this._extractAllocCidFromResult(legAResult);
+    legAAllocCid = this._extractAllocCidFromResult(legAResult);
     const uid3a = legAResult?.transaction?.updateId || legAResult?.updateId;
     if (uid3a) updateIds.push({ step: 'alloc-seller-to-buyer', updateId: uid3a });
     if (!legAAllocCid) {
@@ -1129,7 +1133,7 @@ class MatchingEngine {
       hashingSchemeVersion: legBPrep.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
     }, adminToken);
 
-    let legBAllocCid = this._extractAllocCidFromResult(legBResult);
+    legBAllocCid = this._extractAllocCidFromResult(legBResult);
     const uid3b = legBResult?.transaction?.updateId || legBResult?.updateId;
     if (uid3b) updateIds.push({ step: 'alloc-buyer-to-seller', updateId: uid3b });
     if (!legBAllocCid) {
@@ -1287,6 +1291,35 @@ class MatchingEngine {
     const settleUpdateId = settleResult?.transaction?.updateId || settleResult?.updateId;
     if (settleUpdateId) updateIds.push({ step: 'execute-settle-dvp', updateId: settleUpdateId });
     console.log(`[MatchingEngine]    ✅ Atomic DvP settled (updateId: ${settleUpdateId || 'N/A'})`);
+
+    } catch (settlementError) {
+      console.error(`[MatchingEngine] ❌ Atomic Settlement Flow Interrupted: ${settlementError.message}`);
+      console.log(`[MatchingEngine] 🔄 Executing ROLLBACK for orphaned allocations...`);
+      
+      const rollbackPromises = [];
+      if (legAAllocCid) {
+        console.log(`[MatchingEngine]    Rolling back base allocation leg: ${legAAllocCid.substring(0, 24)}...`);
+        rollbackPromises.push(
+          sdkClient.withdrawAllocation(legAAllocCid, sellOrder.owner, operatorPartyId, baseSymbol)
+            .catch(err => console.warn(`[MatchingEngine]    ⚠️ Rollback warning (base): ${err.message}`))
+        );
+      }
+      if (legBAllocCid) {
+        console.log(`[MatchingEngine]    Rolling back quote allocation leg: ${legBAllocCid.substring(0, 24)}...`);
+        rollbackPromises.push(
+          sdkClient.withdrawAllocation(legBAllocCid, buyOrder.owner, operatorPartyId, quoteSymbol)
+            .catch(err => console.warn(`[MatchingEngine]    ⚠️ Rollback warning (quote): ${err.message}`))
+        );
+      }
+      
+      if (rollbackPromises.length > 0) {
+        await Promise.allSettled(rollbackPromises);
+        console.log(`[MatchingEngine] ✅ Rollback complete. Orphaned funds unlocked via Allocation_Withdraw.`);
+      }
+      
+      // Re-throw the error so the outer loop in `_processBatch` quarantines the trades
+      throw settlementError;
+    }
 
     console.log(`[MatchingEngine] ✅ DvP settlement complete — both legs settled atomically`);
     if (updateIds.length > 0) {
