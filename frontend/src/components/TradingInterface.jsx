@@ -391,30 +391,6 @@ export default function TradingInterface({ partyId }) {
     // Immediately remove cancelled order from local state (no flicker)
     setOrders(prev => prev.filter(o => o.contractId !== contractId));
 
-    // Then refresh from Canton after propagation for consistency
-    setTimeout(async () => {
-      try {
-        const ordersData = await apiClient.get(API_ROUTES.ORDERS.GET_USER(partyId, 'OPEN'));
-        const ordersList = ordersData?.data?.orders || [];
-        setOrders(ordersList.map(order => ({
-          id: order.orderId || order.contractId,
-          contractId: order.contractId,
-          type: order.orderType,
-          mode: order.orderMode,
-          price: order.price,
-          quantity: order.quantity,
-          filled: order.filled || '0',
-          remaining: order.remaining,
-          status: order.status,
-          tradingPair: order.tradingPair,
-          timestamp: order.timestamp,
-          stopPrice: order.stopPrice || null,
-          triggeredAt: order.triggeredAt || null,
-        })));
-      } catch (e) {
-        console.warn('[Cancel Order] Failed to refresh orders:', e);
-      }
-    }, 2000);
     
     // Refresh order book (cancelled order should be removed)
     try {
@@ -569,9 +545,6 @@ export default function TradingInterface({ partyId }) {
           if (cancelledCid) {
             setOrders(prev => prev.filter(o => o.contractId !== cancelledCid));
           }
-
-          // Then refresh from Canton after propagation for consistency
-          setTimeout(() => refreshAllData(tradingPair), 2000);
         } else {
           throw new Error(response.error || 'Failed to execute order cancellation');
         }
