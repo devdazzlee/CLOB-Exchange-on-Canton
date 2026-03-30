@@ -957,258 +957,141 @@ class MatchingEngine {
     const adminToken = await tokenProvider.getServiceToken();
     const updateIds = [];
 
-    // ═══ Steps 1-2 PREPARE PHASE: Validate BOTH allocations BEFORE consuming either ═══
-    // This prevents the half-settled state where one allocation is consumed but the
-    // other is stale/missing, leaving the first party's tokens freed but order quarantined.
-    console.log(`[MatchingEngine]    Step 1-2 prepare: Validating both allocations exist on ledger...`);
+    // ═══ SETTLEMENT: Single CreateAndExercise TX (TradeSettlement::DoSettle) ═══
+    // All settlement steps happen in ONE Canton transaction (single updateId).
+    // TX 1 (order placement): AllocationFactory_Allocate self-alloc — already done per party.
+    // TX 2 (settlement): CreateAndExercise TradeSettlement → DoSettle.
+    //   Inside DoSettle (DAML): withdraw both self-allocs, create directional allocs,
+    //   execute both Allocation_ExecuteTransfer legs atomically.
+    console.log(`[MatchingEngine]    Building settlement: CreateAndExercise TradeSettlement::DoSettle`);
 
-    let sellerWithdrawPrep, buyerWithdrawPrep;
+    // Fetch locked holding CIDs from self-allocations first.
+    // At settlement time the holdings are locked inside the self-allocs, so
+    // listHoldingUtxos(false) returns empty. We use listHoldingUtxos(true) to
+    // get the locked CIDs and pass them as overrideHoldingCids to the factory API.
+    const [sellerHoldingCids, buyerHoldingCids] = await Promise.all([
+      sdkClient.getHoldingCidsForSettlement(sellOrder.owner, baseSymbol),
+      sdkClient.getHoldingCidsForSettlement(buyOrder.owner, quoteSymbol),
+    ]);
+    console.log(`[MatchingEngine]    Seller locked holdings (${baseSymbol}): ${sellerHoldingCids.length}`);
+    console.log(`[MatchingEngine]    Buyer locked holdings (${quoteSymbol}): ${buyerHoldingCids.length}`);
 
-    // Prepare seller withdrawal (no side effects — just builds transaction)
-    try {
-      sellerWithdrawPrep = await sdkClient.prepareWithdrawInteractive(
-        sellOrder.allocationContractId, sellOrder.owner, baseSymbol, adminToken
-      );
-    } catch (prepErr) {
-      throw new Error(`SELLER_ALLOCATION_FAILED: STALE_ALLOCATION_LOCK_MISSING: ${prepErr.message}`);
+    if (sellerHoldingCids.length === 0) {
+      throw new Error(`SELLER_HOLDINGS_MISSING: No locked ${baseSymbol} holdings found for seller — self-allocation may be expired or missing`);
+    }
+    if (buyerHoldingCids.length === 0) {
+      throw new Error(`BUYER_HOLDINGS_MISSING: No locked ${quoteSymbol} holdings found for buyer — self-allocation may be expired or missing`);
     }
 
-    // Prepare buyer withdrawal (no side effects — just builds transaction)
-    try {
-      buyerWithdrawPrep = await sdkClient.prepareWithdrawInteractive(
-        buyOrder.allocationContractId, buyOrder.owner, quoteSymbol, adminToken
-      );
-    } catch (prepErr) {
-      throw new Error(`BUYER_ALLOCATION_FAILED: STALE_ALLOCATION_LOCK_MISSING: ${prepErr.message}`);
-    }
-
-    console.log(`[MatchingEngine]    ✅ Both allocations validated — proceeding with withdrawals`);
-
-    // ═══ Steps 1-2 EXECUTE PHASE: Both validated, now sign and execute ═══
-    // Step 1: Execute seller withdrawal
-    console.log(`[MatchingEngine]    Step 1: Executing seller's self-allocation withdrawal (${baseSymbol})...`);
-    const sellerWithdrawSig = await signHash(sellerKey.keyBase64, sellerWithdrawPrep.preparedTransactionHash);
-    const sellerWithdrawResult = await cantonService.executeInteractiveSubmission({
-      preparedTransaction: sellerWithdrawPrep.preparedTransaction,
-      partySignatures: {
-        signatures: [{
-          party: sellOrder.owner,
-          signatures: [{
-            format: 'SIGNATURE_FORMAT_RAW',
-            signature: sellerWithdrawSig,
-            signedBy: sellerKey.fingerprint,
-            signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
-          }],
-        }],
-      },
-      hashingSchemeVersion: sellerWithdrawPrep.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
-    }, adminToken);
-    const uid1 = sellerWithdrawResult?.transaction?.updateId || sellerWithdrawResult?.updateId;
-    if (uid1) updateIds.push({ step: 'seller-withdraw', updateId: uid1 });
-    console.log(`[MatchingEngine]    ✅ Seller allocation withdrawn`);
-
-    // Step 2: Execute buyer withdrawal
-    console.log(`[MatchingEngine]    Step 2: Executing buyer's self-allocation withdrawal (${quoteSymbol})...`);
-    const buyerWithdrawSig = await signHash(buyerKey.keyBase64, buyerWithdrawPrep.preparedTransactionHash);
-    const buyerWithdrawResult = await cantonService.executeInteractiveSubmission({
-      preparedTransaction: buyerWithdrawPrep.preparedTransaction,
-      partySignatures: {
-        signatures: [{
-          party: buyOrder.owner,
-          signatures: [{
-            format: 'SIGNATURE_FORMAT_RAW',
-            signature: buyerWithdrawSig,
-            signedBy: buyerKey.fingerprint,
-            signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
-          }],
-        }],
-      },
-      hashingSchemeVersion: buyerWithdrawPrep.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
-    }, adminToken);
-    const uid2 = buyerWithdrawResult?.transaction?.updateId || buyerWithdrawResult?.updateId;
-    if (uid2) updateIds.push({ step: 'buyer-withdraw', updateId: uid2 });
-    console.log(`[MatchingEngine]    ✅ Buyer allocation withdrawn`);
-
-    // Let holdings + registry catch up after both withdraws (reduces failed executes / orphan allocations).
-    const settleMs = settlementSettleDelayMs();
-    if (settleMs > 0) {
-      console.log(`[MatchingEngine]    ⏳ Waiting ${settleMs}ms after withdraws before direct user-to-user allocations...`);
-      await sleep(settleMs);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // DvP SETTLEMENT — Create Splice allocations, then Execute_DvP
-    //
-    // Steps:
-    //   3a: Create base allocation seller→buyer (seller signs)
-    //   3b: Create quote allocation buyer→seller (buyer signs)
-    //   4a: Create ExchangeAllocation for both parties (embed consent on-chain)
-    //   4b: Fetch ExtraArgs from both registries
-    //   4c: Exercise Execute_DvP — SINGLE non-interactive TX, both legs atomic
-    // ═══════════════════════════════════════════════════════════════════════
-
-    // Snapshot existing allocation CIDs BEFORE creation — so we can identify the NEW ones.
-    const existingAllocCids = await this._snapshotAllocationCids(operatorPartyId, adminToken);
-    console.log(`[MatchingEngine]    Pre-existing allocation CIDs: ${existingAllocCids.size} (will be excluded from search)`);
-
-    let legAAllocCid = null;
-    let legBAllocCid = null;
-
-    try {
-      // ═══ Step 3a: Create base allocation seller→buyer ═══
-    console.log(`[MatchingEngine]    Step 3a: Creating allocation seller→buyer (${matchQtyStr} ${baseSymbol})...`);
-    const legABuild = await sdkClient.buildAllocationInteractiveCommand(
-      sellOrder.owner, buyOrder.owner, matchQtyStr, baseSymbol, operatorPartyId, `${tradeId}-leg-base`
-    );
-    if (!legABuild?.command) throw new Error('Failed to build seller→buyer allocation command');
-    const legAPrep = await cantonService.prepareInteractiveSubmission({
-      token: adminToken,
-      actAsParty: [sellOrder.owner],
-      commands: [legABuild.command],
-      readAs: [...new Set([sellOrder.owner, buyOrder.owner, operatorPartyId])],
-      synchronizerId: legABuild.synchronizerId || synchronizerId,
-      disclosedContracts: legABuild.disclosedContracts || [],
-    });
-    const legASig = await signHash(sellerKey.keyBase64, legAPrep.preparedTransactionHash);
-    const legAResult = await cantonService.executeInteractiveSubmission({
-      preparedTransaction: legAPrep.preparedTransaction,
-      partySignatures: {
-        signatures: [{
-          party: sellOrder.owner,
-          signatures: [{
-            format: 'SIGNATURE_FORMAT_RAW',
-            signature: legASig,
-            signedBy: sellerKey.fingerprint,
-            signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
-          }],
-        }],
-      },
-      hashingSchemeVersion: legAPrep.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
-    }, adminToken);
-
-    legAAllocCid = this._extractAllocCidFromResult(legAResult);
-    const uid3a = legAResult?.transaction?.updateId || legAResult?.updateId;
-    if (uid3a) updateIds.push({ step: 'alloc-seller-to-buyer', updateId: uid3a });
-    if (!legAAllocCid) {
-      // Interactive execute is async — Canton needs time to commit and index.
-      // Wait before first query, then retry with progressive delays.
-      await sleep(3000);
-      for (let attempt = 1; attempt <= 8 && !legAAllocCid; attempt++) {
-        if (attempt > 1) await sleep(3000);
-        console.log(`[MatchingEngine]    ⏳ Querying ACS for seller→buyer allocation (attempt ${attempt}/8)...`);
-        legAAllocCid = await this._findAllocationByACS(operatorPartyId, sellOrder.owner, buyOrder.owner, adminToken, existingAllocCids);
-      }
-    }
-    if (!legAAllocCid) throw new Error('SELLER_ALLOCATION_FAILED: Could not find seller→buyer allocation CID after creation');
-    console.log(`[MatchingEngine]    ✅ Base allocation created: ${legAAllocCid.substring(0, 24)}...`);
-
-    // ═══ Step 3b: Create quote allocation buyer→seller ═══
-    console.log(`[MatchingEngine]    Step 3b: Creating allocation buyer→seller (${quoteAmountStr} ${quoteSymbol})...`);
-    const legBBuild = await sdkClient.buildAllocationInteractiveCommand(
-      buyOrder.owner, sellOrder.owner, quoteAmountStr, quoteSymbol, operatorPartyId, `${tradeId}-leg-quote`
-    );
-    if (!legBBuild?.command) throw new Error('Failed to build buyer→seller allocation command');
-    const legBPrep = await cantonService.prepareInteractiveSubmission({
-      token: adminToken,
-      actAsParty: [buyOrder.owner],
-      commands: [legBBuild.command],
-      readAs: [...new Set([sellOrder.owner, buyOrder.owner, operatorPartyId])],
-      synchronizerId: legBBuild.synchronizerId || synchronizerId,
-      disclosedContracts: legBBuild.disclosedContracts || [],
-    });
-    const legBSig = await signHash(buyerKey.keyBase64, legBPrep.preparedTransactionHash);
-    const legBResult = await cantonService.executeInteractiveSubmission({
-      preparedTransaction: legBPrep.preparedTransaction,
-      partySignatures: {
-        signatures: [{
-          party: buyOrder.owner,
-          signatures: [{
-            format: 'SIGNATURE_FORMAT_RAW',
-            signature: legBSig,
-            signedBy: buyerKey.fingerprint,
-            signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
-          }],
-        }],
-      },
-      hashingSchemeVersion: legBPrep.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
-    }, adminToken);
-
-    legBAllocCid = this._extractAllocCidFromResult(legBResult);
-    const uid3b = legBResult?.transaction?.updateId || legBResult?.updateId;
-    if (uid3b) updateIds.push({ step: 'alloc-buyer-to-seller', updateId: uid3b });
-    if (!legBAllocCid) {
-      const excludeSetB = new Set([...existingAllocCids]);
-      if (legAAllocCid) excludeSetB.add(legAAllocCid);
-      await sleep(3000);
-      for (let attempt = 1; attempt <= 8 && !legBAllocCid; attempt++) {
-        if (attempt > 1) await sleep(3000);
-        console.log(`[MatchingEngine]    ⏳ Querying ACS for buyer→seller allocation (attempt ${attempt}/8)...`);
-        legBAllocCid = await this._findAllocationByACS(operatorPartyId, buyOrder.owner, sellOrder.owner, adminToken, excludeSetB);
-      }
-    }
-    if (!legBAllocCid) throw new Error('BUYER_ALLOCATION_FAILED: Could not find buyer→seller allocation CID after creation');
-    console.log(`[MatchingEngine]    ✅ Quote allocation created: ${legBAllocCid.substring(0, 24)}...`);
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // DvP Step 4 — ATOMIC settlement via DvPAgreement
-    //
-    // 1) Create ONE DvPAgreement contract co-signed by [seller, buyer]
-    //    (interactive signing tx).
-    // 2) Operator exercises Settle_DvP, and DAML executes BOTH
-    //    Allocation_ExecuteTransfer legs in a single Canton transaction.
-    //
-    // Note: DvPAgreement creation is separate because interactive prepare
-    // requires external party signatures. The token movements are atomic
-    // inside Settle_DvP.
-    // ═══════════════════════════════════════════════════════════════════════
-    console.log(`[MatchingEngine]    Step 4: DvP atomic settlement via Settle_DvP...`);
-    console.log(`[MatchingEngine]    Base alloc (${baseSymbol}): ${legAAllocCid.substring(0, 24)}...`);
-    console.log(`[MatchingEngine]    Quote alloc (${quoteSymbol}): ${legBAllocCid.substring(0, 24)}...`);
-
-    // ── Step 4a: Create DvPAgreement (interactive, seller+buyer sign) ──
-    console.log(`[MatchingEngine]    Step 4a: Fetching ExtraArgs for base + quote legs...`);
-    const baseExtra = await sdkClient.fetchAllocationExtraArgs(legAAllocCid, baseSymbol);
-    const quoteExtra = await sdkClient.fetchAllocationExtraArgs(legBAllocCid, quoteSymbol);
-
-    const dvpAgreementTemplateId = `${packageId}:Settlement:DvPAgreement`;
-    const dvpAgreementCreatedAt = new Date().toISOString();
-
-    console.log(`[MatchingEngine]    Step 4a: Creating DvPAgreement contract (seller+buyer signatures)...`);
-    const dvpAgreementPrep = await cantonService.prepareInteractiveSubmission({
-      token: adminToken,
-      actAsParty: [sellOrder.owner, buyOrder.owner],
-      templateId: dvpAgreementTemplateId,
-      createArguments: {
-        tradeId,
-        seller: sellOrder.owner,
-        buyer: buyOrder.owner,
-        executor: operatorPartyId,
-        baseLegAllocCid: legAAllocCid,
-        quoteLegAllocCid: legBAllocCid,
-        matchPrice: matchPrice.toString(),
-        matchQuantity: matchQtyStr,
-        tradingPair,
-        createdAt: dvpAgreementCreatedAt,
-      },
-      readAs: [operatorPartyId, sellOrder.owner, buyOrder.owner],
-      synchronizerId,
-    });
-
-    const dvpAgreementHash = dvpAgreementPrep.preparedTransactionHash;
-    const [sellerDvpSig, buyerDvpSig] = await Promise.all([
-      signHash(sellerKey.keyBase64, dvpAgreementHash),
-      signHash(buyerKey.keyBase64, dvpAgreementHash),
+    // Build both allocation commands in parallel.
+    // The factory ExtraArgs (ccAllocExtraArgs / cbtcAllocExtraArgs) contain the
+    // AmuletRules/Utilities context and are reused for both Allocate AND
+    // ExecuteTransfer inside DoSettle — same registry context is valid for both.
+    // We do NOT fetch separate ExtraArgs for Execute because the new directional
+    // allocation CIDs don't exist yet (they're created inside the DAML choice).
+    const [ccBuild, cbtcBuild] = await Promise.all([
+      sdkClient.buildAllocationInteractiveCommand(
+        sellOrder.owner, buyOrder.owner, matchQtyStr, baseSymbol, operatorPartyId, `${tradeId}-leg-base`, sellerHoldingCids
+      ),
+      sdkClient.buildAllocationInteractiveCommand(
+        buyOrder.owner, sellOrder.owner, quoteAmountStr, quoteSymbol, operatorPartyId, `${tradeId}-leg-quote`, buyerHoldingCids
+      ),
     ]);
 
-    const dvpAgreementCreateResult = await cantonService.executeInteractiveSubmission({
-      preparedTransaction: dvpAgreementPrep.preparedTransaction,
+    if (!ccBuild?.command) throw new Error('Failed to build CC allocation command for settlement');
+    if (!cbtcBuild?.command) throw new Error('Failed to build CBTC allocation command for settlement');
+
+    const ccFactoryId = ccBuild.command.ExerciseCommand.contractId;
+    const ccChoiceArg = ccBuild.command.ExerciseCommand.choiceArgument;
+    const ccAllocSpec = ccChoiceArg.allocation;
+    const ccAllocExtraArgs = ccChoiceArg.extraArgs;   // used for both Allocate and ExecuteTransfer
+    const ccExpectedAdmin = ccChoiceArg.expectedAdmin;
+
+    const cbtcFactoryId = cbtcBuild.command.ExerciseCommand.contractId;
+    const cbtcChoiceArg = cbtcBuild.command.ExerciseCommand.choiceArgument;
+    const cbtcAllocSpec = cbtcChoiceArg.allocation;
+    const cbtcAllocExtraArgs = cbtcChoiceArg.extraArgs;  // used for both Allocate and ExecuteTransfer
+    const cbtcExpectedAdmin = cbtcChoiceArg.expectedAdmin;
+
+    console.log(`[MatchingEngine]    CC factory:   ${ccFactoryId?.substring(0, 24)}...`);
+    console.log(`[MatchingEngine]    CBTC factory: ${cbtcFactoryId?.substring(0, 24)}...`);
+
+    // Collect all disclosed contracts needed for the TX (deduped by CID)
+    const disclosedByContractId = new Map();
+    for (const dc of [
+      ...(ccBuild.disclosedContracts || []),
+      ...(cbtcBuild.disclosedContracts || []),
+    ]) {
+      if (dc?.contractId) disclosedByContractId.set(dc.contractId, dc);
+    }
+    const disclosedContracts = Array.from(disclosedByContractId.values());
+
+    const tradeSettlementTemplateId = `${packageId}:Settlement:TradeSettlement`;
+
+    // Single CreateAndExercise command — creates TradeSettlement AND exercises DoSettle atomically.
+    // This satisfies Canton's "1 interactive command per prepare" requirement.
+    // DoSettle internally: withdraw both self-allocs → create 2 directional allocs → execute both.
+    const createAndExerciseCmd = {
+      CreateAndExerciseCommand: {
+        templateId: tradeSettlementTemplateId,
+        createArguments: {
+          tradeId,
+          seller: sellOrder.owner,
+          buyer: buyOrder.owner,
+          executor: operatorPartyId,
+          sellerSelfAllocCid: sellOrder.allocationContractId,
+          buyerSelfAllocCid: buyOrder.allocationContractId,
+          tradingPair,
+          createdAt: new Date().toISOString(),
+        },
+        choice: 'DoSettle',
+        choiceArgument: {
+          ccFactory: ccFactoryId,
+          cbtcFactory: cbtcFactoryId,
+          // Empty ExtraArgs for Withdraw (no context needed, sender self-authorizes)
+          ccWithdrawArgs: { context: { values: {} }, meta: { values: {} } },
+          cbtcWithdrawArgs: { context: { values: {} }, meta: { values: {} } },
+          ccAllocSpec,
+          cbtcAllocSpec,
+          // Reuse factory ExtraArgs for Allocate and ExecuteTransfer (same AmuletRules context)
+          ccAllocArgs: ccAllocExtraArgs,
+          cbtcAllocArgs: cbtcAllocExtraArgs,
+          ccExpectedAdmin,
+          cbtcExpectedAdmin,
+          ccExecuteArgs: ccAllocExtraArgs,    // same context as alloc — valid for same-TX execute
+          cbtcExecuteArgs: cbtcAllocExtraArgs, // same context as alloc — valid for same-TX execute
+        },
+      },
+    };
+
+    // Interactive submission: actAs=[seller, buyer, operator].
+    // seller + buyer sign hash; operator is local and auto-signs on execute.
+    const settlePrepared = await cantonService.prepareInteractiveSubmission({
+      token: adminToken,
+      actAsParty: [sellOrder.owner, buyOrder.owner, operatorPartyId],
+      commands: [createAndExerciseCmd],
+      readAs: [operatorPartyId, sellOrder.owner, buyOrder.owner],
+      synchronizerId,
+      disclosedContracts: disclosedContracts.length > 0 ? disclosedContracts : null,
+    });
+
+    const settleHash = settlePrepared.preparedTransactionHash;
+    console.log(`[MatchingEngine]    Settlement TX hash: ${settleHash?.substring(0, 16)}...`);
+
+    const [sellerSettleSig, buyerSettleSig] = await Promise.all([
+      signHash(sellerKey.keyBase64, settleHash),
+      signHash(buyerKey.keyBase64, settleHash),
+    ]);
+
+    const settleResult = await cantonService.executeInteractiveSubmission({
+      preparedTransaction: settlePrepared.preparedTransaction,
       partySignatures: {
         signatures: [
           {
             party: sellOrder.owner,
             signatures: [{
               format: 'SIGNATURE_FORMAT_RAW',
-              signature: sellerDvpSig,
+              signature: sellerSettleSig,
               signedBy: sellerKey.fingerprint,
               signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
             }],
@@ -1217,111 +1100,21 @@ class MatchingEngine {
             party: buyOrder.owner,
             signatures: [{
               format: 'SIGNATURE_FORMAT_RAW',
-              signature: buyerDvpSig,
+              signature: buyerSettleSig,
               signedBy: buyerKey.fingerprint,
               signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
             }],
           },
         ],
       },
-      hashingSchemeVersion: dvpAgreementPrep.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
+      hashingSchemeVersion: settlePrepared.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
     }, adminToken);
 
-    let dvpAgreementCid = null;
-    const dvpCreateEvents = dvpAgreementCreateResult?.transaction?.events || [];
-    for (const ev of dvpCreateEvents) {
-      const created = ev.created || ev.CreatedEvent;
-      const tplId = created?.templateId;
-      const tplStr = typeof tplId === 'string'
-        ? tplId
-        : `${tplId?.packageId || ''}:${tplId?.moduleName || ''}:${tplId?.entityName || ''}`;
-
-      if (tplStr.includes('DvPAgreement') && created?.contractId) {
-        dvpAgreementCid = created.contractId;
-        break;
-      }
-    }
-    if (!dvpAgreementCid) {
-      console.log(`[MatchingEngine]    ℹ️ DvPAgreement event not in response, polling ledger for tradeId: ${tradeId}...`);
-      for (let attempt = 1; attempt <= 8 && !dvpAgreementCid; attempt++) {
-        // Wait a moment for the ledger to reflect
-        await new Promise(r => setTimeout(r, 3000));
-        try {
-          const queryRes = await cantonService.queryActiveContracts({
-            templateIds: [dvpAgreementTemplateId],
-            party: operatorPartyId
-          }, adminToken);
-          const match = queryRes.find(c => c.payload && c.payload.tradeId === tradeId);
-          if (match) {
-            dvpAgreementCid = match.contractId;
-          } else {
-            console.log(`[MatchingEngine]    ⏳ Waiting for DvPAgreement (attempt ${attempt}/8)...`);
-          }
-        } catch (err) {
-          console.warn(`[MatchingEngine] Fallback ACS query failed: ${err.message}`);
-        }
-      }
-    }
-    
-    if (!dvpAgreementCid) {
-      throw new Error('DvPAgreement creation failed: could not extract contractId from result');
-    }
-    console.log(`[MatchingEngine]    ✅ DvPAgreement created: ${dvpAgreementCid.substring(0, 24)}...`);
-
-    // ── Step 4b: Operator exercises Settle_DvP (atomic both legs) ──
-    console.log(`[MatchingEngine]    Step 4b: Executing Settle_DvP (single Canton TX expected)...`);
-    const settleResult = await cantonService.exerciseChoice({
-      token: adminToken,
-      actAsParty: operatorPartyId,
-      templateId: dvpAgreementTemplateId,
-      contractId: dvpAgreementCid,
-      choice: 'Settle_DvP',
-      choiceArgument: {
-        baseExtraArgs: baseExtra.extraArgs,
-        quoteExtraArgs: quoteExtra.extraArgs,
-      },
-      readAs: [operatorPartyId, sellOrder.owner, buyOrder.owner],
-      synchronizerId,
-      disclosedContracts: [
-        ...(baseExtra.disclosedContracts || []),
-        ...(quoteExtra.disclosedContracts || []),
-      ],
-    });
-
     const settleUpdateId = settleResult?.transaction?.updateId || settleResult?.updateId;
-    if (settleUpdateId) updateIds.push({ step: 'execute-settle-dvp', updateId: settleUpdateId });
-    console.log(`[MatchingEngine]    ✅ Atomic DvP settled (updateId: ${settleUpdateId || 'N/A'})`);
+    if (settleUpdateId) updateIds.push({ step: 'trade-settlement-do-settle', updateId: settleUpdateId });
+    console.log(`[MatchingEngine]    ✅ TradeSettlement::DoSettle executed (updateId: ${settleUpdateId || 'N/A'})`);
 
-    } catch (settlementError) {
-      console.error(`[MatchingEngine] ❌ Atomic Settlement Flow Interrupted: ${settlementError.message}`);
-      console.log(`[MatchingEngine] 🔄 Executing ROLLBACK for orphaned allocations...`);
-      
-      const rollbackPromises = [];
-      if (legAAllocCid) {
-        console.log(`[MatchingEngine]    Rolling back base allocation leg: ${legAAllocCid.substring(0, 24)}...`);
-        rollbackPromises.push(
-          sdkClient.withdrawAllocation(legAAllocCid, sellOrder.owner, operatorPartyId, baseSymbol)
-            .catch(err => console.warn(`[MatchingEngine]    ⚠️ Rollback warning (base): ${err.message}`))
-        );
-      }
-      if (legBAllocCid) {
-        console.log(`[MatchingEngine]    Rolling back quote allocation leg: ${legBAllocCid.substring(0, 24)}...`);
-        rollbackPromises.push(
-          sdkClient.withdrawAllocation(legBAllocCid, buyOrder.owner, operatorPartyId, quoteSymbol)
-            .catch(err => console.warn(`[MatchingEngine]    ⚠️ Rollback warning (quote): ${err.message}`))
-        );
-      }
-      
-      if (rollbackPromises.length > 0) {
-        await Promise.allSettled(rollbackPromises);
-        console.log(`[MatchingEngine] ✅ Rollback complete. Orphaned funds unlocked via Allocation_Withdraw.`);
-      }
-      
-      // Re-throw the error so the outer loop in `_processBatch` quarantines the trades
-      throw settlementError;
-    }
-
-    console.log(`[MatchingEngine] ✅ DvP settlement complete — both legs settled atomically`);
+    console.log(`[MatchingEngine] ✅ Settlement complete — all steps in single Canton TX`);
     if (updateIds.length > 0) {
       console.log(`[MatchingEngine]    All updateIds for Canton Explorer verification:`);
       for (const u of updateIds) {

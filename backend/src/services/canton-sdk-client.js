@@ -1565,10 +1565,31 @@ class CantonSDKClient {
   }
 
   /**
+   * Get all holding CIDs (including locked) for a party + instrument.
+   * Used at settlement time when holdings are locked inside self-allocations.
+   * listHoldingUtxos(true) returns all holdings including ones locked in allocations.
+   */
+  async getHoldingCidsForSettlement(partyId, symbol) {
+    if (!this.isReady()) return [];
+    const instrumentId = toCantonInstrument(symbol);
+    try {
+      const allHoldings = await this._withPartyContext(partyId, async () => {
+        return await this.sdk.tokenStandard?.listHoldingUtxos(true) || [];
+      });
+      return allHoldings
+        .filter(h => extractInstrumentId(h.interfaceViewValue?.instrumentId) === instrumentId)
+        .map(h => h.contractId);
+    } catch (err) {
+      console.warn(`[CantonSDK] getHoldingCidsForSettlement failed for ${symbol}: ${err.message}`);
+      return [];
+    }
+  }
+
+  /**
    * Build an AllocationFactory_Allocate interactive command payload for an external signer.
    * This does NOT submit the command; caller includes the returned command in
    * /v2/interactive-submission/prepare so the external party signs it.
-   * 
+   *
    * For Temple pattern: receiverPartyId can be same as senderPartyId (self-allocation).
    */
   async buildAllocationInteractiveCommand(senderPartyId, receiverPartyId, amount, symbol, executorPartyId, orderId = '', overrideHoldingCids = null) {

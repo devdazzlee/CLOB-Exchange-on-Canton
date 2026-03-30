@@ -19,7 +19,8 @@ module Settlement where
 import Instrument (InstrumentId)
 import Holding
 import DA.Action (when)
-import Splice.Api.Token.AllocationV1 (Allocation, Allocation_ExecuteTransfer(..), Allocation_ExecuteTransferResult)
+import Splice.Api.Token.AllocationV1 (Allocation, Allocation_ExecuteTransfer(..), Allocation_ExecuteTransferResult, Allocation_Withdraw(..), Allocation_WithdrawResult, AllocationSpecification(..), SettlementInfo(..), TransferLeg(..))
+import Splice.Api.Token.AllocationInstructionV1 (AllocationFactory, AllocationFactory_Allocate(..), AllocationInstructionResult(..), AllocationInstructionResult_Output(..))
 import Splice.Api.Token.MetadataV1 (ExtraArgs)
 
 -- | Settlement status
@@ -451,6 +452,93 @@ template ExchangeAllocation
 --   - Non-interactive can't authorize external parties
 --   - Signatory carry-forward across nested exercises doesn't work for ext parties
 --
+-- =============================================================================
+-- TRADE SETTLEMENT (2-TX PATTERN — CLIENT REQUIREMENT)
+-- =============================================================================
+-- Achieves the client requirement: 2 TXs per party visible in Canton Explorer.
+--
+-- TX 1 (order placement): AllocationFactory_Allocate (self-alloc lock)
+-- TX 2 (settlement): CreateAndExercise TradeSettlement::DoSettle
+--                    — does EVERYTHING in one Canton transaction:
+--                      1. Withdraw seller CC self-alloc (auth from signatory seller)
+--                      2. Withdraw buyer CBTC self-alloc (auth from signatory buyer)
+--                      3. AllocationFactory_Allocate seller→buyer (CC)
+--                      4. AllocationFactory_Allocate buyer→seller (CBTC)
+--                      5. Allocation_ExecuteTransfer CC (auth: executor+seller+buyer)
+--                      6. Allocation_ExecuteTransfer CBTC (auth: executor+buyer+seller)
+--
+-- Authorization: signatory [seller, buyer] on TradeSettlement + controller executor
+-- = auth set {executor, seller, buyer} propagates into all nested exercises.
+--
+-- Backend uses CreateAndExercise command (single interactive command).
+-- actAs = [seller, buyer, executor] — seller+buyer sign hash, executor auto-signs.
+--
+template TradeSettlement
+  with
+    tradeId : Text
+    seller : Party
+    buyer : Party
+    executor : Party
+    sellerSelfAllocCid : ContractId Allocation   -- CC self-alloc (seller→seller, locked at order placement)
+    buyerSelfAllocCid : ContractId Allocation    -- CBTC self-alloc (buyer→buyer, locked at order placement)
+    tradingPair : Text
+    createdAt : Text
+  where
+    signatory [seller, buyer]
+    observer executor
+
+    -- All settlement in ONE Canton transaction.
+    -- Auth set = {executor} (controller) ∪ {seller, buyer} (signatories of consumed contract)
+    --          = {executor, seller, buyer} — satisfies all nested choice controllers.
+    choice DoSettle : (Allocation_ExecuteTransferResult, Allocation_ExecuteTransferResult)
+      with
+        ccFactory : ContractId AllocationFactory          -- CC (Amulet) allocation factory
+        cbtcFactory : ContractId AllocationFactory        -- CBTC (Utilities) allocation factory
+        ccWithdrawArgs : ExtraArgs                        -- ExtraArgs for CC Allocation_Withdraw
+        cbtcWithdrawArgs : ExtraArgs                      -- ExtraArgs for CBTC Allocation_Withdraw
+        ccAllocSpec : AllocationSpecification             -- seller→buyer CC allocation spec
+        cbtcAllocSpec : AllocationSpecification           -- buyer→seller CBTC allocation spec
+        ccAllocArgs : ExtraArgs                           -- ExtraArgs for CC AllocationFactory_Allocate
+        cbtcAllocArgs : ExtraArgs                         -- ExtraArgs for CBTC AllocationFactory_Allocate
+        ccExpectedAdmin : Party                           -- CC instrument admin (DSO/Splice)
+        cbtcExpectedAdmin : Party                         -- CBTC instrument admin (Utilities)
+        ccExecuteArgs : ExtraArgs                         -- ExtraArgs for CC Allocation_ExecuteTransfer
+        cbtcExecuteArgs : ExtraArgs                       -- ExtraArgs for CBTC Allocation_ExecuteTransfer
+      controller executor
+      do
+        now <- getTime
+        -- 1. Withdraw seller's CC self-allocation → returns CC holdings to seller
+        ccWr <- exercise sellerSelfAllocCid (Allocation_Withdraw with extraArgs = ccWithdrawArgs)
+        -- 2. Withdraw buyer's CBTC self-allocation → returns CBTC holdings to buyer
+        cbtcWr <- exercise buyerSelfAllocCid (Allocation_Withdraw with extraArgs = cbtcWithdrawArgs)
+        -- 3. Create CC allocation seller→buyer using just-freed holdings
+        ccAllocRes <- exercise ccFactory (AllocationFactory_Allocate with
+          expectedAdmin = ccExpectedAdmin
+          allocation = ccAllocSpec
+          requestedAt = now
+          inputHoldingCids = ccWr.senderHoldingCids
+          extraArgs = ccAllocArgs)
+        -- 4. Create CBTC allocation buyer→seller using just-freed holdings
+        cbtcAllocRes <- exercise cbtcFactory (AllocationFactory_Allocate with
+          expectedAdmin = cbtcExpectedAdmin
+          allocation = cbtcAllocSpec
+          requestedAt = now
+          inputHoldingCids = cbtcWr.senderHoldingCids
+          extraArgs = cbtcAllocArgs)
+        -- 5. Extract new allocation CIDs (must be Completed — both Amulet and Utilities create allocations directly)
+        let (ccAllocCid : ContractId Allocation) = case ccAllocRes.output of
+              AllocationInstructionResult_Completed cid -> cid
+              _ -> error "CC AllocationFactory_Allocate did not complete immediately"
+        let (cbtcAllocCid : ContractId Allocation) = case cbtcAllocRes.output of
+              AllocationInstructionResult_Completed cid -> cid
+              _ -> error "CBTC AllocationFactory_Allocate did not complete immediately"
+        -- 6. Execute CC transfer (seller→buyer) — auth: executor+seller+buyer ✓
+        ccResult <- exercise ccAllocCid (Allocation_ExecuteTransfer with extraArgs = ccExecuteArgs)
+        -- 7. Execute CBTC transfer (buyer→seller) — auth: executor+buyer+seller ✓
+        cbtcResult <- exercise cbtcAllocCid (Allocation_ExecuteTransfer with extraArgs = cbtcExecuteArgs)
+        return (ccResult, cbtcResult)
+
+
 -- Solution: ONE contract with BOTH parties as signatories.
 --   Step 1: Create via interactive submission, actAs=[seller, buyer] (1 command ✓)
 --           Both parties sign with their stored Ed25519 keys.
