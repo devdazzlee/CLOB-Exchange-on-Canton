@@ -2204,6 +2204,57 @@ class CantonSDKClient {
   }
 
   /**
+   * Fetch ExtraArgs required for Allocation_Withdraw choice.
+   *
+   * Allocation_Withdraw on a Splice (Amulet/CC) allocation requires the
+   * "expire-lock" AmuletRules context to release the underlying LockedAmulet.
+   * Without it, DAML throws: "Missing context entry for: expire-lock".
+   *
+   * We CAN fetch this ahead of time because we have the self-alloc CID
+   * (created at order placement) before we build the DoSettle command.
+   *
+   * @param {string} allocationContractId - The self-allocation contract ID
+   * @param {string} symbol - Token symbol for routing (splice vs utilities)
+   * @returns {{ extraArgs: ExtraArgs, disclosedContracts: Array }}
+   */
+  async fetchAllocationWithdrawArgs(allocationContractId, symbol) {
+    const tokenSystemType = symbol ? getTokenSystemType(symbol) : null;
+    const adminParty = this.getInstrumentAdminForSymbol(symbol);
+    const encodedCid = encodeURIComponent(allocationContractId);
+
+    const withdrawContextUrl = tokenSystemType === 'utilities'
+      ? `${UTILITIES_CONFIG.TOKEN_STANDARD_URL}/v0/registrars/${encodeURIComponent(adminParty)}/registry/allocations/v1/${encodedCid}/choice-contexts/withdraw`
+      : `${CANTON_SDK_CONFIG.REGISTRY_API_URL}/registry/allocations/v1/${encodedCid}/choice-contexts/withdraw`;
+
+    const adminToken = await tokenProvider.getServiceToken();
+
+    console.log(`[CantonSDK] Fetching Withdraw ExtraArgs for ${symbol} allocation ${allocationContractId.substring(0, 24)}...`);
+    const { data: context } = await getRegistryApi().post(withdrawContextUrl, { meta: {}, excludeDebugFields: true }, {
+      headers: { Authorization: `Bearer ${adminToken}`, Accept: 'application/json' },
+    });
+    const configModule = require('../config');
+    const synchronizerId = await cantonService.resolveSubmissionSynchronizerId(
+      adminToken,
+      configModule.canton.synchronizerId
+    );
+
+    const disclosedContracts = (context.disclosedContracts || []).map(dc => ({
+      templateId: dc.templateId,
+      contractId: dc.contractId,
+      createdEventBlob: dc.createdEventBlob,
+      synchronizerId: dc.synchronizerId || synchronizerId,
+    }));
+
+    const extraArgs = {
+      context: context.choiceContextData || { values: {} },
+      meta: { values: {} },
+    };
+
+    console.log(`[CantonSDK] ✅ Withdraw ExtraArgs fetched for ${symbol}: ${disclosedContracts.length} disclosed contract(s)`);
+    return { extraArgs, disclosedContracts };
+  }
+
+  /**
    * Execute an Allocation — exchange acts as executor.
    *
    * Called at MATCH TIME. The exchange (executor) settles the allocation,

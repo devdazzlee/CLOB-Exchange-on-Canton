@@ -983,19 +983,21 @@ class MatchingEngine {
       throw new Error(`BUYER_HOLDINGS_MISSING: No locked ${quoteSymbol} holdings found for buyer — self-allocation may be expired or missing`);
     }
 
-    // Build both allocation commands in parallel.
-    // The factory ExtraArgs (ccAllocExtraArgs / cbtcAllocExtraArgs) contain the
-    // AmuletRules/Utilities context and are reused for both Allocate AND
-    // ExecuteTransfer inside DoSettle — same registry context is valid for both.
-    // We do NOT fetch separate ExtraArgs for Execute because the new directional
-    // allocation CIDs don't exist yet (they're created inside the DAML choice).
-    const [ccBuild, cbtcBuild] = await Promise.all([
+    // Fetch allocation commands AND withdrawal ExtraArgs in parallel.
+    // Withdrawal ExtraArgs: Allocation_Withdraw on a CC (Amulet) self-alloc
+    // requires the "expire-lock" AmuletRules context. Without it, DAML throws:
+    //   "Missing context entry for: expire-lock"
+    // We fetch these upfront using the known self-alloc CIDs.
+    // Factory ExtraArgs are reused for both Allocate and ExecuteTransfer steps.
+    const [ccBuild, cbtcBuild, ccWithdrawData, cbtcWithdrawData] = await Promise.all([
       sdkClient.buildAllocationInteractiveCommand(
         sellOrder.owner, buyOrder.owner, matchQtyStr, baseSymbol, operatorPartyId, `${tradeId}-leg-base`, sellerHoldingCids
       ),
       sdkClient.buildAllocationInteractiveCommand(
         buyOrder.owner, sellOrder.owner, quoteAmountStr, quoteSymbol, operatorPartyId, `${tradeId}-leg-quote`, buyerHoldingCids
       ),
+      sdkClient.fetchAllocationWithdrawArgs(sellOrder.allocationContractId, baseSymbol),
+      sdkClient.fetchAllocationWithdrawArgs(buyOrder.allocationContractId, quoteSymbol),
     ]);
 
     if (!ccBuild?.command) throw new Error('Failed to build CC allocation command for settlement');
@@ -1015,12 +1017,16 @@ class MatchingEngine {
 
     console.log(`[MatchingEngine]    CC factory:   ${ccFactoryId?.substring(0, 24)}...`);
     console.log(`[MatchingEngine]    CBTC factory: ${cbtcFactoryId?.substring(0, 24)}...`);
+    console.log(`[MatchingEngine]    CC withdraw disclosed: ${ccWithdrawData.disclosedContracts?.length || 0}`);
+    console.log(`[MatchingEngine]    CBTC withdraw disclosed: ${cbtcWithdrawData.disclosedContracts?.length || 0}`);
 
     // Collect all disclosed contracts needed for the TX (deduped by CID)
     const disclosedByContractId = new Map();
     for (const dc of [
       ...(ccBuild.disclosedContracts || []),
       ...(cbtcBuild.disclosedContracts || []),
+      ...(ccWithdrawData.disclosedContracts || []),
+      ...(cbtcWithdrawData.disclosedContracts || []),
     ]) {
       if (dc?.contractId) disclosedByContractId.set(dc.contractId, dc);
     }
@@ -1048,9 +1054,9 @@ class MatchingEngine {
         choiceArgument: {
           ccFactory: ccFactoryId,
           cbtcFactory: cbtcFactoryId,
-          // Empty ExtraArgs for Withdraw (no context needed, sender self-authorizes)
-          ccWithdrawArgs: { context: { values: {} }, meta: { values: {} } },
-          cbtcWithdrawArgs: { context: { values: {} }, meta: { values: {} } },
+          // Real AmuletRules "expire-lock" context fetched from registry
+          ccWithdrawArgs: ccWithdrawData.extraArgs,
+          cbtcWithdrawArgs: cbtcWithdrawData.extraArgs,
           ccAllocSpec,
           cbtcAllocSpec,
           // Reuse factory ExtraArgs for Allocate and ExecuteTransfer (same AmuletRules context)
