@@ -411,7 +411,7 @@ function PriceChart({
                 className={cn(
                   "p-1 rounded transition-all duration-200",
                   chartType === type.value
-                    ? "bg-[#2b3139] text-[#F7B500] shadow-inner border border-[#3A4149]"
+                    ? "bg-[#1e2329] text-[#F7B500] shadow-inner border border-[#3A4149]"
                     : "text-[#848E9C] hover:text-white hover:bg-white/5"
                 )}
               >
@@ -430,7 +430,7 @@ function PriceChart({
               className={cn(
                 "px-2 py-0.5 text-[10px] font-bold uppercase transition-all duration-200 rounded",
                 selectedInterval.value === interval.value
-                  ? "bg-[#2b3139] text-[#F7B500] shadow-inner border border-[#3A4149]"
+                  ? "bg-[#1e2329] text-[#F7B500] shadow-inner border border-[#3A4149]"
                   : "text-[#848E9C] hover:text-white hover:bg-white/5"
               )}
             >
