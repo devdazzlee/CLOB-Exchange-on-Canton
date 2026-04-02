@@ -1,46 +1,33 @@
 import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
-import { TrendingUp, TrendingDown, Wallet, Lock } from 'lucide-react';
+import { Wallet, Lock, RefreshCw, TrendingUp, TrendingDown, BarChart2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { apiClient, API_ROUTES } from '@/config/config';
-import { getBalances, getHoldings } from '../../services/balanceService';
+import { getHoldings } from '../../services/balanceService';
 
 /**
- * Portfolio View Component - Shows user's positions across all trading pairs.
+ * Portfolio View Component - Shows user's real balances and trade positions.
  *
- * Source of truth: Splice Holding contracts via /balance/v2 API, which queries
- * splice-api-token-holding-v1:Splice.Api.Token.HoldingV1:Holding contracts.
- *
+ * Balance data comes from TradingInterface props (already loaded via WebSocket/API).
  * Trade history enriches the view with P&L calculations.
  */
-
-export default function PortfolioView({ partyId }) {
+export default function PortfolioView({ partyId, balance = {}, lockedBalance = {} }) {
   const [positions, setPositions] = useState([]);
-  const [holdings, setHoldings] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [totalValue, setTotalValue] = useState(0);
+  const [tradesLoading, setTradesLoading] = useState(true);
+  const [refreshKey, setRefreshKey] = useState(0);
 
+  // Load trade history for P&L calculation
   useEffect(() => {
-    if (partyId) {
-      loadPortfolio();
-    }
-  }, [partyId]);
+    if (!partyId) return;
+    loadTradeHistory();
+  }, [partyId, refreshKey]);
 
-  const loadPortfolio = async () => {
-    setLoading(true);
+  const loadTradeHistory = async () => {
+    setTradesLoading(true);
     try {
-      // ═══ Source of truth: Splice Holdings via Token Standard API ═══
-      const [balanceData, holdingsData, tradesJson] = await Promise.all([
-        getBalances(partyId),
-        getHoldings(partyId),
-        apiClient.get(API_ROUTES.TRADES.GET_USER(partyId, 500)).catch(() => ({ data: {} })),
-      ]);
-
-      const balances = balanceData.available || {};
-      const lockedBalances = balanceData.locked || {};
-      const holdingsList = holdingsData?.holdings || [];
-      setHoldings(holdingsList);
+      const tradesJson = await apiClient
+        .get(API_ROUTES.TRADES.GET_USER(partyId, 500))
+        .catch(() => ({ data: {} }));
 
       const tradesPayload = tradesJson?.data ?? tradesJson;
       const trades = tradesPayload?.trades || [];
@@ -50,9 +37,8 @@ export default function PortfolioView({ partyId }) {
         return buyer === partyId || seller === partyId;
       });
 
-      // Calculate positions per trading pair from trade history
+      // Build position map from trade history
       const positionMap = new Map();
-
       userTrades.forEach(trade => {
         const pair = trade.payload?.tradingPair || trade.tradingPair || 'UNKNOWN';
         const price = parseFloat(trade.payload?.price || trade.price || 0);
@@ -62,207 +48,183 @@ export default function PortfolioView({ partyId }) {
         if (!positionMap.has(pair)) {
           positionMap.set(pair, {
             tradingPair: pair,
-            baseQuantity: 0,
-            quoteQuantity: 0,
-            avgBuyPrice: 0,
-            avgSellPrice: 0,
             totalBuyQty: 0,
             totalSellQty: 0,
             totalBuyValue: 0,
             totalSellValue: 0,
-            trades: []
+            tradeCount: 0,
           });
         }
 
-        const position = positionMap.get(pair);
-        position.trades.push(trade);
-
+        const pos = positionMap.get(pair);
+        pos.tradeCount++;
         if (isBuy) {
-          position.totalBuyQty += quantity;
-          position.totalBuyValue += price * quantity;
-          position.baseQuantity += quantity;
-          position.quoteQuantity -= price * quantity;
+          pos.totalBuyQty += quantity;
+          pos.totalBuyValue += price * quantity;
         } else {
-          position.totalSellQty += quantity;
-          position.totalSellValue += price * quantity;
-          position.baseQuantity -= quantity;
-          position.quoteQuantity += price * quantity;
+          pos.totalSellQty += quantity;
+          pos.totalSellValue += price * quantity;
         }
       });
 
-      // Enrich with real balances from Splice Holdings (source of truth)
       const positionsList = Array.from(positionMap.values()).map(pos => {
         pos.avgBuyPrice = pos.totalBuyQty > 0 ? pos.totalBuyValue / pos.totalBuyQty : 0;
         pos.avgSellPrice = pos.totalSellQty > 0 ? pos.totalSellValue / pos.totalSellQty : 0;
-
-        const [baseToken, quoteToken] = pos.tradingPair.split('/');
-        pos.currentBaseBalance = parseFloat(balances[baseToken] || 0);
-        pos.currentQuoteBalance = parseFloat(balances[quoteToken] || 0);
-        pos.lockedBase = parseFloat(lockedBalances[baseToken] || 0);
-        pos.lockedQuote = parseFloat(lockedBalances[quoteToken] || 0);
-
         pos.realizedPnL = pos.totalSellValue - (pos.avgBuyPrice * pos.totalSellQty);
-        pos.realizedPnLPercent = pos.avgBuyPrice > 0
+        pos.realizedPnLPct = pos.avgBuyPrice > 0 && pos.totalSellQty > 0
           ? (pos.realizedPnL / (pos.avgBuyPrice * pos.totalSellQty)) * 100
           : 0;
-
         return pos;
       });
 
-      // Add tokens that have a holding balance but no trades yet
-      const tradedTokens = new Set();
-      positionsList.forEach(p => {
-        const [base, quote] = p.tradingPair.split('/');
-        tradedTokens.add(base);
-        tradedTokens.add(quote);
-      });
-
-      const untradedTokens = Object.entries(balances)
-        .filter(([symbol, amount]) => !tradedTokens.has(symbol) && parseFloat(amount) > 0);
-
       setPositions(positionsList);
-
-      // Calculate total portfolio value (in USDT or base unit)
-      const total = positionsList.reduce((sum, pos) => {
-        const [, quoteToken] = pos.tradingPair.split('/');
-        const quoteValue = pos.currentQuoteBalance || 0;
-        return sum + (quoteToken === 'USDT' ? quoteValue : 0);
-      }, 0);
-
-      setTotalValue(total);
-    } catch (error) {
-      console.error('[PortfolioView] Error loading portfolio:', error);
+    } catch (err) {
+      console.error('[PortfolioView] Failed to load trade history:', err);
       setPositions([]);
     } finally {
-      setLoading(false);
+      setTradesLoading(false);
     }
   };
 
+  // Build token list from the balance prop (real data from TradingInterface)
+  const availableTokens = Object.entries(balance || {}).filter(([, v]) => parseFloat(v) > 0);
+  const lockedTokens = Object.entries(lockedBalance || {}).filter(([, v]) => parseFloat(v) > 0);
+
+  // All unique tokens across available and locked
+  const allTokenSymbols = [...new Set([
+    ...Object.keys(balance || {}),
+    ...Object.keys(lockedBalance || {}),
+  ])];
+
+  const hasBalances = allTokenSymbols.length > 0;
+
   return (
-    <Card>
-      <CardHeader>
-        <div className="flex items-center justify-between">
-          <CardTitle className="flex items-center space-x-2">
-            <Wallet className="w-5 h-5 text-primary" />
-            <span>Portfolio</span>
-          </CardTitle>
-          <div className="text-right">
-            <div className="text-xs text-muted-foreground uppercase tracking-wide">Total Value</div>
-            <div className="text-2xl font-bold text-foreground">
-              {totalValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDT
-            </div>
-          </div>
+    <div className="h-full flex flex-col gap-3 overflow-auto p-1">
+      {/* Header */}
+      <div className="flex items-center justify-between flex-shrink-0">
+        <div className="flex items-center gap-2">
+          <Wallet className="w-4 h-4 text-[#F7B500]" />
+          <span className="text-[11px] font-black uppercase tracking-widest text-[#F7B500]">Portfolio</span>
         </div>
-      </CardHeader>
-      <CardContent>
-        {loading ? (
-          <div className="flex items-center justify-center py-8">
-            <div className="animate-pulse text-muted-foreground text-sm">Loading portfolio...</div>
-          </div>
-        ) : positions.length === 0 && holdings.length === 0 ? (
-          <div className="flex items-center justify-center py-8 text-muted-foreground text-sm">
-            No positions found
+        <button
+          onClick={() => setRefreshKey(k => k + 1)}
+          className="p-1.5 text-[#848E9C] hover:text-white hover:bg-white/5 rounded transition-colors"
+          title="Refresh"
+        >
+          <RefreshCw className="w-3.5 h-3.5" />
+        </button>
+      </div>
+
+      {/* Token Balances — Real data from TradingInterface */}
+      <div className="flex-shrink-0">
+        <div className="text-[10px] font-bold uppercase tracking-widest text-[#848E9C] mb-2">
+          Balances
+        </div>
+        {!hasBalances ? (
+          <div className="text-[12px] text-[#848E9C] italic py-3">
+            No token balances found. Use the faucet to mint test tokens.
           </div>
         ) : (
-          <div className="space-y-4">
-            {/* Holdings summary from Splice Token Standard */}
-            {holdings.length > 0 && (
-              <div className="border border-border rounded-lg p-3 mb-2">
-                <h5 className="text-xs text-muted-foreground uppercase tracking-wide mb-2">
-                  On-Chain Holdings (Token Standard)
-                </h5>
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-                  {holdings.map((h, i) => (
-                    <div key={i} className="text-xs font-mono">
-                      <span className="text-foreground">{parseFloat(h.amount || 0).toFixed(4)}</span>
-                      <span className="text-muted-foreground ml-1">{h.symbol || h.exchangeSymbol || '?'}</span>
-                      {h.lock && (
-                        <Lock className="inline w-3 h-3 text-yellow-500 ml-1" />
-                      )}
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
+            {allTokenSymbols.map(symbol => {
+              const avail = parseFloat(balance?.[symbol] || 0);
+              const locked = parseFloat(lockedBalance?.[symbol] || 0);
+              const total = avail + locked;
+              if (total === 0) return null;
+              return (
+                <motion.div
+                  key={symbol}
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  className="bg-[#161b22] border border-[#21262d] rounded-xl p-3 hover:border-[#F7B500]/30 transition-colors"
+                >
+                  <div className="text-[11px] font-bold text-[#F7B500] mb-1">{symbol}</div>
+                  <div className="text-[15px] font-mono font-bold text-white">
+                    {avail.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })}
+                  </div>
+                  {locked > 0 && (
+                    <div className="flex items-center gap-1 mt-1">
+                      <Lock className="w-2.5 h-2.5 text-yellow-500/70" />
+                      <span className="text-[10px] text-yellow-500/70 font-mono">
+                        {locked.toLocaleString(undefined, { maximumFractionDigits: 4 })} locked
+                      </span>
                     </div>
-                  ))}
-                </div>
-              </div>
-            )}
+                  )}
+                </motion.div>
+              );
+            })}
+          </div>
+        )}
+      </div>
 
-            {positions.map((position, idx) => (
+      {/* Trade Positions — P&L from trade history */}
+      <div className="flex-1 min-h-0">
+        <div className="text-[10px] font-bold uppercase tracking-widest text-[#848E9C] mb-2 flex items-center gap-2">
+          <BarChart2 className="w-3 h-3" />
+          Trade History &amp; P&amp;L
+        </div>
+        {tradesLoading ? (
+          <div className="text-[12px] text-[#848E9C] animate-pulse py-2">Loading trade history...</div>
+        ) : positions.length === 0 ? (
+          <div className="text-[12px] text-[#848E9C] italic py-2">
+            No trades yet. Place your first order to see P&amp;L here.
+          </div>
+        ) : (
+          <div className="space-y-2 overflow-auto">
+            {positions.map((pos, idx) => (
               <motion.div
-                key={position.tradingPair}
-                initial={{ opacity: 0, y: 10 }}
+                key={pos.tradingPair}
+                initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
-                transition={{ delay: idx * 0.1 }}
-                className="border border-border rounded-lg p-4 hover:border-primary/40 transition-colors"
+                transition={{ delay: idx * 0.05 }}
+                className="bg-[#161b22] border border-[#21262d] rounded-xl p-3 hover:border-[#F7B500]/20 transition-colors"
               >
-                <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center justify-between mb-2">
                   <div>
-                    <h4 className="font-semibold text-foreground">{position.tradingPair}</h4>
-                    <p className="text-xs text-muted-foreground">{position.trades.length} trades</p>
+                    <span className="text-[13px] font-bold text-white">{pos.tradingPair}</span>
+                    <span className="ml-2 text-[10px] text-[#848E9C]">{pos.tradeCount} trades</span>
                   </div>
                   <div className="text-right">
                     <div className={cn(
-                      "text-lg font-bold",
-                      position.realizedPnL >= 0 ? "text-success" : "text-destructive"
+                      "text-[13px] font-bold font-mono",
+                      pos.realizedPnL >= 0 ? "text-[#00b07b]" : "text-[#f84962]"
                     )}>
-                      {position.realizedPnL >= 0 ? '+' : ''}
-                      {position.realizedPnL.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDT
+                      {pos.realizedPnL >= 0 ? '+' : ''}
+                      {pos.realizedPnL.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
                     </div>
-                    <div className={cn(
-                      "text-xs",
-                      position.realizedPnLPercent >= 0 ? "text-success" : "text-destructive"
-                    )}>
-                      {position.realizedPnLPercent >= 0 ? '+' : ''}
-                      {position.realizedPnLPercent.toFixed(2)}%
-                    </div>
+                    {pos.realizedPnLPct !== 0 && (
+                      <div className={cn(
+                        "text-[10px] font-mono",
+                        pos.realizedPnLPct >= 0 ? "text-[#00b07b]" : "text-[#f84962]"
+                      )}>
+                        {pos.realizedPnLPct >= 0 ? '+' : ''}{pos.realizedPnLPct.toFixed(2)}%
+                      </div>
+                    )}
                   </div>
                 </div>
-
-                <div className="grid grid-cols-2 gap-4 text-sm">
-                  <div>
-                    <div className="text-xs text-muted-foreground mb-1">Available Base</div>
-                    <div className="font-mono text-foreground">
-                      {position.currentBaseBalance.toFixed(8)}
-                    </div>
-                    {position.lockedBase > 0 && (
-                      <div className="flex items-center gap-1 mt-0.5">
-                        <Lock className="w-2.5 h-2.5 text-yellow-500" />
-                        <span className="text-[10px] text-yellow-500/80">
-                          {position.lockedBase.toFixed(4)} locked
-                        </span>
-                      </div>
-                    )}
+                <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[11px]">
+                  <div className="flex justify-between">
+                    <span className="text-[#848E9C]">Avg Buy</span>
+                    <span className="font-mono text-white">{pos.avgBuyPrice > 0 ? pos.avgBuyPrice.toFixed(4) : '--'}</span>
                   </div>
-                  <div>
-                    <div className="text-xs text-muted-foreground mb-1">Available Quote</div>
-                    <div className="font-mono text-foreground">
-                      {position.currentQuoteBalance.toFixed(2)}
-                    </div>
-                    {position.lockedQuote > 0 && (
-                      <div className="flex items-center gap-1 mt-0.5">
-                        <Lock className="w-2.5 h-2.5 text-yellow-500" />
-                        <span className="text-[10px] text-yellow-500/80">
-                          {position.lockedQuote.toFixed(4)} locked
-                        </span>
-                      </div>
-                    )}
+                  <div className="flex justify-between">
+                    <span className="text-[#848E9C]">Avg Sell</span>
+                    <span className="font-mono text-white">{pos.avgSellPrice > 0 ? pos.avgSellPrice.toFixed(4) : '--'}</span>
                   </div>
-                  <div>
-                    <div className="text-xs text-muted-foreground mb-1">Avg Buy Price</div>
-                    <div className="font-mono text-foreground">
-                      {position.avgBuyPrice > 0 ? position.avgBuyPrice.toFixed(2) : '--'}
-                    </div>
+                  <div className="flex justify-between">
+                    <span className="text-[#848E9C]">Buy Vol</span>
+                    <span className="font-mono text-[#00b07b]">{pos.totalBuyQty.toFixed(4)}</span>
                   </div>
-                  <div>
-                    <div className="text-xs text-muted-foreground mb-1">Avg Sell Price</div>
-                    <div className="font-mono text-foreground">
-                      {position.avgSellPrice > 0 ? position.avgSellPrice.toFixed(2) : '--'}
-                    </div>
+                  <div className="flex justify-between">
+                    <span className="text-[#848E9C]">Sell Vol</span>
+                    <span className="font-mono text-[#f84962]">{pos.totalSellQty.toFixed(4)}</span>
                   </div>
                 </div>
               </motion.div>
             ))}
           </div>
         )}
-      </CardContent>
-    </Card>
+      </div>
+    </div>
   );
 }

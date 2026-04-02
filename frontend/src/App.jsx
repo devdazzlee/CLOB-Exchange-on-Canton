@@ -288,23 +288,27 @@ function App() {
                 walletReady ? (
                   <Navigate to="/trading" replace />
                 ) : (
-                  <div className="max-w-2xl mx-auto px-4 py-12">
-                    <div className="text-center mb-10">
-                      <div className="flex items-center justify-center space-x-3 mb-4">
-                        <svg className="w-10 h-10" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
-                          <rect width="28" height="28" rx="6" fill="#6C5CE7"/>
-                          <path d="M8 14L13 9L18 14L13 19L8 14Z" fill="white" fillOpacity="0.9"/>
-                          <path d="M13 14L18 9L23 14L18 19L13 14Z" fill="white" fillOpacity="0.5"/>
-                        </svg>
-                        <h2 className="text-4xl font-bold text-white">
-                          Cardiv
-                        </h2>
+                  <div className="h-full overflow-y-auto w-full">
+                    <div className="max-w-2xl mx-auto px-4 py-12">
+                      <div className="text-center mb-10">
+                        <div className="flex items-center justify-center space-x-3 mb-4">
+                          <div className="w-10 h-10 bg-primary rounded-lg flex items-center justify-center shadow-lg shadow-primary/20">
+                            <svg className="w-6 h-6 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+                              <path d="M12 2L2 7L12 12L22 7L12 2Z" />
+                              <path d="M2 17L12 22L22 17" />
+                              <path d="M2 12L12 17L22 12" />
+                            </svg>
+                          </div>
+                          <h2 className="text-4xl font-bold text-white">
+                            Cardiv
+                          </h2>
+                        </div>
+                        <p className="text-[#848E9C] text-lg">
+                          Decentralized trading on Canton blockchain
+                        </p>
                       </div>
-                      <p className="text-[#848E9C] text-lg">
-                        Decentralized trading on Canton blockchain
-                      </p>
+                      <WalletSetup onWalletReady={handleWalletReady} />
                     </div>
-                    <WalletSetup onWalletReady={handleWalletReady} />
                   </div>
                 )
               }
@@ -312,8 +316,10 @@ function App() {
             <Route
               path="/wallet"
               element={
-                <div className="max-w-2xl mx-auto">
-                  <WalletSetup onWalletReady={handleWalletReady} />
+                <div className="h-full overflow-y-auto w-full">
+                  <div className="max-w-2xl mx-auto px-4 py-12">
+                    <WalletSetup onWalletReady={handleWalletReady} />
+                  </div>
                 </div>
               }
             />
