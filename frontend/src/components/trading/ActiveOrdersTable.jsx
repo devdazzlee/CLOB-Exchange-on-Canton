@@ -185,86 +185,175 @@ export default function ActiveOrdersTable({ orders, onCancelOrder }) {
 
   return (
     <>
-      {/* Compact table for dashboard bottom panel */}
-      <div className="overflow-x-auto h-full bg-card">
-        <table className="w-full min-w-[700px]">
-          <thead>
-            <tr className="border-b border-border/50 bg-[#161b22]/30">
-              {['ID', 'Side', 'Mode', 'Price', 'Amount', 'Filled', 'Remain', 'Progress', 'Status', 'Action'].map(h => (
-                <th key={h} className="text-left py-2.5 px-4 text-[10px] font-bold text-muted-foreground uppercase tracking-widest whitespace-nowrap">{h}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-border/30">
-            <AnimatePresence>
-              {activeOrders.length > 0 ? (
-                activeOrders.map((order) => {
-                  const quantity = parseFloat(order.quantity || 0);
-                  const filled = parseFloat(order.filled || 0);
-                  const fillPct = quantity > 0 ? (filled / quantity) * 100 : 0;
-                  const remaining = Math.max(0, quantity - filled);
-                  return (
-                    <motion.tr
-                      key={order.id}
-                      initial={{ opacity: 0 }}
-                      animate={{ opacity: 1 }}
-                      exit={{ opacity: 0 }}
-                      className="hover:bg-[#161b22]/50 transition-colors group"
-                    >
-                      <td className="py-2 px-4 text-white font-mono text-[11px] font-medium">
-                        {order.id?.substring(0, 8)}
-                      </td>
-                      <td className={cn("py-2 px-4 text-[11px] font-bold", order.type === 'BUY' ? 'text-green-500' : 'text-red-500')}>
-                        {order.type}
-                      </td>
-                      <td className="py-2 px-4 text-muted-foreground text-[11px] font-medium uppercase">{order.mode}</td>
-                      <td className="py-2 px-4 text-white font-mono text-[11px] font-bold">{formatOrderPrice(order)}</td>
-                      <td className="py-2 px-4 text-white text-[11px] font-mono">{quantity.toFixed(4)}</td>
-                      <td className="py-2 px-4 text-white text-[11px] font-mono">{filled.toFixed(4)}</td>
-                      <td className="py-2 px-4 text-white/70 text-[11px] font-mono">{remaining.toFixed(4)}</td>
-                      <td className="py-2 px-4">
-                        <div className="flex items-center gap-2 min-w-[100px]">
-                          <div className="flex-1 h-1.5 bg-[#21262d] rounded-full overflow-hidden">
-                            <motion.div
+      <div className="h-full relative overflow-y-auto w-full">
+        {/* Desktop View: Dense Table */}
+        <div className="hidden md:block overflow-x-auto h-full bg-card">
+          <table className="w-full min-w-[700px]">
+            <thead>
+              <tr className="border-b border-border/50 bg-[#161b22]/30">
+                {['ID', 'Side', 'Mode', 'Price', 'Amount', 'Filled', 'Remain', 'Progress', 'Status', 'Action'].map(h => (
+                  <th key={h} className="text-left py-2.5 px-4 text-[10px] font-bold text-muted-foreground uppercase tracking-widest whitespace-nowrap">{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border/30">
+              <AnimatePresence>
+                {activeOrders.length > 0 ? (
+                  activeOrders.map((order) => {
+                    const quantity = parseFloat(order.quantity || 0);
+                    const filled = parseFloat(order.filled || 0);
+                    const fillPct = quantity > 0 ? (filled / quantity) * 100 : 0;
+                    const remaining = Math.max(0, quantity - filled);
+                    return (
+                      <motion.tr
+                        key={order.id}
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        exit={{ opacity: 0 }}
+                        className="hover:bg-[#161b22]/50 transition-colors group"
+                      >
+                        <td className="py-2 px-4 text-white font-mono text-[11px] font-medium">
+                          {order.id?.substring(0, 8)}
+                        </td>
+                        <td className={cn("py-2 px-4 text-[11px] font-bold", order.type === 'BUY' ? 'text-green-500' : 'text-red-500')}>
+                          {order.type}
+                        </td>
+                        <td className="py-2 px-4 text-muted-foreground text-[11px] font-medium uppercase">{order.mode}</td>
+                        <td className="py-2 px-4 text-white font-mono text-[11px] font-bold">{formatOrderPrice(order)}</td>
+                        <td className="py-2 px-4 text-white text-[11px] font-mono">{quantity.toFixed(4)}</td>
+                        <td className="py-2 px-4 text-white text-[11px] font-mono">{filled.toFixed(4)}</td>
+                        <td className="py-2 px-4 text-white/70 text-[11px] font-mono">{remaining.toFixed(4)}</td>
+                        <td className="py-2 px-4">
+                          <div className="flex items-center gap-2 min-w-[100px]">
+                            <div className="flex-1 h-1.5 bg-[#21262d] rounded-full overflow-hidden">
+                              <motion.div
+                                initial={{ width: 0 }}
+                                animate={{ width: `${Math.min(100, fillPct)}%` }}
+                                className={cn("h-full rounded-full transition-all", fillPct > 0 ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.4)]' : 'bg-muted-foreground/30')}
+                              />
+                            </div>
+                            <span className="text-[10px] text-muted-foreground font-bold font-mono">{fillPct.toFixed(0)}</span>
+                          </div>
+                        </td>
+                        <td className="py-2 px-4">
+                          <span className={cn(
+                            "px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-tighter",
+                            order.status === 'OPEN' ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' :
+                            order.status === 'PENDING_TRIGGER' ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20' :
+                            'bg-green-500/10 text-green-500 border border-green-500/20'
+                          )}>
+                            {order.status === 'PENDING_TRIGGER' ? 'Stop' : order.status}
+                          </span>
+                        </td>
+                        <td className="py-2 px-4">
+                          {(order.status === 'OPEN' || order.status === 'PENDING_TRIGGER') && (
+                            <button
+                              onClick={() => handleCancelClick(order)}
+                              className="bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white px-2.5 py-1 text-[10px] font-bold uppercase tracking-widest rounded-lg border border-red-500/20 transition-all active:scale-95"
+                            >
+                              Cancel
+                            </button>
+                          )}
+                        </td>
+                      </motion.tr>
+                    );
+                  })
+                ) : (
+                  <tr>
+                    <td colSpan="10" className="py-12 text-center text-muted-foreground text-xs font-medium italic">No active orders</td>
+                  </tr>
+                )}
+              </AnimatePresence>
+            </tbody>
+          </table>
+        </div>
+
+        {/* Mobile View: High-Density UI Cards */}
+        <div className="md:hidden flex flex-col gap-3 p-3">
+          <AnimatePresence>
+            {activeOrders.length > 0 ? (
+              activeOrders.map((order) => {
+                const quantity = parseFloat(order.quantity || 0);
+                const filled = parseFloat(order.filled || 0);
+                const fillPct = quantity > 0 ? (filled / quantity) * 100 : 0;
+                const remaining = Math.max(0, quantity - filled);
+                return (
+                  <motion.div
+                    key={order.id}
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, scale: 0.95 }}
+                    className="bg-[#161b22] border border-[#30363d] rounded-2xl overflow-hidden shadow-xl p-3 relative flex flex-col gap-2.5"
+                  >
+                    {/* Card Header */}
+                    <div className="flex items-center justify-between pb-2 border-b border-[#30363d]/50">
+                      <div className="flex items-center gap-2">
+                        <span className={cn(
+                          "px-2 py-0.5 rounded-md text-[10px] font-black uppercase tracking-widest border",
+                          order.type === 'BUY' ? 'bg-green-500/10 text-green-500 border-green-500/20' : 'bg-red-500/10 text-red-500 border-red-500/20'
+                        )}>
+                          {order.type} {order.mode}
+                        </span>
+                        <span className="text-white text-[11px] font-bold uppercase tracking-wider">{order.tradingPair || 'BTC/USDT'}</span>
+                      </div>
+                      <span className={cn(
+                        "text-[9px] font-bold uppercase tracking-widest",
+                        order.status === 'OPEN' ? 'text-blue-400' :
+                        order.status === 'PENDING_TRIGGER' ? 'text-amber-400' :
+                        'text-green-500'
+                      )}>
+                        {order.status === 'PENDING_TRIGGER' ? 'Stop' : order.status}
+                      </span>
+                    </div>
+
+                    {/* Numeric Row  */}
+                    <div className="grid grid-cols-2 gap-y-1 gap-x-4">
+                      <div>
+                        <p className="text-[9px] text-[#848E9C] font-black uppercase tracking-widest">Price</p>
+                        <p className="text-xs text-white font-mono font-bold leading-tight">{formatOrderPrice(order)}</p>
+                      </div>
+                      <div>
+                        <p className="text-[9px] text-[#848E9C] font-black uppercase tracking-widest text-right">Amount</p>
+                        <p className="text-xs text-white font-mono font-bold leading-tight text-right">{quantity.toFixed(4)}</p>
+                      </div>
+                      <div className="col-span-2 mt-1">
+                        <div className="flex items-center justify-between mt-1 mb-1.5 text-[9px] font-bold text-[#848E9C] uppercase tracking-widest">
+                          <span>Fill: {filled.toFixed(4)}</span>
+                          <span>Left: {remaining.toFixed(4)}</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <div className="flex-1 h-1.5 bg-[#0d1117] rounded-full overflow-hidden border border-[#30363d]/50">
+                            <motion.div 
                               initial={{ width: 0 }}
                               animate={{ width: `${Math.min(100, fillPct)}%` }}
-                              className={cn("h-full rounded-full transition-all", fillPct > 0 ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.4)]' : 'bg-muted-foreground/30')}
+                              className={cn("h-full rounded-full transition-all", fillPct > 0 ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.4)]' : 'bg-transparent')} 
                             />
                           </div>
-                          <span className="text-[10px] text-muted-foreground font-bold font-mono">{fillPct.toFixed(0)}%</span>
+                          <span className="text-[9px] text-white font-mono font-bold">{fillPct.toFixed(0)}%</span>
                         </div>
-                      </td>
-                      <td className="py-2 px-4">
-                        <span className={cn(
-                          "px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-tighter",
-                          order.status === 'OPEN' ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' :
-                          order.status === 'PENDING_TRIGGER' ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20' :
-                          'bg-green-500/10 text-green-500 border border-green-500/20'
-                        )}>
-                          {order.status === 'PENDING_TRIGGER' ? 'Stop' : order.status}
-                        </span>
-                      </td>
-                      <td className="py-2 px-4">
-                        {(order.status === 'OPEN' || order.status === 'PENDING_TRIGGER') && (
-                          <button
-                            onClick={() => handleCancelClick(order)}
-                            className="bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white px-2.5 py-1 text-[10px] font-bold uppercase tracking-widest rounded-lg border border-red-500/20 transition-all active:scale-95"
-                          >
-                            Cancel
-                          </button>
-                        )}
-                      </td>
-                    </motion.tr>
-                  );
-                })
-              ) : (
-                <tr>
-                  <td colSpan="10" className="py-12 text-center text-muted-foreground text-xs font-medium italic">No active orders</td>
-                </tr>
-              )}
-            </AnimatePresence>
-          </tbody>
-        </table>
+                      </div>
+                    </div>
+
+                    {/* Actions */}
+                    {(order.status === 'OPEN' || order.status === 'PENDING_TRIGGER') && (
+                      <button
+                        onClick={() => handleCancelClick(order)}
+                        className="mt-1.5 w-full bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white py-2.5 text-[10px] font-black uppercase tracking-widest rounded-xl border border-red-500/20 transition-all active:scale-95 flex items-center justify-center gap-1"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                        Cancel Order
+                      </button>
+                    )}
+                  </motion.div>
+                );
+              })
+            ) : (
+               <div className="py-12 bg-[#161b22] border border-[#30363d]/50 rounded-2xl flex flex-col items-center justify-center">
+                 <p className="text-[#848E9C] text-[10px] font-black uppercase tracking-[2px]">No Active Orders</p>
+               </div>
+            )}
+          </AnimatePresence>
+        </div>
       </div>
 
 

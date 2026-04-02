@@ -1260,7 +1260,7 @@ export default function TradingInterface({ partyId }) {
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto lg:overflow-hidden lg:grid lg:grid-cols-12 lg:grid-rows-[1fr_220px] gap-4 lg:gap-3 p-2 lg:p-3 min-h-0">
+      <div className="flex-1 overflow-y-auto lg:overflow-hidden flex flex-col lg:grid lg:grid-cols-12 lg:grid-rows-[1fr_220px] gap-4 lg:gap-3 p-2 lg:p-3 min-h-0">
         
         {/* ── ROW 2: Trading Columns ── */}
         {isMobile ? (
@@ -1353,7 +1353,7 @@ export default function TradingInterface({ partyId }) {
         ) : (
           <>
             {/* Desktop: Chart */}
-            <main className="col-span-6 bg-card border border-border rounded-3xl overflow-hidden shadow-2xl flex flex-col min-h-0">
+            <main className="col-span-6 bg-card border border-border rounded-3xl overflow-hidden shadow-2xl flex flex-col min-h-[450px] lg:min-h-0 flex-shrink-0 mb-4 lg:mb-0">
               <PriceChart
                 tradingPair={tradingPair}
                 trades={trades}
@@ -1363,7 +1363,7 @@ export default function TradingInterface({ partyId }) {
             </main>
 
             {/* Desktop: Order Book / Recent Trades */}
-            <aside className="col-span-3 bg-card border border-border rounded-3xl overflow-hidden shadow-2xl flex flex-col min-h-0">
+            <aside className="col-span-3 bg-card border border-border rounded-3xl overflow-hidden shadow-2xl flex flex-col min-h-[450px] lg:min-h-0 flex-shrink-0 mb-4 lg:mb-0">
               <div className="flex items-center gap-1 p-1 bg-[#161b22] border border-[#30363d] m-3 mb-2 rounded-xl w-fit flex-shrink-0 shadow-lg">
                 {['Order Book', 'Recent Trades'].map(tab => {
                    const isActive = (tab === 'Order Book' && activeTab !== 'recenttrades') || (tab === 'Recent Trades' && activeTab === 'recenttrades');
@@ -1393,7 +1393,7 @@ export default function TradingInterface({ partyId }) {
             </aside>
 
             {/* Desktop: Order Form */}
-            <aside className="col-span-3 bg-card border border-border rounded-3xl overflow-hidden shadow-2xl flex flex-col min-h-0">
+            <aside className="col-span-3 bg-card border border-border rounded-3xl overflow-hidden shadow-2xl flex flex-col min-h-[450px] lg:min-h-0 flex-shrink-0 mb-4 lg:mb-0">
               <OrderForm
                 tradingPair={tradingPair}
                 availablePairs={availablePairs}
@@ -1418,7 +1418,7 @@ export default function TradingInterface({ partyId }) {
 
         {/* ── ROW 3: Bottom Analytics ── */}
         <section className="col-span-12 lg:col-span-9 bg-card border border-border rounded-3xl shadow-2xl overflow-hidden flex flex-col min-h-[400px] lg:min-h-0 mb-4 lg:mb-0">
-          <div className="flex items-center gap-1 p-1 bg-[#161b22] border border-[#30363d] m-3 mb-0 rounded-xl w-fit flex-shrink-0 shadow-lg">
+          <div className="flex items-center gap-1 p-1 bg-[#161b22] border border-[#30363d] m-3 mb-0 rounded-xl w-[calc(100vw-2rem)] md:w-full lg:w-fit overflow-x-auto scrollbar-hide flex-nowrap flex-shrink-0 shadow-lg">
             {[
               { key: 'active', label: 'Active Orders' },
               { key: 'depth', label: 'Market Depth' },
