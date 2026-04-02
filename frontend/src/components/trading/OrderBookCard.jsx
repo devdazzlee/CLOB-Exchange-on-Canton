@@ -1,33 +1,60 @@
-import { useMemo } from 'react';
+import { useMemo, useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { TrendingUp, TrendingDown, RefreshCw, Loader2, Globe, CheckCircle2 } from 'lucide-react';
+import { TrendingUp, TrendingDown, RefreshCw, Loader2, Globe, CheckCircle2, ChevronDown } from 'lucide-react';
 import { Button } from '../ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
-import { OPERATOR_PARTY_ID } from '../../config/authConfig';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../ui/select';
+import { cn } from '../../lib/utils';
 
 /**
- * OrderBookCard - Displays the GLOBAL order book
- * 
- * IMPORTANT: Users do NOT create order books.
- * The order book is owned by the Operator (venue) and is shared by all users.
- * This component shows the global market state, like Hyperliquid or other pro exchanges.
+ * OrderBookCard - Displays the GLOBAL order book with aggregation and view modes.
  */
 export default function OrderBookCard({ 
   tradingPair, 
   orderBook, 
   loading, 
   onRefresh,
-  userOrders = [],
-  // DEPRECATED: These props are no longer used in Global OrderBook model
-  onCreateOrderBook, 
-  creatingOrderBook 
+  userOrders = []
 }) {
-  const isEmpty = orderBook.buys.length === 0 && orderBook.sells.length === 0;
-  const isConnectedToGlobalMarket = true; // Always connected to global market
+  const [viewMode, setViewMode] = useState('both'); // 'both', 'sell', 'buy'
+  const [aggregation, setAggregation] = useState('0.001');
 
-  // Build a map of user's orders by price+side for quick lookup
-  // Key: "BUY|<roundedPrice>" or "SELL|<roundedPrice>"  Value: { count, totalQty }
-  // Uses multiple precision levels (2..8) so we match regardless of aggregation rounding
+  // Helper to aggregate orders by price at a certain precision
+  const aggregateOrders = (orders, precision) => {
+    const step = parseFloat(precision);
+    const groups = {};
+    
+    for (const o of (orders || [])) {
+      const price = parseFloat(o.price || 0);
+      if (!price) continue;
+      
+      const decimals = precision.includes('.') ? precision.split('.')[1].length : 0;
+      const roundedPriceVal = Math.floor(price / step) * step;
+      const roundedPrice = roundedPriceVal.toFixed(decimals);
+      
+      const qty = parseFloat(o.remaining || o.quantity || 0);
+      
+      if (!groups[roundedPrice]) {
+        groups[roundedPrice] = { price: roundedPrice, remaining: 0 };
+      }
+      groups[roundedPrice].remaining += qty;
+    }
+    
+    return Object.values(groups);
+  };
+
+  const aggregatedBuys = useMemo(() => 
+    aggregateOrders(orderBook?.buys || [], aggregation)
+      .sort((a, b) => parseFloat(b.price) - parseFloat(a.price)),
+    [orderBook?.buys, aggregation]
+  );
+
+  const aggregatedSells = useMemo(() => 
+    aggregateOrders(orderBook?.sells || [], aggregation)
+      .sort((a, b) => parseFloat(a.price) - parseFloat(b.price)),
+    [orderBook?.sells, aggregation]
+  );
+
   const myOrdersByPrice = useMemo(() => {
     const map = {};
     for (const o of userOrders) {
@@ -35,250 +62,192 @@ export default function OrderBookCard({
       const side = (o.type || '').toUpperCase();
       const p = parseFloat(o.price || 0);
       if (!p) continue;
-      const remaining = parseFloat(o.quantity || 0) - parseFloat(o.filled || 0);
-      // Index at multiple precisions so we match the aggregated price string
-      for (let prec = 0; prec <= 8; prec++) {
-        const key = `${side}|${p.toFixed(prec)}`;
-        if (!map[key]) map[key] = { count: 0, totalQty: 0 };
-        map[key].count += 1;
-        map[key].totalQty += remaining;
-      }
+      
+      const step = parseFloat(aggregation);
+      const decimals = aggregation.includes('.') ? aggregation.split('.')[1].length : 0;
+      const roundedPrice = (Math.floor(p / step) * step).toFixed(decimals);
+      
+      const key = `${side}|${roundedPrice}`;
+      if (!map[key]) map[key] = true;
     }
     return map;
-  }, [userOrders, tradingPair]);
+  }, [userOrders, tradingPair, aggregation]);
 
-  const getMyInfo = (price, side) => {
-    // The aggregated order book price comes as a string like "0.10" or "51000.00"
-    const priceStr = String(price);
-    const key = `${side}|${priceStr}`;
-    return myOrdersByPrice[key] || null;
-  };
+  const getMyInfo = (price, side) => myOrdersByPrice[`${side}|${price}`] || null;
 
-  // Calculate cumulative depth for visualization
   const calculateDepth = (orders) => {
     let cumulative = 0;
-    return orders
-      .filter(order => order.price !== null && order.price !== undefined)
-      .map(order => {
-        const qty = parseFloat(order.remaining || order.quantity || 0);
-        cumulative += qty;
-        return { ...order, cumulative, depth: qty };
-      });
+    return orders.map(order => {
+      cumulative += order.remaining;
+      return { ...order, cumulative };
+    });
   };
 
-  // Sort buy orders: highest price first (best bid at top)
-  const sortedBuys = [...orderBook.buys].sort((a, b) => parseFloat(b.price || 0) - parseFloat(a.price || 0));
-  // Sort sell orders: lowest price first (best ask at top)  
-  const sortedSells = [...orderBook.sells].sort((a, b) => parseFloat(a.price || 0) - parseFloat(b.price || 0));
-  
-  const buyOrdersWithDepth = calculateDepth(sortedBuys);
-  const sellOrdersWithDepth = calculateDepth(sortedSells);
+  const buyOrdersWithDepth = useMemo(() => calculateDepth(aggregatedBuys), [aggregatedBuys]);
+  const sellOrdersWithDepth = useMemo(() => calculateDepth(aggregatedSells), [aggregatedSells]);
   
   const maxDepth = Math.max(
     buyOrdersWithDepth.length > 0 ? buyOrdersWithDepth[buyOrdersWithDepth.length - 1]?.cumulative || 0 : 0,
-    sellOrdersWithDepth.length > 0 ? sellOrdersWithDepth[sellOrdersWithDepth.length - 1]?.cumulative || 0 : 0
+    sellOrdersWithDepth.length > 0 ? sellOrdersWithDepth[sellOrdersWithDepth.length - 1]?.cumulative || 0 : 0,
+    1
   );
 
-  // Calculate spread
-  const bestBid = buyOrdersWithDepth.length > 0 ? parseFloat(buyOrdersWithDepth[0]?.price || 0) : 0;
-  const bestAsk = sellOrdersWithDepth.length > 0 ? parseFloat(sellOrdersWithDepth[0]?.price || 0) : 0;
+  const sortedRawBuys = [...(orderBook?.buys || [])].sort((a, b) => parseFloat(b.price || 0) - parseFloat(a.price || 0));
+  const sortedRawSells = [...(orderBook?.sells || [])].sort((a, b) => parseFloat(a.price || 0) - parseFloat(b.price || 0));
+  const bestBid = sortedRawBuys.length > 0 ? parseFloat(sortedRawBuys[0]?.price || 0) : 0;
+  const bestAsk = sortedRawSells.length > 0 ? parseFloat(sortedRawSells[0]?.price || 0) : 0;
   const spread = bestBid > 0 && bestAsk > 0 ? bestAsk - bestBid : 0;
   const spreadPercent = bestBid > 0 ? (spread / bestBid) * 100 : 0;
 
+  const sellsReversed = [...sellOrdersWithDepth].reverse();
+  
+  const displaySells = viewMode === 'buy' ? [] : (viewMode === 'sell' ? sellsReversed : sellsReversed.slice(-15));
+  const displayBuys = viewMode === 'sell' ? [] : (viewMode === 'buy' ? buyOrdersWithDepth : buyOrdersWithDepth.slice(0, 15));
+
   return (
-    <Card>
-      <CardHeader className="px-3 sm:px-6">
-        <div className="flex items-center justify-between gap-2 flex-wrap">
-          <div className="flex items-center gap-2 min-w-0">
-            <CardTitle className="text-sm sm:text-base truncate">Order Book - {tradingPair}</CardTitle>
-            {/* Global Market Indicator */}
-            {isConnectedToGlobalMarket && (
-              <div className="hidden sm:flex items-center gap-1.5 px-2 py-1 bg-success/10 border border-success/20 rounded-full flex-shrink-0">
-                <Globe className="w-3 h-3 text-success" />
-                <span className="text-xs font-medium text-success">Global Market</span>
-              </div>
+    <div className="flex flex-col h-full bg-card overflow-hidden">
+      {/* Top Filter Controls - Segmented Style */}
+      <div className="flex items-center justify-between px-3 py-1.5 border-b border-border/50 bg-[#0d1117]/50 flex-shrink-0">
+        <div className="flex items-center gap-1 py-0.5 px-2 bg-[#0d1117] border border-[#2B3139] rounded-lg">
+          <button 
+            onClick={() => setViewMode('sell')}
+            className={cn(
+              "p-1.5 rounded transition-all duration-200", 
+              viewMode === 'sell' 
+                ? "bg-[#2b3139] text-[#f84962] border border-[#3A4149] shadow-inner" 
+                : "text-muted-foreground hover:bg-white/5 hover:text-white"
             )}
-          </div>
-          <div className="flex items-center space-x-2 flex-shrink-0">
-            {/* Connected Status */}
-            <div className="flex items-center gap-1 sm:gap-1.5 text-[10px] sm:text-xs text-muted-foreground">
-              <CheckCircle2 className="w-3 h-3 text-success" />
-              <span className="hidden sm:inline">Connected</span>
-            </div>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={onRefresh}
-              disabled={loading}
-              className="h-7 w-7 sm:h-8 sm:w-8"
-            >
-              {loading ? (
-                <Loader2 className="h-3.5 w-3.5 sm:h-4 sm:w-4 animate-spin" />
-              ) : (
-                <RefreshCw className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
-              )}
-            </Button>
+            title="Sell Orders Only"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" strokeWidth="1"><rect x="3" y="3" width="18" height="6" rx="1"/><rect x="3" y="15" width="18" height="6" rx="1" opacity="0.3"/></svg>
+          </button>
+          <button 
+            onClick={() => setViewMode('both')}
+            className={cn(
+              "p-1.5 rounded transition-all duration-200", 
+              viewMode === 'both' 
+                ? "bg-[#2b3139] text-white border border-[#3A4149] shadow-inner" 
+                : "text-muted-foreground hover:bg-white/5 hover:text-white"
+            )}
+            title="Both Sides"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" strokeWidth="1"><rect x="3" y="3" width="18" height="6" rx="1"/><rect x="3" y="15" width="18" height="6" rx="1"/></svg>
+          </button>
+          <button 
+            onClick={() => setViewMode('buy')}
+            className={cn(
+              "p-1.5 rounded transition-all duration-200", 
+              viewMode === 'buy' 
+                ? "bg-[#2b3139] text-[#00b07b] border border-[#3A4149] shadow-inner" 
+                : "text-muted-foreground hover:bg-white/5 hover:text-white"
+            )}
+            title="Buy Orders Only"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" strokeWidth="1"><rect x="3" y="3" width="18" height="6" rx="1" opacity="0.3"/><rect x="3" y="15" width="18" height="6" rx="1"/></svg>
+          </button>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] text-[#848E9C] font-bold uppercase tracking-widest hidden sm:inline">Aggregation</span>
+          <div className="w-[80px] sm:w-[90px] relative z-[60]">
+             <Select value={aggregation} onValueChange={setAggregation}>
+                <SelectTrigger className="h-7 w-full bg-[#1e2329] border-[#F7B500] hover:border-[#F7B500] text-[11px] font-bold rounded-full px-2 shadow-sm">
+                   <SelectValue placeholder="Precision" />
+                </SelectTrigger>
+                <SelectContent className="bg-[#1e2329] border-[#2B3139]">
+                  {['0.001', '0.01', '0.1', '1', '10', '50', '100'].map(val => (
+                    <SelectItem key={val} value={val} className="text-[11px] font-bold">{val}</SelectItem>
+                  ))}
+                </SelectContent>
+             </Select>
           </div>
         </div>
-      </CardHeader>
-      <CardContent className="px-3 sm:px-6">
-        {loading ? (
-          <div className="flex flex-col items-center justify-center py-12 sm:py-16">
-            <Loader2 className="w-10 h-10 sm:w-12 sm:h-12 animate-spin text-primary mb-4" />
-            <p className="text-muted-foreground text-xs sm:text-sm font-medium">Loading order book data...</p>
-          </div>
-        ) : (
-          <div className="space-y-3 sm:space-y-4">
-            {/* Spread Indicator */}
-            {bestBid > 0 && bestAsk > 0 && (
-              <div className="flex items-center justify-between p-2 sm:p-3 bg-card border border-border rounded-lg">
-                <div className="text-[10px] sm:text-xs text-muted-foreground uppercase tracking-wide">Spread</div>
-                <div className="text-right">
-                  <div className="text-xs sm:text-sm font-semibold text-foreground font-mono">
-                    {spread.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 })}
-                  </div>
-                  <div className="text-[10px] sm:text-xs text-muted-foreground">
-                    ({spreadPercent.toFixed(2)}%)
-                  </div>
+      </div>
+
+      {/* Column headers */}
+      <div className="flex items-center px-4 py-2 border-b border-border/50 bg-[#161b22]/50 flex-shrink-0">
+        <span className="flex-1 text-[11px] text-[#848E9C] font-bold uppercase tracking-widest">Price</span>
+        <span className="w-24 text-right text-[11px] text-[#848E9C] font-bold uppercase tracking-widest">Quantity</span>
+        <span className="w-24 text-right text-[11px] text-[#848E9C] font-bold uppercase tracking-widest">Total</span>
+      </div>
+
+      {loading ? (
+        <div className="flex-1 flex items-center justify-center">
+          <Loader2 className="w-5 h-5 animate-spin text-primary" />
+        </div>
+      ) : (
+        <div className="flex-1 flex flex-col overflow-hidden">
+          {/* Sell orders (red) */}
+          <div className={cn("overflow-y-auto flex flex-col justify-end min-h-0 custom-scrollbar", viewMode === 'both' ? 'flex-1' : viewMode === 'sell' ? 'flex-[2]' : 'hidden')}>
+            {displaySells.length > 0 ? displaySells.map((order, i) => {
+              const depthPercent = maxDepth > 0 ? (order.cumulative / maxDepth) * 100 : 0;
+              const myInfo = getMyInfo(order.price, 'SELL');
+              const priceNum = parseFloat(order.price);
+              const qty = order.remaining;
+              const total = priceNum * qty;
+              return (
+                <div
+                  key={i}
+                  className="flex items-center px-4 py-[5px] hover:bg-red-500/5 cursor-pointer relative group transition-colors"
+                  style={{ background: `linear-gradient(to left, rgba(248,73,96,0.12) ${depthPercent}%, transparent ${depthPercent}%)` }}
+                >
+                  <span className={cn("flex-1 text-[13px] font-mono font-bold", myInfo ? "text-primary" : "text-[#f84962]")}>
+                    {priceNum.toFixed(aggregation.includes('.') ? aggregation.split('.')[1].length : 0)}
+                    {myInfo && <span className="ml-1 text-[10px] text-primary">●</span>}
+                  </span>
+                  <span className="w-24 text-right text-[13px] font-mono text-white font-medium">{qty.toFixed(4)}</span>
+                  <span className="w-24 text-right text-[13px] font-mono text-[#848E9C]">
+                    {total.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                  </span>
                 </div>
-              </div>
+              );
+            }) : (
+              <div className="py-8 text-center text-muted-foreground text-xs font-medium italic">No sell orders</div>
             )}
+          </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
-              {/* Sell Orders (Red - Top) */}
-              <div>
-                <h4 className="text-xs sm:text-sm font-semibold text-destructive mb-2 sm:mb-3 uppercase tracking-wide flex items-center">
-                  <TrendingDown className="w-3.5 h-3.5 sm:w-4 sm:h-4 mr-1.5 sm:mr-2" />
-                  Sell Orders
-                </h4>
-                <div className="overflow-x-auto -mx-1">
-                  <table className="w-full relative">
-                    <thead>
-                      <tr className="border-b border-border">
-                        <th className="text-left py-2 sm:py-3 px-1.5 sm:px-3 text-[10px] sm:text-xs font-semibold text-muted-foreground uppercase tracking-wide">Price</th>
-                        <th className="text-right py-2 sm:py-3 px-1.5 sm:px-3 text-[10px] sm:text-xs font-semibold text-muted-foreground uppercase tracking-wide">Qty</th>
-                        <th className="text-right py-2 sm:py-3 px-1.5 sm:px-3 text-[10px] sm:text-xs font-semibold text-muted-foreground uppercase tracking-wide hidden sm:table-cell">Total</th>
-                        <th className="w-6 sm:w-8 py-2 sm:py-3 px-0.5 sm:px-1 text-center text-[10px] sm:text-xs font-semibold text-muted-foreground uppercase tracking-wide">My</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <AnimatePresence>
-                        {sellOrdersWithDepth.length > 0 ? (
-                          sellOrdersWithDepth.map((order, i) => {
-                            const depthPercent = maxDepth > 0 ? (order.cumulative / maxDepth) * 100 : 0;
-                            const myInfo = getMyInfo(order.price, 'SELL');
-                            return (
-                              <motion.tr
-                                key={i}
-                                initial={{ opacity: 0, x: -10 }}
-                                animate={{ opacity: 1, x: 0 }}
-                                exit={{ opacity: 0 }}
-                                className={`border-b border-border/50 hover:bg-card transition-colors cursor-pointer relative ${myInfo ? 'ring-1 ring-inset ring-primary/30' : ''}`}
-                                style={{
-                                  background: myInfo
-                                    ? `linear-gradient(to left, rgba(239, 68, 68, 0.18) ${depthPercent}%, rgba(99, 102, 241, 0.06) ${depthPercent}%)`
-                                    : `linear-gradient(to left, rgba(239, 68, 68, 0.1) ${depthPercent}%, transparent ${depthPercent}%)`
-                                }}
-                              >
-                                <td className="py-1.5 sm:py-2.5 px-1.5 sm:px-3 text-destructive font-mono text-[11px] sm:text-sm font-medium">
-                                  {order.price !== null ? parseFloat(order.price).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 }) : 'Market'}
-                                </td>
-                                <td className="py-1.5 sm:py-2.5 px-1.5 sm:px-3 text-right text-foreground text-[11px] sm:text-sm font-mono">
-                                  {order.remaining != null ? parseFloat(order.remaining).toFixed(4) : '0.0000'}
-                                </td>
-                                <td className="py-1.5 sm:py-2.5 px-1.5 sm:px-3 text-right text-muted-foreground text-[11px] sm:text-sm hidden sm:table-cell">
-                                  {order.price !== null && order.remaining != null ? (parseFloat(order.price) * parseFloat(order.remaining)).toLocaleString(undefined, { maximumFractionDigits: 2 }) : '-'}
-                                </td>
-                                <td className="w-6 sm:w-8 py-1.5 sm:py-2.5 px-0.5 sm:px-1 text-center">
-                                  {myInfo && (
-                                    <span className="inline-flex items-center justify-center w-4 h-4 sm:w-5 sm:h-5 rounded-full bg-primary/20 text-primary text-[8px] sm:text-[10px] font-bold" title={`You have ${myInfo.count} order(s) here`}>
-                                      {myInfo.count}
-                                    </span>
-                                  )}
-                                </td>
-                              </motion.tr>
-                            );
-                          })
-                        ) : (
-                          <tr>
-                            <td colSpan="4" className="py-6 sm:py-8 text-center text-muted-foreground text-xs sm:text-sm">No sell orders</td>
-                          </tr>
-                        )}
-                      </AnimatePresence>
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-
-              {/* Buy Orders (Green - Bottom) */}
-              <div>
-                <h4 className="text-xs sm:text-sm font-semibold text-success mb-2 sm:mb-3 uppercase tracking-wide flex items-center">
-                  <TrendingUp className="w-3.5 h-3.5 sm:w-4 sm:h-4 mr-1.5 sm:mr-2" />
-                  Buy Orders
-                </h4>
-                <div className="overflow-x-auto -mx-1">
-                  <table className="w-full relative">
-                    <thead>
-                      <tr className="border-b border-border">
-                        <th className="text-left py-2 sm:py-3 px-1.5 sm:px-3 text-[10px] sm:text-xs font-semibold text-muted-foreground uppercase tracking-wide">Price</th>
-                        <th className="text-right py-2 sm:py-3 px-1.5 sm:px-3 text-[10px] sm:text-xs font-semibold text-muted-foreground uppercase tracking-wide">Qty</th>
-                        <th className="text-right py-2 sm:py-3 px-1.5 sm:px-3 text-[10px] sm:text-xs font-semibold text-muted-foreground uppercase tracking-wide hidden sm:table-cell">Total</th>
-                        <th className="w-6 sm:w-8 py-2 sm:py-3 px-0.5 sm:px-1 text-center text-[10px] sm:text-xs font-semibold text-muted-foreground uppercase tracking-wide">My</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <AnimatePresence>
-                        {buyOrdersWithDepth.length > 0 ? (
-                          buyOrdersWithDepth.map((order, i) => {
-                            const depthPercent = maxDepth > 0 ? (order.cumulative / maxDepth) * 100 : 0;
-                            const myInfo = getMyInfo(order.price, 'BUY');
-                            return (
-                              <motion.tr
-                                key={i}
-                                initial={{ opacity: 0, x: 10 }}
-                                animate={{ opacity: 1, x: 0 }}
-                                exit={{ opacity: 0 }}
-                                className={`border-b border-border/50 hover:bg-card transition-colors cursor-pointer ${myInfo ? 'ring-1 ring-inset ring-primary/30' : ''}`}
-                                style={{
-                                  background: myInfo
-                                    ? `linear-gradient(to right, rgba(34, 197, 94, 0.18) ${depthPercent}%, rgba(99, 102, 241, 0.06) ${depthPercent}%)`
-                                    : `linear-gradient(to right, rgba(34, 197, 94, 0.1) ${depthPercent}%, transparent ${depthPercent}%)`
-                                }}
-                              >
-                                <td className="py-1.5 sm:py-2.5 px-1.5 sm:px-3 text-success font-mono text-[11px] sm:text-sm font-medium">
-                                  {order.price !== null ? parseFloat(order.price).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 8 }) : 'Market'}
-                                </td>
-                                <td className="py-1.5 sm:py-2.5 px-1.5 sm:px-3 text-right text-foreground text-[11px] sm:text-sm font-mono">
-                                  {order.remaining != null ? parseFloat(order.remaining).toFixed(4) : '0.0000'}
-                                </td>
-                                <td className="py-1.5 sm:py-2.5 px-1.5 sm:px-3 text-right text-muted-foreground text-[11px] sm:text-sm hidden sm:table-cell">
-                                  {order.price !== null && order.remaining != null ? (parseFloat(order.price) * parseFloat(order.remaining)).toLocaleString(undefined, { maximumFractionDigits: 2 }) : '-'}
-                                </td>
-                                <td className="w-6 sm:w-8 py-1.5 sm:py-2.5 px-0.5 sm:px-1 text-center">
-                                  {myInfo && (
-                                    <span className="inline-flex items-center justify-center w-4 h-4 sm:w-5 sm:h-5 rounded-full bg-primary/20 text-primary text-[8px] sm:text-[10px] font-bold" title={`You have ${myInfo.count} order(s) here`}>
-                                      {myInfo.count}
-                                    </span>
-                                  )}
-                                </td>
-                              </motion.tr>
-                            );
-                          })
-                        ) : (
-                          <tr>
-                            <td colSpan="4" className="py-6 sm:py-8 text-center text-muted-foreground text-xs sm:text-sm">No buy orders</td>
-                          </tr>
-                        )}
-                      </AnimatePresence>
-                    </tbody>
-                  </table>
-                </div>
-              </div>
+          {/* Spread Bar */}
+          <div className="flex items-center px-4 py-2 bg-[#161b22] border-y border-border/80 flex-shrink-0">
+            <div className="flex-1 flex items-baseline gap-2">
+               <span className={`text-[14px] font-bold font-mono ${spread > 0 ? 'text-white' : 'text-muted-foreground/50'}`}>
+                {spread.toFixed(4)}
+               </span>
+               <span className="text-[10px] text-[#848E9C] font-bold uppercase tracking-tight">Spread</span>
+            </div>
+            <div className="text-[11px] text-[#00b07b] font-bold bg-[#00b07b]/10 px-2 py-0.5 rounded border border-[#00b07b]/20">
+              {spreadPercent.toFixed(3)}%
             </div>
           </div>
-        )}
-      </CardContent>
-    </Card>
+
+          {/* Buy orders (green) */}
+          <div className={cn("overflow-y-auto min-h-0 custom-scrollbar", viewMode === 'both' ? 'flex-1' : viewMode === 'buy' ? 'flex-[2]' : 'hidden')}>
+            {displayBuys.length > 0 ? displayBuys.map((order, i) => {
+              const depthPercent = maxDepth > 0 ? (order.cumulative / maxDepth) * 100 : 0;
+              const myInfo = getMyInfo(order.price, 'BUY');
+              const priceNum = parseFloat(order.price);
+              const qty = order.remaining;
+              const total = priceNum * qty;
+              return (
+                <div
+                  key={i}
+                  className="flex items-center px-4 py-[5px] hover:bg-green-500/5 cursor-pointer relative group transition-colors"
+                  style={{ background: `linear-gradient(to left, rgba(0,176,123,0.12) ${depthPercent}%, transparent ${depthPercent}%)` }}
+                >
+                  <span className={cn("flex-1 text-[13px] font-mono font-bold", myInfo ? "text-primary" : "text-[#00b07b]")}>
+                    {priceNum.toFixed(aggregation.includes('.') ? aggregation.split('.')[1].length : 0)}
+                    {myInfo && <span className="ml-1 text-[10px] text-primary">●</span>}
+                  </span>
+                  <span className="w-24 text-right text-[13px] font-mono text-white font-medium">{qty.toFixed(4)}</span>
+                  <span className="w-24 text-right text-[13px] font-mono text-[#848E9C]">
+                    {total.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                  </span>
+                </div>
+              );
+            }) : (
+              <div className="py-8 text-center text-muted-foreground text-xs font-medium italic">No buy orders</div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
-

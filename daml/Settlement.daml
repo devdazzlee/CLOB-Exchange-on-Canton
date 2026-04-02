@@ -444,6 +444,96 @@ template ExchangeAllocation
 
 
 -- =============================================================================
+-- EXCHANGE SETTLER HUB (SINGLETON — 2-TX SETTLEMENT PATTERN)
+-- =============================================================================
+-- Root-cause fix for "Transaction with multiple root nodes are not supported":
+--   CreateAndExercise produces 2 root nodes (Create + Exercise).
+--   A plain ExerciseCommand on an existing contract produces 1 root node.
+--
+-- Architecture:
+--   Operator creates this contract ONCE at system startup (non-interactive).
+--   Every trade settlement calls SettleTrade (non-consuming) — hub persists.
+--
+-- TX 1: AllocationFactory_Allocate self-alloc (user locks funds at order time)
+-- TX 2: ExchangeSettlerHub::SettleTrade — single ExerciseCommand, one root node:
+--         Withdraw CC self-alloc  → Withdraw CBTC self-alloc
+--         → Allocate CC seller→buyer → Allocate CBTC buyer→seller
+--         → ExecuteTransfer CC → ExecuteTransfer CBTC
+--         All atomic in ONE Canton transaction.
+--
+-- Authorization propagation:
+--   Hub signatory: operator (local, auto-signs)
+--   SettleTrade controllers: [operator, seller, buyer]
+--   Auth set = {operator, seller, buyer} — satisfies ALL nested choices:
+--     Allocation_Withdraw  (owner = seller or buyer)
+--     AllocationFactory_Allocate (sender = seller or buyer)
+--     Allocation_ExecuteTransfer (allocationControllers includes executor+seller+buyer)
+--
+template ExchangeSettlerHub
+  with
+    operator : Party
+    createdAt : Text
+  where
+    signatory operator
+
+    -- Non-consuming: hub stays active after every settlement.
+    -- seller + buyer sign the interactive submission hash;
+    -- operator (local party) auto-signs on execute.
+    nonconsuming choice SettleTrade : (Allocation_ExecuteTransferResult, Allocation_ExecuteTransferResult)
+      with
+        tradeId         : Text
+        seller          : Party
+        buyer           : Party
+        sellerSelfAllocCid : ContractId Allocation   -- CC self-alloc (seller→seller)
+        buyerSelfAllocCid  : ContractId Allocation   -- CBTC self-alloc (buyer→buyer)
+        ccFactory       : ContractId AllocationFactory
+        cbtcFactory     : ContractId AllocationFactory
+        ccWithdrawArgs  : ExtraArgs   -- expire-lock AmuletRules context
+        cbtcWithdrawArgs : ExtraArgs  -- withdraw context for CBTC
+        ccAllocSpec     : AllocationSpecification   -- seller→buyer CC spec
+        cbtcAllocSpec   : AllocationSpecification   -- buyer→seller CBTC spec
+        ccAllocArgs     : ExtraArgs   -- AmuletRules context for CC Allocate
+        cbtcAllocArgs   : ExtraArgs   -- transfer-rule context for CBTC Allocate
+        ccExpectedAdmin : Party       -- DSO / Splice admin
+        cbtcExpectedAdmin : Party     -- Utilities / CBTC admin
+        ccExecuteArgs   : ExtraArgs   -- AmuletRules context for CC ExecuteTransfer
+        cbtcExecuteArgs : ExtraArgs   -- transfer-rule context for CBTC ExecuteTransfer
+      controller [operator, seller, buyer]
+      do
+        now <- getTime
+        -- Step 1: Withdraw seller's CC self-allocation → frees CC holdings
+        ccWr <- exercise sellerSelfAllocCid (Allocation_Withdraw with extraArgs = ccWithdrawArgs)
+        -- Step 2: Withdraw buyer's CBTC self-allocation → frees CBTC holdings
+        cbtcWr <- exercise buyerSelfAllocCid (Allocation_Withdraw with extraArgs = cbtcWithdrawArgs)
+        -- Step 3: Create directional CC allocation (seller→buyer)
+        ccAllocRes <- exercise ccFactory (AllocationFactory_Allocate with
+          expectedAdmin    = ccExpectedAdmin
+          allocation       = ccAllocSpec
+          requestedAt      = now
+          inputHoldingCids = ccWr.senderHoldingCids
+          extraArgs        = ccAllocArgs)
+        -- Step 4: Create directional CBTC allocation (buyer→seller)
+        cbtcAllocRes <- exercise cbtcFactory (AllocationFactory_Allocate with
+          expectedAdmin    = cbtcExpectedAdmin
+          allocation       = cbtcAllocSpec
+          requestedAt      = now
+          inputHoldingCids = cbtcWr.senderHoldingCids
+          extraArgs        = cbtcAllocArgs)
+        -- Step 5: Extract new allocation contract IDs (must complete immediately)
+        let (ccAllocCid : ContractId Allocation) = case ccAllocRes.output of
+              AllocationInstructionResult_Completed cid -> cid
+              _ -> error "CC AllocationFactory_Allocate did not complete immediately"
+        let (cbtcAllocCid : ContractId Allocation) = case cbtcAllocRes.output of
+              AllocationInstructionResult_Completed cid -> cid
+              _ -> error "CBTC AllocationFactory_Allocate did not complete immediately"
+        -- Step 6: Execute CC transfer (seller→buyer) — auth {operator, seller, buyer} ✓
+        ccResult <- exercise ccAllocCid (Allocation_ExecuteTransfer with extraArgs = ccExecuteArgs)
+        -- Step 7: Execute CBTC transfer (buyer→seller) — auth {operator, buyer, seller} ✓
+        cbtcResult <- exercise cbtcAllocCid (Allocation_ExecuteTransfer with extraArgs = cbtcExecuteArgs)
+        return (ccResult, cbtcResult)
+
+
+-- =============================================================================
 -- DvP AGREEMENT — Both parties co-sign, operator settles atomically
 -- =============================================================================
 --

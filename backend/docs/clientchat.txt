@@ -6411,3 +6411,18 @@ I’ve made the changes and both allocation legs are now executing. Could you pl
 Thanks!
 Hey @AHMED,
 It would be better for us to test once the single-tx implementation is completed as well, so we can validate the final intended flow directly.
+
+[3:34 PM, 3/30/2026] +91 79903 24401: @AHMED 
+Matchmaking and token transfer between the parties is working fine, can you share me the 2 updateIds (place-order and settlement) for this party ext-ddd039cb9d91::1220b175a04aee0c5bcffa159b993e64d13d9337f95ec88566ffc184d35e53890ab3
+[4:01 PM, 3/30/2026] AHMED: @AHMED 
+Matchmaking and token transfer between the parties is working fine, can you share me the 2 updateIds (place-order and settlement) for this party ext-ddd039cb9d91::1220b175a04aee0c5bcffa159b993e64d13d9337f95ec88566ffc184d35e53890ab3
+I’ll check the logs and share them with you.
+[4:18 PM, 3/30/2026] AHMED: @~huz, everything is complete and working. Please share the final changes so we can finalize this.
+[4:27 PM, 3/30/2026] +91 79903 24401: @~huz, everything is complete and working. Please share the final changes so we can finalize this.
+Sure, once we verify the flow is correct. Can you share the 2 updateIds
+[4:35 PM, 3/30/2026] +91 79903 24401: Can you also push the final code and remove all the unnecessary daml files from here
+[4:42 PM, 3/30/2026] +91 79903 24401: On checking out the partyId from the explorer, it seems there are more than 2 tx. Please club all the exercises into 2 tx as mentioned in the doc shared before
+[4:48 PM, 3/30/2026] AHMED: Can you also push the final code and remove all the unnecessary daml files from here
+I will push the updated code.
+[5:04 PM, 3/30/2026] +91 79903 24401: There are multiple contracts which are being created on party allocation with this package clob-exchange-splice-v2:Holding:Holding, is there any use of this contract? If not please remove the creation of this contracts….
+[5:21 PM, 3/30/2026] +91 79903 24401: Also please confirm, in no way we are storing a user’s wallet credentials in any form (password or privatekey)

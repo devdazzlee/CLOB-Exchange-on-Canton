@@ -389,162 +389,93 @@ function PriceChart({
   const isPositiveChange = priceChange24h >= 0;
 
   return (
-    <Card className={cn("bg-card/50 backdrop-blur-sm border-border/50 overflow-hidden", className)}>
-      <CardHeader className="pb-2 px-3 sm:px-6">
-        {/* Top: Trading pair name + price */}
-        <div className="flex items-start justify-between gap-2">
-          <div className="min-w-0">
-            <CardTitle className="text-base sm:text-lg font-bold text-foreground flex items-center gap-2">
-              {tradingPair}
-              {isPositiveChange ? (
-                <TrendingUp className="w-4 h-4 text-success flex-shrink-0" />
-              ) : (
-                <TrendingDown className="w-4 h-4 text-destructive flex-shrink-0" />
-              )}
-            </CardTitle>
-            <div className="flex items-center gap-2 sm:gap-3 mt-1 flex-wrap">
-              <span className="text-xl sm:text-2xl font-bold text-foreground font-mono">
-                ${formatPrice(currentPrice)}
-              </span>
-              <span className={cn(
-                "text-xs sm:text-sm font-semibold px-1.5 sm:px-2 py-0.5 rounded",
-                isPositiveChange 
-                  ? "text-success bg-success/10" 
-                  : "text-destructive bg-destructive/10"
-              )}>
-                {isPositiveChange ? '+' : ''}{priceChangePercent.toFixed(2)}%
-              </span>
-            </div>
-          </div>
-          
-          {/* 24h stats - hidden on mobile */}
-          <div className="hidden md:flex items-center gap-4 text-xs flex-shrink-0">
-            <div className="border-l border-border pl-4">
-              <div className="text-muted-foreground">24h High</div>
-              <div className="text-foreground font-mono font-medium">${formatPrice(high24h)}</div>
-            </div>
-            <div>
-              <div className="text-muted-foreground">24h Low</div>
-              <div className="text-foreground font-mono font-medium">${formatPrice(low24h)}</div>
-            </div>
-            <div>
-              <div className="text-muted-foreground">24h Vol</div>
-              <div className="text-foreground font-mono font-medium">{formatVolume(volume24h)}</div>
-            </div>
-          </div>
-        </div>
+    <div className={cn("flex flex-col h-full bg-[#0d1117]", className)}>
+      {/* Chart controls bar */}
+      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-[#21262d] flex-shrink-0 flex-wrap">
+        {/* Trading pair label */}
+        <span className="text-xs font-medium text-white mr-1">{tradingPair}</span>
+        {isPositiveChange
+          ? <TrendingUp className="w-3 h-3 text-[#26a641]" />
+          : <TrendingDown className="w-3 h-3 text-[#f85149]" />
+        }
 
-        {/* Mobile: 24h stats row */}
-        <div className="flex md:hidden items-center gap-3 mt-2 text-[10px] sm:text-xs overflow-x-auto">
-          <div className="flex-shrink-0">
-            <span className="text-muted-foreground">H: </span>
-            <span className="text-foreground font-mono">${formatPrice(high24h)}</span>
-          </div>
-          <div className="flex-shrink-0">
-            <span className="text-muted-foreground">L: </span>
-            <span className="text-foreground font-mono">${formatPrice(low24h)}</span>
-          </div>
-          <div className="flex-shrink-0">
-            <span className="text-muted-foreground">Vol: </span>
-            <span className="text-foreground font-mono">{formatVolume(volume24h)}</span>
-          </div>
-        </div>
-
-        {/* Chart controls row */}
-        <div className="flex items-center gap-1.5 sm:gap-2 mt-3 flex-wrap">
-          {/* Chart type toggles */}
-          <div className="flex items-center bg-background/50 rounded-lg p-0.5 sm:p-1 border border-border/50">
-            {CHART_TYPES.map((type) => {
-              const Icon = type.icon;
-              return (
-                <Button
-                  key={type.value}
-                  variant="ghost"
-                  size="sm"
-                  className={cn(
-                    "h-6 w-6 sm:h-7 sm:w-7 p-0 rounded",
-                    chartType === type.value 
-                      ? "bg-primary text-primary-foreground" 
-                      : "text-muted-foreground hover:text-foreground"
-                  )}
-                  onClick={() => setChartType(type.value)}
-                  title={type.label}
-                >
-                  <Icon className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
-                </Button>
-              );
-            })}
-          </div>
-
-          {/* Time interval toggles */}
-          <div className="flex items-center bg-background/50 rounded-lg p-0.5 sm:p-1 border border-border/50 overflow-x-auto">
-            {TIME_INTERVALS.map((interval) => (
-              <Button
-                key={interval.value}
-                variant="ghost"
-                size="sm"
+        {/* Chart type toggles - Segmented Style */}
+        <div className="flex items-center gap-1 p-0.5 bg-[#0d1117] border border-[#2B3139] rounded-lg">
+          {CHART_TYPES.map((type) => {
+            const Icon = type.icon;
+            return (
+              <button
+                key={type.value}
+                onClick={() => setChartType(type.value)}
+                title={type.label}
                 className={cn(
-                  "h-6 sm:h-7 px-1.5 sm:px-2 text-[10px] sm:text-xs font-medium rounded flex-shrink-0",
-                  selectedInterval.value === interval.value
-                    ? "bg-primary text-primary-foreground"
-                    : "text-muted-foreground hover:text-foreground"
+                  "p-1 rounded transition-all duration-200",
+                  chartType === type.value
+                    ? "bg-[#2b3139] text-[#F7B500] shadow-inner border border-[#3A4149]"
+                    : "text-[#848E9C] hover:text-white hover:bg-white/5"
                 )}
-                onClick={() => setSelectedInterval(interval)}
               >
-                {interval.displayLabel}
-              </Button>
-            ))}
-          </div>
-
-          {/* Refresh */}
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-6 w-6 sm:h-7 sm:w-7 p-0 text-muted-foreground hover:text-foreground flex-shrink-0"
-            onClick={() => {
-              setIsLoading(true);
-              const data = generateOHLCData(trades, selectedInterval.value);
-              setChartData(data);
-            }}
-            title="Refresh Chart"
-          >
-            <RefreshCw className={cn("w-3.5 h-3.5 sm:w-4 sm:h-4", isLoading && "animate-spin")} />
-          </Button>
+                <Icon className="w-3.5 h-3.5" />
+              </button>
+            );
+          })}
         </div>
-      </CardHeader>
-      
-      <CardContent className="p-0">
-        <div 
-          ref={chartContainerRef} 
-          className="w-full h-[280px] sm:h-[350px] md:h-[400px] relative"
+
+        {/* Time interval toggles - Segmented Style */}
+        <div className="flex items-center gap-1 p-0.5 bg-[#0d1117] border border-[#2B3139] rounded-lg">
+          {TIME_INTERVALS.map((interval) => (
+            <button
+              key={interval.value}
+              onClick={() => setSelectedInterval(interval)}
+              className={cn(
+                "px-2 py-0.5 text-[10px] font-bold uppercase transition-all duration-200 rounded",
+                selectedInterval.value === interval.value
+                  ? "bg-[#2b3139] text-[#F7B500] shadow-inner border border-[#3A4149]"
+                  : "text-[#848E9C] hover:text-white hover:bg-white/5"
+              )}
+            >
+              {interval.displayLabel}
+            </button>
+          ))}
+        </div>
+
+        {/* Refresh */}
+        <button
+          onClick={() => {
+            setIsLoading(true);
+            const data = generateOHLCData(trades, selectedInterval.value);
+            setChartData(data);
+          }}
+          className="p-1 text-[#848E9C] hover:text-white hover:bg-[#21262d] rounded transition-colors"
+          title="Refresh"
         >
-          {isLoading && (
-            <div className="absolute inset-0 flex items-center justify-center bg-background/50 backdrop-blur-sm z-10">
-              <div className="flex items-center gap-2 text-muted-foreground">
-                <RefreshCw className="w-5 h-5 animate-spin" />
-                <span className="text-sm">Loading chart...</span>
-              </div>
-            </div>
-          )}
-        </div>
+          <RefreshCw className={cn("w-3.5 h-3.5", isLoading && "animate-spin")} />
+        </button>
 
-        <div className="px-3 sm:px-4 py-2 border-t border-border/50 flex items-center justify-between text-[10px] sm:text-xs text-muted-foreground">
-          <div className="flex items-center gap-3 sm:gap-4">
-            <span className="flex items-center gap-1">
-              <span className="w-2.5 h-2.5 sm:w-3 sm:h-3 bg-success rounded-sm"></span>
-              Bullish
-            </span>
-            <span className="flex items-center gap-1">
-              <span className="w-2.5 h-2.5 sm:w-3 sm:h-3 bg-destructive rounded-sm"></span>
-              Bearish
-            </span>
-          </div>
-          {lastUpdate && (
-            <span>Updated: {lastUpdate.toLocaleTimeString()}</span>
-          )}
+        {/* Legend */}
+        <div className="ml-auto flex items-center gap-3 text-[10px] text-[#848E9C]">
+          <span className="flex items-center gap-1">
+            <span className="w-2.5 h-2.5 bg-[#26a641] rounded-sm" />Bullish
+          </span>
+          <span className="flex items-center gap-1">
+            <span className="w-2.5 h-2.5 bg-[#f85149] rounded-sm" />Bearish
+          </span>
+          {lastUpdate && <span>Updated: {lastUpdate.toLocaleTimeString()}</span>}
         </div>
-      </CardContent>
-    </Card>
+      </div>
+
+      {/* Chart container - fills remaining height */}
+      <div ref={chartContainerRef} className="flex-1 min-h-0 relative w-full">
+        {isLoading && (
+          <div className="absolute inset-0 flex items-center justify-center bg-[#0d1117]/80 backdrop-blur-sm z-10">
+            <div className="flex items-center gap-2 text-[#848E9C]">
+              <RefreshCw className="w-4 h-4 animate-spin" />
+              <span className="text-xs">Loading chart...</span>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 

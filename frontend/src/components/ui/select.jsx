@@ -1,4 +1,5 @@
 import * as React from "react";
+import { createPortal } from "react-dom";
 import { cn } from "@/lib/utils";
 import { ChevronDown, Check } from "lucide-react";
 
@@ -7,29 +8,52 @@ const SelectContext = React.createContext(null);
 const Select = ({ value, onValueChange, children }) => {
   const [open, setOpen] = React.useState(false);
   const [items, setItems] = React.useState({}); // value -> label
+  const [triggerRect, setTriggerRect] = React.useState(null);
   const selectRef = React.useRef(null);
+  const triggerRef = React.useRef(null);
 
   React.useEffect(() => {
     const handleClickOutside = (event) => {
-      if (selectRef.current && !selectRef.current.contains(event.target)) {
+      if (selectRef.current && !selectRef.current.contains(event.target) && 
+          !document.getElementById('select-portal-root')?.contains(event.target)) {
         setOpen(false);
       }
     };
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
+    
+    const handleScroll = () => {
+      if (open) setOpen(false); // standard UX: close on main scroll
+    };
+
+    if (open) {
+      document.addEventListener("mousedown", handleClickOutside);
+      window.addEventListener("scroll", handleScroll, true);
+    }
+    
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      window.removeEventListener("scroll", handleScroll, true);
+    };
+  }, [open]);
+
+  const updateTriggerRect = React.useCallback(() => {
+    if (triggerRef.current) {
+      setTriggerRect(triggerRef.current.getBoundingClientRect());
+    }
   }, []);
 
   const registerItem = React.useCallback((itemValue, label) => {
     setItems((prev) => {
-      // avoid rerenders if same
       if (prev[itemValue] === label) return prev;
       return { ...prev, [itemValue]: label };
     });
   }, []);
 
   return (
-    <SelectContext.Provider value={{ value, onValueChange, open, setOpen, items, registerItem }}>
-      <div ref={selectRef} className="relative">
+    <SelectContext.Provider value={{ 
+      value, onValueChange, open, setOpen, items, registerItem, 
+      triggerRef, triggerRect, updateTriggerRect 
+    }}>
+      <div ref={selectRef} className="relative inline-block w-full">
         {children}
       </div>
     </SelectContext.Provider>
@@ -37,13 +61,22 @@ const Select = ({ value, onValueChange, children }) => {
 };
 
 const SelectTrigger = React.forwardRef(({ className, children, ...props }, ref) => {
-  const { open, setOpen } = React.useContext(SelectContext);
+  const { open, setOpen, triggerRef, updateTriggerRect } = React.useContext(SelectContext);
   
+  const handleOpen = () => {
+    updateTriggerRect();
+    setOpen(!open);
+  };
+
   return (
     <button
-      ref={ref}
+      ref={(node) => {
+        triggerRef.current = node;
+        if (typeof ref === 'function') ref(node);
+        else if (ref) ref.current = node;
+      }}
       type="button"
-      onClick={() => setOpen(!open)}
+      onClick={handleOpen}
       className={cn(
         "flex h-12 w-full items-center justify-between rounded-md border border-input",
         "bg-[#1E2329] px-4 py-3 text-sm font-medium text-[#EAECEF]",
@@ -55,9 +88,9 @@ const SelectTrigger = React.forwardRef(({ className, children, ...props }, ref) 
       )}
       {...props}
     >
-      {children}
+      <div className="truncate flex-1 text-left">{children}</div>
       <ChevronDown className={cn(
-        "h-4 w-4 text-muted-foreground transition-transform duration-200",
+        "h-4 w-4 text-muted-foreground transition-transform duration-200 flex-shrink-0 ml-2",
         open && "rotate-180"
       )} />
     </button>
@@ -67,9 +100,7 @@ SelectTrigger.displayName = "SelectTrigger";
 
 const SelectValue = ({ placeholder, className }) => {
   const { value, items } = React.useContext(SelectContext);
-
   const label = value ? items?.[value] : null;
-
   return (
     <span className={cn("text-white", !value && "text-muted-foreground", className)}>
       {value ? (label ?? value) : placeholder}
@@ -77,26 +108,37 @@ const SelectValue = ({ placeholder, className }) => {
   );
 };
 
-
 const SelectContent = React.forwardRef(({ className, children, ...props }, ref) => {
-  const { open } = React.useContext(SelectContext);
+  const { open, triggerRect } = React.useContext(SelectContext);
   
-  if (!open) return null;
+  if (!open || !triggerRect) return null;
   
-  return (
+  // Custom Styles for Fixed Positioning in Portal
+  const contentStyle = {
+    position: 'fixed',
+    top: `${triggerRect.bottom + 4}px`,
+    left: `${triggerRect.left}px`,
+    width: `${triggerRect.width}px`,
+    zIndex: 9999,
+  };
+
+  return createPortal(
     <div
+      id="select-portal-root"
       ref={ref}
+      style={contentStyle}
       className={cn(
-        "absolute z-50 mt-1 w-full overflow-hidden rounded-md border border-input",
-        "bg-[#1E2329] shadow-lg animate-in fade-in-0 zoom-in-95",
+        "overflow-hidden rounded-md border border-[#2B3139]",
+        "bg-[#1E2329] shadow-2xl animate-in fade-in-0 zoom-in-95",
         className
       )}
       {...props}
     >
-      <div className="p-1">
+      <div className="p-1 max-h-[300px] overflow-y-auto custom-scrollbar">
         {children}
       </div>
-    </div>
+    </div>,
+    document.body
   );
 });
 SelectContent.displayName = "SelectContent";
@@ -109,9 +151,7 @@ const SelectItem = React.forwardRef(
     const isSelected = selectedValue === value;
 
     React.useEffect(() => {
-      // register label (string only; if children is ReactNode, fallback)
-      const label =
-        typeof children === "string" ? children : (Array.isArray(children) ? children.join("") : String(value));
+      const label = typeof children === "string" ? children : (Array.isArray(children) ? children.join("") : String(value));
       registerItem?.(value, label);
     }, [value, children, registerItem]);
 
@@ -126,8 +166,8 @@ const SelectItem = React.forwardRef(
           setOpen(false);
         }}
         className={cn(
-          "relative flex w-full cursor-pointer select-none items-center rounded-sm px-3 py-2.5",
-          "text-sm text-[#EAECEF] outline-none transition-colors",
+          "relative flex w-full cursor-pointer select-none items-center rounded-sm px-3 py-2",
+          "text-sm text-[#EAECEF] outline-none transition-colors justify-between",
           "hover:bg-[#2B3139] focus:bg-[#2B3139]",
           isSelected && "bg-primary/10 text-primary",
           disabled && "cursor-not-allowed opacity-50 hover:bg-transparent",
@@ -135,8 +175,8 @@ const SelectItem = React.forwardRef(
         )}
         {...props}
       >
-        <span className="flex-1 text-left">{children}</span>
-        {isSelected && <Check className="h-4 w-4 text-primary" />}
+        <span className="flex-1 text-left truncate">{children}</span>
+        {isSelected && <Check className="h-4 w-4 text-primary flex-shrink-0" />}
       </button>
     );
   }

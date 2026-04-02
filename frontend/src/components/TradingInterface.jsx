@@ -4,6 +4,7 @@ import { motion } from 'framer-motion';
 import { AlertCircle } from 'lucide-react';
 import { useConfirmationModal } from './ConfirmationModal';
 import { useToast, OrderSuccessModal } from './ui/toast';
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from './ui/select';
 
 // Import trading components
 import OrderForm from './trading/OrderForm';
@@ -33,6 +34,20 @@ import * as balanceService from '../services/balanceService';
 import * as orderService from '../services/orderService';
 // Wallet signing (for external party interactive submission)
 import { loadWallet, decryptPrivateKey, signMessage, bytesToBase64 } from '../wallet/keyManager';
+import { cn } from '../lib/utils';
+
+/**
+ * Modern Number Formatter
+ */
+const formatNumber = (value, decimals = 2) => {
+  if (value === null || value === undefined || value === '') return '0.00';
+  const num = parseFloat(value);
+  if (isNaN(num)) return '0.00';
+  return num.toLocaleString(undefined, {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  });
+};
 
 export default function TradingInterface({ partyId }) {
   // === PHASE 1: ALL HOOKS MUST BE DECLARED FIRST - NO EXCEPTIONS ===
@@ -66,12 +81,15 @@ export default function TradingInterface({ partyId }) {
   const [creatingOrderBook, setCreatingOrderBook] = useState(false);
   const [trades, setTrades] = useState([]);
   const [tradesLoading, setTradesLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState('trading');
+  const [activeTab, setActiveTab] = useState('active');
   const [showOrderSuccess, setShowOrderSuccess] = useState(false);
   const [initialLoading, setInitialLoading] = useState(true);
   const [lastOrderData, setLastOrderData] = useState(null);
   const { showModal, ModalComponent, isOpenRef: modalIsOpenRef } = useConfirmationModal();
   const isLoadingRef = useRef(false);
+  const [windowWidth, setWindowWidth] = useState(typeof window !== 'undefined' ? window.innerWidth : 1200);
+  const [mobileTradeTab, setMobileTradeTab] = useState('chart'); // 'chart', 'orderbook', 'trade'
+  const isMobile = windowWidth < 1024;
 
   // Minting state
   const [mintingLoading, setMintingLoading] = useState(false);
@@ -96,7 +114,12 @@ export default function TradingInterface({ partyId }) {
     setMintingLoading(true);
     
     try {
-      // TOKEN STANDARD V2: Create Holding contracts (real tokens, not text balances)
+      // TOKEN STANDARD V2: Create Holding contracts (real tokens, not text balances)  // Handle window resize for mobile check
+  useEffect(() => {
+    const handleResize = () => setWindowWidth(window.innerWidth);
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
       const mintPayload = Array.isArray(tokensToMint) && tokensToMint.length > 0
         ? tokensToMint
         : [
@@ -1166,142 +1189,285 @@ export default function TradingInterface({ partyId }) {
           </div>
         </div>
       )}
-      
-    <div className="space-y-4 sm:space-y-6">
-      <div className="flex items-center justify-between">
-          <h2 className="text-xl sm:text-2xl md:text-3xl font-bold text-foreground">Trading</h2>
-        <div className="flex items-center space-x-2">
-          <div className="w-2 h-2 bg-success rounded-full animate-pulse"></div>
-          <span className="text-xs sm:text-sm text-muted-foreground">Connected</span>
-        </div>
-      </div>
+
+    {/* ── Cardiv Dashboard: Pixel-Perfect Grid Layout ── */}
+    <div className="flex flex-col bg-[#0b0e11] text-foreground h-[calc(100vh-56px)] overflow-hidden">
       
       {error && (
-          <motion.div
-            initial={{ opacity: 0, y: -10 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="bg-destructive/10 border border-destructive rounded-lg p-4"
-          >
-            <p className="text-destructive text-sm">{error}</p>
-          </motion.div>
-        )}
-
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6">
-            <OrderForm
-              tradingPair={tradingPair}
-              availablePairs={availablePairs}
-              onTradingPairChange={setTradingPair}
-              orderBookExists={orderBookExists}
-              orderType={orderType}
-              onOrderTypeChange={(e) => setOrderType(e.target.value)}
-              orderMode={orderMode}
-              onOrderModeChange={(e) => setOrderMode(e.target.value)}
-              price={price}
-              onPriceChange={setPrice}
-              quantity={quantity}
-              onQuantityChange={setQuantity}
-              loading={orderPlacing}
-              onSubmit={handlePlaceOrder}
-              balance={balance}
-              lockedBalance={lockedBalance}
-              orderBook={orderBook}
-              lastTradePrice={trades.length > 0 ? trades[0]?.price : null}
-            />
-
-          {/* Balance Card - Shows all token holdings including CBTC */}
-          <BalanceCard
-            partyId={partyId}
-            balance={balance}
-            lockedBalance={lockedBalance}
-            loading={balanceLoading}
-            onRefresh={() => loadBalance(true)}
-            mintingLoading={mintingLoading}
-            onMintToken={async (symbol, amount) => {
-              await handleMintTokens([{ symbol, amount }]);
-            }}
-          />
-          
-          {/* Settlement is now instant (server-side auto-settle using stored signing keys).
-             No manual "Sign Withdraw" needed — removed PendingSettlements component. */}
-          {/* Transfer Offers - Accept incoming tokens (CBTC from faucet, etc.) */}
-          <TransferOffers
-            partyId={partyId}
-            onTransferAccepted={handleTransferAccepted}
-          />
+        <div className="mx-4 mt-3 p-3 bg-destructive/10 border border-destructive/20 rounded-xl text-destructive text-sm flex items-center gap-3 animate-in fade-in slide-in-from-top-2">
+          <AlertCircle className="w-4 h-4" />
+          {error}
         </div>
+      )}
 
-        {/* Price Chart - Full Width */}
-        <PriceChart 
-          tradingPair={tradingPair}
-          trades={trades}
-          currentPrice={
-            // Priority: last trade price > best bid > best ask
-            (trades.length > 0 && parseFloat(trades[0]?.price) > 0) ? parseFloat(trades[0].price) :
-            orderBook.buys?.[0]?.price ? parseFloat(orderBook.buys[0].price) : 
-            orderBook.sells?.[0]?.price ? parseFloat(orderBook.sells[0].price) : 0
-          }
-          priceChange24h={0}
-          high24h={trades.length > 0 ? Math.max(...trades.map(t => parseFloat(t.price) || 0)) : 0}
-          low24h={trades.length > 0 ? Math.min(...trades.filter(t => parseFloat(t.price) > 0).map(t => parseFloat(t.price))) : 0}
-          volume24h={trades.reduce((sum, t) => sum + (parseFloat(t.quantity) || 0), 0)}
-        />
-
-        {/* Order Book, Market Data & Recent Trades */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 sm:gap-6">
-          <div className="lg:col-span-2">
-            {/* Order Book */}
-            <OrderBookCard 
-              orderBook={orderBook}
-              loading={orderBookLoading}
-              tradingPair={tradingPair}
-              userOrders={orders}
-            />
+      {/* ── TOP STATS BAR (Proper Mobile Grid - No Scroll) ── */}
+      <div className="flex flex-col lg:flex-row lg:items-center gap-3 lg:gap-8 px-3 lg:px-4 py-3 lg:py-2 border-b border-border/50 bg-[#161b22]/70 relative z-50">
+        
+        {/* Top Row: Market & Live Status */}
+        <div className="flex items-center justify-between lg:justify-start gap-4 flex-shrink-0">
+          <div className="bg-[#1e2329] rounded-xl border border-border p-0.5 relative">
+            <Select value={tradingPair} onValueChange={setTradingPair}>
+              <SelectTrigger className="h-8 lg:h-9 w-[130px] lg:w-[160px] bg-transparent border-0 ring-0 focus:ring-0 text-white font-black text-[11px] lg:text-sm">
+                <SelectValue placeholder="Select Pair" />
+              </SelectTrigger>
+              <SelectContent className="bg-[#1e2329] border-[#2B3139] z-[100]">
+                {availablePairs.map(p => (
+                  <SelectItem key={p} value={p} className="text-xs lg:text-sm font-bold">
+                    {p.replace('/', ' / ')}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
 
-          {/* Market Data and Recent Trades */}
-          <div className="space-y-4 sm:space-y-6">
-            <MarketData 
-              tradingPair={tradingPair}
-              orderBook={orderBook}
-              trades={trades}
-            />
-            
-            <RecentTrades 
-              trades={trades}
-              loading={tradesLoading}
-              tradingPair={tradingPair}
-            />
+          <div className="flex lg:hidden items-center gap-1.5 bg-[#0ECB81]/10 px-2.5 py-1 rounded-full border border-[#0ECB81]/20">
+            <div className="w-1 h-1 bg-[#0ECB81] rounded-full animate-pulse" />
+            <span className="text-[9px] font-black text-[#0ECB81] uppercase tracking-[1px]">Live</span>
           </div>
         </div>
 
-        {/* Active Orders - Full Width */}
-        <ActiveOrdersTable
-          orders={orders}
-          loading={loading}
-          onCancelOrder={handleCancelOrder}
-          partyId={partyId}
-        />
+        {/* Bottom Row (Mobile) / Side Row (Desktop): Stats Grid */}
+        <div className="grid grid-cols-2 lg:flex lg:items-center gap-y-3 gap-x-6 lg:gap-10 lg:border-l lg:border-[#30363d] lg:pl-10 flex-1">
+          <div className="flex flex-col">
+            <p className="text-[9px] text-[#848E9C] uppercase font-black tracking-[1.5px] mb-0.5">Price</p>
+            <p className="text-xs lg:text-base font-mono font-bold text-[#0ECB81] leading-none">
+              {formatNumber(trades[0]?.price || orderBook.sells[0]?.price || '0', 2)}
+            </p>
+          </div>
+          <div className="flex flex-col">
+            <p className="text-[9px] text-[#848E9C] uppercase font-black tracking-[1.5px] mb-0.5">24h High</p>
+            <p className="text-[11px] lg:text-sm font-mono font-bold text-white leading-none">
+              {formatNumber(trades.length > 0 ? Math.max(...trades.map(t => parseFloat(t.price) || 0)) : '0', 2)}
+            </p>
+          </div>
+          <div className="flex flex-col">
+            <p className="text-[9px] text-[#848E9C] uppercase font-black tracking-[1.5px] mb-0.5">24h Low</p>
+            <p className="text-[11px] lg:text-sm font-mono font-bold text-white leading-none">
+              {formatNumber(trades.length > 0 ? Math.min(...trades.filter(t => parseFloat(t.price) > 0).map(t => parseFloat(t.price))) : '0', 2)}
+            </p>
+          </div>
+          <div className="flex flex-col">
+            <p className="text-[9px] text-[#848E9C] uppercase font-black tracking-[1.5px] mb-0.5">24h Volume</p>
+            <p className="text-[11px] lg:text-sm font-mono font-bold text-white leading-none">
+              {formatNumber(trades.reduce((sum, t) => sum + (parseFloat(t.quantity) || 0), 0), 2)}
+            </p>
+          </div>
+        </div>
 
-        {/* Depth Chart and History */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6">
-          <DepthChart 
-            orderBook={{
-              bids: orderBook.buys || [],
-              asks: orderBook.sells || []
-            }}
-            currentPrice={
-              (trades.length > 0 && parseFloat(trades[0]?.price) > 0) ? parseFloat(trades[0].price) :
-              orderBook.buys?.[0]?.price ? parseFloat(orderBook.buys[0].price) : 
-              orderBook.sells?.[0]?.price ? parseFloat(orderBook.sells[0].price) : 0
-            }
-          />
-          
-          <TransactionHistory 
-            partyId={partyId}
-            tradingPair={tradingPair}
-          />
+        <div className="hidden lg:flex items-center gap-1.5 bg-[#0ECB81]/10 px-3 py-1.5 rounded-full border border-[#0ECB81]/20 flex-shrink-0">
+          <div className="w-1.5 h-1.5 bg-[#0ECB81] rounded-full animate-pulse" />
+          <span className="text-[9px] font-black text-[#0ECB81] uppercase tracking-[1px]">Live Network</span>
         </div>
       </div>
+
+      <div className="flex-1 overflow-y-auto lg:overflow-hidden lg:grid lg:grid-cols-12 lg:grid-rows-[1fr_220px] gap-4 lg:gap-3 p-2 lg:p-3 min-h-0">
+        
+        {/* ── ROW 2: Trading Columns ── */}
+        {isMobile ? (
+          <div className="col-span-12 flex flex-col gap-4 min-h-0 mb-4 lg:mb-0">
+            {/* Mobile Trade Navigation */}
+            <div className="flex p-1 bg-[#161b22] mb-3 rounded-xl border border-border flex-shrink-0">
+              {[
+                { id: 'chart', label: 'Chart' },
+                { id: 'orderbook', label: 'Order Book' },
+                { id: 'trade', label: 'Trade' }
+              ].map(tab => (
+                <button
+                  key={tab.id}
+                  onClick={() => setMobileTradeTab(tab.id)}
+                  className={cn(
+                    "flex-1 py-1.5 text-[10px] font-bold uppercase tracking-widest transition-all duration-300 rounded-lg",
+                    mobileTradeTab === tab.id 
+                      ? "bg-[#2b3139] text-[#F7B500] shadow-lg border border-[#F7B500]/20" 
+                      : "text-muted-foreground hover:text-white"
+                  )}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex-1 min-h-[400px] lg:min-h-0 overflow-hidden">
+              <div className="h-full bg-card border border-border rounded-3xl overflow-hidden shadow-2xl flex flex-col">
+                {mobileTradeTab === 'chart' && (
+                  <PriceChart
+                    tradingPair={tradingPair}
+                    trades={trades}
+                    currentPrice={parseFloat(trades[0]?.price || '0')}
+                    className="flex-1"
+                  />
+                )}
+                {mobileTradeTab === 'orderbook' && (
+                  <div className="flex-1 flex flex-col min-h-0">
+                    <div className="flex items-center gap-1 p-1 bg-[#161b22] border border-[#30363d] m-3 mb-2 rounded-xl w-fit flex-shrink-0 shadow-lg">
+                      {['Order Book', 'Recent Trades'].map(tab => {
+                        const isActive = (tab === 'Order Book' && activeTab !== 'recenttrades') || (tab === 'Recent Trades' && activeTab === 'recenttrades');
+                        return (
+                          <button
+                            key={tab}
+                            onClick={() => setActiveTab(tab === 'Order Book' ? 'orderbook' : 'recenttrades')}
+                            className={cn(
+                              "py-1.5 px-6 text-[11px] font-black uppercase tracking-[1px] transition-all duration-200 rounded-lg whitespace-nowrap",
+                              isActive
+                                ? "bg-[#2b3139] text-[#F7B500] border border-[#484f58] shadow-inner"
+                                : "text-muted-foreground hover:bg-white/5 hover:text-white"
+                            )}
+                          >
+                            {tab === 'Order Book' ? 'BOOK' : 'TRADES'}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <div className="flex-1 overflow-hidden min-h-0">
+                      {activeTab === 'recenttrades' ? (
+                        <RecentTrades trades={trades} loading={tradesLoading} tradingPair={tradingPair} />
+                      ) : (
+                        <OrderBookCard orderBook={orderBook} loading={orderBookLoading} tradingPair={tradingPair} userOrders={orders} />
+                      )}
+                    </div>
+                  </div>
+                )}
+                {mobileTradeTab === 'trade' && (
+                  <OrderForm
+                    tradingPair={tradingPair}
+                    availablePairs={availablePairs}
+                    orderMode={orderMode}
+                    onOrderModeChange={(e) => setOrderMode(e.target.value)}
+                    orderType={orderType}
+                    onOrderTypeChange={(e) => setOrderType(e.target.value)}
+                    price={price}
+                    onPriceChange={setPrice}
+                    quantity={quantity}
+                    onQuantityChange={setQuantity}
+                    onSubmit={handlePlaceOrder}
+                    loading={orderPlacing}
+                    balance={balance}
+                    lockedBalance={lockedBalance}
+                    orderBook={orderBook}
+                    lastTradePrice={trades.length > 0 ? trades[0]?.price : null}
+                  />
+                )}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <>
+            {/* Desktop: Chart */}
+            <main className="col-span-6 bg-card border border-border rounded-3xl overflow-hidden shadow-2xl flex flex-col min-h-0">
+              <PriceChart
+                tradingPair={tradingPair}
+                trades={trades}
+                currentPrice={parseFloat(trades[0]?.price || '0')}
+                className="flex-1"
+              />
+            </main>
+
+            {/* Desktop: Order Book / Recent Trades */}
+            <aside className="col-span-3 bg-card border border-border rounded-3xl overflow-hidden shadow-2xl flex flex-col min-h-0">
+              <div className="flex items-center gap-1 p-1 bg-[#161b22] border border-[#30363d] m-3 mb-2 rounded-xl w-fit flex-shrink-0 shadow-lg">
+                {['Order Book', 'Recent Trades'].map(tab => {
+                   const isActive = (tab === 'Order Book' && activeTab !== 'recenttrades') || (tab === 'Recent Trades' && activeTab === 'recenttrades');
+                   return (
+                    <button
+                      key={tab}
+                      onClick={() => setActiveTab(tab === 'Order Book' ? 'orderbook' : 'recenttrades')}
+                      className={cn(
+                        "py-1.5 px-6 text-[10px] font-black uppercase tracking-[1px] transition-all duration-200 rounded-lg whitespace-nowrap",
+                        isActive
+                          ? "bg-[#2b3139] text-[#F7B500] border border-[#484f58] shadow-inner"
+                          : "text-muted-foreground hover:bg-white/5 hover:text-white"
+                      )}
+                    >
+                      {tab === 'Order Book' ? 'BOOK' : 'TRADES'}
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="flex-1 overflow-hidden min-h-0">
+                {activeTab === 'recenttrades' ? (
+                  <RecentTrades trades={trades} loading={tradesLoading} tradingPair={tradingPair} />
+                ) : (
+                  <OrderBookCard orderBook={orderBook} loading={orderBookLoading} tradingPair={tradingPair} userOrders={orders} />
+                )}
+              </div>
+            </aside>
+
+            {/* Desktop: Order Form */}
+            <aside className="col-span-3 bg-card border border-border rounded-3xl overflow-hidden shadow-2xl flex flex-col min-h-0">
+              <OrderForm
+                tradingPair={tradingPair}
+                availablePairs={availablePairs}
+                orderMode={orderMode}
+                onOrderModeChange={(e) => setOrderMode(e.target.value)}
+                orderType={orderType}
+                onOrderTypeChange={(e) => setOrderType(e.target.value)}
+                price={price}
+                onPriceChange={setPrice}
+                quantity={quantity}
+                onQuantityChange={setQuantity}
+                onSubmit={handlePlaceOrder}
+                loading={orderPlacing}
+                balance={balance}
+                lockedBalance={lockedBalance}
+                orderBook={orderBook}
+                lastTradePrice={trades.length > 0 ? trades[0]?.price : null}
+              />
+            </aside>
+          </>
+        )}
+
+        {/* ── ROW 3: Bottom Analytics ── */}
+        <section className="col-span-12 lg:col-span-9 bg-card border border-border rounded-3xl shadow-2xl overflow-hidden flex flex-col min-h-[400px] lg:min-h-0 mb-4 lg:mb-0">
+          <div className="flex items-center gap-1 p-1 bg-[#161b22] border border-[#30363d] m-3 mb-0 rounded-xl w-fit flex-shrink-0 shadow-lg">
+            {[
+              { key: 'active', label: 'Active Orders' },
+              { key: 'depth', label: 'Market Depth' },
+              { key: 'history', label: 'Transactions' },
+              { key: 'portfolio', label: 'Portfolio' }
+            ].map(tab => (
+              <button
+                key={tab.key}
+                onClick={() => setActiveTab(tab.key)}
+                className={cn(
+                  "py-1.5 px-4 text-[10px] font-black uppercase tracking-[1px] transition-all duration-200 rounded-lg whitespace-nowrap",
+                  activeTab === tab.key
+                    ? "bg-[#2b3139] text-[#F7B500] border border-[#484f58] shadow-inner"
+                    : "text-muted-foreground hover:bg-white/5 hover:text-white"
+                )}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+          <div className="flex-1 overflow-auto p-4 pt-2">
+            {activeTab === 'depth' ? (
+              <DepthChart 
+                orderBook={{ bids: orderBook.buys || [], asks: orderBook.sells || [] }}
+                currentPrice={parseFloat(trades[0]?.price || '0')} 
+              />
+            ) : activeTab === 'history' ? (
+              <TransactionHistory partyId={partyId} tradingPair={tradingPair} />
+            ) : activeTab === 'portfolio' ? (
+              <PortfolioView partyId={partyId} balance={balance} lockedBalance={lockedBalance} />
+            ) : (
+              <ActiveOrdersTable orders={orders} loading={loading} onCancelOrder={handleCancelOrder} partyId={partyId} />
+            )}
+          </div>
+        </section>
+
+        {/* Desktop: Incoming Transfers */}
+        <section className="col-span-12 lg:col-span-3 bg-card border border-border rounded-3xl overflow-hidden shadow-2xl flex flex-col min-h-[300px] lg:min-h-0">
+          <div className="p-4 flex items-center gap-2 border-b border-border bg-[#161b22]/30 flex-shrink-0">
+             <div className="w-2 h-2 bg-[#F7B500] rounded-full animate-pulse" />
+             <h3 className="text-[10px] font-bold uppercase tracking-widest text-[#F7B500]">Incoming Transfers</h3>
+          </div>
+          <div className="flex-1 overflow-auto">
+            <TransferOffers partyId={partyId} onTransferAccepted={handleTransferAccepted} />
+          </div>
+        </section>
+
+      </div>
+    </div>
     </>
   );
 }

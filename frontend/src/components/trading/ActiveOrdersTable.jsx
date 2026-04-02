@@ -185,246 +185,89 @@ export default function ActiveOrdersTable({ orders, onCancelOrder }) {
 
   return (
     <>
-      <Card>
-        <CardHeader className="px-3 sm:px-6">
-          <CardTitle className="text-sm sm:text-base">Your Active Orders</CardTitle>
-        </CardHeader>
-        <CardContent className="px-3 sm:px-6">
-
-          {/* Mobile: Card layout */}
-          <div className="md:hidden space-y-4">
+      {/* Compact table for dashboard bottom panel */}
+      <div className="overflow-x-auto h-full bg-card">
+        <table className="w-full min-w-[700px]">
+          <thead>
+            <tr className="border-b border-border/50 bg-[#161b22]/30">
+              {['ID', 'Side', 'Mode', 'Price', 'Amount', 'Filled', 'Remain', 'Progress', 'Status', 'Action'].map(h => (
+                <th key={h} className="text-left py-2.5 px-4 text-[10px] font-bold text-muted-foreground uppercase tracking-widest whitespace-nowrap">{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-border/30">
             <AnimatePresence>
               {activeOrders.length > 0 ? (
                 activeOrders.map((order) => {
                   const quantity = parseFloat(order.quantity || 0);
                   const filled = parseFloat(order.filled || 0);
-                  const fillPercentage = quantity > 0 ? (filled / quantity) * 100 : 0;
+                  const fillPct = quantity > 0 ? (filled / quantity) * 100 : 0;
                   const remaining = Math.max(0, quantity - filled);
-                  const isPartiallyFilled = filled > 0 && remaining > 0;
-
                   return (
-                    <motion.div
+                    <motion.tr
                       key={order.id}
-                      initial={{ opacity: 0, y: 10 }}
-                      animate={{ opacity: 1, y: 0 }}
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
                       exit={{ opacity: 0 }}
-                      className={cn(
-                        "rounded-xl p-4 space-y-3 border-l-4",
-                        order.type === 'BUY' 
-                          ? 'border-l-success bg-success/5 border border-success/20' 
-                          : 'border-l-destructive bg-destructive/5 border border-destructive/20'
-                      )}
+                      className="hover:bg-[#161b22]/50 transition-colors group"
                     >
-                      {/* Header: Type/Mode + Status Badge + Cancel */}
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-2">
-                          <span className={cn(
-                            "text-base font-bold",
-                            order.type === 'BUY' ? 'text-success' : 'text-destructive'
-                          )}>
-                            {order.type}
-                          </span>
-                          <span className="text-sm text-muted-foreground font-medium">{order.mode}</span>
-                          <span className={cn(
-                            "px-2 py-0.5 rounded-full text-xs font-semibold inline-flex items-center gap-1",
-                            order.status === 'OPEN' ? 'bg-primary/15 text-primary border border-primary/40' :
-                            order.status === 'PENDING_TRIGGER' ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/40' :
-                            order.status === 'FILLED' ? 'bg-success/15 text-success border border-success/40' :
-                            'bg-destructive/15 text-destructive border border-destructive/40'
-                          )}>
-                            {order.status === 'PENDING_TRIGGER' && <ShieldAlert className="w-3 h-3" />}
-                            {order.status === 'PENDING_TRIGGER' ? 'Stop' : order.status}
-                          </span>
+                      <td className="py-2 px-4 text-white font-mono text-[11px] font-medium">
+                        {order.id?.substring(0, 8)}
+                      </td>
+                      <td className={cn("py-2 px-4 text-[11px] font-bold", order.type === 'BUY' ? 'text-green-500' : 'text-red-500')}>
+                        {order.type}
+                      </td>
+                      <td className="py-2 px-4 text-muted-foreground text-[11px] font-medium uppercase">{order.mode}</td>
+                      <td className="py-2 px-4 text-white font-mono text-[11px] font-bold">{formatOrderPrice(order)}</td>
+                      <td className="py-2 px-4 text-white text-[11px] font-mono">{quantity.toFixed(4)}</td>
+                      <td className="py-2 px-4 text-white text-[11px] font-mono">{filled.toFixed(4)}</td>
+                      <td className="py-2 px-4 text-white/70 text-[11px] font-mono">{remaining.toFixed(4)}</td>
+                      <td className="py-2 px-4">
+                        <div className="flex items-center gap-2 min-w-[100px]">
+                          <div className="flex-1 h-1.5 bg-[#21262d] rounded-full overflow-hidden">
+                            <motion.div
+                              initial={{ width: 0 }}
+                              animate={{ width: `${Math.min(100, fillPct)}%` }}
+                              className={cn("h-full rounded-full transition-all", fillPct > 0 ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.4)]' : 'bg-muted-foreground/30')}
+                            />
+                          </div>
+                          <span className="text-[10px] text-muted-foreground font-bold font-mono">{fillPct.toFixed(0)}%</span>
                         </div>
+                      </td>
+                      <td className="py-2 px-4">
+                        <span className={cn(
+                          "px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-tighter",
+                          order.status === 'OPEN' ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' :
+                          order.status === 'PENDING_TRIGGER' ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20' :
+                          'bg-green-500/10 text-green-500 border border-green-500/20'
+                        )}>
+                          {order.status === 'PENDING_TRIGGER' ? 'Stop' : order.status}
+                        </span>
+                      </td>
+                      <td className="py-2 px-4">
                         {(order.status === 'OPEN' || order.status === 'PENDING_TRIGGER') && (
-                          <Button
+                          <button
                             onClick={() => handleCancelClick(order)}
-                            variant="destructive"
-                            size="sm"
-                            className="h-8 px-3 text-xs font-semibold"
+                            className="bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white px-2.5 py-1 text-[10px] font-bold uppercase tracking-widest rounded-lg border border-red-500/20 transition-all active:scale-95"
                           >
                             Cancel
-                          </Button>
+                          </button>
                         )}
-                      </div>
-
-                      {/* Order ID */}
-                      <div className="text-xs text-muted-foreground font-mono">
-                        ID: {order.id?.substring(0, 16)}...
-                      </div>
-
-                      {/* Details Grid */}
-                      <div className="grid grid-cols-2 gap-3">
-                        <div className="bg-background/60 rounded-lg p-2.5">
-                          <div className="text-[11px] text-muted-foreground uppercase tracking-wide mb-0.5">Price</div>
-                          <div className="text-sm font-mono font-semibold text-foreground">{formatOrderPrice(order)}</div>
-                        </div>
-                        <div className="bg-background/60 rounded-lg p-2.5">
-                          <div className="text-[11px] text-muted-foreground uppercase tracking-wide mb-0.5">Quantity</div>
-                          <div className="text-sm font-mono font-semibold text-foreground">{quantity.toFixed(6)}</div>
-                        </div>
-                        <div className="bg-background/60 rounded-lg p-2.5">
-                          <div className="text-[11px] text-muted-foreground uppercase tracking-wide mb-0.5">Filled</div>
-                          <div className="text-sm font-mono font-semibold text-foreground">{filled.toFixed(6)}</div>
-                        </div>
-                        <div className="bg-background/60 rounded-lg p-2.5">
-                          <div className="text-[11px] text-muted-foreground uppercase tracking-wide mb-0.5">Remaining</div>
-                          <div className="text-sm font-mono font-semibold text-foreground">{remaining.toFixed(6)}</div>
-                        </div>
-                      </div>
-
-                      {/* Progress bar */}
-                      <div className="space-y-1.5">
-                        <div className="flex items-center justify-between text-xs">
-                          <span className="text-muted-foreground">Fill Progress</span>
-                          <span className={cn(
-                            "font-semibold",
-                            fillPercentage >= 100 ? 'text-success' : isPartiallyFilled ? 'text-warning' : 'text-muted-foreground'
-                          )}>
-                            {fillPercentage.toFixed(1)}%
-                          </span>
-                        </div>
-                        <div className="w-full h-2 bg-muted rounded-full overflow-hidden">
-                          <div
-                            className={cn(
-                              "h-full rounded-full transition-all duration-300",
-                              isPartiallyFilled ? 'bg-warning' : 'bg-success',
-                              fillPercentage >= 100 ? 'bg-success' : ''
-                            )}
-                            style={{ width: `${Math.min(100, fillPercentage)}%` }}
-                          />
-                        </div>
-                      </div>
-                    </motion.div>
+                      </td>
+                    </motion.tr>
                   );
                 })
               ) : (
-                <div className="py-8 text-center text-muted-foreground text-sm">No active orders</div>
+                <tr>
+                  <td colSpan="10" className="py-12 text-center text-muted-foreground text-xs font-medium italic">No active orders</td>
+                </tr>
               )}
             </AnimatePresence>
-          </div>
+          </tbody>
+        </table>
+      </div>
 
-          {/* Desktop: Table layout */}
-          <div className="hidden md:block overflow-x-auto">
-            <table className="w-full">
-              <thead>
-                <tr className="border-b border-border">
-                  <th className="text-left py-3 px-4 text-xs font-semibold text-muted-foreground uppercase tracking-wide">ID</th>
-                  <th className="text-left py-3 px-4 text-xs font-semibold text-muted-foreground uppercase tracking-wide">Type</th>
-                  <th className="text-left py-3 px-4 text-xs font-semibold text-muted-foreground uppercase tracking-wide">Mode</th>
-                  <th className="text-left py-3 px-4 text-xs font-semibold text-muted-foreground uppercase tracking-wide">Price</th>
-                  <th className="text-right py-3 px-4 text-xs font-semibold text-muted-foreground uppercase tracking-wide">Quantity</th>
-                  <th className="text-right py-3 px-4 text-xs font-semibold text-muted-foreground uppercase tracking-wide">Filled</th>
-                  <th className="text-right py-3 px-4 text-xs font-semibold text-muted-foreground uppercase tracking-wide">Remaining</th>
-                  <th className="text-left py-3 px-4 text-xs font-semibold text-muted-foreground uppercase tracking-wide">Progress</th>
-                  <th className="text-left py-3 px-4 text-xs font-semibold text-muted-foreground uppercase tracking-wide">Status</th>
-                  <th className="text-left py-3 px-4 text-xs font-semibold text-muted-foreground uppercase tracking-wide">Action</th>
-                </tr>
-              </thead>
-              <tbody>
-                <AnimatePresence>
-                  {activeOrders.length > 0 ? (
-                    activeOrders.map((order) => (
-                      <motion.tr
-                        key={order.id}
-                        initial={{ opacity: 0, y: 10 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0 }}
-                        className="border-b border-border/50 hover:bg-card transition-colors"
-                      >
-                        <td className="py-3 px-4 text-foreground font-mono text-sm">
-                          {order.id?.includes('-PARTIAL-') ? (
-                            <span className="flex items-center gap-1">
-                              <span>{order.id?.substring(0, 10)}...</span>
-                              <span className="text-xs text-muted-foreground" title="Remainder order from partial fill">🔄</span>
-                            </span>
-                          ) : (
-                            <span>{order.id?.substring(0, 10)}...</span>
-                          )}
-                        </td>
-                        <td className={cn("py-3 px-4 font-semibold", order.type === 'BUY' ? 'text-success' : 'text-destructive')}>
-                          {order.type}
-                        </td>
-                        <td className="py-3 px-4 text-foreground">{order.mode}</td>
-                        <td className="py-3 px-4 text-foreground font-mono">{formatOrderPrice(order)}</td>
-                        <td className="py-3 px-4 text-right text-foreground">{parseFloat(order.quantity || 0).toFixed(8)}</td>
-                        <td className="py-3 px-4 text-right text-foreground">{parseFloat(order.filled || 0).toFixed(8)}</td>
-                        <td className="py-3 px-4 text-right text-foreground">
-                          {(() => {
-                            const quantity = parseFloat(order.quantity || 0);
-                            const filled = parseFloat(order.filled || 0);
-                            const remaining = Math.max(0, quantity - filled);
-                            return remaining.toFixed(8);
-                          })()}
-                        </td>
-                        <td className="py-3 px-4">
-                          {(() => {
-                            const quantity = parseFloat(order.quantity || 0);
-                            const filled = parseFloat(order.filled || 0);
-                            const fillPercentage = quantity > 0 ? (filled / quantity) * 100 : 0;
-                            const remaining = Math.max(0, quantity - filled);
-                            const isPartiallyFilled = filled > 0 && remaining > 0;
-                            
-                            return (
-                              <div className="flex items-center gap-2 min-w-[100px]">
-                                <div className="flex-1 h-2 bg-muted rounded-full overflow-hidden">
-                                  <div
-                                    className={cn(
-                                      "h-full transition-all duration-300",
-                                      isPartiallyFilled ? 'bg-warning' : 'bg-success',
-                                      fillPercentage >= 100 ? 'bg-success' : ''
-                                    )}
-                                    style={{ width: `${Math.min(100, fillPercentage)}%` }}
-                                  />
-                                </div>
-                                <span className="text-xs text-muted-foreground min-w-[35px] text-right">
-                                  {fillPercentage.toFixed(1)}%
-                                </span>
-                              </div>
-                            );
-                          })()}
-                        </td>
-                        <td className="py-3 px-4">
-                          <span className={cn(
-                            "px-2.5 py-1 rounded text-xs font-semibold inline-flex items-center gap-1",
-                            order.status === 'OPEN' ? 'bg-primary/15 text-primary border border-primary/40' :
-                            order.status === 'PENDING_TRIGGER' ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/40' :
-                            order.status === 'FILLED' ? 'bg-success/15 text-success border border-success/40' :
-                            'bg-destructive/15 text-destructive border border-destructive/40'
-                          )}>
-                            {order.status === 'PENDING_TRIGGER' && <ShieldAlert className="w-3 h-3" />}
-                            {order.status === 'PENDING_TRIGGER' ? 'Stop-Loss' : order.status}
-                            {order.stopPrice && order.status === 'PENDING_TRIGGER' && (
-                              <span className="ml-1 font-mono">@ {parseFloat(order.stopPrice).toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
-                            )}
-                          </span>
-                        </td>
-                        <td className="py-3 px-4">
-                          {(order.status === 'OPEN' || order.status === 'PENDING_TRIGGER') && (
-                            <Button
-                              onClick={() => handleCancelClick(order)}
-                              variant="destructive"
-                              size="sm"
-                            >
-                              Cancel
-                            </Button>
-                          )}
-                        </td>
-                      </motion.tr>
-                    ))
-                  ) : (
-                    <tr>
-                      <td colSpan="10" className="py-8 text-center text-muted-foreground text-sm">No active orders</td>
-                    </tr>
-                  )}
-                </AnimatePresence>
-              </tbody>
-            </table>
-          </div>
-        </CardContent>
-      </Card>
 
-      {/* Cancel Confirmation Modal */}
       <CancelOrderModal
         isOpen={cancelModalOpen}
         onClose={handleCloseModal}

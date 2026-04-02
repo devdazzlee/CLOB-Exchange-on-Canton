@@ -24,6 +24,7 @@ import {
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
 import { Button } from '../ui/button';
 import { useToast } from '../ui/toast';
+import { cn } from '../../lib/utils';
 import { apiClient } from '../../config/config';
 import { loadWallet, decryptPrivateKey, signMessage } from '../../wallet/keyManager';
 import websocketService from '../../services/websocketService';
@@ -254,224 +255,190 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
   };
 
   return (
-    <Card className="bg-gradient-to-br from-card to-background border-2 border-border shadow-xl">
-      <CardHeader className="pb-3 px-3 sm:px-6">
-        <div className="flex items-center justify-between">
-          <CardTitle className="text-sm sm:text-lg font-bold flex items-center space-x-2">
-            <Gift className="w-4 h-4 sm:w-5 sm:h-5 text-primary" />
-            <span>Incoming Transfers</span>
-            {offers.length > 0 && (
-              <span className="ml-2 px-2 py-0.5 text-xs bg-primary/20 text-primary rounded-full">
-                {offers.length}
-              </span>
-            )}
-          </CardTitle>
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={fetchOffers}
-            disabled={loading}
-            className="h-8 w-8"
-          >
-            {loading ? (
-              <Loader2 className="h-4 w-4 animate-spin text-primary" />
-            ) : (
-              <RefreshCw className="h-4 w-4 text-muted-foreground" />
-            )}
-          </Button>
-        </div>
-        <p className="text-xs text-muted-foreground mt-1">
-          Accept incoming token transfers (2-step transfers)
-        </p>
-      </CardHeader>
-      
-      <CardContent className="space-y-3 px-3 sm:px-6">
+    <div className="bg-card h-full flex flex-col">
+      {/* Content */}
+      <div className="p-2 space-y-2 overflow-y-auto flex-1">
         {error && (
-          <div className="flex items-center gap-2 p-3 bg-destructive/10 border border-destructive/30 rounded-lg text-sm text-destructive">
-            <AlertCircle className="w-4 h-4 flex-shrink-0" />
-            <span>{error}</span>
+          <div className="flex items-center gap-2 p-2 mb-2 bg-destructive/10 border border-destructive/20 rounded-xl text-xs text-destructive animate-in fade-in slide-in-from-top-1">
+            <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
+            <span className="font-medium">{error.substring(0, 80)}</span>
           </div>
         )}
-        
+
         {loading && offers.length === 0 ? (
-          <div className="flex items-center justify-center py-8">
-            <Loader2 className="w-6 h-6 animate-spin text-primary" />
+          <div className="flex flex-col items-center justify-center py-10 gap-2">
+            <Loader2 className="w-5 h-5 animate-spin text-[#F7B500]" />
+            <p className="text-[9px] text-[#848E9C] font-black uppercase tracking-widest">Scanning...</p>
           </div>
         ) : offers.length === 0 ? (
-          <div className="text-center py-6 text-muted-foreground">
-            <Inbox className="w-10 h-10 mx-auto mb-2 opacity-50" />
-            <p className="text-sm">No pending transfers</p>
-            <p className="text-xs mt-1">
-              Request tokens from{' '}
-              <a 
-                href="https://cbtc-faucet.bitsafe.finance/" 
-                target="_blank" 
-                rel="noopener noreferrer"
-                className="text-primary hover:underline inline-flex items-center gap-1"
-              >
-                CBTC Faucet <ExternalLink className="w-3 h-3" />
-              </a>
+          <div className="flex flex-col items-center py-6 px-2 text-center">
+            {/* Ultra-Compact Empty State */}
+            <div className="relative mb-3">
+              <div className="absolute inset-0 bg-[#F7B500]/10 blur-2xl rounded-full animate-pulse" />
+              <div className="relative w-12 h-12 bg-gradient-to-br from-[#161b22] to-[#0d1117] border border-[#30363d] rounded-2xl flex items-center justify-center shadow-xl overflow-hidden group">
+                <Inbox className="w-6 h-6 text-[#F7B500] drop-shadow-[0_0_10px_rgba(247,181,0,0.3)]" />
+              </div>
+              <div className="absolute -bottom-0.5 -right-0.5 w-5 h-5 bg-[#0d1117] border border-[#30363d] rounded-full flex items-center justify-center shadow-md">
+                <ArrowDownToLine className="w-2.5 h-2.5 text-[#F7B500]" />
+              </div>
+            </div>
+
+            <h3 className="text-[11px] font-black text-white uppercase tracking-[1.5px] mb-1">No Transfers</h3>
+            <p className="text-[9px] text-[#848E9C] font-bold max-w-[160px] leading-relaxed mb-4 uppercase tracking-widest">
+              Ledger is Clear
             </p>
+
+            {/* Compact Faucet CTA Card */}
+            <a
+              href="https://cbtc-faucet.bitsafe.finance/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="group relative w-full p-2.5 bg-[#161b22] border border-[#30363d] rounded-xl transition-all duration-300 hover:border-[#F7B500]/40 overflow-hidden"
+            >
+              <div className="relative flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <div className="w-8 h-8 bg-[#F7B500]/10 border border-[#F7B500]/20 rounded-lg flex items-center justify-center">
+                    <Gift className="w-4 h-4 text-[#F7B500]" />
+                  </div>
+                  <div className="text-left leading-none">
+                    <p className="text-[9px] text-white font-black uppercase tracking-widest">Faucet</p>
+                    <p className="text-[8px] text-[#F7B500]/70 font-bold uppercase tracking-tight mt-0.5">Get Tokens</p>
+                  </div>
+                </div>
+                <ExternalLink className="w-3 h-3 text-[#848E9C]" />
+              </div>
+            </a>
           </div>
         ) : (
-          <AnimatePresence mode="popLayout">
-            {offers.map((offer, index) => {
-              const info = getTokenInfo(offer.token);
-              const isAccepting = accepting === offer.contractId;
-              
-              return (
-                <motion.div
-                  key={offer.contractId}
-                  initial={{ opacity: 0, y: -10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, x: 100 }}
-                  transition={{ delay: index * 0.05 }}
-                  className={`relative overflow-hidden rounded-xl border-2 ${info.border} ${info.bg} p-4`}
-                >
-                  <div className="flex items-center justify-between">
-                    {/* Token info */}
-                    <div className="flex items-center gap-3">
-                      <div className={`w-10 h-10 rounded-lg ${info.bg} flex items-center justify-center border ${info.border}`}>
-                        <span className={`text-xl font-bold ${info.color}`}>{info.icon}</span>
+          <div className="space-y-2.5">
+            <AnimatePresence>
+              {offers.map((offer) => {
+                const info = getTokenInfo(offer.token);
+                const isAccepting = accepting === offer.contractId;
+                return (
+                  <motion.div
+                    key={offer.contractId}
+                    initial={{ opacity: 0, x: -10 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    exit={{ opacity: 0, x: 20 }}
+                    className="flex items-center justify-between p-3 bg-[#161b22] border border-border/50 rounded-2xl hover:border-primary/30 transition-all group"
+                  >
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className={cn("w-10 h-10 rounded-xl flex items-center justify-center text-lg font-bold shadow-inner", info.bg)}>
+                        <span className={info.color}>{info.icon}</span>
                       </div>
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <span className="font-bold text-foreground">
-                            {parseFloat(offer.amount).toLocaleString(undefined, {
-                              minimumFractionDigits: 0,
-                              maximumFractionDigits: 8
-                            })}
-                          </span>
-                          <span className={`font-medium ${info.color}`}>{offer.token}</span>
+                      <div className="min-w-0">
+                        <div className="text-sm font-bold text-white leading-tight">
+                          {parseFloat(offer.amount).toLocaleString(undefined, { maximumFractionDigits: 4 })}
+                          <span className="text-[10px] text-muted-foreground ml-1 font-normal tracking-wide uppercase">{offer.token}</span>
                         </div>
-                        <div className="text-xs text-muted-foreground flex items-center gap-1">
-                          <ArrowDownToLine className="w-3 h-3" />
-                          <span>From: {offer.sender?.substring(0, 20)}...</span>
+                        <div className="text-[10px] text-muted-foreground truncate font-mono mt-0.5">
+                          from {offer.sender?.substring(0, 12)}...
                         </div>
                       </div>
                     </div>
-                    
-                    {/* Accept button */}
-                    <div className="flex items-center gap-2">
-                      <Button
-                        size="sm"
-                        className="h-8 px-3 bg-primary hover:bg-primary/90"
-                        onClick={() => handleAccept(offer)}
-                        disabled={isAccepting}
-                      >
-                        {isAccepting ? (
-                          <Loader2 className="w-4 h-4 animate-spin" />
-                        ) : (
-                          <>
-                            <Check className="w-4 h-4 mr-1" />
-                            Accept
-                          </>
-                        )}
-                      </Button>
-                    </div>
-                  </div>
-                  
-                  {/* Splice badge */}
-                  {offer.isSplice && (
-                    <div className="absolute top-2 right-2">
-                      <span className="text-[10px] px-1.5 py-0.5 bg-purple-500/20 text-purple-400 rounded">
-                        Splice
-                      </span>
-                    </div>
-                  )}
-                </motion.div>
-              );
-            })}
-          </AnimatePresence>
+                    <button
+                      onClick={() => handleAccept(offer)}
+                      disabled={isAccepting}
+                      className={cn(
+                        "flex-shrink-0 flex items-center justify-center h-10 w-10 md:w-auto md:px-4 rounded-xl font-bold text-[10px] uppercase tracking-widest transition-all",
+                        isAccepting 
+                          ? "bg-muted cursor-not-allowed text-muted-foreground" 
+                          : "bg-success/10 text-success border border-success/20 hover:bg-success hover:text-white"
+                      )}
+                    >
+                      {isAccepting ? <Loader2 className="w-4 h-4 animate-spin" /> : <><Check className="w-4 h-4 md:mr-1.5" /><span className="hidden md:inline">Accept</span></>}
+                    </button>
+                  </motion.div>
+                );
+              })}
+            </AnimatePresence>
+          </div>
         )}
-        
-        {/* Help text */}
-        <div className="text-xs text-muted-foreground text-center pt-2 border-t border-border">
-          <p>Canton uses 2-step transfers. Click Accept to receive tokens.</p>
-        </div>
-      </CardContent>
+      </div>
 
-      {/* Interactive Signing Dialog (for external parties) */}
+          {/* Interactive Signing Dialog - Professional Standardized Modal */}
       {signingState && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
+        <div className="fixed inset-0 bg-background/90 backdrop-blur-xl flex items-center justify-center z-[100] p-4">
           <motion.div
-            initial={{ opacity: 0, scale: 0.95 }}
-            animate={{ opacity: 1, scale: 1 }}
-            className="bg-card border-2 border-primary/30 rounded-2xl p-6 max-w-md w-full mx-4 shadow-2xl"
+            initial={{ opacity: 0, scale: 0.95, y: 20 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            className="bg-[#161b22] border border-[#30363d] rounded-[2.5rem] p-8 max-w-sm w-full mx-4 shadow-[0_0_100px_rgba(0,0,0,0.5)] overflow-hidden relative"
           >
-            <div className="flex items-center gap-3 mb-4">
-              <div className="w-10 h-10 rounded-lg bg-primary/10 flex items-center justify-center">
-                <KeyRound className="w-5 h-5 text-primary" />
+            {/* Background Glow */}
+            <div className="absolute -top-24 -right-24 w-48 h-48 bg-[#F7B500]/10 blur-[80px] rounded-full" />
+            
+            <div className="relative">
+              <div className="flex items-center gap-3 mb-6">
+                <div className="w-10 h-10 bg-[#F7B500]/10 border border-[#F7B500]/20 rounded-2xl flex items-center justify-center">
+                  <KeyRound className="w-5 h-5 text-[#F7B500]" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-black text-white uppercase tracking-[1px]">Authorize Transfer</h3>
+                  <p className="text-[10px] text-muted-foreground font-bold uppercase tracking-widest mt-0.5">Secure Transaction Signature</p>
+                </div>
               </div>
-              <div>
-                <h3 className="font-bold text-foreground">Sign Transaction</h3>
-                <p className="text-xs text-muted-foreground">
-                  Unlock your wallet to authorize this transfer
-                </p>
+
+              <div className="p-4 bg-[#0d1117] border border-[#30363d] rounded-2xl mb-6 group">
+                <p className="text-[9px] text-[#848E9C] font-black uppercase tracking-widest mb-1 group-hover:text-[#F7B500] transition-colors">Amount to Receive</p>
+                <div className="text-xl font-mono font-bold text-white tracking-tight flex items-baseline gap-2">
+                  {parseFloat(signingState.offer.amount).toLocaleString(undefined, { maximumFractionDigits: 8 })}
+                  <span className="text-xs text-[#F7B500] uppercase">{signingState.offer.token}</span>
+                </div>
               </div>
-            </div>
 
-            <div className="bg-primary/5 border border-primary/20 rounded-lg p-3 mb-4">
-              <p className="text-sm text-foreground">
-                Accept <span className="font-bold">
-                  {parseFloat(signingState.offer.amount).toLocaleString(undefined, {
-                    minimumFractionDigits: 0,
-                    maximumFractionDigits: 8
-                  })}
-                </span>{' '}
-                <span className="text-primary font-medium">{signingState.offer.token}</span>
-              </p>
-              <p className="text-xs text-muted-foreground mt-1">
-                From: {signingState.offer.sender?.substring(0, 25)}...
-              </p>
-            </div>
-
-            <div className="mb-4">
-              <label className="block text-sm font-medium text-foreground mb-1.5">
-                Wallet Password
-              </label>
-              <PasswordInput
-                value={walletPassword}
-                onChange={(e) => setWalletPassword(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && handleSignAndExecute()}
-                placeholder="Enter your wallet password"
-                autoFocus
-                className="w-full px-3 py-2 rounded-lg bg-background border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50"
-              />
-            </div>
-
-            {signingError && (
-              <div className="flex items-center gap-2 p-3 mb-4 bg-destructive/10 border border-destructive/30 rounded-lg text-sm text-destructive">
-                <AlertCircle className="w-4 h-4 flex-shrink-0" />
-                <span>{signingError}</span>
-              </div>
-            )}
-
-            <div className="flex gap-3">
-              <Button
-                variant="ghost"
-                className="flex-1"
-                onClick={handleCancelSigning}
-                disabled={accepting === signingState.offer.contractId}
-              >
-                Cancel
-              </Button>
-              <Button
-                className="flex-1 bg-primary hover:bg-primary/90"
-                onClick={handleSignAndExecute}
-                disabled={!walletPassword || accepting === signingState.offer.contractId}
-              >
-                {accepting === signingState.offer.contractId ? (
-                  <Loader2 className="w-4 h-4 animate-spin mr-2" />
-                ) : (
-                  <Check className="w-4 h-4 mr-2" />
+              <div className="space-y-4 mb-8">
+                <div>
+                  <label className="block text-[10px] text-[#848E9C] font-black uppercase tracking-widest mb-2 ml-1">Wallet Password</label>
+                  <PasswordInput
+                    value={walletPassword}
+                    onChange={(e) => setWalletPassword(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && handleSignAndExecute()}
+                    placeholder="ENTER PASSWORD"
+                    autoFocus
+                    className="w-full px-4 py-3 rounded-2xl bg-[#0d1117] border border-[#30363d] text-white text-sm outline-none focus:border-[#F7B500]/50 transition-all font-mono"
+                  />
+                </div>
+                
+                {signingError && (
+                  <motion.div 
+                    initial={{ opacity: 0, x: -10 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    className="p-3 bg-red-900/10 border border-red-500/20 rounded-xl text-[10px] text-red-500 font-bold uppercase tracking-wider flex items-center gap-2"
+                  >
+                    <AlertCircle className="w-3.5 h-3.5" />
+                    {signingError}
+                  </motion.div>
                 )}
-                Sign & Accept
-              </Button>
+              </div>
+
+              <div className="flex gap-3">
+                <button 
+                  onClick={handleCancelSigning} 
+                  disabled={accepting === signingState.offer.contractId}
+                  className="flex-1 py-3.5 text-[10px] font-black uppercase tracking-[2px] border border-[#30363d] rounded-2xl text-[#848E9C] hover:bg-white/5 transition-all"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleSignAndExecute}
+                  disabled={!walletPassword || accepting === signingState.offer.contractId}
+                  className="flex-[1.5] py-3.5 text-[10px] font-black uppercase tracking-[2px] bg-[#F7B500] hover:bg-[#ffc107] text-[#0d1117] rounded-2xl transition-all disabled:opacity-30 disabled:grayscale flex items-center justify-center gap-2 shadow-[0_0_20px_rgba(247,181,0,0.2)]"
+                >
+                  {accepting === signingState.offer.contractId ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <>
+                      <Check className="w-4 h-4 stroke-[3px]" />
+                      Sign & Execute
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
           </motion.div>
         </div>
       )}
-    </Card>
+    </div>
   );
 }
