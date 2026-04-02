@@ -225,16 +225,27 @@ export default function OrderForm({
             <div className="flex flex-col gap-2">
                <div className="flex items-center justify-between bg-[#131518] rounded-[6px] px-3 h-10 border border-[#1e2329] focus-within:border-[#2b3139] transition-colors">
                  <span className="text-[#848E9C] text-[12px] whitespace-nowrap font-medium">Limit Price</span>
-                 <div className="flex items-center gap-1.5 flex-1 justify-end">
+                 <div className="flex items-center gap-1.5 flex-1 justify-end min-w-0">
                    <input
-                     type="number"
-                     step="0.0001"
+                     type="text"
                      value={price}
-                     onChange={(e) => onPriceChange(e.target.value)}
+                     onChange={(e) => {
+                       let val = e.target.value.replace(/[^0-9.]/g, '');
+                       if (val.length > 1 && val.startsWith('0') && val[1] !== '.') {
+                         val = val.substring(1);
+                       }
+                       onPriceChange(val);
+                     }}
                      placeholder="0.00"
-                     className="bg-transparent text-white text-right text-[13px] font-mono font-medium w-full outline-none focus:ring-0 p-0 shadow-none border-none"
+                     className="bg-transparent text-white text-right text-[13px] font-mono font-medium flex-1 min-w-0 outline-none focus:ring-0 p-0 shadow-none border-none"
                    />
-                   <button type="button" onClick={() => onPriceChange(midPrice?.toFixed(4) || '0')} className="text-[#626aeb] text-[12px] font-medium ml-1">Mid</button>
+                   <button 
+                     type="button" 
+                     onClick={() => onPriceChange(midPrice?.toFixed(4) || '0')} 
+                     className="text-[#626AEB] text-[12px] font-bold ml-1.5 flex items-center shrink-0 hover:text-[#7d85f5] transition-colors"
+                   >
+                     Mid
+                   </button>
                  </div>
                </div>
             </div>
@@ -244,14 +255,19 @@ export default function OrderForm({
           <div className="flex flex-col gap-2">
              <div className="flex items-center justify-between bg-[#131518] rounded-[6px] px-3 h-10 border border-[#1e2329] focus-within:border-[#2b3139] transition-colors">
                <span className="text-[#848E9C] text-[12px] whitespace-nowrap font-medium">Amount</span>
-               <div className="flex items-center gap-1.5 flex-1 justify-end">
+               <div className="flex items-center gap-1.5 flex-1 justify-end min-w-0">
                  <input
-                   type="number"
-                   step="0.0001"
+                   type="text"
                    value={quantity}
-                   onChange={(e) => onQuantityChange(e.target.value)}
+                   onChange={(e) => {
+                     let val = e.target.value.replace(/[^0-9.]/g, '');
+                     if (val.length > 1 && val.startsWith('0') && val[1] !== '.') {
+                       val = val.substring(1);
+                     }
+                     onQuantityChange(val);
+                   }}
                    placeholder="0.00"
-                   className="bg-transparent text-[#697280] text-right text-[13px] font-mono font-medium w-full outline-none focus:ring-0 p-0 shadow-none border-none"
+                   className="bg-transparent text-[#EAECEF] text-right text-[13px] font-mono font-medium flex-1 min-w-0 outline-none focus:ring-0 p-0 shadow-none border-none"
                  />
                   <div className="min-w-fit flex items-center pr-1 border-l border-[#21262d] pl-2 ml-2 h-5">
                     <Select value={tradingPair} onValueChange={onTradingPairChange}>
