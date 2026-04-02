@@ -1193,61 +1193,85 @@ export default function TradingInterface({ partyId }) {
         </div>
       )}
 
-      {/* ── TOP STATS BAR ── */}
-      <div className="flex flex-col lg:flex-row lg:items-center gap-2 lg:gap-8 px-3 lg:px-4 py-2 lg:py-2 border-b border-border/50 bg-[#161b22]/70 relative z-50 flex-shrink-0">
-        
-        {/* Top Row: Market & Live Status */}
-        <div className="flex items-center justify-between lg:justify-start gap-4 flex-shrink-0">
-          <div className="bg-[#1e2329] rounded-xl border border-border p-0.5 relative">
-            <Select value={tradingPair} onValueChange={setTradingPair}>
-              <SelectTrigger className="h-8 lg:h-9 w-[130px] lg:w-[160px] bg-transparent border-0 ring-0 focus:ring-0 text-white font-black text-[11px] lg:text-sm">
-                <SelectValue placeholder="Select Pair" />
-              </SelectTrigger>
-              <SelectContent className="bg-[#1e2329] border-[#2B3139] z-[100]">
-                {availablePairs.map(p => (
-                  <SelectItem key={p} value={p} className="text-xs lg:text-sm font-bold">
-                    {p.replace('/', ' / ')}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          <div className="flex lg:hidden items-center gap-1.5 bg-[#0ECB81]/10 px-2.5 py-1 rounded-full border border-[#0ECB81]/20">
-            <div className="w-1 h-1 bg-[#0ECB81] rounded-full animate-pulse" />
-            <span className="text-[9px] font-black text-[#0ECB81] uppercase tracking-[1px]">Live</span>
+      {/* ══ MOBILE HEADER (hidden on desktop) ══
+           One compact row: pair selector | price + change | live dot
+           Matches Binance/OKX mobile header pattern              */}
+      <div className="lg:hidden flex-shrink-0 flex items-center justify-between px-3 py-2.5 border-b border-[#21262d] bg-[#0d1117] z-50">
+        {/* Pair selector */}
+        <div className="bg-[#161b22] rounded-xl border border-[#21262d]">
+          <Select value={tradingPair} onValueChange={setTradingPair}>
+            <SelectTrigger className="h-8 w-[120px] bg-transparent border-0 ring-0 focus:ring-0 text-white font-black text-[12px]">
+              <SelectValue placeholder="Pair" />
+            </SelectTrigger>
+            <SelectContent className="bg-[#1e2329] border-[#2B3139] z-[100]">
+              {availablePairs.map(p => (
+                <SelectItem key={p} value={p} className="text-xs font-bold">{p}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        {/* Price + stats */}
+        <div className="flex flex-col items-center">
+          <span className="text-[15px] font-mono font-black text-[#0ECB81] leading-none">
+            {formatNumber(trades[0]?.price || orderBook.sells[0]?.price || '0', 2)}
+          </span>
+          <div className="flex items-center gap-2 mt-0.5">
+            <span className="text-[10px] text-[#848E9C] font-mono">
+              H: {formatNumber(trades.length > 0 ? Math.max(...trades.map(t => parseFloat(t.price) || 0)) : 0, 0)}
+            </span>
+            <span className="text-[10px] text-[#848E9C] font-mono">
+              L: {formatNumber(trades.length > 0 ? Math.min(...trades.filter(t => parseFloat(t.price) > 0).map(t => parseFloat(t.price))) : 0, 0)}
+            </span>
           </div>
         </div>
+        {/* Live indicator */}
+        <div className="flex items-center gap-1.5 bg-[#0ECB81]/10 px-2.5 py-1 rounded-full border border-[#0ECB81]/20">
+          <div className="w-1.5 h-1.5 bg-[#0ECB81] rounded-full animate-pulse" />
+          <span className="text-[9px] font-black text-[#0ECB81] uppercase tracking-wider">Live</span>
+        </div>
+      </div>
 
-        {/* Bottom Row (Mobile) / Side Row (Desktop): Stats Grid */}
-        <div className="grid grid-cols-2 lg:flex lg:items-center gap-y-1.5 gap-x-4 lg:gap-10 lg:border-l lg:border-[#30363d] lg:pl-10 flex-1">
+      {/* ══ DESKTOP STATS BAR (hidden on mobile) ══ */}
+      <div className="hidden lg:flex lg:items-center gap-8 px-4 py-2 border-b border-border/50 bg-[#161b22]/70 z-50 flex-shrink-0">
+        <div className="bg-[#1e2329] rounded-xl border border-border p-0.5">
+          <Select value={tradingPair} onValueChange={setTradingPair}>
+            <SelectTrigger className="h-9 w-[160px] bg-transparent border-0 ring-0 focus:ring-0 text-white font-black text-sm">
+              <SelectValue placeholder="Select Pair" />
+            </SelectTrigger>
+            <SelectContent className="bg-[#1e2329] border-[#2B3139] z-[100]">
+              {availablePairs.map(p => (
+                <SelectItem key={p} value={p} className="text-sm font-bold">{p.replace('/', ' / ')}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="flex items-center gap-10 border-l border-[#30363d] pl-10 flex-1">
           <div className="flex flex-col">
             <p className="text-[9px] text-[#848E9C] uppercase font-black tracking-[1.5px] mb-0.5">Price</p>
-            <p className="text-xs lg:text-base font-mono font-bold text-[#0ECB81] leading-none">
+            <p className="text-base font-mono font-bold text-[#0ECB81] leading-none">
               {formatNumber(trades[0]?.price || orderBook.sells[0]?.price || '0', 2)}
             </p>
           </div>
           <div className="flex flex-col">
             <p className="text-[9px] text-[#848E9C] uppercase font-black tracking-[1.5px] mb-0.5">24h High</p>
-            <p className="text-[11px] lg:text-sm font-mono font-bold text-white leading-none">
+            <p className="text-sm font-mono font-bold text-white leading-none">
               {formatNumber(trades.length > 0 ? Math.max(...trades.map(t => parseFloat(t.price) || 0)) : '0', 2)}
             </p>
           </div>
           <div className="flex flex-col">
             <p className="text-[9px] text-[#848E9C] uppercase font-black tracking-[1.5px] mb-0.5">24h Low</p>
-            <p className="text-[11px] lg:text-sm font-mono font-bold text-white leading-none">
+            <p className="text-sm font-mono font-bold text-white leading-none">
               {formatNumber(trades.length > 0 ? Math.min(...trades.filter(t => parseFloat(t.price) > 0).map(t => parseFloat(t.price))) : '0', 2)}
             </p>
           </div>
           <div className="flex flex-col">
             <p className="text-[9px] text-[#848E9C] uppercase font-black tracking-[1.5px] mb-0.5">24h Volume</p>
-            <p className="text-[11px] lg:text-sm font-mono font-bold text-white leading-none">
+            <p className="text-sm font-mono font-bold text-white leading-none">
               {formatNumber(trades.reduce((sum, t) => sum + (parseFloat(t.quantity) || 0), 0), 2)}
             </p>
           </div>
         </div>
-
-        <div className="hidden lg:flex items-center gap-1.5 bg-[#0ECB81]/10 px-3 py-1.5 rounded-full border border-[#0ECB81]/20 flex-shrink-0">
+        <div className="flex items-center gap-1.5 bg-[#0ECB81]/10 px-3 py-1.5 rounded-full border border-[#0ECB81]/20 flex-shrink-0">
           <div className="w-1.5 h-1.5 bg-[#0ECB81] rounded-full animate-pulse" />
           <span className="text-[9px] font-black text-[#0ECB81] uppercase tracking-[1px]">Live Network</span>
         </div>
@@ -1255,84 +1279,255 @@ export default function TradingInterface({ partyId }) {
 
       {/* ══════════════════════════════════════════════════════════
            RESPONSIVE LAYOUT — pure CSS breakpoints, zero JS
-           Mobile  (<lg): tab-based single-panel view
-           Desktop (≥lg): fixed 2-row grid
+           Mobile  (<lg): chart-first + fixed bottom nav (Binance pattern)
+           Desktop (≥lg): 2-row fixed grid
           ══════════════════════════════════════════════════════════ */}
       <div className="flex-1 min-h-0 overflow-hidden flex flex-col lg:block">
 
-        {/* ── MOBILE TAB BAR (hidden on desktop) ── */}
-        <div className="lg:hidden flex-shrink-0 flex overflow-x-auto scrollbar-hide gap-1 px-2 py-2 bg-[#0d1117] border-b border-[#21262d]">
-          {[
-            { id: 'chart',     label: 'Chart' },
-            { id: 'book',      label: 'Book' },
-            { id: 'trades',    label: 'Trades' },
-            { id: 'trade',     label: 'Trade' },
-            { id: 'orders',    label: 'Orders' },
-            { id: 'depth',     label: 'Depth' },
-            { id: 'history',   label: 'History' },
-            { id: 'portfolio', label: 'Portfolio' },
-            { id: 'transfers', label: 'Transfers' },
-          ].map(tab => (
-            <button
-              key={tab.id}
-              onClick={() => setMobileTradeTab(tab.id)}
-              className={cn(
-                "flex-shrink-0 px-3 py-1.5 text-[10px] font-black uppercase tracking-widest rounded-lg transition-all duration-200 whitespace-nowrap",
-                mobileTradeTab === tab.id
-                  ? "bg-[#2b3139] text-[#F7B500] border border-[#484f58]"
-                  : "text-[#848E9C] hover:text-white hover:bg-white/5"
-              )}
-            >
-              {tab.label}
-            </button>
-          ))}
-        </div>
+        {/* ══ MOBILE: Chart-first layout with secondary top pills + fixed bottom nav ══ */}
+        <div className="lg:hidden flex-1 flex flex-col min-h-0 overflow-hidden">
 
-        {/* ── MOBILE PANEL (hidden on desktop) ── */}
-        <div className="lg:hidden flex-1 min-h-0 overflow-hidden">
-          <div className={cn("h-full overflow-hidden", mobileTradeTab !== 'chart' && "hidden")}>
-            <PriceChart tradingPair={tradingPair} trades={trades} currentPrice={parseFloat(trades[0]?.price || '0')} />
+          {/* Chart view: always visible at top, shrinks when trade panel is open */}
+          {/* Secondary pill tabs below chart (Book / Trades) — only shown on chart view */}
+          {(mobileTradeTab === 'chart' || mobileTradeTab === 'book' || mobileTradeTab === 'trades') && (
+            <div className="flex-shrink-0 flex items-center gap-1 px-3 pt-2 pb-1">
+              {[
+                { id: 'chart',  label: 'Chart' },
+                { id: 'book',   label: 'Order Book' },
+                { id: 'trades', label: 'Trades' },
+              ].map(t => (
+                <button
+                  key={t.id}
+                  onClick={() => setMobileTradeTab(t.id)}
+                  className={cn(
+                    "px-3 py-1 text-[10px] font-black uppercase tracking-wider rounded-full border transition-all duration-200",
+                    mobileTradeTab === t.id
+                      ? "bg-[#2b3139] text-[#F7B500] border-[#F7B500]/40"
+                      : "text-[#848E9C] border-[#21262d] hover:text-white"
+                  )}
+                >
+                  {t.label}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Main content panel — fills available height above bottom nav */}
+          <div className="flex-1 min-h-0 overflow-hidden pb-16">
+            {/* Chart */}
+            <div className={cn("h-full overflow-hidden", mobileTradeTab !== 'chart' && "hidden")}>
+              <PriceChart tradingPair={tradingPair} trades={trades} currentPrice={parseFloat(trades[0]?.price || '0')} />
+            </div>
+            {/* Order Book */}
+            <div className={cn("h-full overflow-hidden", mobileTradeTab !== 'book' && "hidden")}>
+              <OrderBookCard orderBook={orderBook} loading={orderBookLoading} tradingPair={tradingPair} userOrders={orders} />
+            </div>
+            {/* Recent Trades */}
+            <div className={cn("h-full overflow-hidden", mobileTradeTab !== 'trades' && "hidden")}>
+              <RecentTrades trades={trades} loading={tradesLoading} tradingPair={tradingPair} />
+            </div>
+            {/* Trade / Order Form */}
+            <div className={cn("h-full overflow-y-auto", mobileTradeTab !== 'trade' && "hidden")}>
+              <OrderForm
+                tradingPair={tradingPair}
+                availablePairs={availablePairs}
+                orderMode={orderMode}
+                onOrderModeChange={(e) => setOrderMode(e.target.value)}
+                orderType={orderType}
+                onOrderTypeChange={(e) => setOrderType(e.target.value)}
+                price={price}
+                onPriceChange={setPrice}
+                quantity={quantity}
+                onQuantityChange={setQuantity}
+                onSubmit={handlePlaceOrder}
+                loading={orderPlacing}
+                balance={balance}
+                lockedBalance={lockedBalance}
+                orderBook={orderBook}
+                lastTradePrice={trades.length > 0 ? trades[0]?.price : null}
+              />
+            </div>
+            {/* Orders — Active Orders + sub-tabs for history/depth */}
+            <div className={cn("h-full flex flex-col overflow-hidden", mobileTradeTab !== 'orders' && "hidden")}>
+              <div className="flex-shrink-0 flex items-center gap-1 px-3 pt-2 pb-1">
+                {[
+                  { id: 'orders',  label: 'Active' },
+                  { id: 'depth',   label: 'Depth' },
+                  { id: 'history', label: 'History' },
+                ].map(t => (
+                  <button key={t.id} onClick={() => setMobileTradeTab(t.id)}
+                    className={cn("px-3 py-1 text-[10px] font-black uppercase tracking-wider rounded-full border transition-all",
+                      mobileTradeTab === t.id
+                        ? "bg-[#2b3139] text-[#F7B500] border-[#F7B500]/40"
+                        : "text-[#848E9C] border-[#21262d] hover:text-white")}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+              <div className="flex-1 overflow-y-auto p-3">
+                <ActiveOrdersTable orders={orders} loading={loading} onCancelOrder={handleCancelOrder} partyId={partyId} />
+              </div>
+            </div>
+            {/* Market Depth */}
+            <div className={cn("h-full overflow-y-auto p-3", mobileTradeTab !== 'depth' && "hidden")}>
+              <div className="flex items-center gap-1 mb-3">
+                {[{ id: 'orders', label: 'Active' }, { id: 'depth', label: 'Depth' }, { id: 'history', label: 'History' }].map(t => (
+                  <button key={t.id} onClick={() => setMobileTradeTab(t.id)}
+                    className={cn("px-3 py-1 text-[10px] font-black uppercase tracking-wider rounded-full border transition-all",
+                      mobileTradeTab === t.id ? "bg-[#2b3139] text-[#F7B500] border-[#F7B500]/40" : "text-[#848E9C] border-[#21262d] hover:text-white")}
+                  >{t.label}</button>
+                ))}
+              </div>
+              <DepthChart orderBook={{ bids: orderBook.buys || [], asks: orderBook.sells || [] }} currentPrice={parseFloat(trades[0]?.price || '0')} />
+            </div>
+            {/* Transaction History */}
+            <div className={cn("h-full overflow-y-auto p-3", mobileTradeTab !== 'history' && "hidden")}>
+              <div className="flex items-center gap-1 mb-3">
+                {[{ id: 'orders', label: 'Active' }, { id: 'depth', label: 'Depth' }, { id: 'history', label: 'History' }].map(t => (
+                  <button key={t.id} onClick={() => setMobileTradeTab(t.id)}
+                    className={cn("px-3 py-1 text-[10px] font-black uppercase tracking-wider rounded-full border transition-all",
+                      mobileTradeTab === t.id ? "bg-[#2b3139] text-[#F7B500] border-[#F7B500]/40" : "text-[#848E9C] border-[#21262d] hover:text-white")}
+                  >{t.label}</button>
+                ))}
+              </div>
+              <TransactionHistory partyId={partyId} tradingPair={tradingPair} />
+            </div>
+            {/* Account — Portfolio + Transfers (this panel only shown briefly on nav tap, immediately redirects) */}
+            <div className={cn("h-full flex flex-col overflow-hidden", mobileTradeTab !== 'account' && "hidden")}>
+              <div className="flex-shrink-0 flex items-center gap-1 px-3 pt-2 pb-1">
+                {[{ id: 'portfolio', label: 'Portfolio' }, { id: 'transfers', label: 'Transfers' }].map(t => (
+                  <button key={t.id} onClick={() => setMobileTradeTab(t.id)}
+                    className={cn("px-3 py-1 text-[10px] font-black uppercase tracking-wider rounded-full border transition-all",
+                      mobileTradeTab === t.id
+                        ? "bg-[#2b3139] text-[#F7B500] border-[#F7B500]/40"
+                        : "text-[#848E9C] border-[#21262d] hover:text-white")}
+                  >{t.label}</button>
+                ))}
+              </div>
+              <div className="flex-1 overflow-y-auto p-3">
+                <PortfolioView partyId={partyId} balance={balance} lockedBalance={lockedBalance} />
+              </div>
+            </div>
+            {/* Portfolio */}
+            <div className={cn("h-full overflow-y-auto p-3", mobileTradeTab !== 'portfolio' && "hidden")}>
+              <div className="flex items-center gap-1 mb-3">
+                {[{ id: 'portfolio', label: 'Portfolio' }, { id: 'transfers', label: 'Transfers' }].map(t => (
+                  <button key={t.id} onClick={() => setMobileTradeTab(t.id)}
+                    className={cn("px-3 py-1 text-[10px] font-black uppercase tracking-wider rounded-full border transition-all",
+                      mobileTradeTab === t.id ? "bg-[#2b3139] text-[#F7B500] border-[#F7B500]/40" : "text-[#848E9C] border-[#21262d] hover:text-white")}
+                  >{t.label}</button>
+                ))}
+              </div>
+              <PortfolioView partyId={partyId} balance={balance} lockedBalance={lockedBalance} />
+            </div>
+            {/* Transfers */}
+            <div className={cn("h-full overflow-y-auto", mobileTradeTab !== 'transfers' && "hidden")}>
+              <div className="flex items-center gap-1 px-3 pt-2 pb-1 mb-1">
+                {[{ id: 'portfolio', label: 'Portfolio' }, { id: 'transfers', label: 'Transfers' }].map(t => (
+                  <button key={t.id} onClick={() => setMobileTradeTab(t.id)}
+                    className={cn("px-3 py-1 text-[10px] font-black uppercase tracking-wider rounded-full border transition-all",
+                      mobileTradeTab === t.id ? "bg-[#2b3139] text-[#F7B500] border-[#F7B500]/40" : "text-[#848E9C] border-[#21262d] hover:text-white")}
+                  >{t.label}</button>
+                ))}
+              </div>
+              <TransferOffers partyId={partyId} onTransferAccepted={handleTransferAccepted} />
+            </div>
           </div>
-          <div className={cn("h-full overflow-hidden", mobileTradeTab !== 'book' && "hidden")}>
-            <OrderBookCard orderBook={orderBook} loading={orderBookLoading} tradingPair={tradingPair} userOrders={orders} />
-          </div>
-          <div className={cn("h-full overflow-hidden", mobileTradeTab !== 'trades' && "hidden")}>
-            <RecentTrades trades={trades} loading={tradesLoading} tradingPair={tradingPair} />
-          </div>
-          <div className={cn("h-full overflow-y-auto", mobileTradeTab !== 'trade' && "hidden")}>
-            <OrderForm
-              tradingPair={tradingPair}
-              availablePairs={availablePairs}
-              orderMode={orderMode}
-              onOrderModeChange={(e) => setOrderMode(e.target.value)}
-              orderType={orderType}
-              onOrderTypeChange={(e) => setOrderType(e.target.value)}
-              price={price}
-              onPriceChange={setPrice}
-              quantity={quantity}
-              onQuantityChange={setQuantity}
-              onSubmit={handlePlaceOrder}
-              loading={orderPlacing}
-              balance={balance}
-              lockedBalance={lockedBalance}
-              orderBook={orderBook}
-              lastTradePrice={trades.length > 0 ? trades[0]?.price : null}
-            />
-          </div>
-          <div className={cn("h-full overflow-y-auto p-3", mobileTradeTab !== 'orders' && "hidden")}>
-            <ActiveOrdersTable orders={orders} loading={loading} onCancelOrder={handleCancelOrder} partyId={partyId} />
-          </div>
-          <div className={cn("h-full overflow-y-auto p-3", mobileTradeTab !== 'depth' && "hidden")}>
-            <DepthChart orderBook={{ bids: orderBook.buys || [], asks: orderBook.sells || [] }} currentPrice={parseFloat(trades[0]?.price || '0')} />
-          </div>
-          <div className={cn("h-full overflow-y-auto p-3", mobileTradeTab !== 'history' && "hidden")}>
-            <TransactionHistory partyId={partyId} tradingPair={tradingPair} />
-          </div>
-          <div className={cn("h-full overflow-y-auto p-3", mobileTradeTab !== 'portfolio' && "hidden")}>
-            <PortfolioView partyId={partyId} balance={balance} lockedBalance={lockedBalance} />
-          </div>
-          <div className={cn("h-full overflow-y-auto", mobileTradeTab !== 'transfers' && "hidden")}>
-            <TransferOffers partyId={partyId} onTransferAccepted={handleTransferAccepted} />
+
+          {/* ── FIXED BOTTOM NAV — thumb-zone, Binance/OKX pattern ── */}
+          <div className="fixed bottom-0 left-0 right-0 z-[200] flex items-end bg-[#0d1117] border-t border-[#21262d]" style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}>
+            {[
+              {
+                id: 'chart',
+                label: 'Chart',
+                icon: (active) => (
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={active ? '#F7B500' : '#848E9C'} strokeWidth="2" strokeLinecap="round">
+                    <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+                  </svg>
+                ),
+              },
+              {
+                id: 'book',
+                label: 'Market',
+                icon: (active) => (
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={active ? '#F7B500' : '#848E9C'} strokeWidth="2" strokeLinecap="round">
+                    <line x1="8" y1="6" x2="21" y2="6" /><line x1="8" y1="12" x2="21" y2="12" /><line x1="8" y1="18" x2="21" y2="18" />
+                    <line x1="3" y1="6" x2="3.01" y2="6" /><line x1="3" y1="12" x2="3.01" y2="12" /><line x1="3" y1="18" x2="3.01" y2="18" />
+                  </svg>
+                ),
+              },
+              {
+                id: 'trade',
+                label: 'Trade',
+                isAction: true,
+                icon: () => (
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#0d1117" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M7 16V4m0 0L3 8m4-4l4 4" />
+                    <path d="M17 8v12m0 0l4-4m-4 4l-4-4" />
+                  </svg>
+                ),
+              },
+              {
+                id: 'orders',
+                label: 'Orders',
+                icon: (active) => (
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={active ? '#F7B500' : '#848E9C'} strokeWidth="2" strokeLinecap="round">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                    <polyline points="14 2 14 8 20 8" />
+                    <line x1="16" y1="13" x2="8" y2="13" /><line x1="16" y1="17" x2="8" y2="17" /><polyline points="10 9 9 9 8 9" />
+                  </svg>
+                ),
+              },
+              {
+                id: 'account',
+                label: 'Account',
+                icon: (active) => (
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={active ? '#F7B500' : '#848E9C'} strokeWidth="2" strokeLinecap="round">
+                    <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+                    <circle cx="12" cy="7" r="4" />
+                  </svg>
+                ),
+              },
+            ].map(tab => {
+              const isActive = tab.id === 'chart'
+                ? ['chart', 'trades'].includes(mobileTradeTab)
+                : tab.id === 'book'
+                  ? mobileTradeTab === 'book'
+                  : tab.id === 'orders'
+                    ? ['orders', 'depth', 'history'].includes(mobileTradeTab)
+                    : tab.id === 'account'
+                      ? ['account', 'portfolio', 'transfers'].includes(mobileTradeTab)
+                      : mobileTradeTab === tab.id;
+              return (
+                <button
+                  key={tab.id}
+                  onClick={() => setMobileTradeTab(
+                    tab.id === 'orders' ? 'orders'
+                    : tab.id === 'account' ? 'portfolio'
+                    : tab.id
+                  )}
+                  className={cn("flex-1 flex flex-col items-center justify-center py-2 transition-all duration-200 relative",
+                    tab.isAction && "relative -top-3"
+                  )}
+                >
+                  {tab.isAction ? (
+                    <div className="w-12 h-12 rounded-full bg-[#F7B500] flex items-center justify-center shadow-lg shadow-[#F7B500]/30">
+                      {tab.icon(true)}
+                    </div>
+                  ) : (
+                    <>
+                      {tab.icon(isActive)}
+                      <span className={cn("text-[9px] font-black uppercase tracking-wider mt-0.5 transition-colors",
+                        isActive ? "text-[#F7B500]" : "text-[#848E9C]"
+                      )}>
+                        {tab.label}
+                      </span>
+                    </>
+                  )}
+                </button>
+              );
+            })}
           </div>
         </div>
 

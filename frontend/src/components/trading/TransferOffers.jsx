@@ -271,41 +271,42 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
             <p className="text-[9px] text-[#848E9C] font-black uppercase tracking-widest">Scanning...</p>
           </div>
         ) : offers.length === 0 ? (
-          <div className="flex flex-col items-center py-6 px-2 text-center">
-            {/* Ultra-Compact Empty State */}
-            <div className="relative mb-3">
+          <div className="flex flex-col items-center justify-center py-10 lg:py-6 px-6 text-center h-full lg:h-auto">
+            {/* Empty State — scales up on mobile (full screen), compact on desktop sidebar */}
+            <div className="relative mb-5 lg:mb-3">
               <div className="absolute inset-0 bg-[#F7B500]/10 blur-2xl rounded-full animate-pulse" />
-              <div className="relative w-12 h-12 bg-gradient-to-br from-[#161b22] to-[#0d1117] border border-[#30363d] rounded-2xl flex items-center justify-center shadow-xl overflow-hidden group">
-                <Inbox className="w-6 h-6 text-[#F7B500] drop-shadow-[0_0_10px_rgba(247,181,0,0.3)]" />
+              <div className="relative w-20 h-20 lg:w-12 lg:h-12 bg-gradient-to-br from-[#161b22] to-[#0d1117] border border-[#30363d] rounded-3xl lg:rounded-2xl flex items-center justify-center shadow-xl overflow-hidden">
+                <Inbox className="w-10 h-10 lg:w-6 lg:h-6 text-[#F7B500] drop-shadow-[0_0_10px_rgba(247,181,0,0.3)]" />
               </div>
-              <div className="absolute -bottom-0.5 -right-0.5 w-5 h-5 bg-[#0d1117] border border-[#30363d] rounded-full flex items-center justify-center shadow-md">
-                <ArrowDownToLine className="w-2.5 h-2.5 text-[#F7B500]" />
+              <div className="absolute -bottom-1 -right-1 w-7 h-7 lg:w-5 lg:h-5 bg-[#0d1117] border border-[#30363d] rounded-full flex items-center justify-center shadow-md">
+                <ArrowDownToLine className="w-3.5 h-3.5 lg:w-2.5 lg:h-2.5 text-[#F7B500]" />
               </div>
             </div>
 
-            <h3 className="text-[11px] font-black text-white uppercase tracking-[1.5px] mb-1">No Transfers</h3>
-            <p className="text-[9px] text-[#848E9C] font-bold max-w-[160px] leading-relaxed mb-4 uppercase tracking-widest">
+            <h3 className="text-base lg:text-[11px] font-black text-white uppercase tracking-[2px] mb-2 lg:mb-1">No Transfers</h3>
+            <p className="text-xs lg:text-[9px] text-[#848E9C] font-bold leading-relaxed mb-8 lg:mb-4 uppercase tracking-widest">
               Ledger is Clear
             </p>
 
-            {/* Compact Faucet CTA Card */}
+            {/* Faucet CTA — larger on mobile */}
             <a
               href="https://cbtc-faucet.bitsafe.finance/"
               target="_blank"
               rel="noopener noreferrer"
-              className="group relative w-full p-2.5 bg-[#161b22] border border-[#30363d] rounded-xl transition-all duration-300 hover:border-[#F7B500]/40 overflow-hidden"
+              className="group relative w-full max-w-xs lg:max-w-none p-5 lg:p-2.5 bg-[#161b22] border border-[#30363d] rounded-2xl lg:rounded-xl transition-all duration-300 hover:border-[#F7B500]/40 overflow-hidden"
             >
+              <div className="absolute inset-0 bg-gradient-to-r from-[#F7B500]/0 via-[#F7B500]/5 to-[#F7B500]/0 opacity-0 group-hover:opacity-100 transition-opacity" />
               <div className="relative flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <div className="w-8 h-8 bg-[#F7B500]/10 border border-[#F7B500]/20 rounded-lg flex items-center justify-center">
-                    <Gift className="w-4 h-4 text-[#F7B500]" />
+                <div className="flex items-center gap-4 lg:gap-2">
+                  <div className="w-12 h-12 lg:w-8 lg:h-8 bg-[#F7B500]/10 border border-[#F7B500]/20 rounded-xl lg:rounded-lg flex items-center justify-center">
+                    <Gift className="w-6 h-6 lg:w-4 lg:h-4 text-[#F7B500]" />
                   </div>
                   <div className="text-left leading-none">
-                    <p className="text-[9px] text-white font-black uppercase tracking-widest">Faucet</p>
-                    <p className="text-[8px] text-[#F7B500]/70 font-bold uppercase tracking-tight mt-0.5">Get Tokens</p>
+                    <p className="text-sm lg:text-[9px] text-white font-black uppercase tracking-widest">Faucet</p>
+                    <p className="text-xs lg:text-[8px] text-[#F7B500]/70 font-bold uppercase tracking-tight mt-1 lg:mt-0.5">Get Test Tokens</p>
                   </div>
                 </div>
-                <ExternalLink className="w-3 h-3 text-[#848E9C]" />
+                <ExternalLink className="w-5 h-5 lg:w-3 lg:h-3 text-[#848E9C] group-hover:text-[#F7B500] transition-colors" />
               </div>
             </a>
           </div>
@@ -321,19 +322,19 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
                     initial={{ opacity: 0, x: -10 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, x: 20 }}
-                    className="flex items-center justify-between p-3 bg-[#161b22] border border-border/50 rounded-2xl hover:border-primary/30 transition-all group"
+                    className="flex items-center justify-between p-4 lg:p-3 bg-[#161b22] border border-border/50 rounded-2xl hover:border-primary/30 transition-all group"
                   >
-                    <div className="flex items-center gap-3 min-w-0">
-                      <div className={cn("w-10 h-10 rounded-xl flex items-center justify-center text-lg font-bold shadow-inner", info.bg)}>
+                    <div className="flex items-center gap-4 lg:gap-3 min-w-0">
+                      <div className={cn("w-14 h-14 lg:w-10 lg:h-10 rounded-2xl lg:rounded-xl flex items-center justify-center text-2xl lg:text-lg font-bold shadow-inner flex-shrink-0", info.bg)}>
                         <span className={info.color}>{info.icon}</span>
                       </div>
                       <div className="min-w-0">
-                        <div className="text-sm font-bold text-white leading-tight">
+                        <div className="text-base lg:text-sm font-bold text-white leading-tight">
                           {parseFloat(offer.amount).toLocaleString(undefined, { maximumFractionDigits: 4 })}
-                          <span className="text-[10px] text-muted-foreground ml-1 font-normal tracking-wide uppercase">{offer.token}</span>
+                          <span className="text-xs lg:text-[10px] text-muted-foreground ml-1.5 font-normal tracking-wide uppercase">{offer.token}</span>
                         </div>
-                        <div className="text-[10px] text-muted-foreground truncate font-mono mt-0.5">
-                          from {offer.sender?.substring(0, 12)}...
+                        <div className="text-xs lg:text-[10px] text-muted-foreground truncate font-mono mt-1">
+                          from {offer.sender?.substring(0, 14)}...
                         </div>
                       </div>
                     </div>
@@ -341,13 +342,13 @@ export default function TransferOffers({ partyId, onTransferAccepted }) {
                       onClick={() => handleAccept(offer)}
                       disabled={isAccepting}
                       className={cn(
-                        "flex-shrink-0 flex items-center justify-center h-10 w-10 md:w-auto md:px-4 rounded-xl font-bold text-[10px] uppercase tracking-widest transition-all",
-                        isAccepting 
-                          ? "bg-muted cursor-not-allowed text-muted-foreground" 
+                        "flex-shrink-0 flex items-center justify-center h-12 w-12 lg:h-10 lg:w-10 lg:w-auto lg:px-4 rounded-xl font-bold text-[11px] uppercase tracking-widest transition-all",
+                        isAccepting
+                          ? "bg-muted cursor-not-allowed text-muted-foreground"
                           : "bg-success/10 text-success border border-success/20 hover:bg-success hover:text-white"
                       )}
                     >
-                      {isAccepting ? <Loader2 className="w-4 h-4 animate-spin" /> : <><Check className="w-4 h-4 md:mr-1.5" /><span className="hidden md:inline">Accept</span></>}
+                      {isAccepting ? <Loader2 className="w-5 h-5 animate-spin" /> : <><Check className="w-5 h-5 lg:w-4 lg:h-4 lg:mr-1.5" /><span className="hidden lg:inline">Accept</span></>}
                     </button>
                   </motion.div>
                 );
