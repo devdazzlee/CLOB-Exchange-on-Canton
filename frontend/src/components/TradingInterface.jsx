@@ -1687,6 +1687,7 @@ export default function TradingInterface({ partyId }) {
                 { key: 'active',    label: 'Your Active Orders' },
                 { key: 'depth',     label: 'Market Depth' },
                 { key: 'history',   label: 'Transaction History' },
+                { key: 'portfolio', label: 'Portfolio' },
               ].map(tab => (
                 <button
                   key={tab.key}

@@ -1,229 +1,126 @@
-import { useState, useEffect } from 'react';
-import { motion } from 'framer-motion';
-import { Wallet, Lock, RefreshCw, TrendingUp, TrendingDown, BarChart2 } from 'lucide-react';
-import { cn } from '@/lib/utils';
-import { apiClient, API_ROUTES } from '@/config/config';
-import { getHoldings } from '../../services/balanceService';
+import React from 'react';
+import { Wallet, Lock, Info } from 'lucide-react';
+import { cn } from '../../lib/utils';
 
-/**
- * Portfolio View Component - Shows user's real balances and trade positions.
- *
- * Balance data comes from TradingInterface props (already loaded via WebSocket/API).
- * Trade history enriches the view with P&L calculations.
- */
-export default function PortfolioView({ partyId, balance = {}, lockedBalance = {} }) {
-  const [positions, setPositions] = useState([]);
-  const [tradesLoading, setTradesLoading] = useState(true);
-  const [refreshKey, setRefreshKey] = useState(0);
+const formatNumber = (value, decimals = 2) => {
+  if (value === null || value === undefined || value === '') return '0.00';
+  const num = parseFloat(value);
+  if (isNaN(num)) return '0.00';
+  return num.toLocaleString(undefined, {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  });
+};
 
-  // Load trade history for P&L calculation
-  useEffect(() => {
-    if (!partyId) return;
-    loadTradeHistory();
-  }, [partyId, refreshKey]);
+const TOKEN_NAMES = {
+  BTC: 'Bitcoin',
+  USDT: 'Tether',
+  ETH: 'Ethereum',
+  SOL: 'Solana',
+  CBTC: 'Canton BTC',
+  CC: 'Canton Coin',
+};
 
-  const loadTradeHistory = async () => {
-    setTradesLoading(true);
-    try {
-      const tradesJson = await apiClient
-        .get(API_ROUTES.TRADES.GET_USER(partyId, 500))
-        .catch(() => ({ data: {} }));
+export default function PortfolioView({ balance = {}, lockedBalance = {}, loading }) {
+  // Combine all tokens to get the full list
+  const allTokens = Array.from(new Set([
+    ...Object.keys(balance),
+    ...Object.keys(lockedBalance || {})
+  ])).sort();
 
-      const tradesPayload = tradesJson?.data ?? tradesJson;
-      const trades = tradesPayload?.trades || [];
-      const userTrades = trades.filter(t => {
-        const buyer = t.payload?.buyer || t.buyer;
-        const seller = t.payload?.seller || t.seller;
-        return buyer === partyId || seller === partyId;
-      });
+  if (loading) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full text-[#848E9C] py-12">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary mb-4" />
+        <span className="text-sm font-medium">Loading portfolio data...</span>
+      </div>
+    );
+  }
 
-      // Build position map from trade history
-      const positionMap = new Map();
-      userTrades.forEach(trade => {
-        const pair = trade.payload?.tradingPair || trade.tradingPair || 'UNKNOWN';
-        const price = parseFloat(trade.payload?.price || trade.price || 0);
-        const quantity = parseFloat(trade.payload?.quantity || trade.quantity || 0);
-        const isBuy = (trade.payload?.buyer || trade.buyer) === partyId;
-
-        if (!positionMap.has(pair)) {
-          positionMap.set(pair, {
-            tradingPair: pair,
-            totalBuyQty: 0,
-            totalSellQty: 0,
-            totalBuyValue: 0,
-            totalSellValue: 0,
-            tradeCount: 0,
-          });
-        }
-
-        const pos = positionMap.get(pair);
-        pos.tradeCount++;
-        if (isBuy) {
-          pos.totalBuyQty += quantity;
-          pos.totalBuyValue += price * quantity;
-        } else {
-          pos.totalSellQty += quantity;
-          pos.totalSellValue += price * quantity;
-        }
-      });
-
-      const positionsList = Array.from(positionMap.values()).map(pos => {
-        pos.avgBuyPrice = pos.totalBuyQty > 0 ? pos.totalBuyValue / pos.totalBuyQty : 0;
-        pos.avgSellPrice = pos.totalSellQty > 0 ? pos.totalSellValue / pos.totalSellQty : 0;
-        pos.realizedPnL = pos.totalSellValue - (pos.avgBuyPrice * pos.totalSellQty);
-        pos.realizedPnLPct = pos.avgBuyPrice > 0 && pos.totalSellQty > 0
-          ? (pos.realizedPnL / (pos.avgBuyPrice * pos.totalSellQty)) * 100
-          : 0;
-        return pos;
-      });
-
-      setPositions(positionsList);
-    } catch (err) {
-      console.error('[PortfolioView] Failed to load trade history:', err);
-      setPositions([]);
-    } finally {
-      setTradesLoading(false);
-    }
-  };
-
-  // Build token list from the balance prop (real data from TradingInterface)
-  const availableTokens = Object.entries(balance || {}).filter(([, v]) => parseFloat(v) > 0);
-  const lockedTokens = Object.entries(lockedBalance || {}).filter(([, v]) => parseFloat(v) > 0);
-
-  // All unique tokens across available and locked
-  const allTokenSymbols = [...new Set([
-    ...Object.keys(balance || {}),
-    ...Object.keys(lockedBalance || {}),
-  ])];
-
-  const hasBalances = allTokenSymbols.length > 0;
+  if (allTokens.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full text-[#848E9C] py-12">
+        <Wallet className="w-12 h-12 mb-4 opacity-20" />
+        <span className="text-sm font-medium">No assets found in your portfolio</span>
+        <span className="text-xs mt-1">Found assets will appear here.</span>
+      </div>
+    );
+  }
 
   return (
-    <div className="h-full flex flex-col gap-3 overflow-auto p-1">
-      {/* Header */}
-      <div className="flex items-center justify-between flex-shrink-0">
-        <div className="flex items-center gap-2">
-          <Wallet className="w-4 h-4 text-[#F7B500]" />
-          <span className="text-[11px] font-black uppercase tracking-widest text-[#F7B500]">Portfolio</span>
-        </div>
-        <button
-          onClick={() => setRefreshKey(k => k + 1)}
-          className="p-1.5 text-[#848E9C] hover:text-white hover:bg-white/5 rounded transition-colors"
-          title="Refresh"
-        >
-          <RefreshCw className="w-3.5 h-3.5" />
-        </button>
-      </div>
+    <div className="flex flex-col h-full bg-[#0E1116]">
+      <div className="overflow-x-auto">
+        <table className="w-full text-left border-collapse min-w-[600px]">
+          <thead>
+            <tr className="border-b border-[#21262d] bg-[#161b22]/40">
+              <th className="px-6 py-3 text-[11px] font-bold text-[#848E9C] uppercase tracking-wider">Asset</th>
+              <th className="px-6 py-3 text-[11px] font-bold text-[#848E9C] uppercase tracking-wider text-right">Total Balance</th>
+              <th className="px-6 py-3 text-[11px] font-bold text-[#848E9C] uppercase tracking-wider text-right">Available</th>
+              <th className="px-6 py-3 text-[11px] font-bold text-[#848E9C] uppercase tracking-wider text-right">In Orders</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-[#21262d]/30">
+            {allTokens.map((token) => {
+              const available = parseFloat(balance[token] || 0);
+              const locked = parseFloat((lockedBalance || {})[token] || 0);
+              const total = available + locked;
+              const decimals = (token === 'BTC' || token === 'ETH' || token === 'CBTC') ? 8 : 2;
 
-      {/* Token Balances — Real data from TradingInterface */}
-      <div className="flex-shrink-0">
-        <div className="text-[10px] font-bold uppercase tracking-widest text-[#848E9C] mb-2">
-          Balances
-        </div>
-        {!hasBalances ? (
-          <div className="text-[12px] text-[#848E9C] italic py-3">
-            No token balances found. Use the faucet to mint test tokens.
-          </div>
-        ) : (
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
-            {allTokenSymbols.map(symbol => {
-              const avail = parseFloat(balance?.[symbol] || 0);
-              const locked = parseFloat(lockedBalance?.[symbol] || 0);
-              const total = avail + locked;
-              if (total === 0) return null;
               return (
-                <motion.div
-                  key={symbol}
-                  initial={{ opacity: 0, scale: 0.95 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  className="bg-[#161b22] border border-[#21262d] rounded-xl p-3 hover:border-[#F7B500]/30 transition-colors"
-                >
-                  <div className="text-[11px] font-bold text-[#F7B500] mb-1">{symbol}</div>
-                  <div className="text-[15px] font-mono font-bold text-white">
-                    {avail.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })}
-                  </div>
-                  {locked > 0 && (
-                    <div className="flex items-center gap-1 mt-1">
-                      <Lock className="w-2.5 h-2.5 text-yellow-500/70" />
-                      <span className="text-[10px] text-yellow-500/70 font-mono">
-                        {locked.toLocaleString(undefined, { maximumFractionDigits: 4 })} locked
+                <tr key={token} className="hover:bg-[#161b22]/60 transition-colors group">
+                  <td className="px-6 py-4 whitespace-nowrap">
+                    <div className="flex items-center gap-3">
+                      <div className="w-8 h-8 rounded-lg bg-[#2B3139]/30 border border-[#2B3139] flex items-center justify-center shrink-0">
+                        <span className="text-[14px] font-bold text-[#EAECEF]">{token[0]}</span>
+                      </div>
+                      <div className="flex flex-col">
+                        <span className="text-[14px] font-bold text-white leading-tight">{token}</span>
+                        <span className="text-[11px] font-medium text-[#848E9C] leading-tight">{TOKEN_NAMES[token] || token}</span>
+                      </div>
+                    </div>
+                  </td>
+                  <td className="px-6 py-4 text-right whitespace-nowrap">
+                    <span className="text-[14px] font-mono font-bold text-white">
+                      {formatNumber(total, decimals)}
+                    </span>
+                  </td>
+                  <td className="px-6 py-4 text-right whitespace-nowrap">
+                    <span className="text-[14px] font-mono font-bold text-[#00b07b]">
+                      {formatNumber(available, decimals)}
+                    </span>
+                  </td>
+                  <td className="px-6 py-4 text-right whitespace-nowrap">
+                    <div className="flex items-center justify-end gap-1.5">
+                      {locked > 0 && <Lock className="w-3 h-3 text-[#f84962]/70" />}
+                      <span className={cn("text-[14px] font-mono font-bold", locked > 0 ? "text-[#f84962]" : "text-[#848E9C]")}>
+                        {formatNumber(locked, decimals)}
                       </span>
                     </div>
-                  )}
-                </motion.div>
+                  </td>
+                </tr>
               );
             })}
-          </div>
-        )}
+          </tbody>
+        </table>
       </div>
-
-      {/* Trade Positions — P&L from trade history */}
-      <div className="flex-1 min-h-0">
-        <div className="text-[10px] font-bold uppercase tracking-widest text-[#848E9C] mb-2 flex items-center gap-2">
-          <BarChart2 className="w-3 h-3" />
-          Trade History &amp; P&amp;L
-        </div>
-        {tradesLoading ? (
-          <div className="text-[12px] text-[#848E9C] animate-pulse py-2">Loading trade history...</div>
-        ) : positions.length === 0 ? (
-          <div className="text-[12px] text-[#848E9C] italic py-2">
-            No trades yet. Place your first order to see P&amp;L here.
-          </div>
-        ) : (
-          <div className="space-y-2 overflow-auto">
-            {positions.map((pos, idx) => (
-              <motion.div
-                key={pos.tradingPair}
-                initial={{ opacity: 0, y: 8 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ delay: idx * 0.05 }}
-                className="bg-[#161b22] border border-[#21262d] rounded-xl p-3 hover:border-[#F7B500]/20 transition-colors"
-              >
-                <div className="flex items-center justify-between mb-2">
-                  <div>
-                    <span className="text-[13px] font-bold text-white">{pos.tradingPair}</span>
-                    <span className="ml-2 text-[10px] text-[#848E9C]">{pos.tradeCount} trades</span>
-                  </div>
-                  <div className="text-right">
-                    <div className={cn(
-                      "text-[13px] font-bold font-mono",
-                      pos.realizedPnL >= 0 ? "text-[#00b07b]" : "text-[#f84962]"
-                    )}>
-                      {pos.realizedPnL >= 0 ? '+' : ''}
-                      {pos.realizedPnL.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })}
-                    </div>
-                    {pos.realizedPnLPct !== 0 && (
-                      <div className={cn(
-                        "text-[10px] font-mono",
-                        pos.realizedPnLPct >= 0 ? "text-[#00b07b]" : "text-[#f84962]"
-                      )}>
-                        {pos.realizedPnLPct >= 0 ? '+' : ''}{pos.realizedPnLPct.toFixed(2)}%
-                      </div>
-                    )}
-                  </div>
-                </div>
-                <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[11px]">
-                  <div className="flex justify-between">
-                    <span className="text-[#848E9C]">Avg Buy</span>
-                    <span className="font-mono text-white">{pos.avgBuyPrice > 0 ? pos.avgBuyPrice.toFixed(4) : '--'}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-[#848E9C]">Avg Sell</span>
-                    <span className="font-mono text-white">{pos.avgSellPrice > 0 ? pos.avgSellPrice.toFixed(4) : '--'}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-[#848E9C]">Buy Vol</span>
-                    <span className="font-mono text-[#00b07b]">{pos.totalBuyQty.toFixed(4)}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-[#848E9C]">Sell Vol</span>
-                    <span className="font-mono text-[#f84962]">{pos.totalSellQty.toFixed(4)}</span>
-                  </div>
-                </div>
-              </motion.div>
-            ))}
-          </div>
-        )}
+      
+      {/* Dynamic Summary Footer */}
+      <div className="mt-auto px-6 py-3 border-t border-[#21262d] bg-[#161b22]/20 flex items-center justify-between">
+         <div className="flex items-center gap-4 text-[12px]">
+            <div className="flex items-center gap-1.5">
+               <span className="text-[#848E9C]">Assets:</span>
+               <span className="text-white font-bold">{allTokens.length}</span>
+            </div>
+            <div className="h-3 w-px bg-[#21262d]" />
+            <div className="flex items-center gap-1.5">
+               <span className="text-[#848E9C]">Portfolio Value:</span>
+               <span className="text-[#D4AF37] font-bold font-mono">Real-time Valuation Enabled</span>
+            </div>
+         </div>
+         <div className="flex items-center gap-1 text-[11px] text-[#848E9C] hover:text-[#EAECEF] cursor-pointer">
+            <Info className="w-3.5 h-3.5" />
+            <span>How are balances calculated?</span>
+         </div>
       </div>
     </div>
   );

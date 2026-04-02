@@ -88,7 +88,7 @@ const SelectTrigger = React.forwardRef(({ className, children, ...props }, ref) 
       )}
       {...props}
     >
-      <div className="truncate flex-1 text-left">{children}</div>
+      <div className="flex-1 text-left">{children}</div>
       <ChevronDown className={cn(
         "h-4 w-4 text-muted-foreground transition-transform duration-200 flex-shrink-0 ml-2",
         open && "rotate-180"
@@ -108,19 +108,43 @@ const SelectValue = ({ placeholder, className }) => {
   );
 };
 
-const SelectContent = React.forwardRef(({ className, children, ...props }, ref) => {
+const SelectContent = React.forwardRef(({ className, align = "start", sideOffset = 4, collisionPadding = 12, children, ...props }, ref) => {
   const { open, triggerRect } = React.useContext(SelectContext);
   
   if (!open || !triggerRect) return null;
   
-  // Custom Styles for Fixed Positioning in Portal
+  const viewportWidth = typeof window !== 'undefined' ? window.innerWidth : 0;
+  const viewportHeight = typeof window !== 'undefined' ? window.innerHeight : 0;
+  
+  // Base style
   const contentStyle = {
     position: 'fixed',
-    top: `${triggerRect.bottom + 4}px`,
-    left: `${triggerRect.left}px`,
-    width: `${triggerRect.width}px`,
+    top: `${triggerRect.bottom + sideOffset}px`,
+    minWidth: `${triggerRect.width}px`,
     zIndex: 9999,
   };
+
+  // Senior Fix: Viewport-aware horizontal alignment
+  if (align === "end") {
+    const rightSide = viewportWidth - triggerRect.right;
+    contentStyle.right = `${Math.max(collisionPadding, rightSide)}px`;
+  } else {
+    contentStyle.left = `${Math.max(collisionPadding, triggerRect.left)}px`;
+    
+    // Safety check for right-edge collision
+    const estimatedWidth = 160; 
+    if (triggerRect.left + estimatedWidth > viewportWidth - collisionPadding) {
+      contentStyle.left = 'auto';
+      contentStyle.right = `${collisionPadding}px`;
+    }
+  }
+
+  // Senior Fix: Vertical flip if near bottom
+  const estimatedHeight = 220;
+  if (triggerRect.bottom + sideOffset + estimatedHeight > viewportHeight - collisionPadding) {
+    contentStyle.top = 'auto';
+    contentStyle.bottom = `${viewportHeight - triggerRect.top + sideOffset}px`;
+  }
 
   return createPortal(
     <div
