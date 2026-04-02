@@ -185,18 +185,18 @@ export default function ActiveOrdersTable({ orders, onCancelOrder }) {
 
   return (
     <>
-      <div className="h-full relative overflow-y-auto w-full">
+      <div className="h-full relative overflow-y-auto w-full bg-transparent">
         {/* Desktop View: Dense Table */}
-        <div className="hidden md:block overflow-x-auto h-full bg-card">
+        <div className="hidden md:block overflow-x-auto h-full bg-transparent">
           <table className="w-full min-w-[700px]">
             <thead>
-              <tr className="border-b border-border/50 bg-[#161b22]/30">
-                {['ID', 'Side', 'Mode', 'Price', 'Amount', 'Filled', 'Remain', 'Progress', 'Status', 'Action'].map(h => (
-                  <th key={h} className="text-left py-2.5 px-4 text-[10px] font-bold text-muted-foreground uppercase tracking-widest whitespace-nowrap">{h}</th>
+              <tr className="border-b border-[#1A1E24]">
+                {['ID', 'TYPE', 'MODE', 'PRICE', 'QUANTITY', 'FILLED', 'REMAINING', 'PROGRESS', 'STATUS', 'ACTION'].map(h => (
+                  <th key={h} className="text-left py-4 px-4 text-[10px] font-bold text-[#697280] uppercase tracking-wider whitespace-nowrap">{h}</th>
                 ))}
               </tr>
             </thead>
-            <tbody className="divide-y divide-border/30">
+            <tbody className="divide-y divide-[#1A1E24]">
               <AnimatePresence>
                 {activeOrders.length > 0 ? (
                   activeOrders.map((order) => {
@@ -212,18 +212,18 @@ export default function ActiveOrdersTable({ orders, onCancelOrder }) {
                         exit={{ opacity: 0 }}
                         className="hover:bg-[#161b22]/50 transition-colors group"
                       >
-                        <td className="py-2 px-4 text-white font-mono text-[11px] font-medium">
+                        <td className="py-3 px-4 text-white font-mono text-[11px] font-medium">
                           {order.id?.substring(0, 8)}
                         </td>
-                        <td className={cn("py-2 px-4 text-[11px] font-bold", order.type === 'BUY' ? 'text-green-500' : 'text-red-500')}>
+                        <td className={cn("py-3 px-4 text-[11px] font-bold", order.type === 'BUY' ? 'text-green-500' : 'text-red-500')}>
                           {order.type}
                         </td>
-                        <td className="py-2 px-4 text-muted-foreground text-[11px] font-medium uppercase">{order.mode}</td>
-                        <td className="py-2 px-4 text-white font-mono text-[11px] font-bold">{formatOrderPrice(order)}</td>
-                        <td className="py-2 px-4 text-white text-[11px] font-mono">{quantity.toFixed(4)}</td>
-                        <td className="py-2 px-4 text-white text-[11px] font-mono">{filled.toFixed(4)}</td>
-                        <td className="py-2 px-4 text-white/70 text-[11px] font-mono">{remaining.toFixed(4)}</td>
-                        <td className="py-2 px-4">
+                        <td className="py-3 px-4 text-muted-foreground text-[11px] font-medium uppercase">{order.mode}</td>
+                        <td className="py-3 px-4 text-white font-mono text-[11px] font-bold">{formatOrderPrice(order)}</td>
+                        <td className="py-3 px-4 text-white text-[11px] font-mono">{quantity.toFixed(4)}</td>
+                        <td className="py-3 px-4 text-white text-[11px] font-mono">{filled.toFixed(4)}</td>
+                        <td className="py-3 px-4 text-white/70 text-[11px] font-mono">{remaining.toFixed(4)}</td>
+                        <td className="py-3 px-4">
                           <div className="flex items-center gap-2 min-w-[100px]">
                             <div className="flex-1 h-1.5 bg-[#21262d] rounded-full overflow-hidden">
                               <motion.div
@@ -235,9 +235,9 @@ export default function ActiveOrdersTable({ orders, onCancelOrder }) {
                             <span className="text-[10px] text-muted-foreground font-bold font-mono">{fillPct.toFixed(0)}</span>
                           </div>
                         </td>
-                        <td className="py-2 px-4">
+                        <td className="py-3 px-4">
                           <span className={cn(
-                            "px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-tighter",
+                            "px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-tighter",
                             order.status === 'OPEN' ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' :
                             order.status === 'PENDING_TRIGGER' ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20' :
                             'bg-green-500/10 text-green-500 border border-green-500/20'
@@ -245,11 +245,11 @@ export default function ActiveOrdersTable({ orders, onCancelOrder }) {
                             {order.status === 'PENDING_TRIGGER' ? 'Stop' : order.status}
                           </span>
                         </td>
-                        <td className="py-2 px-4">
+                        <td className="py-3 px-4">
                           {(order.status === 'OPEN' || order.status === 'PENDING_TRIGGER') && (
                             <button
                               onClick={() => handleCancelClick(order)}
-                              className="bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white px-2.5 py-1 text-[10px] font-bold uppercase tracking-widest rounded-lg border border-red-500/20 transition-all active:scale-95"
+                              className="bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white px-2.5 py-1 text-[10px] font-bold uppercase tracking-widest rounded border border-red-500/20 transition-all active:scale-95"
                             >
                               Cancel
                             </button>
@@ -260,7 +260,7 @@ export default function ActiveOrdersTable({ orders, onCancelOrder }) {
                   })
                 ) : (
                   <tr>
-                    <td colSpan="10" className="py-12 text-center text-muted-foreground text-xs font-medium italic">No active orders</td>
+                    <td colSpan="10" className="opacity-100 py-12 text-center text-[#697280] text-[12px] font-medium border-0">No active orders</td>
                   </tr>
                 )}
               </AnimatePresence>

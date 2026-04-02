@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import React from 'react';
 import { motion } from 'framer-motion';
-import { AlertCircle } from 'lucide-react';
+import { AlertCircle, TrendingUp, TrendingDown, BarChart3 } from 'lucide-react';
 import { useConfirmationModal } from './ConfirmationModal';
 import { useToast, OrderSuccessModal } from './ui/toast';
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from './ui/select';
@@ -1232,7 +1232,7 @@ export default function TradingInterface({ partyId }) {
       </div>
 
       {/* ══ DESKTOP STATS BAR (hidden on mobile) ══ */}
-      <div className="hidden lg:flex lg:items-center gap-8 px-4 py-2 border-b border-border/50 bg-[#161b22]/70 z-50 flex-shrink-0">
+      <div className="hidden">
         <div className="bg-[#1e2329] rounded-xl border border-border p-0.5">
           <Select value={tradingPair} onValueChange={setTradingPair}>
             <SelectTrigger className="h-9 w-[160px] bg-transparent border-0 ring-0 focus:ring-0 text-white font-black text-sm">
@@ -1532,16 +1532,97 @@ export default function TradingInterface({ partyId }) {
         </div>
 
         {/* ── DESKTOP GRID (hidden on mobile) ── */}
-        <div className="hidden lg:grid h-full grid-cols-12 grid-rows-[1fr_220px] gap-3 p-3">
+        <div className="hidden lg:grid h-full w-full overflow-hidden p-3 gap-3 bg-[#06080A] shadow-inner" style={{ gridTemplateColumns: 'minmax(0, 1fr) 300px 300px', gridTemplateRows: '1fr 220px' }}>
 
-          {/* Chart */}
-          <main className="col-span-6 bg-card border border-border rounded-3xl overflow-hidden shadow-2xl flex flex-col min-h-0">
-            <PriceChart tradingPair={tradingPair} trades={trades} currentPrice={parseFloat(trades[0]?.price || '0')} className="flex-1" />
-          </main>
+          {/* LEFT COLUMN: Stats Header + Chart */}
+          <div className="flex flex-col min-h-0 overflow-hidden gap-3">
+             {/* Stats Header Bar */}
+             <div className="flex items-stretch justify-between rounded-[14px] border border-[#21262d] bg-[#0A0D10] flex-shrink-0 min-h-[60px]">
+               
+               {/* Left Side: Pair & Current Price */}
+               <div className="flex items-center gap-x-12 px-5 border-r border-[#21262d] flex-shrink-0">
+                 <div className="relative min-w-fit">
+                   <Select value={tradingPair} onValueChange={setTradingPair}>
+                     <SelectTrigger className="h-full bg-transparent border-0 ring-0 focus:ring-0 text-[#EAECEF] font-medium text-[16px] tracking-wide p-0 hover:bg-transparent shadow-none gap-3 min-w-fit">
+                       <SelectValue placeholder="Pair">
+                         {tradingPair.replace('/', '-')}
+                       </SelectValue>
+                     </SelectTrigger>
+                     <SelectContent className="bg-[#1e2329] border-[#2B3139] z-[100] min-w-[160px]">
+                       {availablePairs.map(p => (
+                         <SelectItem key={p} value={p} className="text-sm">{p.replace('/', '-')}</SelectItem>
+                       ))}
+                     </SelectContent>
+                   </Select>
+                 </div>
+                 
+                 <div className="flex flex-col items-start justify-center pr-2">
+                   <p className="text-[10px] font-bold text-[#848E9C] uppercase tracking-wider mb-1">Current Price</p>
+                   <div className="flex items-baseline gap-2 whitespace-nowrap">
+                     <span className="text-[15px] font-mono font-bold text-[#00b07b]">
+                       {formatNumber(trades[0]?.price || orderBook.sells[0]?.price || '0', 2)}
+                     </span>
+                     <span className="text-[11px] font-bold text-[#697280]">{tradingPair.split('/')[1] || 'USDT'}</span>
+                   </div>
+                 </div>
+               </div>
 
-          {/* Order Book / Recent Trades */}
-          <aside className="col-span-3 bg-card border border-border rounded-3xl overflow-hidden shadow-2xl flex flex-col min-h-0">
-            <div className="flex items-center gap-1 p-1 bg-[#161b22] border border-[#30363d] m-3 mb-2 rounded-xl w-fit flex-shrink-0 shadow-lg">
+               {/* Right Side: 3 Stat Boxes */}
+               <div className="flex items-center gap-3 pl-4 pr-4 py-2 flex-shrink-0">
+                 {/* 24H HIGH */}
+                 <div className="flex flex-col gap-1 px-4 py-2.5 rounded-[10px] bg-[#0a2016] border border-[#06331a] min-w-[130px]">
+                   <div className="flex items-center gap-1.5 text-[10px] text-[#848E9C] uppercase font-bold tracking-wide">
+                     <TrendingUp className="w-3.5 h-3.5 text-[#00b07b]" />
+                     24H HIGH
+                   </div>
+                   <span className="text-[14px] font-mono font-bold text-[#00b07b]">
+                     {formatNumber(trades.length > 0 ? Math.max(...trades.map(t => parseFloat(t.price) || 0)) : '0', 2)}
+                   </span>
+                 </div>
+                 
+                 {/* 24H LOW */}
+                 <div className="flex flex-col gap-1 px-4 py-2.5 rounded-[10px] bg-[#240d12] border border-[#381016] min-w-[130px]">
+                   <div className="flex items-center gap-1.5 text-[10px] text-[#848E9C] uppercase font-bold tracking-wide">
+                     <TrendingDown className="w-3.5 h-3.5 text-[#F6465D]" />
+                     24H LOW
+                   </div>
+                   <span className="text-[14px] font-mono font-bold text-[#F6465D]">
+                     {formatNumber(trades.length > 0 ? Math.min(...trades.filter(t => parseFloat(t.price) > 0).map(t => parseFloat(t.price))) : '0', 2)}
+                   </span>
+                 </div>
+                 
+                 {/* 24H VOL */}
+                 <div className="flex flex-col gap-1 px-4 py-2.5 rounded-[10px] bg-[#131518] border border-[#21262d] min-w-[140px]">
+                   <div className="flex items-center gap-1.5 text-[10px] text-[#848E9C] uppercase font-bold tracking-wider">
+                     <BarChart3 className="w-3.5 h-3.5 text-[#848E9C]" />
+                     24H VOLUME
+                   </div>
+                   <div className="flex items-baseline gap-2 whitespace-nowrap">
+                     <span className="text-[14px] font-mono font-bold text-white">
+                       {formatNumber(trades.reduce((sum, t) => sum + (parseFloat(t.quantity) || 0), 0), 2)}
+                     </span>
+                     <span className="text-[11px] font-bold text-[#697280]">{tradingPair.split('/')[0] || 'BTC'}</span>
+                   </div>
+                 </div>
+               </div>
+             </div>
+
+             {/* Chart Component */}
+             <div className="flex-1 min-h-0 overflow-hidden rounded-[14px] border border-[#21262d]">
+               <PriceChart 
+                 tradingPair={tradingPair} 
+                 trades={trades} 
+                 currentPrice={parseFloat(trades[0]?.price || '0')}
+                 high24h={trades.length > 0 ? Math.max(...trades.map(t => parseFloat(t.price) || 0)) : 0}
+                 low24h={trades.length > 0 ? Math.min(...trades.filter(t => parseFloat(t.price) > 0).map(t => parseFloat(t.price))) : 0}
+                 volume24h={trades.reduce((sum, t) => sum + (parseFloat(t.quantity) || 0), 0)}
+               />
+             </div>
+          </div>
+
+          {/* MIDDLE COLUMN: Order Book & Recent Trades */}
+          <aside className="flex flex-col bg-[#0b0e11] min-h-0 overflow-hidden rounded-[14px] border border-[#21262d]">
+            <div className="flex items-stretch border-b border-[#21262d] flex-shrink-0 bg-[#06080A]">
               {['Order Book', 'Recent Trades'].map(tab => {
                 const isActive = (tab === 'Order Book' && activeTab !== 'recenttrades') || (tab === 'Recent Trades' && activeTab === 'recenttrades');
                 return (
@@ -1549,28 +1630,39 @@ export default function TradingInterface({ partyId }) {
                     key={tab}
                     onClick={() => setActiveTab(tab === 'Order Book' ? 'orderbook' : 'recenttrades')}
                     className={cn(
-                      "py-1.5 px-5 text-[10px] font-black uppercase tracking-[1px] transition-all duration-200 rounded-lg whitespace-nowrap",
-                      isActive ? "bg-[#2b3139] text-[#F7B500] border border-[#484f58] shadow-inner" : "text-muted-foreground hover:bg-white/5 hover:text-white"
+                      "flex-1 py-3.5 text-[14px] font-normal transition-all duration-200 relative",
+                      isActive ? "bg-[#13171e] text-white" : "text-[#B7BDC6] hover:text-white bg-[#06080A]"
                     )}
                   >
-                    {tab === 'Order Book' ? 'BOOK' : 'TRADES'}
+                    {tab}
+                    {isActive && (
+                      <span className="absolute bottom-[-1px] left-0 right-0 h-[3px] bg-[#626AEB] rounded-t-sm" />
+                    )}
                   </button>
                 );
               })}
             </div>
-            <div className="flex-1 overflow-hidden min-h-0">
+            <div className="flex-1 overflow-hidden min-h-0 bg-[#0E1116]">
               {activeTab === 'recenttrades'
                 ? <RecentTrades trades={trades} loading={tradesLoading} tradingPair={tradingPair} />
-                : <OrderBookCard orderBook={orderBook} loading={orderBookLoading} tradingPair={tradingPair} userOrders={orders} />
+                : <OrderBookCard 
+                    orderBook={orderBook} 
+                    loading={orderBookLoading} 
+                    tradingPair={tradingPair} 
+                    userOrders={orders} 
+                    availablePairs={availablePairs}
+                    onTradingPairChange={setTradingPair}
+                  />
               }
             </div>
           </aside>
 
-          {/* Order Form */}
-          <aside className="col-span-3 bg-card border border-border rounded-3xl overflow-hidden shadow-2xl flex flex-col min-h-0">
+          {/* RIGHT COLUMN: Order Form */}
+          <aside className="flex flex-col bg-[#0E1116] min-h-0 overflow-hidden rounded-[14px] border border-[#21262d]">
             <OrderForm
               tradingPair={tradingPair}
               availablePairs={availablePairs}
+              onTradingPairChange={setTradingPair}
               orderMode={orderMode}
               onOrderModeChange={(e) => setOrderMode(e.target.value)}
               orderType={orderType}
@@ -1589,27 +1681,29 @@ export default function TradingInterface({ partyId }) {
           </aside>
 
           {/* Bottom Analytics */}
-          <section className="col-span-9 bg-card border border-border rounded-3xl shadow-2xl overflow-hidden flex flex-col min-h-0">
-            <div className="flex items-center gap-1 p-1 bg-[#161b22] border border-[#30363d] m-3 mb-0 rounded-xl w-fit flex-shrink-0 shadow-lg">
+          <section className="bg-[#0E1116] border border-[#21262d] rounded-[14px] overflow-hidden flex flex-col min-h-0" style={{ gridColumn: '1 / 3' }}>
+            <div className="flex items-stretch border-b border-[#21262d] flex-shrink-0 bg-transparent px-2">
               {[
-                { key: 'active',    label: 'Active Orders' },
+                { key: 'active',    label: 'Your Active Orders' },
                 { key: 'depth',     label: 'Market Depth' },
-                { key: 'history',   label: 'Transactions' },
-                { key: 'portfolio', label: 'Portfolio' },
+                { key: 'history',   label: 'Transaction History' },
               ].map(tab => (
                 <button
                   key={tab.key}
                   onClick={() => setActiveTab(tab.key)}
                   className={cn(
-                    "py-1.5 px-4 text-[10px] font-black uppercase tracking-[1px] transition-all duration-200 rounded-lg whitespace-nowrap",
-                    activeTab === tab.key ? "bg-[#2b3139] text-[#F7B500] border border-[#484f58] shadow-inner" : "text-muted-foreground hover:bg-white/5 hover:text-white"
+                    "px-4 py-3.5 text-[14px] transition-all duration-200 relative whitespace-nowrap",
+                    activeTab === tab.key ? "text-white font-medium" : "text-[#848E9C] hover:text-white"
                   )}
                 >
                   {tab.label}
+                  {activeTab === tab.key && (
+                    <span className="absolute bottom-[-1px] left-0 right-0 h-[3px] bg-[#626AEB] rounded-t-sm" />
+                  )}
                 </button>
               ))}
             </div>
-            <div className="flex-1 overflow-auto p-4 pt-2 min-h-0">
+            <div className="flex-1 overflow-auto min-h-0">
               {activeTab === 'depth' ? (
                 <DepthChart orderBook={{ bids: orderBook.buys || [], asks: orderBook.sells || [] }} currentPrice={parseFloat(trades[0]?.price || '0')} />
               ) : activeTab === 'history' ? (
@@ -1623,10 +1717,9 @@ export default function TradingInterface({ partyId }) {
           </section>
 
           {/* Incoming Transfers */}
-          <section className="col-span-3 bg-card border border-border rounded-3xl overflow-hidden shadow-2xl flex flex-col min-h-0">
-            <div className="p-4 flex items-center gap-2 border-b border-border bg-[#161b22]/30 flex-shrink-0">
-              <div className="w-2 h-2 bg-[#F7B500] rounded-full animate-pulse" />
-              <h3 className="text-[10px] font-bold uppercase tracking-widest text-[#F7B500]">Incoming Transfers</h3>
+          <section className="bg-[#0E1116] border border-[#21262d] rounded-[14px] overflow-hidden flex flex-col min-h-0">
+            <div className="py-4 flex justify-center items-center border-b border-[#21262d] flex-shrink-0 bg-transparent">
+              <h3 className="text-[14px] font-medium text-white">Incoming Transfers</h3>
             </div>
             <div className="flex-1 overflow-auto min-h-0">
               <TransferOffers partyId={partyId} onTransferAccepted={handleTransferAccepted} />

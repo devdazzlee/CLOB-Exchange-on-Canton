@@ -400,7 +400,7 @@ function PriceChart({
         }
 
         {/* Chart type toggles - Segmented Style */}
-        <div className="flex items-center gap-1 p-0.5 bg-[#0d1117] border border-[#2B3139] rounded-lg">
+        <div className="flex items-center gap-0.5 px-2 py-0.5 bg-[#0E1116] border border-[#2B3139] rounded-[20px]">
           {CHART_TYPES.map((type) => {
             const Icon = type.icon;
             return (
@@ -412,7 +412,7 @@ function PriceChart({
                   "p-1 rounded transition-all duration-200",
                   chartType === type.value
                     ? "bg-[#1e2329] text-[#F7B500] shadow-inner border border-[#3A4149]"
-                    : "text-[#848E9C] hover:text-white hover:bg-white/5"
+                    : "text-[#848E9C] hover:text-white hover:bg-white/5 border border-transparent"
                 )}
               >
                 <Icon className="w-3.5 h-3.5" />
@@ -422,7 +422,7 @@ function PriceChart({
         </div>
 
         {/* Time interval toggles - Segmented Style */}
-        <div className="flex items-center gap-1 p-0.5 bg-[#0d1117] border border-[#2B3139] rounded-lg">
+        <div className="flex items-center gap-0.5 px-2 py-0.5 bg-[#0E1116] border border-[#2B3139] rounded-[20px]">
           {TIME_INTERVALS.map((interval) => (
             <button
               key={interval.value}
@@ -431,7 +431,7 @@ function PriceChart({
                 "px-2 py-0.5 text-[10px] font-bold uppercase transition-all duration-200 rounded",
                 selectedInterval.value === interval.value
                   ? "bg-[#1e2329] text-[#F7B500] shadow-inner border border-[#3A4149]"
-                  : "text-[#848E9C] hover:text-white hover:bg-white/5"
+                  : "text-[#848E9C] hover:text-white hover:bg-white/5 border border-transparent"
               )}
             >
               {interval.displayLabel}

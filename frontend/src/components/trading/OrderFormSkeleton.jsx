@@ -49,11 +49,7 @@ export default function OrderFormSkeleton() {
           <Skeleton className="h-3 w-24" />
         </div>
         <Skeleton className="h-10 w-full" />
-        <div className="flex gap-2">
-          {[25, 50, 75, 100].map((percent) => (
-            <Skeleton key={percent} className="h-8 flex-1" />
-          ))}
-        </div>
+
       </div>
 
       {/* Order Summary */}

@@ -28,12 +28,12 @@ export default function RecentTrades({ trades, tradingPair, loading }) {
     .slice(0, 50);
 
   return (
-    <div className="flex flex-col h-full bg-[#0d1117]">
+    <div className="flex flex-col h-full bg-[#0E1116]">
       {/* Column headers - using Grid for perfect alignment */}
-      <div className="grid grid-cols-[1fr_85px_85px] items-center px-4 py-2.5 border-b border-[#21262d] flex-shrink-0 bg-[#161b22]/30">
-        <span className="text-[11px] text-[#848E9C] font-bold uppercase tracking-widest">Price</span>
-        <span className="text-right text-[11px] text-[#848E9C] font-bold uppercase tracking-widest">Amount</span>
-        <span className="text-right text-[11px] text-[#848E9C] font-bold uppercase tracking-widest">Time</span>
+      <div className="grid grid-cols-[1fr_85px_85px] items-center px-4 py-2 border-b border-[#21262d] flex-shrink-0 bg-transparent">
+        <span className="text-[11px] text-[#848E9C] font-semibold tracking-wide">Price</span>
+        <span className="text-right text-[11px] text-[#848E9C] font-semibold tracking-wide">Amount</span>
+        <span className="text-right text-[11px] text-[#848E9C] font-semibold tracking-wide">Time</span>
       </div>
 
       {loading ? (

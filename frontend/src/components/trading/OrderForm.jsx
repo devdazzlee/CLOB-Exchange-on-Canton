@@ -142,54 +142,51 @@ export default function OrderForm({
   };
 
   return (
-    <div className="flex flex-col bg-card h-full overflow-y-auto scrollbar-thin transition-all">
-      {/* Order Mode tabs - Professional Segmented Control */}
-      <div className="flex items-center gap-1 p-1 bg-[#0d1117] border border-[#2B3139] m-3 mb-2 rounded-xl w-fit flex-shrink-0 shadow-sm">
+    <div className="flex flex-col bg-[#0E1116] h-full overflow-y-auto scrollbar-thin transition-all">
+      {/* Order Mode tabs - Underline Tab Style Matching Reference */}
+      <div className="flex items-stretch border-b border-[#21262d] flex-shrink-0 bg-[#06080A]">
         {['MARKET', 'LIMIT', 'STOP_LOSS'].map(mode => (
           <button
             key={mode}
             type="button"
             onClick={() => onOrderModeChange({ target: { value: mode } })}
             className={cn(
-              "py-1.5 px-4 text-[10px] font-bold uppercase tracking-[1px] transition-all duration-200 rounded-lg whitespace-nowrap",
+              "flex-1 py-3.5 text-[14px] font-normal transition-all duration-200 relative",
               orderMode === mode 
-                ? "bg-[#2b3139] text-[#F7B500] border border-[#3A4149] shadow-inner" 
-                : "text-muted-foreground hover:bg-white/5 hover:text-white"
+                ? "bg-[#101418] text-white" 
+                : "text-[#B7BDC6] hover:text-white"
             )}
           >
-            {mode.replace('_', ' ')}
+            {mode === 'STOP_LOSS' ? 'Stop-Loss' : mode.charAt(0) + mode.slice(1).toLowerCase()}
+            {orderMode === mode && (
+              <span className="absolute bottom-[-1px] left-0 right-0 h-[3px] bg-[#626AEB] rounded-t-sm" />
+            )}
           </button>
         ))}
       </div>
 
-      {/* Buy / Sell Toggles */}
-      <div className="px-3 pb-3">
-        <div className="relative flex p-1 bg-[#161b22] rounded-xl border border-border">
-          <button
+      {/* Buy / Sell Toggles matching reference */}
+      <div className="flex border-b border-[#21262d]">
+         <button
             type="button"
             onClick={() => onOrderTypeChange({ target: { value: 'BUY' } })}
             className={cn(
-              "flex-1 py-2 text-xs font-bold rounded-lg transition-all duration-300 z-10",
-              orderType === 'BUY' 
-                ? "bg-[#0ECB81] text-white shadow-lg shadow-[#0ECB81]/20 ring-1 ring-white/10" 
-                : "text-muted-foreground hover:text-white"
+               "flex-1 py-[11px] text-[14px] font-normal transition-all duration-200",
+               orderType === 'BUY' ? "bg-[#126127] text-white" : "bg-transparent text-[#EAECEF] hover:bg-white/5"
             )}
-          >
+         >
             Buy
-          </button>
-          <button
+         </button>
+         <button
             type="button"
             onClick={() => onOrderTypeChange({ target: { value: 'SELL' } })}
             className={cn(
-              "flex-1 py-2 text-xs font-bold rounded-lg transition-all duration-300 z-10",
-              orderType === 'SELL' 
-                ? "bg-[#F6465D] text-white shadow-lg shadow-[#F6465D]/20 ring-1 ring-white/10" 
-                : "text-muted-foreground hover:text-white"
+               "flex-1 py-[11px] text-[14px] font-normal transition-all duration-200",
+               orderType === 'SELL' ? "bg-[#7A1A22] text-white" : "bg-transparent text-[#EAECEF] hover:bg-white/5"
             )}
-          >
+         >
             Sell
-          </button>
-        </div>
+         </button>
       </div>
 
 
@@ -213,190 +210,131 @@ export default function OrderForm({
         className="flex flex-col gap-0"
       >
         {/* Available section */}
-        <div className="flex items-center justify-between px-4 py-2 border-b border-[#21262d] bg-[#161b22]/30">
-          <span className="text-[#848E9C] text-[11px] uppercase font-bold tracking-tight">Available</span>
-          <span className="text-white text-[12px] font-mono font-bold">
+        <div className="flex items-center justify-between px-4 pt-3 pb-2">
+          <span className="text-[#848E9C] text-[12px] font-semibold">Available to Trade</span>
+          <span className="text-white text-[12px] font-mono">
             {orderType === 'BUY'
-              ? `${formatNumber(quoteBalance, 4)} ${quoteToken}`
-              : `${formatNumber(baseBalance, 8)} ${baseToken}`}
+              ? quoteBalance > 0 ? `${formatNumber(quoteBalance, 4)} ${quoteToken}` : '-'
+              : baseBalance > 0 ? `${formatNumber(baseBalance, 8)} ${baseToken}` : '-'}
           </span>
         </div>
 
         {/* Input Fields Container */}
-        <div className="p-3 space-y-3">
-          {/* Stop Price (if STOP_LOSS) */}
-          {orderMode === 'STOP_LOSS' && (
-            <div className="space-y-1.5 focus-within:translate-y-[-1px] transition-transform">
-              <label className="text-[11px] font-bold text-[#848E9C] uppercase ml-1 tracking-tight">Stop Price</label>
-              <div className="relative group">
-                <Input
-                  type="number"
-                  step="0.0001"
-                  value={stopPrice}
-                  onChange={(e) => setStopPrice(e.target.value)}
-                  placeholder="0.0000"
-                  className="bg-[#161b22] border-[#2B3139] focus:border-[#F7B500]/50 hover:border-[#4a4a5a] pr-12 font-mono h-11 text-[13px] font-bold"
-                />
-                <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[11px] text-[#848E9C] font-bold">{quoteToken}</span>
-              </div>
-            </div>
-          )}
-
-          {/* Limit Price */}
+        <div className="px-4 pb-3 space-y-2">
           {orderMode === 'LIMIT' && (
-            <div className="space-y-1.5 focus-within:translate-y-[-1px] transition-transform">
-              <div className="flex justify-between items-center ml-1">
-                <label className="text-[11px] font-bold text-[#848E9C] uppercase tracking-tight">Price</label>
-                {midPrice && (
-                  <button 
-                    type="button" 
-                    onClick={() => onPriceChange(midPrice.toFixed(4))}
-                    className="text-[10px] text-[#F7B500] hover:underline font-bold"
-                  >
-                    Set Mid
-                  </button>
-                )}
-              </div>
-              <div className="relative group">
-                <Input
-                  type="number"
-                  step="0.0001"
-                  value={price}
-                  onChange={(e) => onPriceChange(e.target.value)}
-                  placeholder={midPrice ? midPrice.toFixed(4) : "0.0000"}
-                  className="bg-[#161b22] border-[#2B3139] focus:border-[#F7B500]/50 hover:border-[#4a4a5a] pr-12 font-mono h-11 text-[13px] font-bold"
-                />
-                <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[11px] text-[#848E9C] font-bold">{quoteToken}</span>
-              </div>
+            <div className="flex flex-col gap-2">
+               <div className="flex items-center justify-between bg-[#131518] rounded-[6px] px-3 h-10 border border-[#1e2329] focus-within:border-[#2b3139] transition-colors">
+                 <span className="text-[#848E9C] text-[12px] whitespace-nowrap font-medium">Limit Price</span>
+                 <div className="flex items-center gap-1.5 flex-1 justify-end">
+                   <input
+                     type="number"
+                     step="0.0001"
+                     value={price}
+                     onChange={(e) => onPriceChange(e.target.value)}
+                     placeholder="0.00"
+                     className="bg-transparent text-white text-right text-[13px] font-mono font-medium w-full outline-none focus:ring-0 p-0 shadow-none border-none"
+                   />
+                   <button type="button" onClick={() => onPriceChange(midPrice?.toFixed(4) || '0')} className="text-[#626aeb] text-[12px] font-medium ml-1">Mid</button>
+                 </div>
+               </div>
             </div>
           )}
 
           {/* Amount Field */}
-          <div className="space-y-1.5 focus-within:translate-y-[-1px] transition-transform">
-            <label className="text-[11px] font-bold text-[#848E9C] uppercase ml-1 tracking-tight">Amount</label>
-            <div className="relative group">
-              <Input
-                type="number"
-                step="0.00000001"
-                value={quantity}
-                onChange={(e) => onQuantityChange(e.target.value)}
-                placeholder="0.00"
-                className="bg-[#161b22] border-[#2B3139] focus:border-[#F7B500]/50 hover:border-[#4a4a5a] pr-12 font-mono h-11 text-[13px] font-bold"
-              />
-              <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[11px] text-[#848E9C] font-bold">{baseToken}</span>
-            </div>
+          <div className="flex flex-col gap-2">
+             <div className="flex items-center justify-between bg-[#131518] rounded-[6px] px-3 h-10 border border-[#1e2329] focus-within:border-[#2b3139] transition-colors">
+               <span className="text-[#848E9C] text-[12px] whitespace-nowrap font-medium">Amount</span>
+               <div className="flex items-center gap-1.5 flex-1 justify-end">
+                 <input
+                   type="number"
+                   step="0.0001"
+                   value={quantity}
+                   onChange={(e) => onQuantityChange(e.target.value)}
+                   placeholder="0.00"
+                   className="bg-transparent text-[#697280] text-right text-[13px] font-mono font-medium w-full outline-none focus:ring-0 p-0 shadow-none border-none"
+                 />
+                  <div className="min-w-fit flex items-center pr-1 border-l border-[#21262d] pl-2 ml-2 h-5">
+                    <Select value={tradingPair} onValueChange={onTradingPairChange}>
+                      <SelectTrigger className="h-full bg-transparent border-0 ring-0 focus:ring-0 text-[#EAECEF] font-bold text-[12px] p-0 hover:bg-transparent shadow-none gap-1">
+                        <SelectValue>
+                          {baseToken}
+                        </SelectValue>
+                      </SelectTrigger>
+                      <SelectContent 
+                        align="end" 
+                        sideOffset={4} 
+                        collisionPadding={12} 
+                        className="bg-[#1e2329] border-[#2B3139] z-[100] min-w-[120px] shadow-2xl"
+                      >
+                        {availablePairs?.map(p => (
+                          <SelectItem key={p} value={p} className="text-[12px] font-semibold cursor-pointer focus:bg-[#2b3139]">
+                            {p.split('/')[0]}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+               </div>
+             </div>
           </div>
 
           {/* Percent Slider & Buttons */}
-          <div className="pt-2 space-y-4">
-            <div className="flex items-center gap-4">
-              <Slider 
-                min={0} 
-                max={100} 
-                step={1} 
-                value={sliderPct} 
-                onValueChange={handlePercentage}
-                className="flex-1 py-1"
-              />
-              <span className="text-xs font-bold text-white w-8 text-right font-mono">{sliderPct}%</span>
-            </div>
-            
-            <div className="grid grid-cols-4 gap-2">
-              {[25, 50, 75, 100].map(p => (
-                <Button
-                  key={p}
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => handlePercentage(p)}
-                  className={cn(
-                    "h-8 text-[11px] font-bold border-[#2B3139] bg-transparent hover:bg-[#F7B500]/10 hover:text-[#F7B500] hover:border-[#F7B500]/30 transition-all",
-                    sliderPct === p && "border-[#F7B500] text-[#F7B500] bg-[#F7B500]/10 shadow-[0_0_10px_rgba(247,181,0,0.1)]"
-                  )}
-                >
-                  {p}%
-                </Button>
-              ))}
-            </div>
+          <div className="pt-3 pb-1 flex items-center gap-4">
+             <div className="flex-1 relative h-6 flex items-center group cursor-pointer" onClick={(e) => {
+                 const rect = e.currentTarget.getBoundingClientRect();
+                 const pct = Math.round(Math.max(0, Math.min(100, ((e.clientX - rect.left) / rect.width) * 100)));
+                 handlePercentage([pct]);
+             }}>
+                 {/* Track Base */}
+                 <div className="absolute left-0 right-0 h-[3px] bg-[#1a1e24] rounded-sm" />
+                 {/* Stops */}
+                 {[0, 25, 50, 75, 100].map(pt => (
+                    <div key={pt} className="absolute h-2 w-px bg-[#2B3139]" style={{ left: `${pt}%` }} />
+                 ))}
+                 {/* Filled Progress */}
+                 <div className="absolute left-0 h-[3px] rounded-sm pointer-events-none" style={{ width: `${sliderPct}%`, backgroundColor: orderType === 'BUY' ? '#118a36' : '#d13c51' }} />
+                 {/* Thumb */}
+                 <div className="absolute w-[5px] h-[14px] rounded-[1px] transition-all -ml-[2px] pointer-events-none" style={{ left: `${sliderPct}%`, backgroundColor: orderType === 'BUY' ? '#21d167' : '#ff4f68' }} />
+             </div>
+             {/* Text Box */}
+             <div className="flex items-center justify-center gap-1.5 px-2 py-0.5 bg-[#131518] rounded-[4px] border border-[#21262d] min-w-[45px]">
+                <span className="text-white text-[12px] font-semibold">{Math.round(sliderPct)}</span>
+                <span className="text-white text-[12px] font-semibold">%</span>
+             </div>
           </div>
         </div>
 
         {/* Advanced Section */}
-        <div className="border-t border-[#21262d]">
+        <div className="px-4 pt-1 pb-4">
           <button
             type="button"
             onClick={() => setShowAdvanced(!showAdvanced)}
-            className="w-full flex items-center justify-between px-4 py-3 hover:bg-[#161b22]/50 transition-colors group"
+            className="flex items-center gap-1.5 mb-4 group"
           >
-            <span className="text-xs font-bold text-[#848E9C] group-hover:text-white uppercase tracking-wider">Advanced Options</span>
-            <ChevronDown className={cn("w-4 h-4 text-[#848E9C] transition-transform duration-300", showAdvanced && "rotate-180")} />
+            <span className="text-[12px] font-semibold text-white group-hover:text-[#EAECEF]">Advanced</span>
+            <ChevronDown className={cn("w-3 h-3 text-[#B7BDC6] transition-transform duration-300", showAdvanced && "rotate-180")} strokeWidth={3} />
           </button>
           
-          <AnimatePresence>
-            {showAdvanced && (
-              <motion.div 
-                initial={{ height: 0, opacity: 0 }}
-                animate={{ height: 'auto', opacity: 1 }}
-                exit={{ height: 0, opacity: 0 }}
-                className="overflow-hidden"
-              >
-                <div className="px-4 pb-4 space-y-4">
-                  <div className="space-y-1.5">
-                    <label className="text-[10px] font-bold text-[#848E9C] uppercase block ml-1">Time In Force</label>
-                    <Select value={timeInForce} onValueChange={setTimeInForce}>
-                      <SelectTrigger className="h-10 bg-[#161b22] border-[#2B3139] text-xs font-bold ring-0 focus:ring-0">
-                        <SelectValue placeholder="Select Time In Force" />
-                      </SelectTrigger>
-                      <SelectContent className="bg-[#1e2329] border-[#2B3139]">
-                        <SelectItem value="GTC" className="text-xs font-bold">GTC - Good Till Cancel</SelectItem>
-                        <SelectItem value="IOC" className="text-xs font-bold">IOC - Immediate Or Cancel</SelectItem>
-                        <SelectItem value="FOK" className="text-xs font-bold">FOK - Fill Or Kill</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="space-y-1.5">
-                      <label className="text-[10px] font-bold text-[#848E9C] uppercase block ml-1">Stop Loss</label>
-                      <Input
-                        type="number"
-                        step="0.01"
-                        value={stopLoss}
-                        onChange={(e) => setStopLoss(e.target.value)}
-                        placeholder="Price"
-                        className="h-10 bg-[#161b22] border-[#2B3139] text-xs font-mono font-bold"
-                      />
-                    </div>
-                    <div className="space-y-1.5">
-                      <label className="text-[10px] font-bold text-[#848E9C] uppercase block ml-1">Take Profit</label>
-                      <Input
-                        type="number"
-                        step="0.01"
-                        value={takeProfit}
-                        onChange={(e) => setTakeProfit(e.target.value)}
-                        placeholder="Price"
-                        className="h-10 bg-[#161b22] border-[#2B3139] text-xs font-mono font-bold"
-                      />
-                    </div>
-                  </div>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </div>
-
-        {/* Order Info Summary */}
-        <div className="mx-3 my-2 p-3 rounded-lg bg-[#161b22]/50 border border-[#21262d] space-y-1.5">
-          <div className="flex justify-between text-[11px]">
-            <span className="text-[#848E9C]">Est. Order Value</span>
-            <span className="text-white font-mono font-bold">
-              {estimatedCost ? `${estimatedCost.toFixed(2)} ${quoteToken}` : '0.00'}
-            </span>
-          </div>
-          <div className="flex justify-between text-[11px]">
-            <span className="text-[#848E9C]">Trading Fee</span>
-            <span className="text-[#848E9C] font-bold tracking-tighter italic">0% Maker / 0.1% Taker</span>
-          </div>
+          {showAdvanced && (
+            <div className="space-y-1.5 pr-2">
+               <div className="flex justify-between items-center text-[12px]">
+                  <span className="text-[#848E9C] font-medium">Order Size</span>
+                  <span className="text-[#EAECEF] font-medium">-</span>
+               </div>
+               <div className="flex justify-between items-center text-[12px]">
+                  <span className="text-[#848E9C] font-medium">Order Value</span>
+                  <span className="text-[#EAECEF] font-medium">-</span>
+               </div>
+               <div className="flex justify-between items-center text-[12px]">
+                  <span className="text-[#848E9C] font-medium">Limit Price</span>
+                  <span className="text-white font-mono font-medium">{price || '-'}</span>
+               </div>
+               <div className="flex justify-between items-center text-[12px]">
+                  <span className="text-[#848E9C] font-medium">Fees</span>
+                  <span className="text-white font-medium text-[11px]">Taker: 0% <span className="text-[#848E9C] mx-0.5">|</span> Maker: 0%</span>
+               </div>
+            </div>
+          )}
         </div>
 
         {/* Validation Errors */}
@@ -419,28 +357,24 @@ export default function OrderForm({
         </AnimatePresence>
 
         {/* Submission Button */}
-        <div className="p-3 pt-0">
+        <div className="px-4 pb-4 pt-1 mt-auto">
           <Button
             type="submit"
             disabled={loading || !validation.isValid}
             className={cn(
-              "w-full h-12 text-sm font-black transition-all duration-300 shadow-xl active:scale-[0.98] border border-white/5",
+              "w-full h-12 rounded-[10px] text-[15px] font-normal transition-all duration-300",
               orderType === 'BUY'
-                ? "bg-[#0ECB81] hover:bg-[#0fdc8c] text-white shadow-[#0ECB81]/10"
-                : "bg-[#F6465D] hover:bg-[#ff5169] text-white shadow-[#F6465D]/10"
+                ? "bg-[#0A5F20] hover:bg-[#0e7529] text-white border border-[#20c25a]/10"
+                : "bg-[#7A1A22] hover:bg-[#96202a] text-white border border-[#e84153]/10"
             )}
           >
             {loading ? (
               <span className="flex items-center justify-center gap-2">
                 <Loader2 className="w-4 h-4 animate-spin" />
-                {orderMode === 'STOP_LOSS' ? 'STAKING...' : 'PLACING...'}
+                Processing
               </span>
             ) : (
-              <span className="uppercase tracking-[2px]">
-                {orderMode === 'STOP_LOSS' 
-                  ? `Set Stop-Loss ${orderType}` 
-                  : `${orderType} ${baseToken}`}
-              </span>
+              <span>{orderType === 'BUY' ? 'Buy' : 'Sell'}</span>
             )}
           </Button>
         </div>

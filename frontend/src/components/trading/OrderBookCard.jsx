@@ -14,7 +14,9 @@ export default function OrderBookCard({
   orderBook, 
   loading, 
   onRefresh,
-  userOrders = []
+  userOrders = [],
+  availablePairs = [],
+  onTradingPairChange
 }) {
   const [viewMode, setViewMode] = useState('both'); // 'both', 'sell', 'buy'
   const [aggregation, setAggregation] = useState('0.001');
@@ -105,56 +107,64 @@ export default function OrderBookCard({
   const displayBuys = viewMode === 'sell' ? [] : (viewMode === 'buy' ? buyOrdersWithDepth : buyOrdersWithDepth.slice(0, 15));
 
   return (
-    <div className="flex flex-col h-full bg-card overflow-hidden">
-      {/* Top Filter Controls - Segmented Style */}
-      <div className="flex items-center justify-between px-3 py-1.5 border-b border-border/50 bg-[#0d1117]/50 flex-shrink-0">
-        <div className="flex items-center gap-1 py-0.5 px-2 bg-[#0d1117] border border-[#2B3139] rounded-lg">
-          <button 
-            onClick={() => setViewMode('sell')}
-            className={cn(
-              "p-1.5 rounded transition-all duration-200", 
-              viewMode === 'sell' 
-                ? "bg-[#2b3139] text-[#f84962] border border-[#3A4149] shadow-inner" 
-                : "text-muted-foreground hover:bg-white/5 hover:text-white"
-            )}
-            title="Sell Orders Only"
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" strokeWidth="1"><rect x="3" y="3" width="18" height="6" rx="1"/><rect x="3" y="15" width="18" height="6" rx="1" opacity="0.3"/></svg>
-          </button>
+    <div className="flex flex-col h-full bg-[#0E1116] overflow-hidden">
+      {/* Top Filter Controls - Matching Reference */}
+      <div className="flex items-center justify-between px-3 py-2 bg-[#0A0D10] border-b border-[#21262d] flex-shrink-0">
+        <div className="flex items-center gap-2">
+          {/* Layout Buttons (custom icons imitating the image) */}
           <button 
             onClick={() => setViewMode('both')}
-            className={cn(
-              "p-1.5 rounded transition-all duration-200", 
-              viewMode === 'both' 
-                ? "bg-[#2b3139] text-white border border-[#3A4149] shadow-inner" 
-                : "text-muted-foreground hover:bg-white/5 hover:text-white"
-            )}
-            title="Both Sides"
+            className={cn("p-1.5 rounded transition-all flex flex-col gap-[2px] items-center justify-center", viewMode === 'both' ? "bg-[#21262d]" : "hover:bg-[#1e2329]")}
           >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" strokeWidth="1"><rect x="3" y="3" width="18" height="6" rx="1"/><rect x="3" y="15" width="18" height="6" rx="1"/></svg>
+            <div className="w-3 h-1 bg-[#F6465D] rounded-sm" />
+            <div className="w-3 h-1 bg-[#0ECB81] rounded-sm" />
+          </button>
+          <button 
+            onClick={() => setViewMode('sell')}
+            className={cn("p-1.5 rounded transition-all flex flex-col gap-[2px] items-center justify-center", viewMode === 'sell' ? "bg-[#21262d]" : "hover:bg-[#1e2329]")}
+          >
+            <div className="w-3 h-1 bg-[#F6465D] rounded-sm" />
+            <div className="w-3 h-1 bg-[#F6465D] rounded-sm" />
           </button>
           <button 
             onClick={() => setViewMode('buy')}
-            className={cn(
-              "p-1.5 rounded transition-all duration-200", 
-              viewMode === 'buy' 
-                ? "bg-[#2b3139] text-[#00b07b] border border-[#3A4149] shadow-inner" 
-                : "text-muted-foreground hover:bg-white/5 hover:text-white"
-            )}
-            title="Buy Orders Only"
+            className={cn("p-1.5 rounded transition-all flex flex-col gap-[2px] items-center justify-center", viewMode === 'buy' ? "bg-[#21262d]" : "hover:bg-[#1e2329]")}
           >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" strokeWidth="1"><rect x="3" y="3" width="18" height="6" rx="1" opacity="0.3"/><rect x="3" y="15" width="18" height="6" rx="1"/></svg>
+            <div className="w-3 h-1 bg-[#0ECB81] rounded-sm" />
+            <div className="w-3 h-1 bg-[#0ECB81] rounded-sm" />
           </button>
         </div>
-        <div className="flex items-center gap-2">
-          <span className="text-[10px] text-[#848E9C] font-bold uppercase tracking-widest hidden sm:inline">Aggregation</span>
-          <div className="w-[80px] sm:w-[90px] relative z-[60]">
+        
+         <div className="flex items-center gap-3">
+           {/* Pair Select - Functional */}
+           <div className="min-w-fit relative z-[60]">
+              <Select value={tradingPair} onValueChange={onTradingPairChange}>
+                 <SelectTrigger className="h-7 w-full bg-transparent border-0 hover:bg-[#1e2329] text-[11px] font-bold px-1 rounded-md shadow-none focus:ring-0 gap-1 text-[#848E9C] hover:text-white transition-colors">
+                    <SelectValue>
+                       {tradingPair.split('/')[0] || 'LIT'}
+                    </SelectValue>
+                 </SelectTrigger>
+                 <SelectContent 
+                   sideOffset={4} 
+                   collisionPadding={12} 
+                   className="bg-[#1e2329] border-[#2B3139] min-w-[120px] shadow-2xl"
+                 >
+                   {availablePairs?.map(p => (
+                     <SelectItem key={p} value={p} className="text-[11px] font-bold cursor-pointer focus:bg-[#2b3139]">
+                       {p.split('/')[0]}
+                     </SelectItem>
+                   ))}
+                 </SelectContent>
+              </Select>
+           </div>
+           {/* Aggregation Select */}
+           <div className="w-[82px] relative z-[60]">
              <Select value={aggregation} onValueChange={setAggregation}>
-                <SelectTrigger className="h-7 w-full bg-[#1e2329] border-[#F7B500] hover:border-[#F7B500] text-[11px] font-bold rounded-full px-2 shadow-sm">
-                   <SelectValue placeholder="Precision" />
+                <SelectTrigger className="h-7 w-full bg-transparent border-0 hover:bg-[#1e2329] text-[11px] font-bold px-2 rounded-md shadow-none focus:ring-0 gap-1">
+                   <SelectValue placeholder="Prec" />
                 </SelectTrigger>
                 <SelectContent className="bg-[#1e2329] border-[#2B3139]">
-                  {['0.001', '0.01', '0.1', '1', '10', '50', '100'].map(val => (
+                  {['0.0001', '0.001', '0.01', '0.1', '1', '10'].map(val => (
                     <SelectItem key={val} value={val} className="text-[11px] font-bold">{val}</SelectItem>
                   ))}
                 </SelectContent>
@@ -164,86 +174,83 @@ export default function OrderBookCard({
       </div>
 
       {/* Column headers */}
-      <div className="flex items-center px-4 py-2 border-b border-border/50 bg-[#161b22]/50 flex-shrink-0">
-        <span className="flex-1 text-[11px] text-[#848E9C] font-bold uppercase tracking-widest">Price</span>
-        <span className="w-24 text-right text-[11px] text-[#848E9C] font-bold uppercase tracking-widest">Quantity</span>
-        <span className="w-24 text-right text-[11px] text-[#848E9C] font-bold uppercase tracking-widest">Total</span>
+      <div className="flex items-center px-4 py-2 border-b border-[#21262d] bg-[#0E1116] flex-shrink-0">
+        <span className="flex-1 text-[11px] text-[#848E9C] font-semibold tracking-wide">Price</span>
+        <div className="w-24 text-right flex items-center justify-end gap-1.5">
+          <span className="text-[11px] text-[#848E9C] font-semibold tracking-wide">Size</span>
+          <span className="text-[9px] text-[#848E9C] bg-[#1e2329] border border-[#2B3139] px-1 rounded font-bold">{tradingPair.split('/')[0] || 'LIT'}</span>
+        </div>
+        <span className="w-24 text-right text-[11px] text-[#848E9C] font-semibold tracking-wide">Total</span>
       </div>
 
       {loading ? (
         <div className="flex-1 flex items-center justify-center">
-          <Loader2 className="w-5 h-5 animate-spin text-primary" />
+          <Loader2 className="w-5 h-5 animate-spin text-[#F7B500]" />
         </div>
       ) : (
-        <div className="flex-1 flex flex-col overflow-hidden">
+        <div className="flex-1 flex flex-col overflow-hidden bg-[#0a0d10]">
           {/* Sell orders (red) */}
           <div className={cn("overflow-y-auto flex flex-col justify-end min-h-0 custom-scrollbar", viewMode === 'both' ? 'flex-1' : viewMode === 'sell' ? 'flex-[2]' : 'hidden')}>
             {displaySells.length > 0 ? displaySells.map((order, i) => {
               const depthPercent = maxDepth > 0 ? (order.cumulative / maxDepth) * 100 : 0;
-              const myInfo = getMyInfo(order.price, 'SELL');
               const priceNum = parseFloat(order.price);
               const qty = order.remaining;
               const total = priceNum * qty;
               return (
                 <div
                   key={i}
-                  className="flex items-center px-4 py-[5px] hover:bg-red-500/5 cursor-pointer relative group transition-colors"
-                  style={{ background: `linear-gradient(to left, rgba(248,73,96,0.12) ${depthPercent}%, transparent ${depthPercent}%)` }}
+                  className="flex items-center px-4 py-[3px] hover:bg-[#F6465D]/10 cursor-pointer relative"
+                  style={{ background: `linear-gradient(to right, rgba(246,70,93,0.15) ${depthPercent}%, transparent ${depthPercent}%)` }}
                 >
-                  <span className={cn("flex-1 text-[13px] font-mono font-bold", myInfo ? "text-primary" : "text-[#f84962]")}>
+                  <span className="flex-1 text-[12px] font-mono font-medium text-[#F6465D]">
                     {priceNum.toFixed(aggregation.includes('.') ? aggregation.split('.')[1].length : 0)}
-                    {myInfo && <span className="ml-1 text-[10px] text-primary">●</span>}
                   </span>
-                  <span className="w-24 text-right text-[13px] font-mono text-white font-medium">{qty.toFixed(4)}</span>
-                  <span className="w-24 text-right text-[13px] font-mono text-[#848E9C]">
-                    {total.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                  <span className="w-24 text-right text-[12px] font-mono text-[#EAECEF] font-medium">{qty.toFixed(2)}</span>
+                  <span className="w-24 text-right text-[12px] font-mono text-[#B7BDC6]">
+                    {total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                   </span>
                 </div>
               );
             }) : (
-              <div className="py-8 text-center text-muted-foreground text-xs font-medium italic">No sell orders</div>
+              <div className="py-8 text-center text-[#848E9C] text-xs font-medium">No sell orders</div>
             )}
           </div>
 
           {/* Spread Bar */}
-          <div className="flex items-center px-4 py-2 bg-[#161b22] border-y border-border/80 flex-shrink-0">
-            <div className="flex-1 flex items-baseline gap-2">
-               <span className={`text-[14px] font-bold font-mono ${spread > 0 ? 'text-white' : 'text-muted-foreground/50'}`}>
-                {spread.toFixed(4)}
-               </span>
-               <span className="text-[10px] text-[#848E9C] font-bold uppercase tracking-tight">Spread</span>
-            </div>
-            <div className="text-[11px] text-[#00b07b] font-bold bg-[#00b07b]/10 px-2 py-0.5 rounded border border-[#00b07b]/20">
+          <div className="flex items-center px-4 py-[5px] bg-[#161a20] border-y border-[#21262d] flex-shrink-0">
+            <span className={`flex-1 text-[13px] font-bold font-mono ${spread > 0 ? 'text-white' : 'text-[#848E9C]'}`}>
+              {spread.toFixed(4)}
+            </span>
+            <span className="w-24 text-center text-[11px] text-[#848E9C] font-semibold">Spread</span>
+            <span className="w-24 text-right text-[12px] text-white font-bold font-mono">
               {spreadPercent.toFixed(3)}%
-            </div>
+            </span>
           </div>
 
           {/* Buy orders (green) */}
           <div className={cn("overflow-y-auto min-h-0 custom-scrollbar", viewMode === 'both' ? 'flex-1' : viewMode === 'buy' ? 'flex-[2]' : 'hidden')}>
             {displayBuys.length > 0 ? displayBuys.map((order, i) => {
               const depthPercent = maxDepth > 0 ? (order.cumulative / maxDepth) * 100 : 0;
-              const myInfo = getMyInfo(order.price, 'BUY');
               const priceNum = parseFloat(order.price);
               const qty = order.remaining;
               const total = priceNum * qty;
               return (
                 <div
                   key={i}
-                  className="flex items-center px-4 py-[5px] hover:bg-green-500/5 cursor-pointer relative group transition-colors"
-                  style={{ background: `linear-gradient(to left, rgba(0,176,123,0.12) ${depthPercent}%, transparent ${depthPercent}%)` }}
+                  className="flex items-center px-4 py-[3px] hover:bg-[#0ECB81]/10 cursor-pointer relative"
+                  style={{ background: `linear-gradient(to right, rgba(14,203,129,0.15) ${depthPercent}%, transparent ${depthPercent}%)` }}
                 >
-                  <span className={cn("flex-1 text-[13px] font-mono font-bold", myInfo ? "text-primary" : "text-[#00b07b]")}>
+                  <span className="flex-1 text-[12px] font-mono font-medium text-[#0ECB81]">
                     {priceNum.toFixed(aggregation.includes('.') ? aggregation.split('.')[1].length : 0)}
-                    {myInfo && <span className="ml-1 text-[10px] text-primary">●</span>}
                   </span>
-                  <span className="w-24 text-right text-[13px] font-mono text-white font-medium">{qty.toFixed(4)}</span>
-                  <span className="w-24 text-right text-[13px] font-mono text-[#848E9C]">
-                    {total.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                  <span className="w-24 text-right text-[12px] font-mono text-[#EAECEF] font-medium">{qty.toFixed(2)}</span>
+                  <span className="w-24 text-right text-[12px] font-mono text-[#B7BDC6]">
+                    {total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                   </span>
                 </div>
               );
             }) : (
-              <div className="py-8 text-center text-muted-foreground text-xs font-medium italic">No buy orders</div>
+              <div className="py-8 text-center text-[#848E9C] text-xs font-medium">No buy orders</div>
             )}
           </div>
         </div>
