@@ -968,7 +968,11 @@ class MatchingEngine {
     }
     console.log(`[MatchingEngine]    ✅ Signing keys retrieved for both parties`);
 
-    const adminToken = await tokenProvider.getServiceToken();
+    // Service token: operator-only hub query/create (submit-and-wait as venue).
+    // Executor OAuth: same as order execute-place / AutoAccept — interactive prepare+execute for ext parties.
+    tokenProvider.assertExecutorOauthConfigured();
+    const serviceToken = await tokenProvider.getServiceToken();
+    const interactiveLedgerToken = await tokenProvider.getExecutorToken();
     const updateIds = [];
 
     // ═══ SETTLEMENT: Execute_DvP — Operator-Only Regular Submission (TX 2) ═══
@@ -1042,7 +1046,7 @@ class MatchingEngine {
     let hubPayload = null;
     const hubTemplateId = `${packageId}:Settlement:ExchangeSettlerHub`;
     try {
-      let hubs = await cantonService.queryActiveContracts({ party: operatorPartyId, templateIds: [hubTemplateId] }, adminToken);
+      let hubs = await cantonService.queryActiveContracts({ party: operatorPartyId, templateIds: [hubTemplateId] }, serviceToken);
       if (hubs && hubs.length > 0) {
           settleHubCid = hubs[0].contractId;
           hubPayload = hubs[0];
@@ -1051,7 +1055,7 @@ class MatchingEngine {
       if (!settleHubCid) {
         console.log(`[MatchingEngine]    Creating ExchangeSettlerHub...`);
         const res = await cantonService.createContract({
-          token: adminToken,
+          token: serviceToken,
           actAsParty: operatorPartyId,
           templateId: hubTemplateId,
           createArguments: { operator: operatorPartyId, createdAt: new Date().toISOString() },
@@ -1071,7 +1075,7 @@ class MatchingEngine {
         if (!settleHubCid) settleHubCid = res?.updateId; // Fallback
         
         // Query again to get the createdEventBlob for disclosedContracts
-        hubs = await cantonService.queryActiveContracts({ party: operatorPartyId, templateIds: [hubTemplateId] }, adminToken);
+        hubs = await cantonService.queryActiveContracts({ party: operatorPartyId, templateIds: [hubTemplateId] }, serviceToken);
         if (hubs && hubs.length > 0) {
             settleHubCid = hubs[0].contractId;
             hubPayload = hubs[0];
@@ -1137,7 +1141,7 @@ class MatchingEngine {
     console.log(`[MatchingEngine]    Preparing interactive settlement: actAs=[seller, buyer]`);
 
     const settlePrep = await cantonService.prepareInteractiveSubmission({
-      token: adminToken,
+      token: interactiveLedgerToken,
       actAsParty: [sellOrder.owner, buyOrder.owner],
       commands: settlementCommands,
       readAs: [sellOrder.owner, buyOrder.owner],
@@ -1178,11 +1182,11 @@ class MatchingEngine {
         ],
       },
       hashingSchemeVersion: settlePrep.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
-    }, adminToken);
+    }, interactiveLedgerToken);
 
     const settleUpdateId = settleResult?.transaction?.updateId || settleResult?.updateId;
     if (settleUpdateId) updateIds.push({ step: 'settle-dvp-fill-trade', updateId: settleUpdateId });
-    console.log(`[MatchingEngine]    ✅ Execute_DvP + FillOrder + Trade ALL in ONE TX — actAs=[operator,seller,buyer] interactive (updateId: ${settleUpdateId || 'N/A'})`);
+    console.log(`[MatchingEngine]    ✅ Settlement TX committed — interactive actAs=[seller,buyer], executor OAuth (updateId: ${settleUpdateId || 'N/A'})`);
 
     // Extract Trade contract ID from the transaction events
     let tradeContractId = null;

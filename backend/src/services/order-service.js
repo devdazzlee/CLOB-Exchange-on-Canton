@@ -213,20 +213,8 @@ class OrderService {
     console.log('[OrderService] Initialized with Canton JSON API v2 + Allocation-based settlement');
   }
 
-  /**
-   * Interactive prepare/execute must use the executor OAuth client — the same Keycloak client
-   * that onboarding grants CanActAs / submission rights for external parties (see AutoAccept).
-   * Without EXECUTOR_CLIENT_ID / EXECUTOR_CLIENT_SECRET, getExecutorToken() falls back to the
-   * service client and Canton returns 403 (masked as "security-sensitive") on execute.
-   */
   _assertExecutorOauthConfigured() {
-    const { clientId, clientSecret } = config.canton.executorOauth || {};
-    if (!String(clientId || '').trim() || !String(clientSecret || '').trim()) {
-      throw new Error(
-        'Configure EXECUTOR_CLIENT_ID and EXECUTOR_CLIENT_SECRET (executor OAuth). ' +
-        'They must match the client used when granting ledger rights to external parties at onboarding.'
-      );
-    }
+    tokenProvider.assertExecutorOauthConfigured();
   }
 
   _templateIdToString(templateId) {

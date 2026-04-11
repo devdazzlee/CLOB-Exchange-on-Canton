@@ -64,6 +64,21 @@ class TokenProvider {
     }
 
     /**
+     * Interactive prepare/execute for external parties must use getExecutorToken(). Without
+     * EXECUTOR_CLIENT_ID / EXECUTOR_CLIENT_SECRET, fetchExecutorToken falls back to the service
+     * client and Canton returns 403 on execute (often masked as "security-sensitive").
+     */
+    assertExecutorOauthConfigured() {
+        const { clientId, clientSecret } = config.canton.executorOauth || {};
+        if (!String(clientId || '').trim() || !String(clientSecret || '').trim()) {
+            throw new Error(
+                'Configure EXECUTOR_CLIENT_ID and EXECUTOR_CLIENT_SECRET (executor OAuth). ' +
+                'They must match the client used when granting ledger rights to external parties at onboarding.'
+            );
+        }
+    }
+
+    /**
      * Check if a cached token is expired (with skew)
      */
     isExpired(expiresAt) {
