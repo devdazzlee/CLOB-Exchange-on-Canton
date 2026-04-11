@@ -1,0 +1,766 @@
+-- | Settlement.daml - Delivery vs Payment (DvP) atomic settlement
+--
+-- This enables atomic swaps: buyer gets tokens, seller gets payment,
+-- or the entire transaction rolls back. No partial state.
+--
+-- Flow:
+--   1. Matching engine finds crossing orders
+--   2. Creates SettlementInstruction with both locked Holdings
+--   3. Operator executes settlement atomically
+--   4. Holdings are transferred, Trade contract created
+--
+-- AllocationRecord:
+--   Fallback for when the Splice Allocation Factory API is unavailable.
+--   Tracks locked funds on the CLOB exchange's own Canton contracts.
+--   Primary path uses the SDK's Allocation Factory; this is the direct fallback.
+--
+module Settlement where
+
+import Instrument (InstrumentId)
+import Holding
+import DA.Action (when)
+import Splice.Api.Token.AllocationV1 (Allocation, Allocation_ExecuteTransfer(..), Allocation_ExecuteTransferResult, Allocation_Withdraw(..), Allocation_WithdrawResult, AllocationSpecification(..), SettlementInfo(..), TransferLeg(..))
+import Splice.Api.Token.AllocationInstructionV1 (AllocationFactory, AllocationFactory_Allocate(..), AllocationInstructionResult(..), AllocationInstructionResult_Output(..))
+import Splice.Api.Token.MetadataV1 (ExtraArgs)
+import qualified Order as OrderModule
+
+-- | Settlement status
+data SettlementStatus 
+  = SettlementPending
+  | SettlementExecuted
+  | SettlementFailed Text
+  | SettlementCancelled
+  deriving (Eq, Show)
+
+-- | Allocation status for AllocationRecord
+data AllocationStatus
+  = AllocationPending     -- Funds locked, awaiting match
+  | AllocationExecuted    -- Match found, funds transferred
+  | AllocationCancelled   -- Order cancelled, funds returned
+  deriving (Eq, Show)
+
+-- | Settlement leg - one side of the trade
+data SettlementLeg = SettlementLeg
+  with
+    party : Party
+    instrumentId : InstrumentId
+    amount : Decimal
+    holdingCid : ContractId Holding
+  deriving (Eq, Show)
+
+-- | SettlementInstruction - Pending atomic settlement
+--
+-- Created by matching engine when orders cross.
+-- Holds references to both parties' locked holdings.
+template SettlementInstruction
+  with
+    operator : Party
+    buyer : Party
+    seller : Party
+    baseInstrumentId : InstrumentId     -- What's being bought (e.g., cBTC)
+    quoteInstrumentId : InstrumentId    -- What's being paid (e.g., USDT)
+    baseAmount : Decimal                 -- Amount of base (e.g., 0.5 BTC)
+    quoteAmount : Decimal                -- Amount of quote (e.g., 25,000 USDT)
+    price : Decimal                      -- Trade price
+    buyerHoldingCid : ContractId Holding  -- Buyer's locked USDT
+    sellerHoldingCid : ContractId Holding -- Seller's locked BTC
+    buyOrderId : Text
+    sellOrderId : Text
+    timestamp : Time
+    status : SettlementStatus
+  where
+    signatory operator
+    observer buyer, seller
+
+    -- Execute the settlement atomically
+    choice Settlement_Execute : (ContractId Holding, ContractId Holding, ContractId Trade)
+      controller operator
+      do
+        -- Fetch both holdings to verify they exist and are locked
+        buyerHolding <- fetch buyerHoldingCid
+        sellerHolding <- fetch sellerHoldingCid
+        
+        -- Verify holdings are properly locked
+        assertMsg "Buyer holding not locked" (buyerHolding.lock /= None)
+        assertMsg "Seller holding not locked" (sellerHolding.lock /= None)
+        
+        -- Verify amounts match
+        assertMsg "Buyer holding insufficient" (buyerHolding.amount >= quoteAmount)
+        assertMsg "Seller holding insufficient" (sellerHolding.amount >= baseAmount)
+        
+        -- Execute atomic swap:
+        -- 1. Transfer base (e.g., BTC) from seller to buyer
+        -- 2. Transfer quote (e.g., USDT) from buyer to seller
+        
+        -- Archive old holdings
+        archive buyerHoldingCid
+        archive sellerHoldingCid
+        
+        -- Create new holdings for buyer (receives base token)
+        buyerNewHolding <- create Holding with
+          owner = buyer
+          instrumentId = baseInstrumentId
+          amount = baseAmount
+          lock = None
+          custodian = operator
+        
+        -- Create new holdings for seller (receives quote token)
+        sellerNewHolding <- create Holding with
+          owner = seller
+          instrumentId = quoteInstrumentId
+          amount = quoteAmount
+          lock = None
+          custodian = operator
+        
+        -- Handle any remainder (partial fills)
+        -- If buyer had more locked than needed, return change
+        when (buyerHolding.amount > quoteAmount) do
+          _ <- create Holding with
+            owner = buyer
+            instrumentId = quoteInstrumentId
+            amount = buyerHolding.amount - quoteAmount
+            lock = None
+            custodian = operator
+          return ()
+        
+        -- If seller had more locked than needed, return change
+        when (sellerHolding.amount > baseAmount) do
+          _ <- create Holding with
+            owner = seller
+            instrumentId = baseInstrumentId
+            amount = sellerHolding.amount - baseAmount
+            lock = None
+            custodian = operator
+          return ()
+        
+        -- Create trade record
+        trade <- create Trade with
+          tradeId = buyOrderId <> "-" <> sellOrderId <> "-" <> show timestamp
+          operator = operator
+          buyer = buyer
+          seller = seller
+          baseInstrumentId = baseInstrumentId
+          quoteInstrumentId = quoteInstrumentId
+          baseAmount = baseAmount
+          quoteAmount = quoteAmount
+          price = price
+          buyOrderId = buyOrderId
+          sellOrderId = sellOrderId
+          timestamp = timestamp
+        
+        return (buyerNewHolding, sellerNewHolding, trade)
+
+    -- Cancel settlement (returns locked funds)
+    choice Settlement_Cancel : ()
+      with
+        reason : Text
+      controller operator
+      do
+        -- Unlock both holdings
+        buyerHolding <- fetch buyerHoldingCid
+        sellerHolding <- fetch sellerHoldingCid
+        
+        archive buyerHoldingCid
+        archive sellerHoldingCid
+        
+        -- Return unlocked holdings
+        _ <- create buyerHolding with lock = None
+        _ <- create sellerHolding with lock = None
+        
+        return ()
+
+-- | Trade - Record of an executed trade
+-- 
+-- ACS Optimization: Trade contracts remain active for history queries.
+-- The operator can archive old trades via ArchiveTrade to keep the
+-- Active Contract Set lean. Archived trades should first be persisted
+-- to the file-backed cache (cantonUpdateStream.js) before archival.
+template Trade
+  with
+    tradeId : Text
+    operator : Party
+    buyer : Party
+    seller : Party
+    baseInstrumentId : InstrumentId
+    quoteInstrumentId : InstrumentId
+    baseAmount : Decimal
+    quoteAmount : Decimal
+    price : Decimal
+    buyOrderId : Text
+    sellOrderId : Text
+    timestamp : Time
+  where
+    signatory operator
+    observer buyer, seller
+
+    -- Archive this trade record to free ACS space.
+    -- Call ONLY after the trade has been persisted to off-ledger storage
+    -- (file cache, database, etc.) to avoid data loss.
+    choice ArchiveTrade : ()
+      controller operator
+      do return ()
+
+-- | Batch settlement for multiple trades
+template BatchSettlement
+  with
+    operator : Party
+    settlements : [ContractId SettlementInstruction]
+    timestamp : Time
+  where
+    signatory operator
+
+    -- Execute all settlements atomically
+    choice BatchSettlement_Execute : [ContractId Trade]
+      controller operator
+      do
+        -- Execute each settlement
+        results <- forA settlements \settlementCid -> do
+          (_, _, tradeCid) <- exercise settlementCid Settlement_Execute
+          return tradeCid
+        return results
+
+
+-- =============================================================================
+-- EXCHANGE ALLOCATION — Propose-Accept Pattern for External Parties
+-- =============================================================================
+--
+-- Solves the Canton protocol limitation:
+--   "Only transactions requiring authorization from a single party are supported"
+--   for external parties.
+--
+-- The Splice DvpLegAllocation contract requires BOTH operator AND external party
+-- to co-authorize Allocation_ExecuteTransfer. Canton cannot do this when one
+-- party is external (hosted as CPN, not SPN).
+--
+-- PROPOSE-ACCEPT PATTERN:
+--   Step 1 (PROPOSE): External party creates ExchangeAllocation at ORDER TIME.
+--     → Single-party tx by external party (user signs via interactive submission).
+--     → User's consent is embedded on-chain as the contract's signatory.
+--
+--   Step 2 (ACCEPT): Operator exercises Execute_Settlement at MATCH TIME.
+--     → Single-party tx by operator (non-interactive, Keycloak token).
+--     → Operator is the controller. Owner's authorization carries forward from
+--       being signatory of the consumed contract (DAML authorization rule).
+--     → NO external party key needed at settlement.
+--
+-- This replaces:
+--   - Splice AllocationFactory_Allocate + DvpLegAllocation (broken for ext parties)
+--   - AllocationRecord (operator-only signatory, no user consent on-chain)
+--
+-- @see https://docs.digitalasset.com/build/3.4/sdlc-howtos/smart-contracts/develop/patterns/propose-accept.html
+--
+template ExchangeAllocation
+  with
+    allocationId : Text       -- Unique allocation ID (e.g., "alloc-order-123")
+    orderId : Text            -- The exchange order this allocation belongs to
+    owner : Party             -- The order placer (external party) — SIGNATORY
+    executor : Party          -- The exchange operator — CONTROLLER of Execute
+    amount : Decimal          -- Amount locked/committed
+    instrumentSymbol : Text   -- Token symbol (e.g., "CC", "CBTC")
+    side : Text               -- "BUY" or "SELL"
+    tradingPair : Text        -- e.g., "CC/CBTC"
+    status : Text             -- "PENDING", "EXECUTED", "CANCELLED"
+    createdAt : Text          -- ISO timestamp
+  where
+    -- CRITICAL: owner (external party) is the SOLE signatory.
+    -- This means the external party can create this contract alone (single-party tx).
+    -- The operator's authorization is NOT needed at creation time.
+    signatory owner
+    observer executor
+
+    -- Execute the settlement at MATCH TIME.
+    --
+    -- The operator (executor) exercises this choice as a single-party tx.
+    -- DAML authorization rule: inside a choice body, the controller (executor)
+    -- AND all signatories of the consumed contract (owner) have authorization.
+    -- This gives combined authorization WITHOUT co-submission.
+    --
+    -- The choice is CONSUMING: the original ExchangeAllocation is archived.
+    --
+    -- PARTIAL FILLS: If matchQuantity < amount, two contracts are created:
+    --   1. EXECUTED allocation for the filled portion
+    --   2. PENDING allocation for the remaining amount (returned as result)
+    -- This allows subsequent matches to settle the remainder.
+    --
+    -- FULL FILLS: If matchQuantity >= amount, one EXECUTED contract is created.
+    --
+    -- Returns the PENDING remainder contract (for partial fills),
+    -- or the EXECUTED contract (for full fills).
+    choice Execute_Settlement : ContractId ExchangeAllocation
+      with
+        matchPrice : Decimal    -- The price the trade executed at
+        matchQuantity : Decimal -- Quantity matched
+        counterparty : Text     -- Party ID of the counterparty
+        tradeId : Text          -- Reference to the Trade record
+      controller executor
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        assertMsg "Match quantity must be positive" (matchQuantity > 0.0)
+
+        let remainingAmount = amount - matchQuantity
+
+        if remainingAmount > 0.0
+          then do
+            -- PARTIAL FILL: create EXECUTED record for filled portion
+            _ <- create this with
+              status = "EXECUTED"
+              amount = matchQuantity
+
+            -- Create PENDING remainder for subsequent matches
+            create this with
+              allocationId = allocationId <> "-remainder-" <> tradeId
+              amount = remainingAmount
+              status = "PENDING"
+          else do
+            -- FULL FILL: mark entire allocation as EXECUTED
+            create this with status = "EXECUTED"
+
+    -- Owner cancels their own allocation (e.g., user cancels order).
+    -- Single-party tx by the external party (owner signs alone).
+    choice Cancel_Settlement : ContractId ExchangeAllocation
+      controller owner
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        create this with status = "CANCELLED"
+
+    -- Operator cancels (e.g., expired allocation, ACS cleanup, order rejection).
+    -- Single-party tx by the operator.
+    --
+    -- DAML authorization: executor is controller, owner is signatory of the
+    -- consumed contract. Creating a new contract with signatory = owner is
+    -- allowed because owner's auth carries forward.
+    choice Operator_Cancel_Settlement : ContractId ExchangeAllocation
+      controller executor
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        create this with status = "CANCELLED"
+
+    -- ═══════════════════════════════════════════════════════════════════════
+    -- ATOMIC DvP: Execute both Splice allocation transfers in ONE transaction.
+    --
+    -- DAML authorization carry-forward makes this possible:
+    --   1. Operator exercises Execute_DvP on seller's ExchangeAllocation
+    --      Auth = {executor, seller}
+    --   2. Inside, it exercises Execute_Settlement_WithTransfers on buyer's EA
+    --      Auth = {executor, seller, buyer} (accumulated!)
+    --   3. Inside THAT, it exercises Allocation_ExecuteTransfer on both legs
+    --      Each needs {executor, sender, receiver} = {executor, seller, buyer} ✓
+    --
+    -- Single Canton transaction. Single actAs = [executor]. Both legs atomic.
+    -- ═══════════════════════════════════════════════════════════════════════
+
+    -- Inner choice: called from Execute_DvP on the counterparty's EA.
+    -- When called from within Execute_DvP, accumulated auth includes
+    -- both the seller (outer signatory) and buyer (inner signatory),
+    -- plus the executor (controller of both choices).
+    choice Execute_Settlement_WithTransfers : (ContractId ExchangeAllocation, Allocation_ExecuteTransferResult, Allocation_ExecuteTransferResult)
+      with
+        matchPrice : Decimal
+        matchQuantity : Decimal
+        counterparty : Text
+        tradeId : Text
+        baseLegAllocCid : ContractId Allocation   -- CC allocation (seller→buyer)
+        quoteLegAllocCid : ContractId Allocation   -- CBTC allocation (buyer→seller)
+        baseExtraArgs : ExtraArgs                  -- choiceContext from CC registry
+        quoteExtraArgs : ExtraArgs                 -- choiceContext from CBTC registry
+      controller executor
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        assertMsg "Match quantity must be positive" (matchQuantity > 0.0)
+
+        -- Execute BOTH Splice allocation transfers atomically.
+        -- Auth here = {executor, seller, buyer} (accumulated from outer Execute_DvP).
+        -- Allocation_ExecuteTransfer controller = allocationControllers = [executor, sender, receiver]
+        -- For base (CC):  sender=seller, receiver=buyer  → needs {executor, seller, buyer} ✓
+        -- For quote (CBTC): sender=buyer, receiver=seller → needs {executor, buyer, seller} ✓
+        baseResult <- exercise baseLegAllocCid Allocation_ExecuteTransfer with extraArgs = baseExtraArgs
+        quoteResult <- exercise quoteLegAllocCid Allocation_ExecuteTransfer with extraArgs = quoteExtraArgs
+
+        -- Update this ExchangeAllocation (buyer's)
+        let remainingAmount = amount - matchQuantity
+        newCid <- if remainingAmount > 0.0
+          then do
+            _ <- create this with status = "EXECUTED", amount = matchQuantity
+            create this with
+              allocationId = allocationId <> "-remainder-" <> tradeId
+              amount = remainingAmount
+              status = "PENDING"
+          else
+            create this with status = "EXECUTED"
+
+        return (newCid, baseResult, quoteResult)
+
+    -- Outer choice: entry point for atomic DvP.
+    -- Exercises Execute_Settlement_WithTransfers on the counterparty's EA,
+    -- which accumulates both parties' authorization.
+    --
+    -- The operator submits this as a SINGLE non-interactive transaction
+    -- with actAs = [executor]. No external party signatures needed at match time.
+    choice Execute_DvP : (ContractId ExchangeAllocation, ContractId ExchangeAllocation, Allocation_ExecuteTransferResult, Allocation_ExecuteTransferResult)
+      with
+        counterpartyCid : ContractId ExchangeAllocation  -- buyer's EA
+        baseLegAllocCid : ContractId Allocation
+        quoteLegAllocCid : ContractId Allocation
+        matchPrice : Decimal
+        matchQuantity : Decimal
+        tradeId : Text
+        baseExtraArgs : ExtraArgs
+        quoteExtraArgs : ExtraArgs
+      controller executor
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        assertMsg "Match quantity must be positive" (matchQuantity > 0.0)
+
+        -- Exercise buyer's EA → inside: auth = {executor, seller, buyer}
+        (buyerNewCid, baseResult, quoteResult) <- exercise counterpartyCid Execute_Settlement_WithTransfers with
+          matchPrice = matchPrice
+          matchQuantity = matchQuantity
+          counterparty = show owner  -- seller's party ID
+          tradeId = tradeId
+          baseLegAllocCid = baseLegAllocCid
+          quoteLegAllocCid = quoteLegAllocCid
+          baseExtraArgs = baseExtraArgs
+          quoteExtraArgs = quoteExtraArgs
+
+        -- Update seller's ExchangeAllocation (this contract)
+        let remainingAmount = amount - matchQuantity
+        sellerNewCid <- if remainingAmount > 0.0
+          then do
+            _ <- create this with status = "EXECUTED", amount = matchQuantity
+            create this with
+              allocationId = allocationId <> "-remainder-" <> tradeId
+              amount = remainingAmount
+              status = "PENDING"
+          else
+            create this with status = "EXECUTED"
+
+        return (sellerNewCid, buyerNewCid, baseResult, quoteResult)
+
+    -- Archive a completed allocation to free ACS space.
+    -- Only EXECUTED or CANCELLED allocations can be archived.
+    choice Archive_ExchangeAllocation : ()
+      controller executor
+      do
+        assertMsg "Can only archive completed allocations" (status == "EXECUTED" || status == "CANCELLED")
+
+
+-- =============================================================================
+-- EXCHANGE SETTLER HUB (SINGLETON — 2-TX SETTLEMENT PATTERN)
+-- =============================================================================
+-- Root-cause fix for "Transaction with multiple root nodes are not supported":
+--   CreateAndExercise produces 2 root nodes (Create + Exercise).
+--   A plain ExerciseCommand on an existing contract produces 1 root node.
+--
+-- Architecture:
+--   Operator creates this contract ONCE at system startup (non-interactive).
+--   Every trade settlement calls SettleTrade (non-consuming) — hub persists.
+--
+-- TX 1: AllocationFactory_Allocate self-alloc (user locks funds at order time)
+-- TX 2: ExchangeSettlerHub::SettleTrade — single ExerciseCommand, one root node:
+--         Withdraw CC self-alloc  → Withdraw CBTC self-alloc
+--         → Allocate CC seller→buyer → Allocate CBTC buyer→seller
+--         → ExecuteTransfer CC → ExecuteTransfer CBTC
+--         All atomic in ONE Canton transaction.
+--
+-- Authorization propagation:
+--   Hub signatory: operator (local, auto-signs)
+--   SettleTrade controllers: [operator, seller, buyer]
+--   Auth set = {operator, seller, buyer} — satisfies ALL nested choices:
+--     Allocation_Withdraw  (owner = seller or buyer)
+--     AllocationFactory_Allocate (sender = seller or buyer)
+--     Allocation_ExecuteTransfer (allocationControllers includes executor+seller+buyer)
+--
+template ExchangeSettlerHub
+  with
+    operator : Party
+    createdAt : Text
+  where
+    signatory operator
+
+    -- Non-consuming: hub stays active after every settlement.
+    -- seller + buyer sign the interactive submission hash;
+    -- operator (local party) auto-signs on execute.
+    --
+    -- 2-TX SETTLEMENT (client requirement):
+    --   TX 1: AllocationFactory_Allocate + Order Create (order placement)
+    --   TX 2: SettleTrade — ALL of the following in ONE Canton transaction:
+    --     1. Withdraw both self-allocations
+    --     2. Create directional allocations (seller→buyer, buyer→seller)
+    --     3. Execute both Allocation_ExecuteTransfer legs
+    --     4. FillOrder on both buy and sell Order contracts
+    --     5. Create Trade record
+    --   This eliminates the separate FillOrder and Trade Create TXs.
+    nonconsuming choice SettleTrade : (Allocation_ExecuteTransferResult, Allocation_ExecuteTransferResult, ContractId Trade)
+      with
+        tradeId         : Text
+        seller          : Party
+        buyer           : Party
+        sellerSelfAllocCid : ContractId Allocation   -- CC self-alloc (seller→seller)
+        buyerSelfAllocCid  : ContractId Allocation   -- CBTC self-alloc (buyer→buyer)
+        ccFactory       : ContractId AllocationFactory
+        cbtcFactory     : ContractId AllocationFactory
+        ccWithdrawArgs  : ExtraArgs   -- expire-lock AmuletRules context
+        cbtcWithdrawArgs : ExtraArgs  -- withdraw context for CBTC
+        ccAllocSpec     : AllocationSpecification   -- seller→buyer CC spec
+        cbtcAllocSpec   : AllocationSpecification   -- buyer→seller CBTC spec
+        ccAllocArgs     : ExtraArgs   -- AmuletRules context for CC Allocate
+        cbtcAllocArgs   : ExtraArgs   -- transfer-rule context for CBTC Allocate
+        ccExpectedAdmin : Party       -- DSO / Splice admin
+        cbtcExpectedAdmin : Party     -- Utilities / CBTC admin
+        ccExecuteArgs   : ExtraArgs   -- AmuletRules context for CC ExecuteTransfer
+        cbtcExecuteArgs : ExtraArgs   -- transfer-rule context for CBTC ExecuteTransfer
+        -- FillOrder parameters (consolidated into settlement TX)
+        buyOrderCid     : ContractId OrderModule.Order   -- Buy order contract to fill
+        sellOrderCid    : ContractId OrderModule.Order   -- Sell order contract to fill
+        fillQuantity    : Decimal                        -- Quantity being filled
+        -- Trade record parameters (consolidated into settlement TX)
+        baseInstrumentId  : InstrumentId
+        quoteInstrumentId : InstrumentId
+        baseAmount      : Decimal
+        quoteAmount     : Decimal
+        price           : Decimal
+        buyOrderId      : Text
+        sellOrderId     : Text
+      controller [seller, buyer]
+      do
+        now <- getTime
+        -- Step 1: Withdraw seller's CC self-allocation → frees CC holdings
+        ccWr <- exercise sellerSelfAllocCid (Allocation_Withdraw with extraArgs = ccWithdrawArgs)
+        -- Step 2: Withdraw buyer's CBTC self-allocation → frees CBTC holdings
+        cbtcWr <- exercise buyerSelfAllocCid (Allocation_Withdraw with extraArgs = cbtcWithdrawArgs)
+        -- Step 3: Create directional CC allocation (seller→buyer)
+        ccAllocRes <- exercise ccFactory (AllocationFactory_Allocate with
+          expectedAdmin    = ccExpectedAdmin
+          allocation       = ccAllocSpec
+          requestedAt      = now
+          inputHoldingCids = ccWr.senderHoldingCids
+          extraArgs        = ccAllocArgs)
+        -- Step 4: Create directional CBTC allocation (buyer→seller)
+        cbtcAllocRes <- exercise cbtcFactory (AllocationFactory_Allocate with
+          expectedAdmin    = cbtcExpectedAdmin
+          allocation       = cbtcAllocSpec
+          requestedAt      = now
+          inputHoldingCids = cbtcWr.senderHoldingCids
+          extraArgs        = cbtcAllocArgs)
+        -- Step 5: Extract new allocation contract IDs (must complete immediately)
+        let (ccAllocCid : ContractId Allocation) = case ccAllocRes.output of
+              AllocationInstructionResult_Completed cid -> cid
+              _ -> error "CC AllocationFactory_Allocate did not complete immediately"
+        let (cbtcAllocCid : ContractId Allocation) = case cbtcAllocRes.output of
+              AllocationInstructionResult_Completed cid -> cid
+              _ -> error "CBTC AllocationFactory_Allocate did not complete immediately"
+        -- Step 6: Execute CC transfer (seller→buyer) — auth {operator, seller, buyer} ✓
+        ccResult <- exercise ccAllocCid (Allocation_ExecuteTransfer with extraArgs = ccExecuteArgs)
+        -- Step 7: Execute CBTC transfer (buyer→seller) — auth {operator, buyer, seller} ✓
+        cbtcResult <- exercise cbtcAllocCid (Allocation_ExecuteTransfer with extraArgs = cbtcExecuteArgs)
+        -- Step 8: FillOrder on both orders — auth {operator} ✓ (operator is controller)
+        exercise buyOrderCid OrderModule.FillOrder with
+          fillQuantity = fillQuantity
+          newAllocationCid = None
+        exercise sellOrderCid OrderModule.FillOrder with
+          fillQuantity = fillQuantity
+          newAllocationCid = None
+        -- Step 9: Create Trade record — auth {operator} ✓ (operator is signatory)
+        tradeCid <- create Trade with
+          tradeId = tradeId
+          operator = operator
+          buyer = buyer
+          seller = seller
+          baseInstrumentId = baseInstrumentId
+          quoteInstrumentId = quoteInstrumentId
+          baseAmount = baseAmount
+          quoteAmount = quoteAmount
+          price = price
+          buyOrderId = buyOrderId
+          sellOrderId = sellOrderId
+          timestamp = now
+        return (ccResult, cbtcResult, tradeCid)
+
+
+-- =============================================================================
+-- DvP AGREEMENT — Both parties co-sign, operator settles atomically
+-- =============================================================================
+--
+-- Solves Canton's authorization limitation for atomic DvP settlement:
+--   - Interactive prepare supports only 1 command
+--   - Non-interactive can't authorize external parties
+--   - Signatory carry-forward across nested exercises doesn't work for ext parties
+--
+-- =============================================================================
+-- TRADE SETTLEMENT (2-TX PATTERN — CLIENT REQUIREMENT)
+-- =============================================================================
+-- Achieves the client requirement: 2 TXs per party visible in Canton Explorer.
+--
+-- TX 1 (order placement): AllocationFactory_Allocate (self-alloc lock)
+-- TX 2 (settlement): CreateAndExercise TradeSettlement::DoSettle
+--                    — does EVERYTHING in one Canton transaction:
+--                      1. Withdraw seller CC self-alloc (auth from signatory seller)
+--                      2. Withdraw buyer CBTC self-alloc (auth from signatory buyer)
+--                      3. AllocationFactory_Allocate seller→buyer (CC)
+--                      4. AllocationFactory_Allocate buyer→seller (CBTC)
+--                      5. Allocation_ExecuteTransfer CC (auth: executor+seller+buyer)
+--                      6. Allocation_ExecuteTransfer CBTC (auth: executor+buyer+seller)
+--
+-- Authorization: signatory [seller, buyer] on TradeSettlement + controller executor
+-- = auth set {executor, seller, buyer} propagates into all nested exercises.
+--
+-- Backend uses CreateAndExercise command (single interactive command).
+-- actAs = [seller, buyer, executor] — seller+buyer sign hash, executor auto-signs.
+--
+template TradeSettlement
+  with
+    tradeId : Text
+    seller : Party
+    buyer : Party
+    executor : Party
+    sellerSelfAllocCid : ContractId Allocation   -- CC self-alloc (seller→seller, locked at order placement)
+    buyerSelfAllocCid : ContractId Allocation    -- CBTC self-alloc (buyer→buyer, locked at order placement)
+    tradingPair : Text
+    createdAt : Text
+  where
+    signatory [seller, buyer]
+    observer executor
+
+    -- All settlement in ONE Canton transaction.
+    -- Auth set = {executor} (controller) ∪ {seller, buyer} (signatories of consumed contract)
+    --          = {executor, seller, buyer} — satisfies all nested choice controllers.
+    choice DoSettle : (Allocation_ExecuteTransferResult, Allocation_ExecuteTransferResult)
+      with
+        ccFactory : ContractId AllocationFactory          -- CC (Amulet) allocation factory
+        cbtcFactory : ContractId AllocationFactory        -- CBTC (Utilities) allocation factory
+        ccWithdrawArgs : ExtraArgs                        -- ExtraArgs for CC Allocation_Withdraw
+        cbtcWithdrawArgs : ExtraArgs                      -- ExtraArgs for CBTC Allocation_Withdraw
+        ccAllocSpec : AllocationSpecification             -- seller→buyer CC allocation spec
+        cbtcAllocSpec : AllocationSpecification           -- buyer→seller CBTC allocation spec
+        ccAllocArgs : ExtraArgs                           -- ExtraArgs for CC AllocationFactory_Allocate
+        cbtcAllocArgs : ExtraArgs                         -- ExtraArgs for CBTC AllocationFactory_Allocate
+        ccExpectedAdmin : Party                           -- CC instrument admin (DSO/Splice)
+        cbtcExpectedAdmin : Party                         -- CBTC instrument admin (Utilities)
+        ccExecuteArgs : ExtraArgs                         -- ExtraArgs for CC Allocation_ExecuteTransfer
+        cbtcExecuteArgs : ExtraArgs                       -- ExtraArgs for CBTC Allocation_ExecuteTransfer
+      controller executor
+      do
+        now <- getTime
+        -- 1. Withdraw seller's CC self-allocation → returns CC holdings to seller
+        ccWr <- exercise sellerSelfAllocCid (Allocation_Withdraw with extraArgs = ccWithdrawArgs)
+        -- 2. Withdraw buyer's CBTC self-allocation → returns CBTC holdings to buyer
+        cbtcWr <- exercise buyerSelfAllocCid (Allocation_Withdraw with extraArgs = cbtcWithdrawArgs)
+        -- 3. Create CC allocation seller→buyer using just-freed holdings
+        ccAllocRes <- exercise ccFactory (AllocationFactory_Allocate with
+          expectedAdmin = ccExpectedAdmin
+          allocation = ccAllocSpec
+          requestedAt = now
+          inputHoldingCids = ccWr.senderHoldingCids
+          extraArgs = ccAllocArgs)
+        -- 4. Create CBTC allocation buyer→seller using just-freed holdings
+        cbtcAllocRes <- exercise cbtcFactory (AllocationFactory_Allocate with
+          expectedAdmin = cbtcExpectedAdmin
+          allocation = cbtcAllocSpec
+          requestedAt = now
+          inputHoldingCids = cbtcWr.senderHoldingCids
+          extraArgs = cbtcAllocArgs)
+        -- 5. Extract new allocation CIDs (must be Completed — both Amulet and Utilities create allocations directly)
+        let (ccAllocCid : ContractId Allocation) = case ccAllocRes.output of
+              AllocationInstructionResult_Completed cid -> cid
+              _ -> error "CC AllocationFactory_Allocate did not complete immediately"
+        let (cbtcAllocCid : ContractId Allocation) = case cbtcAllocRes.output of
+              AllocationInstructionResult_Completed cid -> cid
+              _ -> error "CBTC AllocationFactory_Allocate did not complete immediately"
+        -- 6. Execute CC transfer (seller→buyer) — auth: executor+seller+buyer ✓
+        ccResult <- exercise ccAllocCid (Allocation_ExecuteTransfer with extraArgs = ccExecuteArgs)
+        -- 7. Execute CBTC transfer (buyer→seller) — auth: executor+buyer+seller ✓
+        cbtcResult <- exercise cbtcAllocCid (Allocation_ExecuteTransfer with extraArgs = cbtcExecuteArgs)
+        return (ccResult, cbtcResult)
+
+
+-- Solution: ONE contract with BOTH parties as signatories.
+--   Step 1: Create via interactive submission, actAs=[seller, buyer] (1 command ✓)
+--           Both parties sign with their stored Ed25519 keys.
+--   Step 2: Operator exercises Settle_DvP via non-interactive, actAs=[operator]
+--           Consuming the contract gives auth = {seller, buyer} (both signatories)
+--           + {operator} (controller) = {operator, seller, buyer}
+--           Both Allocation_ExecuteTransfer calls run inside with full auth.
+--           Single Canton transaction. Atomic DvP.
+--
+template DvPAgreement
+  with
+    tradeId : Text            -- Unique trade identifier
+    seller : Party            -- Seller (sends base asset, e.g., CC)
+    buyer : Party             -- Buyer (sends quote asset, e.g., CBTC)
+    executor : Party          -- Exchange operator
+    baseLegAllocCid : ContractId Allocation   -- CC allocation (seller→buyer)
+    quoteLegAllocCid : ContractId Allocation  -- CBTC allocation (buyer→seller)
+    matchPrice : Decimal
+    matchQuantity : Decimal
+    tradingPair : Text
+    createdAt : Text          -- ISO timestamp
+  where
+    -- BOTH external parties are signatories.
+    -- Consuming this contract provides {seller, buyer} authorization.
+    signatory [seller, buyer]
+    observer executor
+
+    -- Operator settles both legs atomically.
+    -- Auth = {seller, buyer} (signatories) + {executor} (controller)
+    -- = {executor, seller, buyer} → satisfies allocationControllers for both legs.
+    choice Settle_DvP : (Allocation_ExecuteTransferResult, Allocation_ExecuteTransferResult)
+      with
+        baseExtraArgs : ExtraArgs   -- choiceContext from CC registry
+        quoteExtraArgs : ExtraArgs  -- choiceContext from CBTC registry
+      controller executor
+      do
+        assertMsg "Seller and buyer must be different" (seller /= buyer)
+        assertMsg "Match quantity must be positive" (matchQuantity > 0.0)
+        -- Both exercises run with auth = {executor, seller, buyer}
+        -- CC leg:   allocationControllers = [executor, seller, buyer] ✓
+        -- CBTC leg: allocationControllers = [executor, buyer, seller] ✓
+        baseResult <- exercise baseLegAllocCid Allocation_ExecuteTransfer with extraArgs = baseExtraArgs
+        quoteResult <- exercise quoteLegAllocCid Allocation_ExecuteTransfer with extraArgs = quoteExtraArgs
+        return (baseResult, quoteResult)
+
+
+-- =============================================================================
+-- LEGACY: ALLOCATION RECORD (kept for backward compatibility)
+-- =============================================================================
+-- NOTE: New code should use ExchangeAllocation (Propose-Accept) above.
+-- AllocationRecord is kept for existing contracts in the ACS.
+--
+template AllocationRecord
+  with
+    allocationId : Text
+    orderId : Text
+    sender : Party
+    receiver : Text
+    executor : Party
+    amount : Text
+    instrument : Text
+    holdingCids : [Text]
+    status : Text
+    createdAt : Text
+    operator : Party
+  where
+    signatory operator
+    observer sender, executor
+
+    choice ExecuteAllocation : ContractId AllocationRecord
+      controller executor
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        create this with status = "EXECUTED"
+
+    choice CancelAllocation : ContractId AllocationRecord
+      controller executor
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        create this with status = "CANCELLED"
+
+    choice SenderCancelAllocation : ContractId AllocationRecord
+      controller sender
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        create this with status = "CANCELLED"
+
+    choice ArchiveAllocation : ()
+      controller operator
+      do
+        assertMsg "Can only archive completed allocations" (status == "EXECUTED" || status == "CANCELLED")
