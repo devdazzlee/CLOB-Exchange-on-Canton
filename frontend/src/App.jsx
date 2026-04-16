@@ -80,6 +80,7 @@ function App() {
     authService.logout().catch(() => {});    // clob_access_token, clob_refresh_token, etc.
     localStorage.removeItem('canton_party_id');
     localStorage.removeItem('canton_key_fingerprint');
+    localStorage.removeItem('clob_user_id'); // Clear device-level anonymous user id
     // Legacy keys used by apiClient interceptors
     localStorage.removeItem('accessToken');
     localStorage.removeItem('refreshToken');
