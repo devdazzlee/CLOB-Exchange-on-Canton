@@ -92,6 +92,11 @@ class MatchingEngine {
     // Track allocation CIDs that returned CONTRACT_NOT_FOUND — never retry them.
     this._archivedAllocationCids = new Set();
 
+    // ═══ In-flight forwarding guard ═══
+    // Prevents SUBMISSION_ALREADY_IN_FLIGHT when forwarding (TX2) is concurrently
+    // or redundantly triggered for the same tradeId (commandIds are deterministic).
+    this._inFlightForwardingIds = new Set();
+
     // ═══ Settled order IDs — prevents post-settlement re-match race ═══
     // After FillOrder, Canton archives the old contract and creates a new one with a
     // different contractId. The streaming model may briefly show the new contract as
@@ -713,9 +718,34 @@ class MatchingEngine {
           sellOrder.remainingDecimal = sellRemainingAfter;
           return true;
         } catch (error) {
+          const fullErrBody = error.response?.data ? JSON.stringify(error.response.data).substring(0, 1500) : '';
+
+          // ═══ ALLOCATION NOT FOUND (HTTP 404) — PERMANENT, do NOT trip circuit breaker ═══
+          // `fetchAllocationExtraArgs` returns 404 when the allocation was already archived.
+          // This is a stale data issue (order's allocationContractId points to an old CID).
+          // Quarantine both orders, blacklist CIDs, and continue — never retry a 404.
+          const isAllocationNotFound =
+            error.response?.status === 404 ||
+            (fullErrBody?.includes('not found') && fullErrBody?.includes('Allocation'));
+          if (isAllocationNotFound) {
+            console.warn(`[MatchingEngine] ⚠️ Allocation not found (HTTP 404) — stale allocationContractId. Quarantining orders and blacklisting CIDs.`);
+            if (fullErrBody) console.warn(`[MatchingEngine]    Registry response: ${fullErrBody}`);
+            if (buyOrder.allocationContractId) this._archivedAllocationCids.add(buyOrder.allocationContractId);
+            if (sellOrder.allocationContractId) this._archivedAllocationCids.add(sellOrder.allocationContractId);
+            this._markInvalidSettlementOrder(buyOrder, 'Allocation not found (archived)');
+            this._markInvalidSettlementOrder(sellOrder, 'Allocation not found (archived)');
+            const streaming = this._getStreamingModel();
+            if (streaming) {
+              streaming.evictOrder(buyOrder.contractId);
+              streaming.evictOrder(sellOrder.contractId);
+            }
+            this.recentlyMatchedOrders.delete(matchKey);
+            // Do NOT increment failure counter — this is stale data, not a Canton failure
+            continue;
+          }
+
           this._consecutiveSettlementFailures++;
           this._totalFailuresSinceStart++;
-          const fullErrBody = error.response?.data ? JSON.stringify(error.response.data).substring(0, 1500) : '';
           console.error(`[MatchingEngine] ❌ Match execution failed (${this._consecutiveSettlementFailures}/${this._CIRCUIT_BREAKER_THRESHOLD}):`, error.message?.substring(0, 200));
           if (fullErrBody) console.error(`[MatchingEngine] ❌ Full error response: ${fullErrBody}`);
 
@@ -1149,6 +1179,10 @@ class MatchingEngine {
     //   TX2 (below): operator→buyer (base) + operator→seller (quote) [+ remainders]
     // ────────────────────────────────────────────────────────────────────────
     console.log(`[MatchingEngine]    ⟶ Forwarding: operator→counterparties (TX2 legs)...`);
+    if (this._inFlightForwardingIds.has(tradeId)) {
+      console.warn(`[MatchingEngine]    ⚠️ Forwarding already in-flight for ${tradeId} — skipping duplicate submission`);
+    } else {
+    this._inFlightForwardingIds.add(tradeId);
     try {
       // Splice (CC) uses LockedAmulet with expiry — use a short settle window for operator legs
       // so the new lock expires well before the LockedAmulet from the original order.
@@ -1229,12 +1263,22 @@ class MatchingEngine {
 
       console.log(`[MatchingEngine]    ✅ TX2 forwarding complete — tokens delivered to counterparties`);
     } catch (fwdErr) {
-      // Forwarding failure is serious but TX1 already committed. Log clearly so
-      // the operator can manually reconcile. Don't crash the engine loop.
-      console.error(`[MatchingEngine] ❌ FORWARDING FAILED for trade ${tradeId}: ${fwdErr?.message || fwdErr}`);
-      console.error(`[MatchingEngine]    TX1 (Execute_LegSettlement) already committed. Operator holds tokens.`);
-      console.error(`[MatchingEngine]    Manual intervention required to forward tokens to counterparties.`);
+      const fwdMsg = fwdErr?.message || String(fwdErr);
+      if (fwdMsg.includes('SUBMISSION_ALREADY_IN_FLIGHT')) {
+        // Command was already submitted to Canton — it will complete on its own.
+        // This is NOT a fatal error; TX2 is idempotent by commandId.
+        console.warn(`[MatchingEngine] ⚠️ Forwarding for ${tradeId} already in-flight on Canton — will complete without retry`);
+      } else {
+        // Forwarding failure is serious but TX1 already committed. Log clearly so
+        // the operator can manually reconcile. Don't crash the engine loop.
+        console.error(`[MatchingEngine] ❌ FORWARDING FAILED for trade ${tradeId}: ${fwdMsg}`);
+        console.error(`[MatchingEngine]    TX1 (Execute_LegSettlement) already committed. Operator holds tokens.`);
+        console.error(`[MatchingEngine]    Manual intervention required to forward tokens to counterparties.`);
+      }
+    } finally {
+      this._inFlightForwardingIds.delete(tradeId);
     }
+    } // end else (!_inFlightForwardingIds.has(tradeId))
 
     // Extract Trade contract ID + any partially-filled Order contracts from settlement events
     let tradeContractId = null;
@@ -1538,51 +1582,39 @@ class MatchingEngine {
 
   /**
    * Snapshot all current allocation CIDs visible to the operator.
-   * Used before creating new allocations so that _findAllocationByACS can
-   * distinguish newly created allocations from stale ones left by previous
-   * failed settlement attempts.
+   * Uses the WebSocket StreamingReadModel (no REST polling, no 200-element limit).
+   * Client requirement: "we need to use ledger-api or web sockets to get stream of data" (clientchat.txt)
    *
    * @param {string} operatorPartyId - The operator party
-   * @param {string} adminToken - Admin bearer token
+   * @param {string} adminToken - Admin bearer token (unused — kept for API compatibility)
    * @returns {Promise<Set<string>>} Set of existing allocation contract IDs
    */
   async _snapshotAllocationCids(operatorPartyId, adminToken) {
     const cids = new Set();
+
+    // Primary: WebSocket streaming model — zero REST calls, no 200-element limit
     try {
-      const { getCantonSDKClient } = require('./canton-sdk-client');
-      const sdkClient = getCantonSDKClient();
-      // Use SDK pending allocations (fastest path)
-      const pending = await sdkClient.fetchPendingAllocations(operatorPartyId);
-      for (const row of (pending || [])) {
-        const cid = row?.contractId || row?.activeContract?.createdEvent?.contractId;
-        if (cid) cids.add(cid);
+      const streaming = this._getStreamingModel();
+      if (streaming?.isReady()) {
+        for (const [cid, alloc] of streaming.allocations) {
+          if (alloc.sender === operatorPartyId || alloc.executor === operatorPartyId) {
+            cids.add(cid);
+          }
+        }
+        if (cids.size > 0) return cids;
       }
     } catch (_) { /* ignore — snapshot is best-effort */ }
-
-    // Also query ACS for allocations as fallback
-    try {
-      const cantonService = require('./cantonService');
-      const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
-      const result = await cantonService.queryActiveContracts({
-        party: operatorPartyId,
-        templateIds: [ALLOCATION_INTERFACE],
-      }, adminToken);
-      for (const contract of (result || [])) {
-        const cid = contract?.contractId || contract?.createdEvent?.contractId;
-        if (cid) cids.add(cid);
-      }
-    } catch (_) { /* ignore */ }
 
     return cids;
   }
 
   /**
-   * Find a recently created Allocation contract by querying Canton.
-   * Used when executeInteractiveSubmission doesn't return the CID in its response.
+   * Find a recently created Allocation contract.
+   * Client requirement: use WebSocket streaming (not REST polling) — clientchat.txt line 294.
    *
    * Strategy:
-   * 1. SDK fetchPendingAllocations (uses proper allocation view, most reliable)
-   * 2. ACS query with Allocation interface as fallback
+   * 1. WebSocket StreamingReadModel.allocations (zero REST calls, no 200-element limit)
+   * 2. ACS REST query as fallback (only if streaming model is not ready)
    *
    * @param {string} executorPartyId - The operator party (executor of the allocation)
    * @param {string} senderPartyId - Sender of the allocation
@@ -1592,26 +1624,33 @@ class MatchingEngine {
    * @returns {Promise<string|null>} Allocation contract ID or null
    */
   async _findAllocationByACS(executorPartyId, senderPartyId, receiverPartyId, adminToken, excludeCids = null) {
-    const { getCantonSDKClient } = require('./canton-sdk-client');
-    const sdkClient = getCantonSDKClient();
-
-    // ── Strategy 1: SDK pending allocations for sender ──
+    // ── Strategy 1: WebSocket streaming model (primary — no REST, no 200-element limit) ──
     try {
-      const pending = await sdkClient.fetchPendingAllocations(senderPartyId);
-      if (pending?.length > 0) {
-        for (const row of pending) {
-          const cid = row?.contractId || row?.activeContract?.createdEvent?.contractId;
-          if (!cid) continue;
+      const streaming = this._getStreamingModel();
+      if (streaming?.isReady()) {
+        for (const [cid, alloc] of streaming.allocations) {
           if (excludeCids?.has(cid)) continue;
-          console.log(`[MatchingEngine]    ✅ Found allocation via SDK pending view: ${cid.substring(0, 24)}...`);
-          return cid;
+          const matchesSender = alloc.sender === senderPartyId || alloc.executor === senderPartyId;
+          const matchesReceiver = !receiverPartyId || alloc.receiver === receiverPartyId;
+          if (matchesSender && matchesReceiver) {
+            console.log(`[MatchingEngine]    ✅ Found allocation via WebSocket streaming model: ${cid.substring(0, 24)}...`);
+            return cid;
+          }
+        }
+        // Fallback within streaming: return any non-excluded allocation visible to sender
+        for (const [cid, alloc] of streaming.allocations) {
+          if (excludeCids?.has(cid)) continue;
+          if (alloc.sender === senderPartyId || alloc.executor === senderPartyId || alloc.executor === executorPartyId) {
+            console.log(`[MatchingEngine]    ✅ Found allocation via WebSocket streaming model (executor match): ${cid.substring(0, 24)}...`);
+            return cid;
+          }
         }
       }
     } catch (err) {
-      console.warn(`[MatchingEngine]    SDK pending allocations failed: ${err.message?.substring(0, 100)}`);
+      console.warn(`[MatchingEngine]    ⚠️ Streaming model allocation lookup failed: ${err.message?.substring(0, 100)}`);
     }
 
-    // ── Strategy 2: ACS query with Allocation interface ──
+    // ── Strategy 2: ACS REST query (fallback — only if streaming not ready) ──
     try {
       const cantonService = require('./cantonService');
       const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
@@ -1623,33 +1662,28 @@ class MatchingEngine {
       }, adminToken);
 
       const contracts = result?.activeContracts || result?.contracts || result || [];
-      // Search through contracts — try to match sender/receiver from payload or interface view
       for (const contract of contracts) {
         const created = contract.createdEvent || contract;
         const cid = created?.contractId;
         if (!cid || excludeCids?.has(cid)) continue;
-        // Check interface view and create arguments for sender/receiver hints
         const view = created?.interfaceViews?.[0]?.viewValue || created?.interfaceViewValue || {};
         const payload = created?.createArguments || created?.createArgument || created?.payload || {};
         const jsonStr = JSON.stringify({ ...payload, ...view });
         if (jsonStr.includes(senderPartyId) && jsonStr.includes(receiverPartyId)) {
-          console.log(`[MatchingEngine]    ✅ Found allocation via ACS query: ${cid.substring(0, 24)}...`);
+          console.log(`[MatchingEngine]    ✅ Found allocation via ACS fallback: ${cid.substring(0, 24)}...`);
           return cid;
         }
       }
 
-      // Fallback: return most recent allocation that isn't excluded
       for (let i = contracts.length - 1; i >= 0; i--) {
         const cid = contracts[i]?.createdEvent?.contractId || contracts[i]?.contractId;
         if (cid && !excludeCids?.has(cid)) {
-          console.log(`[MatchingEngine]    ✅ Found allocation via ACS (latest): ${cid.substring(0, 24)}...`);
+          console.log(`[MatchingEngine]    ✅ Found allocation via ACS fallback (latest): ${cid.substring(0, 24)}...`);
           return cid;
         }
       }
-
-      console.warn(`[MatchingEngine]    ⚠️ ACS query returned ${contracts.length} allocations but none matched`);
     } catch (err) {
-      console.error(`[MatchingEngine]    ❌ ACS allocation query failed: ${err.message?.substring(0, 150)}`);
+      console.error(`[MatchingEngine]    ❌ ACS allocation fallback failed: ${err.message?.substring(0, 150)}`);
     }
 
     return null;

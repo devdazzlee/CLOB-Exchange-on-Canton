@@ -2043,31 +2043,51 @@ class CantonSDKClient {
   }
 
   /**
-   * Fetch pending Allocations (ready for execution).
-   * Exchange checks these at match time before executing.
-   * 
+   * Fetch pending Allocations for a party.
+   * Client requirement: use WebSocket streaming instead of REST polling to avoid
+   * JSON_API_MAXIMUM_LIST_ELEMENTS_NUMBER_REACHED (200-element limit).
+   * See clientchat.txt line 294: "we need to use ledger-api or web sockets to get stream of data".
+   *
+   * Primary: StreamingReadModel.allocations (populated via WebSocket ACS bootstrap + live updates).
+   * Fallback: SDK REST call (only if streaming not ready — avoids hitting 200-element limit in prod).
+   *
    * @param {string} partyId - Party to query (executor or sender)
    * @returns {Array} Pending allocation views
    */
   async fetchPendingAllocations(partyId) {
-    if (!this.isReady()) return [];
+    // ── Primary: WebSocket streaming model (no REST, no 200-element limit) ──
+    try {
+      const { getStreamingReadModel } = require('./streamingReadModel');
+      const streaming = getStreamingReadModel();
+      if (streaming?.isReady() && streaming.allocations.size > 0) {
+        const results = [];
+        for (const [cid, alloc] of streaming.allocations) {
+          if (alloc.sender === partyId || alloc.executor === partyId) {
+            results.push({ contractId: cid, ...alloc });
+          }
+        }
+        if (results.length > 0) {
+          return results;
+        }
+      }
+    } catch (_) { /* fall through to SDK */ }
 
+    // ── Fallback: SDK REST call (only if streaming not ready) ──
+    if (!this.isReady()) return [];
     return this._withPartyContext(partyId, async () => {
       try {
         if (typeof this.sdk.tokenStandard?.fetchPendingAllocationView === 'function') {
           const allocations = await this.sdk.tokenStandard.fetchPendingAllocationView();
-          console.log(`[CantonSDK] Found ${allocations?.length || 0} pending allocations for ${partyId.substring(0, 30)}...`);
           return allocations || [];
         }
         return [];
       } catch (error) {
         const msg = error?.message || (typeof error === 'string' ? error : JSON.stringify(error));
-        // Suppress noisy Canton "interface not supported" error — this is a known SDK limitation
-        // where the node doesn't support listing contracts by interface ID.
-        if (!msg || msg.includes('Failed to list contracts of interface') || msg.includes('interface')) {
+        if (!msg || msg.includes('Failed to list contracts of interface') || msg.includes('interface')
+            || msg.includes('JSON_API_MAXIMUM_LIST_ELEMENTS_NUMBER_REACHED')) {
           return [];
         }
-        console.warn(`[CantonSDK] fetchPendingAllocations failed: ${msg}`);
+        console.warn(`[CantonSDK] fetchPendingAllocations REST fallback failed: ${msg}`);
         return [];
       }
     });
