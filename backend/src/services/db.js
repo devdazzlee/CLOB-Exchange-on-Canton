@@ -18,10 +18,19 @@ let prisma;
 function getDb() {
   if (!prisma) {
     prisma = new PrismaClient({
-      log: process.env.NODE_ENV === 'development'
-        ? ['warn', 'error']
-        : ['error'],
+      log: [
+        { emit: 'stdout', level: 'warn' },
+        { emit: 'event', level: 'error' },
+      ],
     });
+    
+    // Filter out noisy transient network errors (like os error 10054)
+    prisma.$on('error', (e) => {
+      if (!e.message.includes('10054') && !e.message.includes('Connection reset')) {
+        console.error(`[Prisma Error] ${e.target}: ${e.message}`);
+      }
+    });
+
     console.log('[DB] 🗄️  Prisma client initialized (Neon PostgreSQL)');
   }
   return prisma;
