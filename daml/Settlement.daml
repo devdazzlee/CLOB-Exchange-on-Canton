@@ -22,6 +22,7 @@ import DA.Action (when)
 import Splice.Api.Token.AllocationV1 (Allocation, Allocation_ExecuteTransfer(..), Allocation_ExecuteTransferResult, Allocation_Withdraw(..), Allocation_WithdrawResult, AllocationSpecification(..), SettlementInfo(..), TransferLeg(..))
 import Splice.Api.Token.AllocationInstructionV1 (AllocationFactory, AllocationFactory_Allocate(..), AllocationInstructionResult(..), AllocationInstructionResult_Output(..))
 import Splice.Api.Token.MetadataV1 (ExtraArgs)
+import qualified Splice.Api.Token.HoldingV1 as SpliceHolding
 import qualified Order as OrderModule
 
 -- | Settlement status
@@ -314,6 +315,50 @@ template ExchangeAllocation
           else do
             -- FULL FILL: mark entire allocation as EXECUTED
             create this with status = "EXECUTED"
+
+    -- Per-leg settlement: exercises ONE Splice allocation transfer in isolation.
+    --
+    -- Root cause fix for DAML_AUTHORIZATION_ERROR with Execute_DvP:
+    --   Execute_DvP nests Execute_Settlement_WithTransfers inside its choice body.
+    --   In Canton 3.x, auth does NOT accumulate across nested cross-contract
+    --   sub-choice exercises. So seller's auth (from outer Execute_DvP on seller's EA)
+    --   does NOT propagate into Allocation_ExecuteTransfer inside
+    --   Execute_Settlement_WithTransfers on buyer's EA.
+    --
+    -- Fix: exercise Execute_LegSettlement SEPARATELY for EACH party as an
+    --   independent ROOT command in the batch transaction.
+    --   Root cmd 1 on seller's EA:  auth = {executor, seller}
+    --     → Allocation_ExecuteTransfer on seller's Splice alloc needs {executor,seller} ✓
+    --   Root cmd 2 on buyer's EA:   auth = {executor, buyer}
+    --     → Allocation_ExecuteTransfer on buyer's Splice alloc needs {executor,buyer}  ✓
+    --
+    -- Both root commands are in ONE atomic Canton transaction (submitAndWait).
+    -- actAs = [executor] only. No user keys at settlement time. ✓
+    choice Execute_LegSettlement : (ContractId ExchangeAllocation, Allocation_ExecuteTransferResult)
+      with
+        legAllocCid : ContractId Allocation
+        legExtraArgs : ExtraArgs
+        matchPrice : Decimal
+        matchQuantity : Decimal
+        tradeId : Text
+      controller executor
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        assertMsg "Match quantity must be positive" (matchQuantity > 0.0)
+        -- Auth = {executor, owner}  (executor is controller; owner is signatory of this EA)
+        -- For self-alloc: allocationControllers = [executor, owner, owner] = {executor, owner} ⊆ auth ✓
+        result <- exercise legAllocCid Allocation_ExecuteTransfer with extraArgs = legExtraArgs
+        let remainingAmount = amount - matchQuantity
+        newCid <- if remainingAmount > 0.0
+          then do
+            _ <- create this with status = "EXECUTED", amount = matchQuantity
+            create this with
+              allocationId = allocationId <> "-remainder-" <> tradeId
+              amount = remainingAmount
+              status = "PENDING"
+          else
+            create this with status = "EXECUTED"
+        return (newCid, result)
 
     -- Owner cancels their own allocation (e.g., user cancels order).
     -- Single-party tx by the external party (owner signs alone).
@@ -764,3 +809,103 @@ template AllocationRecord
       controller operator
       do
         assertMsg "Can only archive completed allocations" (status == "EXECUTED" || status == "CANCELLED")
+
+
+-- =============================================================================
+-- ORDER PLACER FACTORY — 1-TX order placement, ExerciseCommand pattern
+-- =============================================================================
+--
+-- CLIENT REQUIREMENT: order placement = 1 TX, settlement = 1 TX.
+--
+-- Root-cause fix for "Transaction with multiple root nodes are not supported":
+--   CreateAndExercise produces 2 root nodes (Create + Exercise).
+--   A plain ExerciseCommand on a PRE-EXISTING contract = 1 root node. ✓
+--
+-- Architecture (mirrors ExchangeSettlerHub for settlement):
+--   Operator creates ONE OrderPlacerFactory per user at registration.
+--   Every order placement calls PlaceOrder (nonconsuming) — factory persists.
+--   Single ExerciseCommand = 1 root node = supported by interactive submission.
+--
+-- Authorization chain:
+--   PlaceOrder controller = user (external party, in interactive actAs)
+--   Inside choice, accumulated auth = {user}:
+--     AllocationFactory_Allocate: controller = user (sender = receiver) ✓
+--     Order create: signatory = user (owner) ✓
+--     ExchangeAllocation create: signatory = user (owner) ✓
+--   All satisfied by {user} alone — operator NOT needed at placement time.
+--
+-- Lifecycle:
+--   TX 1 (placement): user exercises PlaceOrder → actAs=[user], 1 root node ✓
+--   TX 2 (settlement): operator exercises Execute_DvP → actAs=[operator], 1 root node ✓
+--
+template OrderPlacerFactory
+  with
+    operator : Party  -- exchange operator (signatory, creates this contract)
+    user     : Party  -- order placer (observer, controller of PlaceOrder)
+  where
+    signatory operator
+    observer user
+
+    -- NONCONSUMING: factory persists across all of a user's order placements.
+    -- actAs=[user] in interactive submission. controller=user → 1 external party ✓
+    -- ExerciseCommand on pre-existing contract = 1 root node ✓
+    nonconsuming choice PlaceOrder : (ContractId OrderModule.Order, ContractId ExchangeAllocation)
+      with
+        orderId          : Text
+        -- AllocationFactory_Allocate parameters (from Splice registry API)
+        allocFactory     : ContractId AllocationFactory
+        expectedAdmin    : Party
+        allocationSpec   : AllocationSpecification
+        inputHoldingCids : [ContractId SpliceHolding.Holding]
+        allocExtraArgs   : ExtraArgs
+        -- Order parameters
+        orderType        : Text          -- "BUY" or "SELL"
+        orderMode        : Text          -- "LIMIT", "MARKET", or "STOP_LOSS"
+        tradingPair      : Text          -- e.g. "CC/CBTC"
+        price            : Optional Decimal
+        quantity         : Decimal
+        stopPrice        : Optional Decimal
+        -- Allocation lock info
+        lockAmount       : Decimal
+        instrumentSymbol : Text          -- token symbol, e.g. "CC" or "CBTC"
+      controller user
+      do
+        now <- getTime
+        -- 1. Lock user funds via Splice self-allocation (sender = receiver = user)
+        allocResult <- exercise allocFactory (AllocationFactory_Allocate with
+          expectedAdmin    = expectedAdmin
+          allocation       = allocationSpec
+          requestedAt      = now
+          inputHoldingCids = inputHoldingCids
+          extraArgs        = allocExtraArgs)
+        let allocCid = case allocResult.output of
+              AllocationInstructionResult_Completed cid -> cid
+              _ -> error "OrderPlacerFactory.PlaceOrder: AllocationFactory_Allocate did not complete immediately"
+        -- 2. Create Order contract (signatory user — satisfied as PlaceOrder controller)
+        orderCid <- create OrderModule.Order with
+          orderId       = orderId
+          owner         = user
+          orderType     = orderType
+          orderMode     = orderMode
+          tradingPair   = tradingPair
+          price         = price
+          quantity      = quantity
+          filled        = 0.0
+          status        = if orderMode == "STOP_LOSS" then "PENDING_TRIGGER" else "OPEN"
+          timestamp     = now
+          operator      = operator
+          allocationCid = show allocCid
+          stopPrice     = stopPrice
+        -- 3. Create ExchangeAllocation (signatory user — embeds consent on-chain)
+        eaCid <- create ExchangeAllocation with
+          allocationId     = "ea-" <> orderId
+          orderId          = orderId
+          owner            = user
+          executor         = operator
+          amount           = lockAmount
+          instrumentSymbol = instrumentSymbol
+          side             = orderType
+          tradingPair      = tradingPair
+          status           = "PENDING"
+          createdAt        = show now
+        return (orderCid, eaCid)

@@ -3,7 +3,7 @@
  * 
  * Stores:
  *   userId -> { partyId, publicKeyBase64, createdAt }
- *   partyId -> { keyBase64, fingerprint }  (signing keys)
+ *   No private key storage is allowed server-side.
  * 
  * ALL reads and writes go DIRECTLY to PostgreSQL.
  * No in-memory cache. Database is the single source of truth.
@@ -130,34 +130,6 @@ async function getAllPartyIds() {
   return [...new Set(users.map(u => u.partyId).filter(Boolean))];
 }
 
-// ─── Signing Key helpers ──────────────────────────────────────────────────
-
-async function storeSigningKey(partyId, keyBase64, fingerprint) {
-  if (!partyId || !keyBase64) return;
-  const db = getDb();
-  await db.signingKey.upsert({
-    where: { partyId },
-    create: { partyId, keyBase64, fingerprint: fingerprint || null },
-    update: { keyBase64, fingerprint: fingerprint || null },
-  });
-  console.log(`[UserRegistry] 🔑 Stored signing key for ${partyId.substring(0, 30)}... (PostgreSQL)`);
-}
-
-async function getSigningKey(partyId) {
-  if (!partyId) return null;
-  const db = getDb();
-  const k = await db.signingKey.findUnique({ where: { partyId } });
-  if (!k) return null;
-  return { keyBase64: k.keyBase64, fingerprint: k.fingerprint };
-}
-
-async function hasSigningKey(partyId) {
-  if (!partyId) return false;
-  const db = getDb();
-  const count = await db.signingKey.count({ where: { partyId } });
-  return count > 0;
-}
-
 module.exports = {
   upsertUser,
   getUser,
@@ -165,7 +137,4 @@ module.exports = {
   requirePartyId,
   requirePublicKey,
   getAllPartyIds,
-  storeSigningKey,
-  getSigningKey,
-  hasSigningKey,
 };

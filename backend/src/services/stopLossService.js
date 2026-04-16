@@ -199,12 +199,47 @@ class StopLossService extends EventEmitter {
     const packageId = config.canton.packageIds.clobExchange;
     const operatorPartyId = config.canton.operatorPartyId;
 
+    // Resolve the real Canton contract ID. When a stop-loss is registered immediately
+    // after interactive order placement, the contractId may be a placeholder ending in
+    // "-pending" because the Canton event hadn't arrived yet. Look it up from the ledger.
+    let resolvedContractId = entry.orderContractId;
+    if (!resolvedContractId || resolvedContractId.endsWith('-pending') || resolvedContractId === orderId) {
+      console.log(`[StopLoss] 🔍 Pending contractId detected — querying Canton for Order ${orderId}...`);
+      try {
+        const contracts = await cantonService.queryActiveContracts(
+          { party: operatorPartyId, templateIds: [`${packageId}:Order:Order`] },
+          token
+        );
+        const list = Array.isArray(contracts) ? contracts : (contracts?.activeContracts || contracts?.contracts || []);
+        for (const c of list) {
+          const ev = c.createdEvent || c;
+          const p = ev?.createArguments || ev?.createArgument || ev?.payload || {};
+          if (p.orderId === orderId) {
+            resolvedContractId = c.contractId || ev?.contractId;
+            console.log(`[StopLoss] ✅ Resolved real contractId: ${resolvedContractId?.substring(0, 24)}...`);
+            // Persist the resolved ID so we don't need to look it up again
+            const db = getDb();
+            await db.stopLossOrder.update({
+              where: { orderId },
+              data: { orderContractId: resolvedContractId },
+            }).catch(() => {});
+            break;
+          }
+        }
+      } catch (lookupErr) {
+        console.warn(`[StopLoss] ⚠️ Contract lookup failed: ${lookupErr.message}`);
+      }
+      if (!resolvedContractId || resolvedContractId.endsWith('-pending')) {
+        throw new Error(`Cannot trigger stop-loss ${orderId}: Order contract not found on ledger`);
+      }
+    }
+
     try {
       await cantonService.exerciseChoice({
         token,
         actAsParty: [operatorPartyId],
         templateId: `${packageId}:Order:Order`,
-        contractId: entry.orderContractId,
+        contractId: resolvedContractId,
         choice: 'TriggerStopLoss',
         choiceArgument: {
           triggeredAt: new Date().toISOString(),
@@ -215,6 +250,7 @@ class StopLossService extends EventEmitter {
       console.log(`[StopLoss] ✅ Order ${orderId} status updated to OPEN on Canton`);
     } catch (choiceErr) {
       console.warn(`[StopLoss] ⚠️ TriggerStopLoss choice failed: ${choiceErr.message}`);
+      throw new Error(`TriggerStopLoss failed for ${orderId}: ${choiceErr.message}`);
     }
 
     // Update DB

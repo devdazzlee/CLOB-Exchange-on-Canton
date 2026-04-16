@@ -27,6 +27,7 @@ const {
   ErrorCodes
 } = require('../../utils/ledgerError');
 const { createLedgerErrorFromResponse } = require('../../utils/ledgerError');
+const { rejectPrivateKeyMaterialInBody } = require('../../utils/nonCustodial');
 
 // Singleton OrderService instance for cancel flow (allocation release + ledger cancel)
 let _orderServiceInstance = null;
@@ -175,6 +176,12 @@ class ExchangeController {
       clientOrderId,
       partyId: bodyPartyId,
     } = req.body;
+
+    try {
+      rejectPrivateKeyMaterialInBody(req.body, 'POST /v1/orders');
+    } catch (e) {
+      throw new ValidationError(e.message);
+    }
 
     // Normalize field names (support both v1 format and legacy format)
     const effectivePair = pair || altPair;

@@ -108,22 +108,24 @@ class OnboardingController {
           ...(publicKeyFingerprint ? { publicKeyFingerprint } : {}),
         });
 
-        // ── Store signing key for server-side interactive settlement ──
-        const signingKeyBase64 = req.body.signingKeyBase64;
-        if (signingKeyBase64 && typeof signingKeyBase64 === 'string' && signingKeyBase64.trim()) {
-          const s = signingKeyBase64.trim();
-          const keyBytes = /^[0-9a-fA-F]+$/.test(s) && s.length % 2 === 0
-            ? Buffer.from(s, 'hex') : Buffer.from(s, 'base64');
-          if (keyBytes.length === 32 || keyBytes.length === 64) {
-            await userRegistry.storeSigningKey(result.partyId, signingKeyBase64.trim(), publicKeyFingerprint || '');
-            console.log(`[OnboardingController] 🔑 Signing key stored for party ${result.partyId.substring(0, 30)}...`);
-            getAutoAcceptService().onNewPartyRegistered(result.partyId).catch(() => {});
-          } else {
-            console.warn(`[OnboardingController] ⚠️ Invalid signing key (${keyBytes.length} bytes) — need 32 or 64. Post-settlement cancel will fail.`);
-          }
-        } else {
-          console.warn(`[OnboardingController] ⚠️ No signingKeyBase64 provided — interactive settlement will not work until key is stored`);
-        }
+        // Notify auto-accept service for this new party
+        getAutoAcceptService().onNewPartyRegistered(result.partyId).catch(() => {});
+
+        // Pre-create OrderPlacerFactory for this user (non-blocking)
+        // Ensures 1-TX order placement is available immediately without delay on first order.
+        setImmediate(() => {
+          const OrderService = require('../services/order-service');
+          const tokenProvider = require('../services/tokenProvider');
+          const config = require('../config');
+          const newPartyId = result.partyId;
+          const operatorPartyId = config.canton.operatorPartyId;
+          const packageId = config.canton.packageIds.clobExchange;
+          const svc = new OrderService();
+          tokenProvider.getServiceToken()
+            .then(token => svc._getOrCreateOrderPlacerFactory(newPartyId, operatorPartyId, packageId, token))
+            .then(cid => console.log(`[Onboarding] ✅ OrderPlacerFactory ready for ${newPartyId.substring(0, 24)}...: ${cid.substring(0, 20)}...`))
+            .catch(err => console.warn(`[Onboarding] ⚠️ OrderPlacerFactory pre-create failed (will retry on first order): ${err.message}`));
+        });
 
         return success(res, { ...result, quotaStatus }, 'Party onboarded successfully', 200);
       } catch (err) {
@@ -158,7 +160,7 @@ class OnboardingController {
    */
   rehydrate = asyncHandler(async (req, res) => {
     const userId = req.userId;
-    const { partyId, publicKeyBase64, signingKeyBase64, publicKeyFingerprint } = req.body || {};
+    const { partyId, publicKeyBase64 } = req.body || {};
 
     if (!partyId || typeof partyId !== 'string' || partyId.trim() === '') {
       return error(res, 'partyId is required', 400);
@@ -173,20 +175,8 @@ class OnboardingController {
       ...(publicKeyBase64 ? { publicKeyBase64: publicKeyBase64.trim() } : {}),
     });
 
-    // Also store signing key if provided (for interactive settlement)
-    if (signingKeyBase64 && typeof signingKeyBase64 === 'string' && signingKeyBase64.trim()) {
-      const s = signingKeyBase64.trim();
-      const keyBytes = /^[0-9a-fA-F]+$/.test(s) && s.length % 2 === 0
-        ? Buffer.from(s, 'hex') : Buffer.from(s, 'base64');
-      if (keyBytes.length === 32 || keyBytes.length === 64) {
-        const fingerprint = publicKeyFingerprint || '';
-        await userRegistry.storeSigningKey(partyId.trim(), signingKeyBase64.trim(), fingerprint);
-        console.log(`[OnboardingController] 🔑 Signing key restored during rehydrate for ${partyId.substring(0, 30)}...`);
-        getAutoAcceptService().onNewPartyRegistered(partyId.trim()).catch(() => {});
-      } else {
-        console.warn(`[OnboardingController] ⚠️ Skipping invalid signing key: ${keyBytes.length} bytes (need 32 or 64). Post-settlement cancel will fail until frontend sends full Ed25519 private key.`);
-      }
-    }
+    // Notify auto-accept service (no signing key stored — settlement is operator-only)
+    getAutoAcceptService().onNewPartyRegistered(partyId.trim()).catch(() => {});
 
     return success(res, { partyId: partyId.trim() }, 'User mapping restored', 200);
   });
@@ -230,32 +220,6 @@ class OnboardingController {
     return success(res, { synchronizerId }, 'Synchronizer discovered successfully', 200);
   });
 
-  /**
-   * Store signing key for interactive settlement
-   * 
-   * This allows the backend to sign allocation operations on behalf
-   * of the external party during settlement (interactive submission).
-   * 
-   * Request: { partyId, signingKeyBase64, publicKeyFingerprint }
-   * Response: { stored: true }
-   */
-  storeSigningKey = asyncHandler(async (req, res) => {
-    const { partyId, signingKeyBase64, publicKeyFingerprint } = req.body || {};
-
-    if (!partyId || typeof partyId !== 'string' || partyId.trim() === '') {
-      return error(res, 'partyId is required', 400);
-    }
-    if (!signingKeyBase64 || typeof signingKeyBase64 !== 'string' || signingKeyBase64.trim() === '') {
-      return error(res, 'signingKeyBase64 is required (base64-encoded Ed25519 private key)', 400);
-    }
-
-    const fingerprint = publicKeyFingerprint || '';
-    await userRegistry.storeSigningKey(partyId.trim(), signingKeyBase64.trim(), fingerprint);
-    console.log(`[OnboardingController] 🔑 Signing key stored via /store-signing-key for ${partyId.substring(0, 30)}...`);
-    // Notify auto-accept service so it subscribes to this party's transfers
-    getAutoAcceptService().onNewPartyRegistered(partyId.trim()).catch(() => {});
-    return success(res, { stored: true, partyId: partyId.trim() }, 'Signing key stored successfully', 200);
-  });
 }
 
 module.exports = new OnboardingController();

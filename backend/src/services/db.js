@@ -3,7 +3,7 @@
  * 
  * Single Prisma client instance shared across the application.
  * Connects to Neon PostgreSQL for persistent storage of:
- * - Users & signing keys
+ * - Users & public keys (private keys NEVER stored server-side)
  * - Wallet info
  * - Order reservations
  * - Stop-loss orders

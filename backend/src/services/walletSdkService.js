@@ -106,16 +106,16 @@ class WalletSdkService {
   }
 
   /**
-   * Accept a transfer instruction using the SDK
-   * This handles getting the disclosed contracts automatically
-   * 
+   * Accept a transfer instruction using the SDK.
+   * Returns the prepared command + disclosed contracts for the frontend to sign.
+   * Private keys must NEVER be sent to or handled by the server.
+   *
    * @param {string} contractId - The transfer instruction contract ID
    * @param {string} partyId - The receiving party
-   * @param {string} privateKey - The party's private key (optional, for external parties)
    */
-  async acceptTransfer(contractId, partyId, privateKey = null) {
+  async acceptTransfer(contractId, partyId) {
     await this.initialize();
-    
+
     if (!this.sdk || !this.sdk.tokenStandard) {
       console.log('[WalletSdkService] SDK not available');
       return { success: false, error: 'SDK not initialized' };
@@ -123,34 +123,22 @@ class WalletSdkService {
 
     try {
       await this.sdk.setPartyId(partyId);
-      
+
       // Get the accept command with disclosed contracts
       const [acceptCommand, disclosedContracts] = await this.sdk.tokenStandard.exerciseTransferInstructionChoice(
         contractId,
         'Accept'
       );
-      
+
       console.log('[WalletSdkService] Got accept command with', disclosedContracts?.length || 0, 'disclosed contracts');
-      
-      if (privateKey) {
-        // If we have the private key, execute directly
-        const { v4: uuidv4 } = require('uuid');
-        const result = await this.sdk.userLedger?.prepareSignAndExecuteTransaction(
-          acceptCommand,
-          privateKey,
-          uuidv4(),
-          disclosedContracts
-        );
-        return { success: true, result, usedSdk: true };
-      } else {
-        // Return the command and disclosed contracts for external execution
-        return {
-          success: true,
-          command: acceptCommand,
-          disclosedContracts: disclosedContracts,
-          usedSdk: true,
-        };
-      }
+
+      // Return command + disclosed contracts — frontend signs, then calls /execute-accept
+      return {
+        success: true,
+        command: acceptCommand,
+        disclosedContracts: disclosedContracts,
+        usedSdk: true,
+      };
     } catch (error) {
       console.error('[WalletSdkService] Failed to accept transfer:', error.message);
       return { success: false, error: error.message };

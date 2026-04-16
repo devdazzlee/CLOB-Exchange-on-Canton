@@ -152,15 +152,13 @@ export default function WalletSetup({ onWalletReady }) {
       console.log('[WalletSetup] Signing multiHash...');
       const signatureBase64 = await signMessage(privateKey, topology.multiHash);
 
-      // 4. Step 2: Allocate party with signature (+ send signing key for settlement)
+      // 4. Step 2: Allocate party with signature
       console.log('[WalletSetup] Step 2: Allocating party...');
-      const privateKeyBase64 = bytesToBase64(privateKey);
       const result = await allocatePartyWithSignature(
         publicKeyBase64,
         signatureBase64,
         topology.topologyTransactions,
-        topology.publicKeyFingerprint,
-        privateKeyBase64
+        topology.publicKeyFingerprint
       );
 
       console.log('[WalletSetup] Party allocated:', result);
@@ -172,9 +170,6 @@ export default function WalletSetup({ onWalletReady }) {
       if (topology.publicKeyFingerprint) {
         localStorage.setItem('canton_key_fingerprint', topology.publicKeyFingerprint);
       }
-      // Cache signing key in sessionStorage for rehydration after page refresh
-      try { sessionStorage.setItem('canton_signing_key_b64', privateKeyBase64); } catch (_) {}
-
       setStep('ready');
       if (onWalletReady) {
         onWalletReady(allocatedPartyId);
@@ -231,15 +226,13 @@ export default function WalletSetup({ onWalletReady }) {
       console.log('[WalletSetup] Signing multiHash...');
       const signatureBase64 = await signMessage(privateKey, topology.multiHash);
 
-      // 4. Step 2: Allocate party (+ send signing key for settlement)
+      // 4. Step 2: Allocate party
       console.log('[WalletSetup] Step 2: Allocating party...');
-      const privateKeyBase64 = bytesToBase64(privateKey);
       const result = await allocatePartyWithSignature(
         publicKeyBase64,
         signatureBase64,
         topology.topologyTransactions,
-        topology.publicKeyFingerprint,
-        privateKeyBase64
+        topology.publicKeyFingerprint
       );
 
       console.log('[WalletSetup] Party allocated:', result);
@@ -251,9 +244,6 @@ export default function WalletSetup({ onWalletReady }) {
       if (topology.publicKeyFingerprint) {
         localStorage.setItem('canton_key_fingerprint', topology.publicKeyFingerprint);
       }
-      // Cache signing key in sessionStorage for rehydration after page refresh
-      try { sessionStorage.setItem('canton_signing_key_b64', privateKeyBase64); } catch (_) {}
-
       setStep('ready');
       if (onWalletReady) {
         onWalletReady(allocatedPartyId);
@@ -303,16 +293,14 @@ export default function WalletSetup({ onWalletReady }) {
       console.log('[WalletSetup] Signing multiHash...');
       const signatureBase64 = await signMessage(privateKey, topologyData.multiHash);
 
-      // 3. Step 2: Allocate party (+ send signing key for settlement)
+      // 3. Step 2: Allocate party
       console.log('[WalletSetup] Step 2: Allocating party...');
       const publicKeyBase64 = bytesToBase64(topologyData.publicKey);
-      const privateKeyBase64 = bytesToBase64(privateKey);
       const result = await allocatePartyWithSignature(
         publicKeyBase64,
         signatureBase64,
         topologyData.topologyTransactions,
-        topologyData.publicKeyFingerprint,
-        privateKeyBase64
+        topologyData.publicKeyFingerprint
       );
 
       console.log('[WalletSetup] Party allocated:', result);
@@ -324,9 +312,6 @@ export default function WalletSetup({ onWalletReady }) {
       if (topologyData.publicKeyFingerprint) {
         localStorage.setItem('canton_key_fingerprint', topologyData.publicKeyFingerprint);
       }
-      // Cache signing key in sessionStorage for rehydration after page refresh
-      try { sessionStorage.setItem('canton_signing_key_b64', privateKeyBase64); } catch (_) {}
-
       setShowUnlockModal(false);
       setStep('ready');
       if (onWalletReady) {

@@ -1,0 +1,9 @@
+module Instrument where
+
+-- Minimal instrument identifier used by settlement/trade contracts.
+data InstrumentId = InstrumentId
+  with
+    issuer : Party
+    symbol : Text
+    version : Text
+  deriving (Eq, Show)

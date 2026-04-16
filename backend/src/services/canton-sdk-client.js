@@ -27,98 +27,9 @@ const { CANTON_SDK_CONFIG, UTILITIES_CONFIG, toCantonInstrument, toExchangeSymbo
 const cantonService = require('./cantonService');
 const tokenProvider = require('./tokenProvider');
 const Decimal = require('decimal.js');
-const userRegistry = require('../state/userRegistry');
 const { getRegistryApi } = require('../http/clients');
 
-// ─── Ed25519 Signing for Interactive Settlement ──────────────────────────
-// Used to sign Allocation_ExecuteTransfer for external parties at match time.
-// External parties' keys are stored in userRegistry during onboarding.
-let ed25519Module = null;
-let sha512Module = null;
-
-async function getEd25519() {
-  if (!ed25519Module) {
-    ed25519Module = require('@noble/ed25519');
-    sha512Module = require('@noble/hashes/sha512');
-    if (!ed25519Module.etc.sha512Sync) {
-      ed25519Module.etc.sha512Sync = (...m) => sha512Module.sha512(ed25519Module.etc.concatBytes(...m));
-    }
-  }
-  return ed25519Module;
-}
-
-/**
- * Decode Ed25519 private key from base64 or hex. Returns 32-byte seed.
- * @param {string} keyInput - Base64 or hex-encoded key (32 or 64 bytes)
- * @returns {Uint8Array} 32-byte seed
- */
-function decodePrivateKey(keyInput) {
-  if (!keyInput || typeof keyInput !== 'string') return null;
-  let s = keyInput.trim();
-  if (s.startsWith('0x')) s = s.slice(2);
-  if (s.startsWith('hex:')) s = s.slice(4);
-  let keyBytes;
-  if (/^[0-9a-fA-F]+$/.test(s) && s.length % 2 === 0) {
-    keyBytes = Buffer.from(s, 'hex');
-  } else {
-    keyBytes = Buffer.from(s, 'base64');
-  }
-  keyBytes = new Uint8Array(keyBytes);
-  if (keyBytes.length === 64) return keyBytes.slice(0, 32);
-  if (keyBytes.length === 32) return keyBytes;
-  return null;
-}
-
-/**
- * Sign a base64-encoded hash with a stored Ed25519 private key.
- * Key can be base64 or hex. Used for interactive settlement.
- *
- * @param {string} privateKeyInput - Base64 or hex-encoded 32-byte Ed25519 private key
- * @param {string|Uint8Array|object} hashInput - preparedTransactionHash from Canton
- * @returns {Promise<string>} Base64-encoded signature
- */
-async function signHashWithKey(privateKeyInput, hashInput) {
-  const ed = await getEd25519();
-  const privateKey = decodePrivateKey(privateKeyInput);
-  if (!privateKey || privateKey.length !== 32) {
-    const s = (privateKeyInput || '').trim();
-    const base64Len = Buffer.from(s, 'base64').length;
-    const hexLen = /^[0-9a-fA-F]+$/.test(s) ? Buffer.from(s, 'hex').length : 0;
-    const len = base64Len || hexLen || 0;
-    throw new Error(`signHashWithKey: key must be 32 or 64 bytes (base64/hex), got ${len} bytes`);
-  }
-
-  // Canton API returns hash as base64 string; normalize to Uint8Array
-  let hashBytes;
-  if (typeof hashInput === 'string') {
-    const s = String(hashInput).trim();
-    try {
-      hashBytes = new Uint8Array(Buffer.from(s, 'base64'));
-    } catch {
-      hashBytes = new Uint8Array(Buffer.from(s, 'base64url'));
-    }
-    if (hashBytes.length === 0 && s.length > 0) {
-      hashBytes = new Uint8Array(Buffer.from(s, 'hex'));
-    }
-  } else if (hashInput instanceof Uint8Array) {
-    hashBytes = hashInput;
-  } else if (hashInput && typeof hashInput.length === 'number' && !(hashInput instanceof String)) {
-    hashBytes = new Uint8Array(hashInput);
-  } else if (hashInput && typeof hashInput === 'object' && (hashInput.value ?? hashInput.base64 ?? hashInput.data)) {
-    const str = String(hashInput.value ?? hashInput.base64 ?? hashInput.data).trim();
-    hashBytes = new Uint8Array(Buffer.from(str, 'base64'));
-  } else {
-    throw new Error(`signHashWithKey: invalid hash format (got ${typeof hashInput})`);
-  }
-
-  if (!hashBytes || hashBytes.length === 0) {
-    throw new Error('signHashWithKey: decoded hash is empty');
-  }
-
-  // Use signAsync — ensures Uint8Array is accepted (sync sign can be stricter)
-  const signature = await ed.signAsync(hashBytes, privateKey);
-  return Buffer.from(signature).toString('base64');
-}
+// Non-custodial policy: user private keys stay in the browser; no server-side signing helpers.
 
 // Configure decimal precision
 Decimal.set({ precision: 20, rounding: Decimal.ROUND_DOWN });
@@ -2150,7 +2061,13 @@ class CantonSDKClient {
         }
         return [];
       } catch (error) {
-        console.warn(`[CantonSDK] fetchPendingAllocations failed: ${error.message}`);
+        const msg = error?.message || (typeof error === 'string' ? error : JSON.stringify(error));
+        // Suppress noisy Canton "interface not supported" error — this is a known SDK limitation
+        // where the node doesn't support listing contracts by interface ID.
+        if (!msg || msg.includes('Failed to list contracts of interface') || msg.includes('interface')) {
+          return [];
+        }
+        console.warn(`[CantonSDK] fetchPendingAllocations failed: ${msg}`);
         return [];
       }
     });
@@ -2366,38 +2283,10 @@ class CantonSDKClient {
       }
     }
 
-    // ── Step 2: INTERACTIVE fallback (external parties sign) ──────────
-    // Only needed if executor-only fails (e.g., DAML_AUTHORIZATION_ERROR
-    // meaning the choice controller includes more than just the executor).
+    // Interactive fallback is intentionally disabled for non-custodial security:
+    // backend must never hold or use user private keys.
     if (hasExternalParty) {
-      const externalParties = involvedParties.filter(p => isExtParty(p));
-      const keyChecks = await Promise.all(externalParties.map(p => userRegistry.hasSigningKey(p)));
-      const allHaveKeys = keyChecks.every(Boolean);
-
-      if (allHaveKeys) {
-        console.log(`[CantonSDK]    🔐 Trying INTERACTIVE settlement (external party signing)...`);
-        try {
-          return await this.executeAllocationInteractive(
-            allocationContractId, executorPartyId, symbol, adminToken,
-            ownerPartyId, receiverPartyId, synchronizerId
-          );
-        } catch (interactiveErr) {
-          const msg = String(interactiveErr?.message || interactiveErr || '');
-          // If stale/expired/not found, propagate immediately — no point retrying further
-          if (msg.includes('STALE_') || msg.includes('SIGNING_KEY_MISSING') ||
-              msg.includes('deadline-exceeded') || msg.includes('settleBefore') ||
-              msg.includes('LockedAmulet') ||
-              msg.includes('CONTRACT_NOT_FOUND') || msg.includes('could not be found')) {
-            throw interactiveErr;
-          }
-          console.warn(`[CantonSDK]    Interactive settlement also failed: ${msg.substring(0, 150)} — falling through to broader non-interactive strategies`);
-        }
-      } else {
-        const missingChecks = await Promise.all(externalParties.map(async p => ({ p, has: await userRegistry.hasSigningKey(p) })));
-        const missing = missingChecks.filter(c => !c.has).map(c => c.p);
-        console.warn(`[CantonSDK]    ⚠️ External parties present but signing keys missing for: ${missing.map(p => p.substring(0, 20) + '...').join(', ')}`);
-        console.warn(`[CantonSDK]    Will attempt non-interactive strategies (may fail)`);
-      }
+      console.log('[CantonSDK]    External parties detected; skipping interactive server-side signing fallback.');
     }
 
     const tryExecuteForActAs = async (actAsParties) => {
@@ -2664,297 +2553,13 @@ class CantonSDKClient {
   }
 
   /**
-   * Execute Allocation via INTERACTIVE SUBMISSION for external parties.
-   *
-   * Canton external parties (ext-*) cannot be included in non-interactive
-   * submit-and-wait because the participant doesn't hold their keys.
-   * Interactive submission flow:
-   *   1. Prepare: POST /v2/interactive-submission/prepare (actAs includes ext party)
-   *   2. Sign: Backend signs preparedTransactionHash with stored Ed25519 key
-   *   3. Execute: POST /v2/interactive-submission/execute (with partySignatures)
-   *
-   * @param {string} allocationContractId - The Allocation contract ID
-   * @param {string} executorPartyId - The exchange operator party
-   * @param {string} symbol - Token symbol for routing
-   * @param {string} adminToken - Service bearer token
-   * @param {string} ownerPartyId - External party that owns the allocation
-   * @param {string} receiverPartyId - Counterparty receiving tokens
-   * @param {string} synchronizerId - Resolved synchronizer ID
-   * @returns {Object} Execute result with transaction/updateId
+   * Disabled in non-custodial mode (no server-side signing with stored keys).
+   * External parties must sign in the browser; use prepare + client signatures instead.
    */
   async executeAllocationInteractive(allocationContractId, executorPartyId, symbol, adminToken, ownerPartyId, receiverPartyId, synchronizerId, options = {}) {
-    console.log(`[CantonSDK] 🔐 Interactive settlement for external party allocation`);
-    console.log(`[CantonSDK]    Allocation: ${allocationContractId.substring(0, 30)}...`);
-    console.log(`[CantonSDK]    Owner (ext): ${ownerPartyId?.substring(0, 30)}...`);
-    console.log(`[CantonSDK]    Receiver: ${receiverPartyId?.substring(0, 30)}...`);
-
-    // ── 1. Determine which external parties need signing ──────────────
-    const isExt = (pid) => typeof pid === 'string' && pid.startsWith('ext-');
-    const externalParties = [ownerPartyId, receiverPartyId].filter(p => p && isExt(p));
-    
-    if (externalParties.length === 0) {
-      throw new Error('executeAllocationInteractive called but no external parties found');
-    }
-
-    // Verify we have signing keys for ALL external parties involved
-    const keyResults = await Promise.all(externalParties.map(async p => ({ p, has: await userRegistry.hasSigningKey(p) })));
-    const missingKeys = keyResults.filter(r => !r.has).map(r => r.p);
-    if (missingKeys.length > 0) {
-      const missing = missingKeys.map(p => p.substring(0, 25) + '...').join(', ');
-      throw new Error(`SIGNING_KEY_MISSING: No signing key stored for external parties: ${missing}. Users must re-onboard or re-login to store their signing key.`);
-    }
-
-    // Interactive submission requires explicit external signatures for ALL actAs
-    // parties. The DvpLegAllocation contract requires BOTH operator + ext-party
-    // as authorizers, so we MUST include both in actAs. We try TWO strategies:
-    //   A) All parties in actAs (required for DvpLegAllocation — operator + ext-party)
-    //   B) External parties only (fallback if operator approval is embedded in allocation)
-    const allActAs = [...new Set([executorPartyId, ownerPartyId, receiverPartyId].filter(Boolean))];
-    const extOnlyActAs = [...new Set(externalParties)];
-    const actAsStrategies = [allActAs, extOnlyActAs]
-      .filter(arr => arr.length > 0)
-      .filter((arr, i, self) => self.findIndex(x => x.join('|') === arr.join('|')) === i);
-    
-    // Start with the first strategy (external-only) and fall back
-    const actAsParties = actAsStrategies[0];
-    const readAsParties = [...new Set([executorPartyId, ownerPartyId, receiverPartyId].filter(Boolean))];
-
-    // ── 2. Build the ExerciseCommand for Allocation_ExecuteTransfer ───
-    const { creationDisclosedContracts = null, choiceContextData: passedContextData = null } = options;
-    let commands = [];
-    let disclosedContracts = [];
-
-    // PRIMARY PATH: If we have pre-extracted disclosed contracts from the creation tx,
-    // build the command directly — no SDK or registry needed for disclosure.
-    if (creationDisclosedContracts && creationDisclosedContracts.length > 0) {
-      const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
-
-      // Use choiceContextData from allocation creation step if available (contains amulet-rules).
-      // Otherwise try a single quick registry call.
-      let choiceContextData = passedContextData || { values: {} };
-      if (passedContextData) {
-        console.log(`[CantonSDK]    Using choiceContextData from allocation creation (amulet-rules included)`);
-      }
-
-      if (!passedContextData) {
-        // Try a single quick registry call for choice context (round/fee info)
-        try {
-          const tokenSystemType = getTokenSystemType(symbol);
-          const adminParty = this.getInstrumentAdminForSymbol(symbol);
-          const encodedCid = encodeURIComponent(allocationContractId);
-          const executeContextUrl = tokenSystemType === 'utilities'
-            ? `${UTILITIES_CONFIG.TOKEN_STANDARD_URL}/v0/registrars/${encodeURIComponent(adminParty)}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`
-            : `${CANTON_SDK_CONFIG.REGISTRY_API_URL}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
-          const resp = await getRegistryApi().post(executeContextUrl, { excludeDebugFields: true }, { timeout: 5000 });
-          if (resp.data?.choiceContextData) choiceContextData = resp.data.choiceContextData;
-        } catch (_) { /* registry not indexed yet — use passed context or empty */ }
-      }
-
-      commands = [{
-        ExerciseCommand: {
-          templateId: ALLOCATION_INTERFACE,
-          contractId: allocationContractId,
-          choice: 'Allocation_ExecuteTransfer',
-          choiceArgument: {
-            extraArgs: {
-              context: choiceContextData,
-              meta: { values: {} },
-            },
-          },
-        }
-      }];
-      disclosedContracts = creationDisclosedContracts.map(dc => ({
-        templateId: dc.templateId,
-        contractId: dc.contractId,
-        createdEventBlob: dc.createdEventBlob,
-        synchronizerId: dc.synchronizerId || synchronizerId,
-      }));
-      console.log(`[CantonSDK]    Built command with ${disclosedContracts.length} pre-extracted disclosed contract(s) — no registry dependency`);
-    }
-
-    // LEGACY: Try SDK to build the command (with disclosed contracts)
-    if (commands.length === 0 && this.isReady() && this.sdk.tokenStandard && typeof this.sdk.tokenStandard.exerciseAllocationChoice === 'function') {
-      try {
-        const commandBuilderPartyId = ownerPartyId || executorPartyId;
-        console.log(`[CantonSDK]    Building interactive command via SDK in context: ${commandBuilderPartyId.substring(0, 30)}...`);
-
-        const result = await this._withPartyContext(commandBuilderPartyId, async () => {
-          return await this.sdk.tokenStandard.exerciseAllocationChoice(
-            allocationContractId,
-            'ExecuteTransfer'
-          );
-        });
-
-        const [executeCmd, disclosed] = result;
-        const rawCommands = Array.isArray(executeCmd) ? executeCmd : [executeCmd];
-        commands = rawCommands.map(rawCmd => {
-          const cmd = rawCmd.ExerciseCommand || rawCmd;
-          return {
-            ExerciseCommand: {
-              templateId: cmd.templateId,
-              contractId: cmd.contractId,
-              choice: cmd.choice,
-              choiceArgument: cmd.choiceArgument,
-            }
-          };
-        });
-        disclosedContracts = (disclosed || []).map(dc => ({
-          templateId: dc.templateId,
-          contractId: dc.contractId,
-          createdEventBlob: dc.createdEventBlob,
-          synchronizerId: dc.synchronizerId || synchronizerId,
-        }));
-        console.log(`[CantonSDK]    SDK built ${commands.length} command(s), ${disclosedContracts.length} disclosed contracts`);
-      } catch (sdkErr) {
-        const sdkMsg = String(sdkErr?.message || sdkErr || '');
-        if (sdkMsg.includes('LockedAmulet') || sdkMsg.includes('not found') ||
-            sdkMsg.includes('deadline-exceeded') || sdkMsg.includes('settleBefore')) {
-          throw new Error(`STALE_ALLOCATION_LOCK_MISSING: ${sdkMsg}`);
-        }
-        console.warn(`[CantonSDK]    SDK command build failed for interactive: ${sdkMsg} — trying registry API`);
-      }
-    }
-
-    // LEGACY: build command from registry API (token-type-aware routing)
-    if (commands.length === 0) {
-      const tokenSystemType = getTokenSystemType(symbol);
-      const adminParty = this.getInstrumentAdminForSymbol(symbol);
-      const encodedCid = encodeURIComponent(allocationContractId);
-      const executeContextUrl = tokenSystemType === 'utilities'
-        ? `${UTILITIES_CONFIG.TOKEN_STANDARD_URL}/v0/registrars/${encodeURIComponent(adminParty)}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`
-        : `${CANTON_SDK_CONFIG.REGISTRY_API_URL}/registry/allocations/v1/${encodedCid}/choice-contexts/execute-transfer`;
-
-      console.log(`[CantonSDK]    Fetching choice-context from registry: ${executeContextUrl}`);
-      const { data: context } = await getRegistryApi().post(executeContextUrl, { excludeDebugFields: true });
-      const ALLOCATION_INTERFACE = '#splice-api-token-allocation-v1:Splice.Api.Token.AllocationV1:Allocation';
-
-      commands = [{
-        ExerciseCommand: {
-          templateId: ALLOCATION_INTERFACE,
-          contractId: allocationContractId,
-          choice: 'Allocation_ExecuteTransfer',
-          choiceArgument: {
-            extraArgs: {
-              context: context.choiceContextData || { values: {} },
-              meta: { values: {} },
-            },
-          },
-        }
-      }];
-      disclosedContracts = (context.disclosedContracts || []).map(dc => ({
-        templateId: dc.templateId,
-        contractId: dc.contractId,
-        createdEventBlob: dc.createdEventBlob,
-        synchronizerId: dc.synchronizerId || synchronizerId,
-      }));
-      console.log(`[CantonSDK]    Registry built ${commands.length} command(s), ${disclosedContracts.length} disclosed contracts`);
-    }
-
-    // ── 3. Try each actAs strategy: ext-only first, then all parties ──
-    let lastInteractiveError = null;
-    for (const currentActAs of actAsStrategies) {
-      try {
-        console.log(`[CantonSDK]    📤 Preparing interactive submission with actAs: [${currentActAs.map(p => p.substring(0, 20) + '...').join(', ')}]`);
-    
-    const prepareResult = await cantonService.prepareInteractiveSubmission({
-      token: adminToken,
-          actAsParty: currentActAs,
-      commands,
-      readAs: readAsParties,
-      synchronizerId,
-      disclosedContracts: disclosedContracts.length > 0 ? disclosedContracts : null,
-      verboseHashing: false,
-    });
-
-    if (!prepareResult.preparedTransaction || !prepareResult.preparedTransactionHash) {
-      throw new Error('Interactive prepare returned incomplete result: missing preparedTransaction or preparedTransactionHash');
-    }
-
-    console.log(`[CantonSDK]    ✅ Prepared — hash: ${prepareResult.preparedTransactionHash.substring(0, 40)}...`);
-
-        // ── 4. SIGN hash with ALL actAs parties that have signing keys ──
-        // Canton interactive mode requires explicit external signatures for ALL
-        // actAs parties — including the operator if its key is managed externally.
-    const partySignatureEntries = [];
-        const unsignedParties = [];
-        for (const partyId of currentActAs) {
-      const hasKey = await userRegistry.hasSigningKey(partyId);
-      if (hasKey) {
-        const keyInfo = await userRegistry.getSigningKey(partyId);
-        if (!keyInfo) continue;
-        console.log(`[CantonSDK]    🔑 Signing hash for ${partyId.substring(0, 30)}... (fingerprint: ${keyInfo.fingerprint?.substring(0, 20)}...)`);
-      const signatureBase64 = await signHashWithKey(keyInfo.keyBase64, prepareResult.preparedTransactionHash);
-      partySignatureEntries.push({
-          party: partyId,
-        signatures: [{
-          format: 'SIGNATURE_FORMAT_RAW',
-          signature: signatureBase64,
-          signedBy: keyInfo.fingerprint,
-          signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
-        }],
-      });
-      } else {
-        unsignedParties.push(partyId);
-      }
-    }
-
-        if (partySignatureEntries.length === 0) {
-          throw new Error('SIGNING_KEY_MISSING: No signing keys available for any actAs party');
-        }
-
-        if (unsignedParties.length > 0) {
-          console.warn(`[CantonSDK]    ⚠️ Missing signing keys for: ${unsignedParties.map(p => p.substring(0, 30) + '...').join(', ')}`);
-          console.warn(`[CantonSDK]    💡 To fix: ensure all actAs parties have signing keys stored via POST /api/onboarding/store-signing-key`);
-    }
-
-    const partySignatures = { signatures: partySignatureEntries };
-        console.log(`[CantonSDK]    Collected ${partySignatureEntries.length} signature(s) for ${currentActAs.length} actAs parties (${unsignedParties.length} unsigned)`);
-
-        // ── 5. EXECUTE interactive submission ────────────────────────
-    const executeResult = await cantonService.executeInteractiveSubmission({
-      preparedTransaction: prepareResult.preparedTransaction,
-      partySignatures,
-      hashingSchemeVersion: prepareResult.hashingSchemeVersion,
-    }, adminToken);
-
-    console.log(`[CantonSDK]    ✅ Interactive settlement succeeded — updateId: ${executeResult?.transaction?.updateId || 'N/A'}`);
-    return executeResult;
-
-      } catch (strategyErr) {
-        lastInteractiveError = strategyErr;
-        const msg = String(strategyErr?.message || strategyErr || '');
-        console.warn(`[CantonSDK]    Interactive attempt failed for actAs [${currentActAs.map(p => p.substring(0, 15) + '...').join(', ')}]: ${msg.substring(0, 150)}`);
-
-        // Fatal errors — no point trying another actAs strategy
-        if (msg.includes('STALE_') || msg.includes('SIGNING_KEY_MISSING') ||
-            msg.includes('LockedAmulet') || msg.includes('CONTRACT_NOT_FOUND') ||
-            msg.includes('could not be found') || msg.includes('deadline-exceeded') ||
-            msg.includes('settleBefore')) {
-          throw strategyErr;
-        }
-        // For FAILED_TO_EXECUTE_TRANSACTION / auth errors, try next actAs strategy
-        continue;
-      }
-    }
-
-    // All interactive strategies exhausted
-    if (lastInteractiveError) throw lastInteractiveError;
-    throw new Error('Interactive settlement: no actAs strategies available');
+    throw new Error('executeAllocationInteractive is disabled: backend server-side signing is not allowed in non-custodial mode.');
   }
 
-  /**
-   * Execute Utilities allocation via backend API.
-   * 
-   * Per Canton: Allocation_ExecuteTransfer can be run with JUST
-   * the executor if other parties already signed the allocation.
-   * 
-   * Strategy:
-   *   1. Executor-only non-interactive (fastest — operator key is hosted)
-   *   2. Interactive with external party signatures (fallback)
-   *   3. All-parties non-interactive (last resort)
-   * 
-   * CRITICAL: Must include synchronizerId in command body.
-   */
   async _executeUtilitiesAllocation(allocationContractId, executorPartyId, symbol, adminToken, ownerPartyId = null, receiverPartyId = null) {
     const adminParty = getInstrumentAdmin(symbol);
     const tokenStandardUrl = UTILITIES_CONFIG.TOKEN_STANDARD_URL;
@@ -3031,106 +2636,11 @@ class CantonSDKClient {
         }
       }
 
-      // ── Strategy 2: Interactive with external party signatures ─────
-      // Utilities DvpLegAllocation requires BOTH authorizers (operator + owner).
-      // In interactive mode, we include BOTH in actAs. We sign for external
-      // parties; the participant should auto-sign for hosted keys (operator).
-      // Try two actAs strategies:
-      //   A) All parties (both operator + external) — most likely to satisfy DAML auth
-      //   B) External-only (if operator approval is embedded in allocation)
+      // ── Strategy 2 intentionally disabled in non-custodial mode ─────
+      // Backend must never sign for external parties.
       const externalParties = [ownerPartyId, receiverPartyId].filter(p => p && isExtParty(p));
       if (externalParties.length > 0) {
-        const utilKeyChecks = await Promise.all(externalParties.map(p => userRegistry.hasSigningKey(p)));
-        const allHaveKeys = utilKeyChecks.every(Boolean);
-        if (allHaveKeys) {
-          const allPartiesActAs = [...new Set([executorPartyId, ownerPartyId, receiverPartyId].filter(Boolean))];
-          const extOnlyActAs = [...new Set(externalParties)];
-          const interactiveStrategies = [allPartiesActAs, extOnlyActAs]
-            .filter(arr => arr.length > 0)
-            .filter((arr, i, self) => self.findIndex(x => x.join('|') === arr.join('|')) === i);
-
-          for (const strategyActAs of interactiveStrategies) {
-            const strategyLabel = strategyActAs.length === allPartiesActAs.length ? 'all-parties' : 'ext-only';
-            console.log(`[CantonSDK]    🔐 Utilities: trying interactive settlement (${strategyLabel}) for ${externalParties.length} external party(ies)`);
-            try {
-              const prepareResult = await cantonService.prepareInteractiveSubmission({
-                token: adminToken,
-                actAsParty: strategyActAs,
-                commands: [{
-                  ExerciseCommand: {
-                    templateId: UTILITIES_CONFIG.ALLOCATION_INTERFACE,
-                    contractId: allocationContractId,
-                    choice: 'Allocation_ExecuteTransfer',
-                    choiceArgument,
-                  }
-                }],
-                readAs: readAsParties,
-                synchronizerId,
-                disclosedContracts: disclosedContracts.length > 0 ? disclosedContracts : null,
-              });
-
-              if (prepareResult.preparedTransaction && prepareResult.preparedTransactionHash) {
-                // Sign for ALL actAs parties that have signing keys in the database.
-                // Canton interactive mode requires explicit external signatures for ALL
-                // actAs parties — including the operator if its key is managed externally
-                // (e.g. Keycloak KMS). The participant does NOT auto-sign in interactive mode.
-                const partySignatureEntries = [];
-                const unsignedParties = [];
-                for (const partyId of strategyActAs) {
-                  const hasKey = await userRegistry.hasSigningKey(partyId);
-                  if (hasKey) {
-                    const keyInfo = await userRegistry.getSigningKey(partyId);
-                    if (!keyInfo) continue;
-                    console.log(`[CantonSDK]    🔑 Signing hash for ${partyId.substring(0, 30)}... (fingerprint: ${keyInfo.fingerprint?.substring(0, 20)}...)`);
-                    const signatureBase64 = await signHashWithKey(keyInfo.keyBase64, prepareResult.preparedTransactionHash);
-                    partySignatureEntries.push({
-                      party: partyId,
-                      signatures: [{
-                        format: 'SIGNATURE_FORMAT_RAW',
-                        signature: signatureBase64,
-                        signedBy: keyInfo.fingerprint,
-                        signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
-                      }],
-                    });
-                  } else {
-                    unsignedParties.push(partyId);
-                  }
-                }
-
-                if (partySignatureEntries.length === 0) {
-                  throw new Error('SIGNING_KEY_MISSING: No signing keys available for any actAs party');
-                }
-
-                if (unsignedParties.length > 0) {
-                  console.warn(`[CantonSDK]    ⚠️ Missing signing keys for: ${unsignedParties.map(p => p.substring(0, 30) + '...').join(', ')}`);
-                  console.warn(`[CantonSDK]    ⚠️ Participant must auto-sign for these parties, or execute will fail`);
-                  console.warn(`[CantonSDK]    💡 To fix: ensure all actAs parties have signing keys stored via POST /api/onboarding/store-signing-key`);
-                }
-
-                console.log(`[CantonSDK]    Collected ${partySignatureEntries.length} signature(s) for ${strategyActAs.length} actAs parties (${unsignedParties.length} unsigned)`);
-
-                const executeResult = await cantonService.executeInteractiveSubmission({
-                  preparedTransaction: prepareResult.preparedTransaction,
-                  partySignatures: { signatures: partySignatureEntries },
-                  hashingSchemeVersion: prepareResult.hashingSchemeVersion,
-                }, adminToken);
-
-                console.log(`[CantonSDK]    ✅ Utilities allocation executed (interactive ${strategyLabel}) — updateId: ${executeResult?.transaction?.updateId || 'N/A'}`);
-                return executeResult;
-              }
-            } catch (interactiveErr) {
-              const msg = String(interactiveErr?.message || interactiveErr || '');
-              if (msg.includes('CONTRACT_NOT_FOUND') || msg.includes('could not be found') ||
-                  msg.includes('deadline-exceeded') || msg.includes('settleBefore') ||
-                  msg.includes('LockedAmulet') || msg.includes('SIGNING_KEY_MISSING')) {
-                throw interactiveErr;
-              }
-              console.warn(`[CantonSDK]    Interactive (${strategyLabel}) failed: ${msg.substring(0, 120)} — trying next strategy...`);
-              continue;
-            }
-          }
-          console.warn(`[CantonSDK]    All interactive strategies failed — trying all-parties non-interactive...`);
-        }
+        console.log(`[CantonSDK]    External parties detected (${externalParties.length}); skipping interactive server-signing strategy.`);
       }
 
       // ── Strategy 3: DISABLED — all-parties non-interactive (last resort) ───
@@ -3724,13 +3234,16 @@ class CantonSDKClient {
         return null;
       }
 
-      // SELF-ALLOCATION: sender=receiver=user (client requirement).
-      // Tokens are locked under user's own name. At match, TradingApp pattern
-      // withdraws and creates direct user-to-user legs. Operator never holds tokens.
-      const receiverPartyId = senderPartyId;
+      // OPERATOR-AS-RECEIVER: sender=user, receiver=operator (executor).
+      // Tokens flow user→operator at allocation execution (Execute_LegSettlement).
+      // Operator then forwards to counterparty after settlement TX.
+      // This satisfies Utility Registry "sender ≠ receiver" requirement (CBTC).
+      // Splice (CC) registry has no such constraint but we use operator-as-receiver
+      // consistently so the matching engine always has the same forwarding logic.
+      const receiverPartyId = executorPartyId;
 
-      console.log(`[CantonSDK] 🔄 Building self-allocation for ${amount} ${symbol} (${tokenSystemType})...`);
-      console.log(`[CantonSDK]    sender=receiver=${senderPartyId.substring(0, 30)}... (SELF), executor=${executorPartyId.substring(0, 30)}...`);
+      console.log(`[CantonSDK] 🔄 Building operator-as-receiver allocation for ${amount} ${symbol} (${tokenSystemType})...`);
+      console.log(`[CantonSDK]    sender=${senderPartyId.substring(0, 30)}..., receiver/executor=${executorPartyId.substring(0, 30)}... (operator)`);
 
       const holdingCidsArray = overrideHoldingCids
         ? (Array.isArray(overrideHoldingCids) ? overrideHoldingCids : [overrideHoldingCids])
@@ -3738,7 +3251,7 @@ class CantonSDKClient {
 
       const result = await this.buildAllocationInteractiveCommand(
         senderPartyId,
-        receiverPartyId,  // always self (sender=receiver=user)
+        receiverPartyId,  // operator (executor) — sender≠receiver satisfies Utility Registry
         amount,
         symbol,
         executorPartyId,
@@ -3752,7 +3265,7 @@ class CantonSDKClient {
       }
 
       const allocationType = tokenSystemType === 'utilities' ? 'UtilitiesAllocation' : 'SpliceAllocation';
-      console.log(`[CantonSDK] ✅ Self-allocation built for ${orderId}`);
+      console.log(`[CantonSDK] ✅ Operator-as-receiver allocation built for ${orderId}`);
 
       return {
         ...result,

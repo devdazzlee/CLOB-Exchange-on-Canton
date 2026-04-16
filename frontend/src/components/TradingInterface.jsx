@@ -33,7 +33,7 @@ import websocketService from '../services/websocketService';
 import * as balanceService from '../services/balanceService';
 import * as orderService from '../services/orderService';
 // Wallet signing (for external party interactive submission)
-import { loadWallet, decryptPrivateKey, signMessage, bytesToBase64 } from '../wallet/keyManager';
+import { loadWallet, decryptPrivateKey, signMessage } from '../wallet/keyManager';
 import { cn } from '../lib/utils';
 
 /**
@@ -283,6 +283,7 @@ export default function TradingInterface({ partyId }) {
           hashingSchemeVersion: data.hashingSchemeVersion,
           orderMeta: {
             orderId: data.orderId,
+            partyId,
             tradingPair: data.tradingPair,
             orderType: data.orderType,
             orderMode: data.orderMode,
@@ -290,7 +291,9 @@ export default function TradingInterface({ partyId }) {
             quantity: data.quantity,
             stopPrice: data.stopPrice,
             lockInfo: data.lockInfo,
-            stage: data.stage || 'ALLOCATION_AND_ORDER_PREPARED',
+            stage: data.stage || 'PLACEMENT_STEP_1_ALLOCATION',
+            placementContext: data.placementContext,
+            executorPartyId: data.executorPartyId,
             allocationType: data.allocationType || null,
           },
           orderData, // original form data for success toast
@@ -455,26 +458,8 @@ export default function TradingInterface({ partyId }) {
       const privateKey = await decryptPrivateKey(wallet.encryptedPrivateKey, walletPassword);
       console.log(`[SignOrder] Wallet unlocked, signing ${action} transaction hash...`);
 
-      // 1b. Immediately sync signing key to backend for server-side settlement.
-      //     This ensures the matching engine can use interactive settlement (Strategy 2)
-      //     even if the user hasn't placed a new order since their last page refresh.
-      const privateKeyBase64ForSync = bytesToBase64(privateKey);
       const fingerprint = localStorage.getItem('canton_key_fingerprint')
         || (partyId && partyId.includes('::') ? partyId.split('::')[1] : null);
-      if (fingerprint && partyId) {
-        // Fire-and-forget: don't block order signing on key sync
-        apiClient.post('/onboarding/store-signing-key', {
-          partyId,
-          signingKeyBase64: privateKeyBase64ForSync,
-          publicKeyFingerprint: fingerprint,
-        }).then(() => {
-          console.log(`[SignOrder] 🔑 Signing key synced to backend for settlement`);
-          // Cache in sessionStorage for rehydration on page refresh
-          try { sessionStorage.setItem('canton_signing_key_b64', privateKeyBase64ForSync); } catch (_) {}
-        }).catch((syncErr) => {
-          console.warn(`[SignOrder] ⚠️ Signing key sync failed (non-fatal):`, syncErr?.message || syncErr);
-        });
-      }
       
       // 2. Sign the prepared transaction hash
       const signatureBase64 = await signMessage(privateKey, preparedTransactionHash);
@@ -489,8 +474,7 @@ export default function TradingInterface({ partyId }) {
       let response;
       
       if (action === 'PLACE') {
-        // 4a. Execute order placement (include signing key for server-side settlement)
-        const privateKeyBase64 = bytesToBase64(privateKey);
+        // 4a. Execute order placement (signature only, private key never leaves browser)
         response = await apiClient.post('/orders/execute-place', {
           preparedTransaction,
           partyId,
@@ -498,11 +482,23 @@ export default function TradingInterface({ partyId }) {
           signedBy,
           hashingSchemeVersion,
           orderMeta: signingState.orderMeta,
-          signingKeyBase64: privateKeyBase64,
         });
 
-        // Single signature flow: backend auto-signs Order Create (step 2) server-side.
-        // No client-side fallback — signing key is stored at step 1 execution.
+        // Multi-step signing flow (if backend returns the next prepared step)
+        if (response.success && response.data?.requiresSignature) {
+          setSigningState((prev) => ({
+            ...prev,
+            preparedTransaction: response.data.preparedTransaction,
+            preparedTransactionHash: response.data.preparedTransactionHash,
+            hashingSchemeVersion: response.data.hashingSchemeVersion,
+            orderMeta: {
+              ...(prev?.orderMeta || {}),
+              ...(response.data || {}),
+            },
+          }));
+          setSigningError(null);
+          return;
+        }
 
         if (response.success) {
           const od = signingState.orderData;

@@ -26,7 +26,6 @@ model User {
   updatedAt      DateTime @updatedAt
 
   // Relations
-  signingKey     SigningKey?
   walletInfo     Wallet?
   orders         Order[]
   stopLossOrders StopLossOrder[]
@@ -35,23 +34,7 @@ model User {
   @@index([partyId])
 }
 
-// ─── 2. Signing Keys ─────────────────────────────────────────────────────
-// Previously: userRegistry.js → signingKeys = new Map()
-// Maps partyId -> { keyBase64, fingerprint }
-// Used for server-side signing of Allocation_ExecuteTransfer
-model SigningKey {
-  partyId     String   @id // Canton party ID (e.g. "ext-abc123::1220...")
-  keyBase64   String   // Base64-encoded 32-byte Ed25519 private key
-  fingerprint String?  // Public key fingerprint (signedBy in Canton)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  // Relation to user (optional — keys can exist without userId mapping)
-  user        User?    @relation(fields: [userId], references: [id])
-  userId      String?  @unique
-}
-
-// ─── 3. Wallet Store ─────────────────────────────────────────────────────
+// ─── 2. Wallet Store ─────────────────────────────────────────────────────
 // Previously: walletService.js → walletStore = new Map()
 // Maps walletId (partyId) -> { publicKeyBase64Der, partyId, allocatedAt }
 model Wallet {

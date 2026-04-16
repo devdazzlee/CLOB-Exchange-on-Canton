@@ -2,27 +2,21 @@
  * Matching Engine Bot — Server-Side Auto-Settlement
  *
  * Core exchange functionality — matches buy/sell orders and settles trades
- * instantly using stored signing keys (same pattern as autoAcceptService).
+ * instantly using provider/operator submission.
  *
- * Settlement Flow (User-to-User, Server-Signed):
+ * Settlement Flow (provider-signed settlement):
  * 1. Poll Canton for OPEN Order contracts via WebSocket streaming read model
  * 2. Separate into buys/sells per trading pair
  * 3. Sort by price-time priority (FIFO)
  * 4. Find crossing orders (buy price >= sell price)
  * 5. For each match:
- *    a. Retrieve stored signing keys for both parties
- *    b. Withdraw seller's self-allocation (server signs as seller)
- *    c. Withdraw buyer's self-allocation (server signs as buyer)
- *    d. Create 2-leg Splice allocation: seller→buyer (base), buyer→seller (quote)
- *    e. Create ExchangeAllocation for both parties (embed consent on-chain)
- *    f. ATOMIC: Exercise Execute_DvP on seller's EA — ONE Canton TX
- *       DAML auth carry-forward gives {executor, seller, buyer} authority
- *       Both Allocation_ExecuteTransfer run inside that single transaction
- *    g. FillOrder on both Canton contracts
- *    h. Create Trade record, trigger stop-loss, broadcast via WebSocket
+ *    a. Resolve seller/buyer ExchangeAllocation contracts
+ *    b. Exercise Execute_DvP on seller EA (counterparty = buyer EA)
+ *    c. FillOrder on both Canton contracts
+ *    d. Create Trade record, trigger stop-loss, broadcast via WebSocket
  *
  * Order placement: self-allocation (sender=receiver=user)
- * Settlement: server signs using stored keys — instant, no manual interaction
+ * Settlement: provider/operator signs server-side using its own party only
  * Token flow: user-to-user ONLY — operator NEVER holds tokens
  *
  * @see backend/docs/clientchat.txt
@@ -481,20 +475,28 @@ class MatchingEngine {
           continue;
         }
 
-        // Extract allocationCid (Token Standard allocation contract ID)
+        // Extract allocationCid (Token Standard allocation contract ID).
         // '#0' is a relative reference from single-sign tx — NOT a real contract ID.
-        const rawAllocationCid = payload.allocationCid || '';
-        const isValidCid = rawAllocationCid
-          && rawAllocationCid !== 'FILL_ONLY'
-          && rawAllocationCid !== 'NONE'
-          && !rawAllocationCid.startsWith('#')
-          && rawAllocationCid.length >= 10;
-        let allocationCid = isValidCid ? rawAllocationCid : null;
-        if (!allocationCid && payload.orderId) {
+        // Canton contract IDs always contain '::' (e.g. "00d4...::1220...").
+        // The Order DAML field is a Text placeholder (orderId like "order-123-abc"),
+        // so we require '::' to distinguish real CIDs from placeholder strings.
+        // Always prefer the DB-stored real CID (set at step-1 execution time).
+        let allocationCid = null;
+        if (payload.orderId) {
           try {
             const { getAllocationContractIdForOrder } = require('./order-service');
             allocationCid = await getAllocationContractIdForOrder(payload.orderId);
           } catch (_) { /* best effort */ }
+        }
+        if (!allocationCid) {
+          const rawAllocationCid = payload.allocationCid || '';
+          const isValidCid = rawAllocationCid
+            && rawAllocationCid !== 'FILL_ONLY'
+            && rawAllocationCid !== 'NONE'
+            && !rawAllocationCid.startsWith('#')
+            && rawAllocationCid.includes('::')  // Canton CIDs always have '::' separator
+            && rawAllocationCid.length >= 10;
+          if (isValidCid) allocationCid = rawAllocationCid;
         }
         if (!allocationCid) continue;
 
@@ -683,24 +685,32 @@ class MatchingEngine {
         }
 
         try {
+          const buyRemainingAfter = buyOrder.remainingDecimal.minus(matchQty);
+          const sellRemainingAfter = sellOrder.remainingDecimal.minus(matchQty);
+          const buyFullySettled = buyRemainingAfter.lte(0);
+          const sellFullySettled = sellRemainingAfter.lte(0);
+
           await this.executeMatch(tradingPair, buyOrder, sellOrder, matchQty, matchPrice, token);
           console.log(`[MatchingEngine] ✅ Match executed successfully via Allocation API`);
-          // Mark both order IDs as settled — prevents re-match even if streaming
-          // model briefly shows them with a new contractId after FillOrder.
-          this._settledOrderIds.set(buyOrder.orderId, Date.now());
-          this._settledOrderIds.set(sellOrder.orderId, Date.now());
-          // Also blacklist their allocation CIDs
-          if (buyOrder.allocationContractId) this._archivedAllocationCids.add(buyOrder.allocationContractId);
-          if (sellOrder.allocationContractId) this._archivedAllocationCids.add(sellOrder.allocationContractId);
+          // Only quarantine a side when it is fully filled.
+          // Partial fills must remain matchable in subsequent cycles.
+          if (buyFullySettled) {
+            this._settledOrderIds.set(buyOrder.orderId, Date.now());
+            if (buyOrder.allocationContractId) this._archivedAllocationCids.add(buyOrder.allocationContractId);
+          }
+          if (sellFullySettled) {
+            this._settledOrderIds.set(sellOrder.orderId, Date.now());
+            if (sellOrder.allocationContractId) this._archivedAllocationCids.add(sellOrder.allocationContractId);
+          }
           // Reset circuit breaker on success
           this._consecutiveSettlementFailures = 0;
           // Update remaining quantities in-place for batch execution.
           // After a match, reduce both orders' remaining so the batch loop
           // can find the next crossing pair without re-querying Canton.
-          buyOrder.remaining = buyOrder.remainingDecimal.minus(matchQty).toNumber();
-          buyOrder.remainingDecimal = buyOrder.remainingDecimal.minus(matchQty);
-          sellOrder.remaining = sellOrder.remainingDecimal.minus(matchQty).toNumber();
-          sellOrder.remainingDecimal = sellOrder.remainingDecimal.minus(matchQty);
+          buyOrder.remaining = buyRemainingAfter.toNumber();
+          buyOrder.remainingDecimal = buyRemainingAfter;
+          sellOrder.remaining = sellRemainingAfter.toNumber();
+          sellOrder.remainingDecimal = sellRemainingAfter;
           return true;
         } catch (error) {
           this._consecutiveSettlementFailures++;
@@ -798,14 +808,6 @@ class MatchingEngine {
             // Quarantine BOTH orders' allocations to prevent immediate re-submission
             this._markInvalidSettlementOrder(buyOrder, 'Synchronizer error — quarantined');
             this._markInvalidSettlementOrder(sellOrder, 'Synchronizer error — quarantined');
-            continue;
-          }
-
-          // Signing key missing — the external party hasn't stored their key yet.
-          // Don't quarantine — the key may arrive when they re-login or place an order.
-          if (error.message?.includes('SIGNING_KEY_MISSING')) {
-            console.warn(`[MatchingEngine] ⚠️ Signing key not available for external party — skipping match (will retry when key is stored)`);
-            this.recentlyMatchedOrders.delete(matchKey);
             continue;
           }
 
@@ -930,7 +932,7 @@ class MatchingEngine {
     // ATOMIC DvP SETTLEMENT — Multi-Command Batch (Single Canton TX)
     //
     // Architecture: Self-allocations at order placement (sender=receiver=user).
-    // At match time, SERVER settles ATOMICALLY using stored signing keys:
+    // At match time, SERVER settles ATOMICALLY using provider submission:
     //   Step 1-2: Withdraw both self-allocations (server signs)
     //   Step 3: Create directional Splice allocations (both legs)
     //   Step 4: Fetch extraArgs from registries
@@ -954,81 +956,56 @@ class MatchingEngine {
 
     const tradeId = `trade-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
     const sdkClient = getCantonSDKClient();
-    const userRegistry = require('../state/userRegistry');
-    const { signHash } = require('./serverSigner');
 
-    // ═══ Step 0: Retrieve stored signing keys for both parties ═══
-    const sellerKey = await userRegistry.getSigningKey(sellOrder.owner);
-    const buyerKey = await userRegistry.getSigningKey(buyOrder.owner);
-    if (!sellerKey?.keyBase64 || !sellerKey?.fingerprint) {
-      throw new Error(`SIGNING_KEY_MISSING: No stored signing key for seller ${sellOrder.owner.substring(0, 30)}...`);
-    }
-    if (!buyerKey?.keyBase64 || !buyerKey?.fingerprint) {
-      throw new Error(`SIGNING_KEY_MISSING: No stored signing key for buyer ${buyOrder.owner.substring(0, 30)}...`);
-    }
-    console.log(`[MatchingEngine]    ✅ Signing keys retrieved for both parties`);
-
-    // Service token: operator-only hub query/create (submit-and-wait as venue).
-    // Executor OAuth: same as order execute-place / AutoAccept — interactive prepare+execute for ext parties.
-    tokenProvider.assertExecutorOauthConfigured();
-    const serviceToken = await tokenProvider.getServiceToken();
-    const interactiveLedgerToken = await tokenProvider.getExecutorToken();
+    // Settlement uses REGULAR submission — operator signs alone.
+    // ExchangeAllocation DAML carry-forward provides {executor, seller, buyer} auth.
+    // No stored private keys are needed at settlement time.
+    const adminToken = await tokenProvider.getServiceToken();
     const updateIds = [];
 
-    // ═══ SETTLEMENT: Execute_DvP — Operator-Only Regular Submission (TX 2) ═══
-    //
-    // Canton external party limitation: interactive submission only supports 1 party in actAs.
-    // Fix: Use ExchangeAllocation Propose-Accept pattern (DAML auth carry-forward).
-    //
-    // TX 1 (order placement): user creates ExchangeAllocation (sole signatory) + Splice self-alloc
-    // TX 2 (settlement): operator regular submission, actAs=[operator] only
-    //   - Ex    // ─── Step 1: Using single CreateAndExercise TradeSettlement::DoSettle ───
-    // We no longer need ExchangeAllocation for the settlement step, as we use
-    // interactive submission with both parties + the operator in the actAs.
-    // This allows one single command to fulfill Canton's interactive prepare constraint.
+    // ─── Step 1: Find ExchangeAllocation CIDs for seller and buyer ───────────
+    // ExchangeAllocations created at TX1 embed user consent on-chain.
+    // We match by orderId (unique) to avoid any ambiguity.
+    const eaTemplateId = `${packageId}:Settlement:ExchangeAllocation`;
+    const allEAContracts = await cantonService.queryActiveContracts(
+      { party: operatorPartyId, templateIds: [eaTemplateId] }, adminToken
+    );
+    const findEAByOrderId = (contracts, targetOrderId) => {
+      const list = Array.isArray(contracts) ? contracts
+        : (contracts?.activeContracts || contracts?.contracts || []);
+      for (const c of list) {
+        const ev = c.createdEvent || c;
+        const p = ev?.createArguments || ev?.createArgument || ev?.payload || {};
+        if (p.orderId === targetOrderId && p.status === 'PENDING') {
+          const cid = c.contractId || ev?.contractId;
+          if (cid) {
+            console.log(`[MatchingEngine]    EA found for orderId ${targetOrderId}: cid=${cid.substring(0, 24)}... owner=${String(p.owner).substring(0, 30)}...`);
+            return cid;
+          }
+        }
+      }
+      return null;
+    };
+    const eaList = Array.isArray(allEAContracts) ? allEAContracts
+      : (allEAContracts?.activeContracts || allEAContracts?.contracts || []);
+    console.log(`[MatchingEngine]    Searching ${eaList.length} ExchangeAllocation(s) for seller orderId=${sellOrder.orderId} buyer orderId=${buyOrder.orderId}`);
+    const sellerEACid = findEAByOrderId(allEAContracts, sellOrder.orderId);
+    const buyerEACid  = findEAByOrderId(allEAContracts, buyOrder.orderId);
 
-    // ─── Step 2: Fetch registry context data ─────────────────────────────────
-    // ccBuild / cbtcBuild: AllocationFactory CID + AllocationSpec + ExtraArgs
-    // ccWithdrawData / cbtcWithdrawData: ExtraArgs for Allocation_Withdraw on self-allocs
-    // ccExtraData / cbtcExtraData: ExtraArgs for Allocation_ExecuteTransfer
-    const [ccBuild, cbtcBuild, ccWithdrawData, cbtcWithdrawData, ccExtraData, cbtcExtraData] = await Promise.all([
-      sdkClient.buildAllocationInteractiveCommand(
-        sellOrder.owner, buyOrder.owner, matchQtyStr, baseSymbol, operatorPartyId, `${tradeId}-leg-base`, []
-      ),
-      sdkClient.buildAllocationInteractiveCommand(
-        buyOrder.owner, sellOrder.owner, quoteAmountStr, quoteSymbol, operatorPartyId, `${tradeId}-leg-quote`, []
-      ),
-      sdkClient.fetchAllocationWithdrawArgs(sellOrder.allocationContractId, baseSymbol),
-      sdkClient.fetchAllocationWithdrawArgs(buyOrder.allocationContractId, quoteSymbol),
+    if (!sellerEACid) throw new Error(`EXCHANGE_ALLOCATION_MISSING: No PENDING ExchangeAllocation for seller orderId=${sellOrder.orderId}`);
+    if (!buyerEACid)  throw new Error(`EXCHANGE_ALLOCATION_MISSING: No PENDING ExchangeAllocation for buyer orderId=${buyOrder.orderId}`);
+    console.log(`[MatchingEngine]    Seller EA: ${sellerEACid.substring(0, 24)}...`);
+    console.log(`[MatchingEngine]    Buyer  EA: ${buyerEACid.substring(0, 24)}...`);
+
+    // ─── Step 2: Fetch execution extraArgs for both allocation legs ──────────
+    const [ccExtraData, cbtcExtraData] = await Promise.all([
       sdkClient.fetchAllocationExtraArgs(sellOrder.allocationContractId, baseSymbol),
       sdkClient.fetchAllocationExtraArgs(buyOrder.allocationContractId, quoteSymbol),
     ]);
 
-    if (!ccBuild?.command) throw new Error('Failed to build CC allocation command for settlement');
-    if (!cbtcBuild?.command) throw new Error('Failed to build CBTC allocation command for settlement');
-
-    const ccFactoryId      = ccBuild.command.ExerciseCommand.contractId;
-    const ccChoiceArg      = ccBuild.command.ExerciseCommand.choiceArgument;
-    const ccAllocSpec      = ccChoiceArg.allocation;
-    const ccAllocExtraArgs = ccChoiceArg.extraArgs;
-    const ccExpectedAdmin  = ccChoiceArg.expectedAdmin;
-
-    const cbtcFactoryId      = cbtcBuild.command.ExerciseCommand.contractId;
-    const cbtcChoiceArg      = cbtcBuild.command.ExerciseCommand.choiceArgument;
-    const cbtcAllocSpec      = cbtcChoiceArg.allocation;
-    const cbtcAllocExtraArgs = cbtcChoiceArg.extraArgs;
-    const cbtcExpectedAdmin  = cbtcChoiceArg.expectedAdmin;
-
-    console.log(`[MatchingEngine]    CC factory:   ${ccFactoryId?.substring(0, 24)}...`);
-    console.log(`[MatchingEngine]    CBTC factory: ${cbtcFactoryId?.substring(0, 24)}...`);
-
     // Collect all disclosed contracts (deduped)
     const disclosedByContractId = new Map();
     for (const dc of [
-      ...(ccBuild.disclosedContracts || []),
-      ...(cbtcBuild.disclosedContracts || []),
-      ...(ccWithdrawData.disclosedContracts || []),
-      ...(cbtcWithdrawData.disclosedContracts || []),
       ...(ccExtraData.disclosedContracts || []),
       ...(cbtcExtraData.disclosedContracts || []),
     ]) {
@@ -1036,161 +1013,233 @@ class MatchingEngine {
     }
     const disclosedContracts = Array.from(disclosedByContractId.values());
 
-    // ─── Step 3: Build settlement commands (operator-only regular submission) ─
+    // ─── Step 3: Build settlement commands — REGULAR SUBMISSION (operator-only) ─
     //
-    // Using a ONE command CreateAndExerciseCommand for TradeSettlement
-    const tradeSettlementTemplateId = `${packageId}:Settlement:TradeSettlement`;
-
-    // Ensure ExchangeSettlerHub exists
-    let settleHubCid = null;
-    let hubPayload = null;
-    const hubTemplateId = `${packageId}:Settlement:ExchangeSettlerHub`;
-    try {
-      let hubs = await cantonService.queryActiveContracts({ party: operatorPartyId, templateIds: [hubTemplateId] }, serviceToken);
-      if (hubs && hubs.length > 0) {
-          settleHubCid = hubs[0].contractId;
-          hubPayload = hubs[0];
-      }
-      
-      if (!settleHubCid) {
-        console.log(`[MatchingEngine]    Creating ExchangeSettlerHub...`);
-        const res = await cantonService.createContract({
-          token: serviceToken,
-          actAsParty: operatorPartyId,
-          templateId: hubTemplateId,
-          createArguments: { operator: operatorPartyId, createdAt: new Date().toISOString() },
-          synchronizerId
-        });
-        if (res?.contractId) {
-          settleHubCid = res.contractId;
-        } else if (res?.transaction?.events) {
-          for (const ev of res.transaction.events) {
-            const created = ev.created || ev.CreatedEvent;
-            if (created && created.templateId) {
-                const tName = typeof created.templateId === 'string' ? created.templateId : created.templateId.entityName;
-                if (tName && tName.includes('ExchangeSettlerHub')) settleHubCid = created.contractId;
-            }
-          }
-        }
-        if (!settleHubCid) settleHubCid = res?.updateId; // Fallback
-        
-        // Query again to get the createdEventBlob for disclosedContracts
-        hubs = await cantonService.queryActiveContracts({ party: operatorPartyId, templateIds: [hubTemplateId] }, serviceToken);
-        if (hubs && hubs.length > 0) {
-            settleHubCid = hubs[0].contractId;
-            hubPayload = hubs[0];
-        }
-      }
-    } catch (e) {
-      console.error("[MatchingEngine] Failed to get/create ExchangeSettlerHub:", e);
-      throw e;
-    }
+    // ROOT CAUSE FIX for DAML_AUTHORIZATION_ERROR:
+    //   Execute_DvP used a nested DAML sub-choice chain:
+    //     Execute_DvP (seller's EA) → Execute_Settlement_WithTransfers (buyer's EA)
+    //     → Allocation_ExecuteTransfer (seller's Splice alloc)
+    //   In Canton 3.x, auth does NOT carry forward across nested cross-contract
+    //   sub-choices. Seller's auth from Execute_DvP on seller's EA was NOT
+    //   available inside Allocation_ExecuteTransfer on the Splice alloc.
+    //
+    // FIX: Execute_LegSettlement — one ROOT command per party.
+    //   Command 1 (root): Execute_LegSettlement on SELLER's EA
+    //     Auth in body = actAs ∪ signatories(seller's EA) = {operator, seller}
+    //     → Allocation_ExecuteTransfer on seller's Splice alloc needs {executor, seller} ✓
+    //   Command 2 (root): Execute_LegSettlement on BUYER's EA
+    //     Auth in body = actAs ∪ signatories(buyer's EA) = {operator, buyer}
+    //     → Allocation_ExecuteTransfer on buyer's Splice alloc needs {executor, buyer} ✓
+    //
+    // Both root commands are submitted in ONE atomic Canton transaction.
+    // actAs = [operator] only. No user keys at settlement time. ✓
+    const eaTemplateIdStr = eaTemplateId;
+    const orderTemplateId = `${packageId}:Order:Order`;
+    const tradeTemplateId = `${packageId}:Settlement:Trade`;
 
     const settlementCommands = [
+      // Command 1: Execute_LegSettlement on SELLER's EA
+      // auth = {operator, seller} → Allocation_ExecuteTransfer on seller's Splice alloc ✓
       {
         ExerciseCommand: {
-          templateId: hubTemplateId,
-          contractId: settleHubCid,
-          choice: 'SettleTrade',
+          templateId: eaTemplateIdStr,
+          contractId: sellerEACid,
+          choice: 'Execute_LegSettlement',
           choiceArgument: {
-            seller: sellOrder.owner,
-            buyer: buyOrder.owner,
+            legAllocCid: sellOrder.allocationContractId,
+            legExtraArgs: ccExtraData.extraArgs,
+            matchPrice: matchPrice.toString(),
+            matchQuantity: matchQtyStr,
             tradeId,
-            sellerSelfAllocCid: sellOrder.allocationContractId,
-            buyerSelfAllocCid: buyOrder.allocationContractId,
-            ccFactory: ccFactoryId,
-            cbtcFactory: cbtcFactoryId,
-            ccWithdrawArgs: ccWithdrawData.extraArgs,
-            cbtcWithdrawArgs: cbtcWithdrawData.extraArgs,
-            ccAllocSpec,
-            cbtcAllocSpec,
-            ccAllocArgs: ccAllocExtraArgs,
-            cbtcAllocArgs: cbtcAllocExtraArgs,
-            ccExpectedAdmin,
-            cbtcExpectedAdmin,
-            ccExecuteArgs: ccExtraData.extraArgs,
-            cbtcExecuteArgs: cbtcExtraData.extraArgs,
-            buyOrderCid: buyOrder.contractId,
-            sellOrderCid: sellOrder.contractId,
-            fillQuantity: matchQtyStr,
-            baseInstrumentId: { issuer: operatorPartyId, symbol: baseSymbol, version: '1.0' },
+          },
+        },
+      },
+      // Command 2: Execute_LegSettlement on BUYER's EA
+      // auth = {operator, buyer} → Allocation_ExecuteTransfer on buyer's Splice alloc ✓
+      {
+        ExerciseCommand: {
+          templateId: eaTemplateIdStr,
+          contractId: buyerEACid,
+          choice: 'Execute_LegSettlement',
+          choiceArgument: {
+            legAllocCid: buyOrder.allocationContractId,
+            legExtraArgs: cbtcExtraData.extraArgs,
+            matchPrice: matchPrice.toString(),
+            matchQuantity: matchQtyStr,
+            tradeId,
+          },
+        },
+      },
+      // Command 3: FillOrder on buy order (controller=operator ✓)
+      {
+        ExerciseCommand: {
+          templateId: orderTemplateId,
+          contractId: buyOrder.contractId,
+          choice: 'FillOrder',
+          choiceArgument: { fillQuantity: matchQtyStr, newAllocationCid: null },
+        },
+      },
+      // Command 4: FillOrder on sell order (controller=operator ✓)
+      {
+        ExerciseCommand: {
+          templateId: orderTemplateId,
+          contractId: sellOrder.contractId,
+          choice: 'FillOrder',
+          choiceArgument: { fillQuantity: matchQtyStr, newAllocationCid: null },
+        },
+      },
+      // Command 5: Create Trade record (signatory=operator ✓)
+      {
+        CreateCommand: {
+          templateId: tradeTemplateId,
+          createArguments: {
+            tradeId,
+            operator: operatorPartyId,
+            buyer:    buyOrder.owner,
+            seller:   sellOrder.owner,
+            baseInstrumentId:  { issuer: operatorPartyId, symbol: baseSymbol,  version: '1.0' },
             quoteInstrumentId: { issuer: operatorPartyId, symbol: quoteSymbol, version: '1.0' },
-            baseAmount: matchQtyStr,
+            baseAmount:  matchQtyStr,
             quoteAmount: quoteAmountStr,
-            price: matchPrice.toString(),
-            buyOrderId: buyOrder.orderId,
-            sellOrderId: sellOrder.orderId
-          }
-        }
-      }
+            price:       matchPrice.toString(),
+            buyOrderId:  buyOrder.orderId,
+            sellOrderId: sellOrder.orderId,
+            timestamp:   new Date().toISOString(),
+          },
+        },
+      },
     ];
 
-    // Add ExchangeSettlerHub to disclosed contracts so buyers and sellers can exercise it!
-    if (hubPayload && hubPayload.createdEventBlob) {
-        disclosedContracts.push({
-            templateId: hubPayload.templateId,
-            contractId: hubPayload.contractId,
-            createdEventBlob: hubPayload.createdEventBlob
-        });
+    if (!operatorPartyId || operatorPartyId.startsWith('ext-')) {
+      throw new Error('Settlement invariant violated: provider/operator partyId must be a hosted provider party.');
+    }
+    if (settlementCommands.length === 0) {
+      throw new Error('Settlement invariant violated: no settlement commands prepared.');
     }
 
-    // ─── Interactive submission: actAs=[seller, buyer] ────────────
-    // DAML auth carry-forward handles the operator authority (operator is signatory of Hub).
-    // The server holds stored Ed25519 keys for both parties and signs on their behalf.
-    // This remains ONE Canton transaction (TX2), satisfying the 2-TX lifecycle.
-    console.log(`[MatchingEngine]    Preparing interactive settlement: actAs=[seller, buyer]`);
-
-    const settlePrep = await cantonService.prepareInteractiveSubmission({
-      token: interactiveLedgerToken,
-      actAsParty: [sellOrder.owner, buyOrder.owner],
-      commands: settlementCommands,
-      readAs: [sellOrder.owner, buyOrder.owner],
-      synchronizerId,
-      disclosedContracts: disclosedContracts.length > 0 ? disclosedContracts : null,
-    });
-
-    if (!settlePrep.preparedTransaction || !settlePrep.preparedTransactionHash) {
-      throw new Error('Settlement prepare failed: missing preparedTransaction or hash');
-    }
-    console.log(`[MatchingEngine]    Signing settlement hash with stored keys for seller + buyer...`);
-
-    const sellerSig = await signHash(sellerKey.keyBase64, settlePrep.preparedTransactionHash);
-    const buyerSig  = await signHash(buyerKey.keyBase64,  settlePrep.preparedTransactionHash);
-
-    const settleResult = await cantonService.executeInteractiveSubmission({
-      preparedTransaction: settlePrep.preparedTransaction,
-      partySignatures: {
-        signatures: [
-          {
-            party: sellOrder.owner,
-            signatures: [{
-              format: 'SIGNATURE_FORMAT_RAW',
-              signature: sellerSig,
-              signedBy: sellerKey.fingerprint,
-              signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
-            }],
-          },
-          {
-            party: buyOrder.owner,
-            signatures: [{
-              format: 'SIGNATURE_FORMAT_RAW',
-              signature: buyerSig,
-              signedBy: buyerKey.fingerprint,
-              signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
-            }],
-          },
-        ],
+    // Settlement TX: app provider (hosted operator party) is the only actAs — matches client requirement.
+    // Users already locked funds at placement; they do not sign this ledger submission.
+    console.log(`[MatchingEngine]    Submitting settlement: actAs=[app provider / operator ${operatorPartyId.substring(0, 24)}...] — hosted keys only (users never sign settlement)`);
+    const settleResult = await cantonService.submitAndWaitForTransaction(adminToken, {
+      commands: {
+        commandId:   `settle-${tradeId}`,
+        actAs:       [operatorPartyId],
+        readAs:      [operatorPartyId, sellOrder.owner, buyOrder.owner],
+        domainId:    synchronizerId,
+        commands:    settlementCommands,
+        ...(disclosedContracts.length > 0 && { disclosedContracts }),
       },
-      hashingSchemeVersion: settlePrep.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
-    }, interactiveLedgerToken);
+    });
 
     const settleUpdateId = settleResult?.transaction?.updateId || settleResult?.updateId;
     if (settleUpdateId) updateIds.push({ step: 'settle-dvp-fill-trade', updateId: settleUpdateId });
-    console.log(`[MatchingEngine]    ✅ Settlement TX committed — interactive actAs=[seller,buyer], executor OAuth (updateId: ${settleUpdateId || 'N/A'})`);
+    console.log(`[MatchingEngine]    ✅ Execute_LegSettlement(x2) + FillOrder + Trade ALL in ONE TX — actAs=[operator] only (updateId: ${settleUpdateId || 'N/A'})`);
 
-    // Extract Trade contract ID from the transaction events
+    // ─── Forwarding: operator → counterparties ──────────────────────────────
+    //
+    // Execute_LegSettlement transferred both legs to the operator:
+    //   - seller's CC (base)  → operator
+    //   - buyer's CBTC (quote) → operator
+    //
+    // Now the operator forwards the matched amounts to the correct counterparties,
+    // and returns any partial-fill remainders to the original parties.
+    //
+    // This is the operator-as-receiver DvP pattern:
+    //   TX1 (above): lock legs execute → user→operator
+    //   TX2 (below): operator→buyer (base) + operator→seller (quote) [+ remainders]
+    // ────────────────────────────────────────────────────────────────────────
+    console.log(`[MatchingEngine]    ⟶ Forwarding: operator→counterparties (TX2 legs)...`);
+    try {
+      // Splice (CC) uses LockedAmulet with expiry — use a short settle window for operator legs
+      // so the new lock expires well before the LockedAmulet from the original order.
+      const operatorLegSettleMs = Number(process.env.OPERATOR_LEG_SETTLE_WINDOW_MS || 120000) || 120000;
+      const baseIsSplice = baseSymbol === 'CC';  // Only CC is Splice/Amulet; others are Utility
+
+      // Forward base (CC) to buyer ─────────────────────────────────────────
+      console.log(`[MatchingEngine]    ⟶ operator → buyer: ${matchQtyStr} ${baseSymbol}`);
+      const ccFwdAlloc = await sdkClient.createAllocation(
+        operatorPartyId, buyOrder.owner, matchQtyStr, baseSymbol,
+        operatorPartyId, `${tradeId}-fwd-base`,
+        baseIsSplice ? { settleWindowMsOverride: operatorLegSettleMs } : {}
+      );
+      if (ccFwdAlloc?.allocationContractId) {
+        await sdkClient.tryRealAllocationExecution(
+          ccFwdAlloc.allocationContractId, operatorPartyId, baseSymbol,
+          operatorPartyId, buyOrder.owner
+        );
+        console.log(`[MatchingEngine]    ✅ ${baseSymbol} forwarded to buyer`);
+      } else {
+        throw new Error(`Forward ${baseSymbol}→buyer: createAllocation returned no CID`);
+      }
+
+      // Forward quote (CBTC) to seller ─────────────────────────────────────
+      console.log(`[MatchingEngine]    ⟶ operator → seller: ${quoteAmountStr} ${quoteSymbol}`);
+      const cbtcFwdAlloc = await sdkClient.createAllocation(
+        operatorPartyId, sellOrder.owner, quoteAmountStr, quoteSymbol,
+        operatorPartyId, `${tradeId}-fwd-quote`
+      );
+      if (cbtcFwdAlloc?.allocationContractId) {
+        await sdkClient.tryRealAllocationExecution(
+          cbtcFwdAlloc.allocationContractId, operatorPartyId, quoteSymbol,
+          operatorPartyId, sellOrder.owner
+        );
+        console.log(`[MatchingEngine]    ✅ ${quoteSymbol} forwarded to seller`);
+      } else {
+        throw new Error(`Forward ${quoteSymbol}→seller: createAllocation returned no CID`);
+      }
+
+      // Partial fill remainders ─────────────────────────────────────────────
+      // The full Splice allocation was consumed by Execute_LegSettlement.
+      // Any unmatched portion must be returned from the operator back to the user.
+      if (sellIsPartial) {
+        const remainderBase = new Decimal(sellOrder.remaining).minus(matchQty).toFixed(10);
+        if (new Decimal(remainderBase).gt(0)) {
+          console.log(`[MatchingEngine]    ⟶ returning ${remainderBase} ${baseSymbol} remainder to seller`);
+          const remBaseAlloc = await sdkClient.createAllocation(
+            operatorPartyId, sellOrder.owner, remainderBase, baseSymbol,
+            operatorPartyId, `${tradeId}-rem-base`,
+            baseIsSplice ? { settleWindowMsOverride: operatorLegSettleMs } : {}
+          );
+          if (remBaseAlloc?.allocationContractId) {
+            await sdkClient.tryRealAllocationExecution(
+              remBaseAlloc.allocationContractId, operatorPartyId, baseSymbol,
+              operatorPartyId, sellOrder.owner
+            );
+            console.log(`[MatchingEngine]    ✅ ${baseSymbol} remainder returned to seller`);
+          }
+        }
+      }
+      if (buyIsPartial) {
+        const remainderQuote = new Decimal(buyOrder.remaining).times(new Decimal(matchPrice)).minus(quoteAmount).toFixed(10);
+        if (new Decimal(remainderQuote).gt(0)) {
+          console.log(`[MatchingEngine]    ⟶ returning ${remainderQuote} ${quoteSymbol} remainder to buyer`);
+          const remQuoteAlloc = await sdkClient.createAllocation(
+            operatorPartyId, buyOrder.owner, remainderQuote, quoteSymbol,
+            operatorPartyId, `${tradeId}-rem-quote`
+          );
+          if (remQuoteAlloc?.allocationContractId) {
+            await sdkClient.tryRealAllocationExecution(
+              remQuoteAlloc.allocationContractId, operatorPartyId, quoteSymbol,
+              operatorPartyId, buyOrder.owner
+            );
+            console.log(`[MatchingEngine]    ✅ ${quoteSymbol} remainder returned to buyer`);
+          }
+        }
+      }
+
+      console.log(`[MatchingEngine]    ✅ TX2 forwarding complete — tokens delivered to counterparties`);
+    } catch (fwdErr) {
+      // Forwarding failure is serious but TX1 already committed. Log clearly so
+      // the operator can manually reconcile. Don't crash the engine loop.
+      console.error(`[MatchingEngine] ❌ FORWARDING FAILED for trade ${tradeId}: ${fwdErr?.message || fwdErr}`);
+      console.error(`[MatchingEngine]    TX1 (Execute_LegSettlement) already committed. Operator holds tokens.`);
+      console.error(`[MatchingEngine]    Manual intervention required to forward tokens to counterparties.`);
+    }
+
+    // Extract Trade contract ID + any partially-filled Order contracts from settlement events
     let tradeContractId = null;
     const streaming = this._getStreamingModel();
+    const newPartialOrders = []; // Track new Order contracts from partial fills
     if (settleResult?.transaction?.events) {
       for (const event of settleResult.transaction.events) {
         const created = event.created || event.CreatedEvent;
@@ -1200,15 +1249,31 @@ class MatchingEngine {
           : `${created.templateId?.packageId || ''}:${created.templateId?.moduleName || ''}:${created.templateId?.entityName || ''}`;
         if (tplId.includes(':Settlement:Trade')) {
           tradeContractId = created.contractId;
+          continue;
+        }
+        // FillOrder creates a new Order contract (consuming choice archives old, creates new).
+        // For partial fills the new Order has status=OPEN. Capture it so we can immediately
+        // re-add it to the streaming model — this prevents a visibility gap where the order
+        // disappears from the book until the WebSocket delivers the event.
+        if (tplId.includes(':Order:Order')) {
+          const payload = created.createArgument || created.createArguments || created.payload || {};
+          newPartialOrders.push({ contractId: created.contractId, templateId: tplId, payload });
         }
       }
     }
     if (!tradeContractId) tradeContractId = tradeId;
 
-    // Evict filled orders from streaming read model
+    // Evict old Order contracts and immediately re-add partial fills.
+    // Fully-filled orders (status=FILLED) are NOT re-added.
     if (streaming) {
       streaming.evictOrder(buyOrder.contractId);
       streaming.evictOrder(sellOrder.contractId);
+      for (const { contractId, templateId, payload } of newPartialOrders) {
+        if (payload.status === 'OPEN' && payload.orderId) {
+          streaming._addOrder(contractId, templateId, payload);
+          console.log(`[MatchingEngine]    ♻️ Partial fill re-added to order book: ${payload.orderId} remaining=${payload.quantity - payload.filled}`);
+        }
+      }
     }
     console.log(`[MatchingEngine]    ✅ Settlement complete: Tokens transferred + Orders filled + Trade recorded in ONE TX`);
 

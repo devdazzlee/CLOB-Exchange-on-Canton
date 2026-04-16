@@ -214,8 +214,8 @@ export default function OrderForm({
           <span className="text-[#848E9C] text-[12px] font-semibold">Available to Trade</span>
           <span className="text-white text-[12px] font-mono">
             {orderType === 'BUY'
-              ? quoteBalance > 0 ? `${formatNumber(quoteBalance, 4)} ${quoteToken}` : '-'
-              : baseBalance > 0 ? `${formatNumber(baseBalance, 8)} ${baseToken}` : '-'}
+              ? `${formatNumber(quoteBalance, 4)} ${quoteToken}`
+              : `${formatNumber(baseBalance, 8)} ${baseToken}`}
           </span>
         </div>
 
@@ -245,6 +245,36 @@ export default function OrderForm({
                      className="text-[#626AEB] text-[12px] font-bold ml-1.5 flex items-center shrink-0 hover:text-[#7d85f5] transition-colors"
                    >
                      Mid
+                   </button>
+                 </div>
+               </div>
+            </div>
+          )}
+
+          {orderMode === 'STOP_LOSS' && (
+            <div className="flex flex-col gap-2">
+               <div className="flex items-center justify-between bg-[#131518] rounded-[6px] px-3 h-10 border border-[#1e2329] focus-within:border-[#2b3139] transition-colors">
+                 <span className="text-[#848E9C] text-[12px] whitespace-nowrap font-medium">Stop Price</span>
+                 <div className="flex items-center gap-1.5 flex-1 justify-end min-w-0">
+                   <input
+                     type="text"
+                     value={stopPrice}
+                     onChange={(e) => {
+                       let val = e.target.value.replace(/[^0-9.]/g, '');
+                       if (val.length > 1 && val.startsWith('0') && val[1] !== '.') {
+                         val = val.substring(1);
+                       }
+                       setStopPrice(val);
+                     }}
+                     placeholder="0.00"
+                     className="bg-transparent text-white text-right text-[13px] font-mono font-medium flex-1 min-w-0 outline-none focus:ring-0 p-0 shadow-none border-none"
+                   />
+                   <button 
+                     type="button" 
+                     onClick={() => setStopPrice(marketPrice?.toFixed(4) || '0')} 
+                     className="text-[#626AEB] text-[12px] font-bold ml-1.5 flex items-center shrink-0 hover:text-[#7d85f5] transition-colors"
+                   >
+                     Last
                    </button>
                  </div>
                </div>

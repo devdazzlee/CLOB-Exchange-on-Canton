@@ -1,8 +1,8 @@
 /**
  * Auto-Accept Incoming Transfers Service — Event-Driven (WebSocket)
  *
- * Professional exchanges (Binance, Coinbase, Kraken) automatically accept
- * incoming token transfers — the user never has to manually approve them.
+ * NOTE: In strict non-custodial mode this service no longer auto-signs
+ * transfer accepts for users. It remains as a detector/telemetry path.
  *
  * Architecture (senior-level, zero polling):
  * ──────────────────────────────────────────
@@ -10,16 +10,14 @@
  *      TransferInstruction contracts (InterfaceFilter).
  *   2. The moment Canton creates a new TransferInstruction, the WS pushes it
  *      to this service in real-time — zero latency, zero polling.
- *   3. If the receiver is one of our registered users, we immediately accept it
- *      via the interactive submission flow (prepare → sign → execute).
+ *   3. If the receiver is one of our registered users, we track it and require
+ *      user-side signing (backend auto-accept disabled).
  *   4. On startup, does ONE initial ACS scan to catch transfers that arrived
  *      while the service was offline — then switches to pure streaming.
  *
- * Why interactive submission?
- * - Our users are EXTERNAL parties (they signed with their own Ed25519 keys)
- * - TransferInstruction_Accept must be authorized by the receiver party
- * - For external parties, Canton requires interactive (prepare → sign → execute)
- * - The signing key was stored during onboarding (userRegistry.storeSigningKey)
+ * Why disabled?
+ * - Users are EXTERNAL parties and must authorize with their own keys
+ * - Private keys must never be stored or used by backend services
  *
  * @see https://docs.sync.global/app_dev/token_standard/index.html
  */
@@ -44,29 +42,6 @@ const getCantonService = () => {
   }
   return cantonServiceInstance;
 };
-
-// Ed25519 signing (same setup as canton-sdk-client.js)
-let ed25519Module = null;
-let sha512Module = null;
-
-async function getEd25519() {
-  if (!ed25519Module) {
-    ed25519Module = require('@noble/ed25519');
-    sha512Module = require('@noble/hashes/sha512');
-    if (!ed25519Module.etc.sha512Sync) {
-      ed25519Module.etc.sha512Sync = (...m) => sha512Module.sha512(ed25519Module.etc.concatBytes(...m));
-    }
-  }
-  return ed25519Module;
-}
-
-async function signHash(privateKeyBase64, hashBase64) {
-  const ed = await getEd25519();
-  const privateKey = Buffer.from(privateKeyBase64, 'base64');
-  const hashBytes = Buffer.from(hashBase64, 'base64');
-  const signature = await ed.sign(hashBytes, privateKey);
-  return Buffer.from(signature).toString('base64');
-}
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const TRANSFER_INSTRUCTION_INTERFACE = '#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction';
@@ -536,7 +511,7 @@ class AutoAcceptService extends EventEmitter {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // ACCEPT A SINGLE TRANSFER — Interactive Submission with stored key
+  // ACCEPT A SINGLE TRANSFER — disabled in non-custodial mode
   // ═══════════════════════════════════════════════════════════════════════════
 
   async _autoAcceptTransfer(transfer) {
@@ -548,96 +523,9 @@ class AutoAcceptService extends EventEmitter {
 
       console.log(`[AutoAccept] 📨 Accepting: ${amount} ${tokenSymbol} from ${sender.substring(0, 25)}... → ${receiver.substring(0, 25)}...`);
 
-      // Step 1: Ensure we have the signing key for this party
-      const signingKeyData = await userRegistry.getSigningKey(receiver);
-      if (!signingKeyData || !signingKeyData.keyBase64) {
-        console.warn(`[AutoAccept] ⚠️ No signing key for ${receiver.substring(0, 25)}... — skipping`);
-        this._failed.set(contractId, { count: MAX_ACCEPT_RETRIES, lastAttempt: Date.now() });
-        return;
-      }
-
-      if (!this._operatorPartyId) {
-        console.error('[AutoAccept] OPERATOR_PARTY_ID is unset — cannot prepare TransferInstruction (visibility/readAs). Set OPERATOR_PARTY_ID in .env.');
-        this._failed.set(contractId, { count: MAX_ACCEPT_RETRIES, lastAttempt: Date.now() });
-        return;
-      }
-
-      // Use executor token (cardiv) — it has actAs rights granted per-party during
-      // onboarding without hitting the operator's TOO_MANY_USER_RIGHTS limit.
-      const adminToken = await tokenProvider.getExecutorToken();
-      const cantonService = getCantonService();
-      const configuredSync = config.canton.synchronizerId;
-      // Contract may live on a different connected synchronizer than DEFAULT_SYNCHRONIZER_ID;
-      // wrong domain → prepare returns CONTRACT_NOT_FOUND even when ACS showed the contract.
-      const synchronizerId = await cantonService.resolveSubmissionSynchronizerId(
-        adminToken,
-        transfer.synchronizerId || configuredSync
-      );
-
-      // Step 2: Get the accept choice context from the registry
-      const { disclosedContracts, choiceContextData } = await this._getAcceptChoiceContext(
-        contractId, adminToken, synchronizerId, registrarParty, templateId
-      );
-
-      // Step 3: Prepare — actAs/readAs come from ledgerInteractiveSubmissionPolicy (Canton auth model).
-      const actAsParties = transferInstructionAcceptActAs(receiver);
-      const readAsParties = transferInstructionAcceptReadAs(receiver, this._operatorPartyId);
-
-      console.log(`[AutoAccept] prepare readAs (${readAsParties.length} parties), synchronizer: ${(synchronizerId || '').substring(0, 40)}...`);
-
-      const prepareResult = await cantonService.prepareInteractiveSubmission({
-        token: adminToken,
-        actAsParty: actAsParties,
-        templateId: TRANSFER_INSTRUCTION_INTERFACE,
-        contractId,
-        choice: 'TransferInstruction_Accept',
-        choiceArgument: {
-          extraArgs: {
-            context: choiceContextData,
-            meta: { values: {} },
-          },
-        },
-        readAs: readAsParties,
-        disclosedContracts,
-        synchronizerId,
-        verboseHashing: false,
-      });
-
-      if (!prepareResult.preparedTransaction || !prepareResult.preparedTransactionHash) {
-        throw new Error('Prepare returned incomplete result');
-      }
-
-      // Step 4: Sign with the stored Ed25519 key
-      const signatureBase64 = await signHash(
-        signingKeyData.keyBase64,
-        prepareResult.preparedTransactionHash
-      );
-
-      // Step 5: Execute the signed transaction
-      const partySignatures = {
-        signatures: [{
-          party: receiver,
-          signatures: [{
-            format: 'SIGNATURE_FORMAT_RAW',
-            signature: signatureBase64,
-            signedBy: signingKeyData.fingerprint || receiver,
-            signingAlgorithmSpec: 'SIGNING_ALGORITHM_SPEC_ED25519',
-          }],
-        }],
-      };
-
-      await cantonService.executeInteractiveSubmission({
-        preparedTransaction: prepareResult.preparedTransaction,
-        partySignatures,
-        hashingSchemeVersion: prepareResult.hashingSchemeVersion || 'HASHING_SCHEME_VERSION_V2',
-      }, adminToken);
-
-      // Success!
-      this._accepted.add(contractId);
-      console.log(`[AutoAccept] ✅ Accepted: ${amount} ${tokenSymbol} → ${receiver.substring(0, 25)}...`);
-
-      // Broadcast balance update via WebSocket
-      this._broadcastBalanceUpdate(receiver);
+      console.warn(`[AutoAccept] Non-custodial mode: backend auto-accept is disabled for ${receiver.substring(0, 25)}...`);
+      this._failed.set(contractId, { count: MAX_ACCEPT_RETRIES, lastAttempt: Date.now() });
+      return;
 
     } catch (err) {
       const msg = err.message || '';

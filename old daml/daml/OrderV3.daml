@@ -1,0 +1,230 @@
+-- | OrderV3.daml - Order contract using real token Holdings
+--
+-- This version uses the proper token standard:
+-- - Orders reference locked Holding contracts (not text balances)
+-- - Settlement is atomic via DvP
+-- - Supports partial fills properly
+--
+module OrderV3 where
+
+import Instrument
+import Holding
+import DA.Action (when)
+
+-- | Order side
+data Side = Buy | Sell
+  deriving (Eq, Show, Ord)
+
+-- | Order type
+data OrderType = Limit | Market | StopLoss Decimal
+  deriving (Eq, Show)
+
+-- | Order status
+data OrderStatus 
+  = Open
+  | PartiallyFilled
+  | Filled
+  | Cancelled
+  | Expired
+  deriving (Eq, Show)
+
+-- | Order - Represents a buy or sell order with locked Holdings
+template Order
+  with
+    orderId : Text
+    operator : Party
+    owner : Party
+    side : Side
+    orderType : OrderType
+    baseInstrumentId : InstrumentId     -- What's being traded (e.g., cBTC)
+    quoteInstrumentId : InstrumentId    -- Quote currency (e.g., USDT)
+    price : Optional Decimal             -- None for market orders
+    quantity : Decimal                   -- Total order size
+    filledQuantity : Decimal             -- How much has been filled
+    lockedHoldingCid : ContractId Holding -- The locked collateral
+    lockedAmount : Decimal               -- How much is locked
+    status : OrderStatus
+    createdAt : Time
+    expiresAt : Optional Time
+  where
+    signatory operator, owner
+    observer operator
+
+    ensure quantity > 0.0 && filledQuantity >= 0.0 && filledQuantity <= quantity
+
+    -- Get remaining quantity
+    nonconsuming choice Order_GetRemaining : Decimal
+      controller owner
+      do return (quantity - filledQuantity)
+
+    -- Partially fill the order
+    choice Order_PartialFill : ContractId Order
+      with
+        fillQuantity : Decimal
+        fillPrice : Decimal
+      controller operator
+      do
+        assertMsg "Cannot fill more than remaining" (fillQuantity <= quantity - filledQuantity)
+        assertMsg "Invalid fill quantity" (fillQuantity > 0.0)
+        
+        let newFilledQty = filledQuantity + fillQuantity
+        let newStatus = if newFilledQty >= quantity then Filled else PartiallyFilled
+        
+        -- Calculate how much locked collateral to release
+        let releaseRatio = fillQuantity / quantity
+        let releaseAmount = lockedAmount * releaseRatio
+        let newLockedAmount = lockedAmount - releaseAmount
+        
+        -- If fully filled, unlock remaining (shouldn't be any, but safety)
+        if newStatus == Filled
+          then do
+            -- Archive the holding and release any remainder
+            archive lockedHoldingCid
+            -- Order is done - no new holding needed
+            create this with
+              filledQuantity = newFilledQty
+              status = Filled
+              lockedAmount = 0.0
+          else do
+            -- Partial fill - split holding
+            holding <- fetch lockedHoldingCid
+            archive lockedHoldingCid
+            
+            -- Keep locked portion
+            newLockedHolding <- create Holding with
+              owner = owner
+              instrumentId = holding.instrumentId
+              amount = newLockedAmount
+              lock = Some HoldingLock with
+                lockHolder = operator
+                lockReason = "order-" <> orderId
+                lockedAmount = newLockedAmount
+              custodian = holding.custodian
+            
+            create this with
+              filledQuantity = newFilledQty
+              status = newStatus
+              lockedHoldingCid = newLockedHolding
+              lockedAmount = newLockedAmount
+
+    -- Cancel the order (return locked funds)
+    choice Order_Cancel : ContractId Holding
+      with
+        reason : Text
+      controller owner
+      do
+        assertMsg "Order already filled" (status /= Filled)
+        
+        -- Unlock and return holding to owner
+        holding <- fetch lockedHoldingCid
+        archive lockedHoldingCid
+        
+        create Holding with
+          owner = owner
+          instrumentId = holding.instrumentId
+          amount = holding.amount
+          lock = None
+          custodian = holding.custodian
+
+    -- Operator cancels (for expired orders, etc.)
+    choice Order_OperatorCancel : ContractId Holding
+      with
+        reason : Text
+      controller operator
+      do
+        -- Unlock and return holding to owner
+        holding <- fetch lockedHoldingCid
+        archive lockedHoldingCid
+        
+        create Holding with
+          owner = owner
+          instrumentId = holding.instrumentId
+          amount = holding.amount
+          lock = None
+          custodian = holding.custodian
+
+-- | OrderRequest - Request to create an order (operator validates and creates)
+template OrderRequest
+  with
+    requestor : Party
+    operator : Party
+    side : Side
+    orderType : OrderType
+    baseInstrumentId : InstrumentId
+    quoteInstrumentId : InstrumentId
+    price : Optional Decimal
+    quantity : Decimal
+    holdingCid : ContractId Holding  -- Unlocked holding to be locked
+    createdAt : Time
+    expiresAt : Optional Time
+  where
+    signatory requestor
+    observer operator
+
+    -- Operator validates and creates the order
+    choice OrderRequest_Accept : ContractId Order
+      with
+        orderId : Text
+      controller operator
+      do
+        -- Fetch the holding
+        holding <- fetch holdingCid
+        
+        -- Calculate required collateral
+        let requiredAmount = case side of
+              Buy -> case price of
+                Some p -> p * quantity  -- USDT needed
+                None -> holding.amount  -- Market order uses full amount
+              Sell -> quantity          -- BTC needed
+        
+        assertMsg "Insufficient collateral" (holding.amount >= requiredAmount)
+        
+        -- Archive original holding
+        archive holdingCid
+        
+        -- Create locked holding
+        lockedHolding <- create Holding with
+          owner = requestor
+          instrumentId = holding.instrumentId
+          amount = requiredAmount
+          lock = Some HoldingLock with
+            lockHolder = operator
+            lockReason = "order-" <> orderId
+            lockedAmount = requiredAmount
+          custodian = holding.custodian
+        
+        -- Return any excess
+        when (holding.amount > requiredAmount) do
+          _ <- create Holding with
+            owner = requestor
+            instrumentId = holding.instrumentId
+            amount = holding.amount - requiredAmount
+            lock = None
+            custodian = holding.custodian
+          return ()
+        
+        -- Create the order
+        create Order with
+          orderId = orderId
+          operator = operator
+          owner = requestor
+          side = side
+          orderType = orderType
+          baseInstrumentId = baseInstrumentId
+          quoteInstrumentId = quoteInstrumentId
+          price = price
+          quantity = quantity
+          filledQuantity = 0.0
+          lockedHoldingCid = lockedHolding
+          lockedAmount = requiredAmount
+          status = Open
+          createdAt = createdAt
+          expiresAt = expiresAt
+
+    -- Reject the request
+    choice OrderRequest_Reject : ()
+      with
+        reason : Text
+      controller operator
+      do
+        return ()

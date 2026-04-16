@@ -1,0 +1,15 @@
+module Holding where
+
+import Instrument (InstrumentId)
+
+-- Minimal holding template for settlement operations.
+template Holding
+  with
+    owner : Party
+    instrumentId : InstrumentId
+    amount : Decimal
+    lock : Optional Text
+    custodian : Party
+  where
+    signatory owner
+    observer custodian

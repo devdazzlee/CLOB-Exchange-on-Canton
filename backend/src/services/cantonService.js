@@ -508,15 +508,18 @@ class CantonService {
     }
 
     const templateLabel = templateIds.join(', ') || 'all';
-    console.log(`[CantonService] 🔌 WebSocket query — party: ${party || 'any'}, templates: ${templateLabel}`);
 
     // ─── PRIMARY: WebSocket ──────────────────────────────────────────────
     try {
       const contracts = await this._queryViaWebSocket(filter, effectiveOffset, token);
-      console.log(`[CantonService] ✅ WebSocket returned ${contracts.length} contracts`);
       return contracts;
     } catch (wsErr) {
-      console.warn(`[CantonService] ⚠️ WebSocket query failed: ${wsErr.message} — falling back to REST`);
+      const errMsg = wsErr.message || '';
+      // Canton node doesn't support interface-based ACS queries — return empty silently.
+      if (errMsg.includes('Failed to list contracts of interface') || errMsg.includes('interface')) {
+        return [];
+      }
+      console.warn(`[CantonService] ⚠️ WebSocket query failed: ${errMsg} — falling back to REST`);
     }
 
     // ─── FALLBACK: REST (only if WebSocket fails) ────────────────────────
@@ -1346,6 +1349,16 @@ class CantonService {
         console.log(`[CantonService] Preparing ExerciseCommand: ${choice} on ${contractId?.substring(0, 20)}...`);
       }
       commandList = [command];
+    }
+
+    // Root contract of many Canton participants: interactive prepare does not batch commands.
+    // See FAILED_TO_PREPARE_TRANSACTION "Preparing multiple commands is currently not supported".
+    // Callers must use sequential prepare → sign → execute (e.g. OrderService 3-step placement).
+    if (commandList.length !== 1) {
+      throw new Error(
+        `Interactive submission prepare requires exactly one DAML command (got ${commandList.length}). ` +
+        'Bundling multiple commands will be rejected by the participant — split into separate prepare calls.'
+      );
     }
 
     const readAsList = Array.isArray(readAs) ? readAs : (readAs ? [readAs] : []);

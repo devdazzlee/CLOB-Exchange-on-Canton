@@ -1,22 +1,20 @@
 /**
  * Order Service — Canton JSON Ledger API v2 + Allocation-Based Settlement
- * 
- * Uses the correct Canton APIs:
- * - POST /v2/commands/submit-and-wait-for-transaction — Place/Cancel orders
+ *
+ * Client signing model (non-custodial):
+ * - Order placement (interactive prepare/execute): only the end-user's `partyId` appears in
+ *   `partySignatures`; hashes are signed in the browser. Private keys never leave the client.
+ *   OAuth bearer tokens on the backend authorize JSON Ledger API calls only, not user keys.
+ * - Order settlement / match (submit-and-wait): `actAs` is the app provider (operator) party
+ *   only — hosted participant keys; users are not signers on settlement transactions.
+ *
+ * Uses:
+ * - POST /v2/interactive-submission/prepare|execute — external user signs placement/cancel
+ * - POST /v2/commands/submit-and-wait-for-transaction — provider-settled matches, cancels server-side where applicable
  * - POST /v2/state/active-contracts — Query orders
- * 
+ *
  * Balance checks use the Canton Wallet SDK (listHoldingUtxos).
- * 
- * Settlement is Allocation-based:
- * - At ORDER PLACEMENT: creates an Allocation (exchange = executor, funds locked)
- * - At MATCH TIME: exchange executes Allocation with its OWN key (no user key needed)
- * - At CANCEL: Allocation_Cancel releases locked funds back to sender
- * 
- * Why Allocations (not TransferInstruction):
- * - TransferInstruction requires user's private key at SETTLEMENT time
- * - With external parties, backend has no user keys → TransferInstruction breaks
- * - Allocation: User signs ONCE at order time, exchange settles with its own key
- * 
+ *
  * @see https://docs.sync.global/app_dev/api/splice-api-token-allocation-v1/
  * @see https://docs.digitalasset.com/integrate/devnet/token-standard/index.html
  */
@@ -211,6 +209,7 @@ async function getAllocationTypeForOrder(orderId) {
 class OrderService {
   constructor() {
     console.log('[OrderService] Initialized with Canton JSON API v2 + Allocation-based settlement');
+    console.log('[OrderService] Order placement pipeline: INTERACTIVE_3_STEP_V1 (1 command per interactive prepare — enforced in cantonService)');
   }
 
   _assertExecutorOauthConfigured() {
@@ -248,6 +247,123 @@ class OrderService {
       }
     }
     return null;
+  }
+
+  /**
+   * Get or create the OrderPlacerFactory for a user.
+   * Operator creates one per user at registration (or on first order if missing).
+   * Cached in-memory to avoid repeated Canton queries.
+   * Returns the contractId of the factory.
+   */
+  async _getOrCreateOrderPlacerFactory(partyId, operatorPartyId, packageId, serviceToken) {
+    // In-memory cache: partyId → contractId
+    if (!this._placerFactoryCache) this._placerFactoryCache = new Map();
+    if (this._placerFactoryCache.has(partyId)) {
+      return this._placerFactoryCache.get(partyId);
+    }
+
+    const templateId = `${packageId}:Settlement:OrderPlacerFactory`;
+    // Query existing factory for this user (operator can see it as signatory)
+    try {
+      const contracts = await cantonService.queryActiveContracts(
+        { party: operatorPartyId, templateIds: [templateId], pageSize: 200 },
+        serviceToken
+      );
+      const list = Array.isArray(contracts) ? contracts : (contracts?.activeContracts || contracts?.contracts || []);
+      for (const c of list) {
+        const ev = c.createdEvent || c;
+        const payload = ev?.createArguments || ev?.createArgument || ev?.payload || {};
+        if (payload.user === partyId || payload.owner === partyId) {
+          const cid = c.contractId || ev?.contractId;
+          if (cid) {
+            this._placerFactoryCache.set(partyId, cid);
+            console.log(`[OrderService] ✅ OrderPlacerFactory found for ${partyId.substring(0, 24)}...: ${cid.substring(0, 20)}...`);
+            return cid;
+          }
+        }
+      }
+    } catch (queryErr) {
+      console.warn(`[OrderService] ⚠️ Factory query failed, will create: ${queryErr.message}`);
+    }
+
+    // Not found — create it now (operator-signed, non-interactive)
+    console.log(`[OrderService] 🔄 Creating OrderPlacerFactory for ${partyId.substring(0, 24)}...`);
+    const result = await cantonService.submitAndWaitForTransaction(serviceToken, {
+      commands: {
+        commandId: `create-placer-factory-${partyId.substring(0, 16)}-${Date.now()}`,
+        actAs:     [operatorPartyId],
+        readAs:    [operatorPartyId, partyId],
+        domainId:  config.canton.synchronizerId,
+        commands:  [{
+          CreateCommand: {
+            templateId,
+            createArguments: {
+              operator: operatorPartyId,
+              user:     partyId,
+            },
+          },
+        }],
+      },
+    });
+
+    // Extract the new contractId from the transaction events
+    let newCid = null;
+    const events = result?.transaction?.events || result?.events || [];
+    for (const ev of events) {
+      const created = ev.created || ev.CreatedEvent || ev;
+      if (created?.contractId && (created?.templateId?.includes?.('OrderPlacerFactory') || JSON.stringify(created?.templateId)?.includes('OrderPlacerFactory'))) {
+        newCid = created.contractId;
+        break;
+      }
+    }
+    if (!newCid && result?.transaction?.updateId) {
+      // Fallback: if we can't parse from events, query again
+      const retryContracts = await cantonService.queryActiveContracts(
+        { party: operatorPartyId, templateIds: [templateId], pageSize: 200 },
+        serviceToken
+      );
+      const retryList = Array.isArray(retryContracts) ? retryContracts : (retryContracts?.activeContracts || []);
+      for (const c of retryList) {
+        const ev = c.createdEvent || c;
+        const payload = ev?.createArguments || ev?.createArgument || ev?.payload || {};
+        if (payload.user === partyId || payload.owner === partyId) {
+          newCid = c.contractId || ev?.contractId;
+          break;
+        }
+      }
+    }
+    if (!newCid) throw new Error(`Failed to get OrderPlacerFactory contractId for ${partyId}`);
+
+    this._placerFactoryCache.set(partyId, newCid);
+    console.log(`[OrderService] ✅ OrderPlacerFactory created for ${partyId.substring(0, 24)}...: ${newCid.substring(0, 20)}...`);
+    return newCid;
+  }
+
+  /**
+   * Parse CreatedEvent contract IDs from an interactive execute response.
+   * Distinguishes lock / token allocations from ExchangeAllocation (step 3).
+   */
+  _parseCreatedCidsFromInteractiveExecute(result) {
+    let orderCid = null;
+    let lockAllocationCid = null;
+    let exchangeAllocationCid = null;
+    for (const event of result.transaction?.events || []) {
+      const created = event.created || event.CreatedEvent;
+      if (!created?.contractId) continue;
+      const tid = this._templateIdToString(created?.templateId);
+      if (tid.includes(':Order:Order')) {
+        orderCid = created.contractId;
+        continue;
+      }
+      if (tid.includes('ExchangeAllocation')) {
+        exchangeAllocationCid = created.contractId;
+        continue;
+      }
+      if (tid.includes('Allocation')) {
+        lockAllocationCid = created.contractId;
+      }
+    }
+    return { orderCid, lockAllocationCid, exchangeAllocationCid };
   }
 
   _extractOrderRefFromAllocationPayload(payload) {
@@ -674,20 +790,9 @@ class OrderService {
     // Create Order contract on Canton
     const timestamp = new Date().toISOString();
 
-    // ═══════════════════════════════════════════════════════════════════
-    // TX 1 (2-TX CLIENT REQUIREMENT):
-    // Allocation + Order Create in ONE interactive submission.
-    //
-    // Both commands go into a SINGLE prepareInteractiveSubmission call:
-    //   commands: [allocationCommand, orderCreateCommand]
-    // User signs ONCE → single Canton transaction → 1 TX for order placement.
-    //
-    // Settlement at match time (TradingApp pattern):
-    //   - Withdraw self-allocations
-    //   - Create 2-leg allocations (seller→buyer, buyer→seller)
-    //   - Execute both legs + FillOrder + Trade — all in TX 2
-    // Operator NEVER holds tokens, even temporarily.
-    // ═══════════════════════════════════════════════════════════════════
+    // Interactive /v2/interactive-submission/prepare: one DAML command per request (participant limit).
+    // Placement is therefore: (1) allocate → (2) create Order → (3) create ExchangeAllocation,
+    // each with its own prepare + external sign + execute. Matching/settlement stays server-driven later.
 
     const sdkClient = getCantonSDKClient();
     let allocationCommand = null;
@@ -697,16 +802,21 @@ class OrderService {
     let allocationType = null;
     let exactAmountHoldingCid = null;
 
-    // ═══ EXECUTOR: use EXECUTOR_PARTY_ID (Cardiv) if configured, else operator ═══
-    // The executor is the party who will execute the allocation at settlement time.
-    // Set EXECUTOR_PARTY_ID in .env to Cardiv’s party ID.
-    const executorPartyId = process.env.EXECUTOR_PARTY_ID || operatorPartyId;
+    // ═══ EXECUTOR: always use operatorPartyId for Splice allocation executor ═══
+    // Settlement uses actAs=[operator] with Execute_LegSettlement (controller=executor on ExchangeAllocation).
+    // Allocation_ExecuteTransfer needs [executor, sender, receiver]. With receiver=executor=operator:
+    //   alloc: [operator, user, operator] = {operator, user} — covered by EA auth carry-forward ✓
+    // Using Cardiv (EXECUTOR_PARTY_ID) here would break the chain because settlement
+    // submits with actAs=[operator], not Cardiv.
+    const executorPartyId = operatorPartyId;
 
-    // ═══ SELF-ALLOCATION: sender=receiver=user (client requirement) ═══
-    console.log(`[OrderService] 🔄 Creating self-allocation (sender=receiver=user, executor=${executorPartyId.substring(0, 30)}...)`);
+    // ═══ OPERATOR-AS-RECEIVER: sender=user, receiver=operator (executor) ═══
+    // Fixes "Sender and receiver must be different parties" error from Utility Registry (CBTC).
+    // Tokens flow user→operator at Execute_LegSettlement; operator forwards to counterparty.
+    console.log(`[OrderService] 🔄 Creating operator-as-receiver allocation (sender=user, receiver=operator, executor=${executorPartyId.substring(0, 30)}...)`);
     const realAlloc = await sdkClient.tryBuildRealAllocationCommand(
       partyId,
-      executorPartyId,  // Cardiv (or operator fallback) as executor
+      operatorPartyId,  // operator as executor AND receiver — must match settlement actAs
       String(lockInfo.amount),
       lockInfo.asset,
       orderId,
@@ -722,23 +832,120 @@ class OrderService {
     disclosedContracts = realAlloc.disclosedContracts || [];
     synchronizerId = realAlloc.synchronizerId || config.canton.synchronizerId;
     allocationType = realAlloc.allocationType;
-    console.log(`[OrderService] ✅ Self-allocation command built for ${orderId} (executor=${executorPartyId.substring(0, 30)}...)`);
+    console.log(`[OrderService] ✅ Operator-as-receiver allocation command built for ${orderId} (executor=${executorPartyId.substring(0, 30)}...)`);
 
     // Store the allocation type with the reservation
     await setAllocationContractIdForOrder(orderId, null, allocationType);
 
     // ═══════════════════════════════════════════════════════════════════
-    // Prepare ONLY the allocation command (Canton interactive submission
-    // supports only 1 command per prepare call).
-    // The Order Create command is prepared separately in executeOrderPlacement()
-    // once the allocation is executed and the allocation CID is known.
+    // 3-TX PLACEMENT (participant constraint):
+    // Many Canton participants reject interactive prepare with multiple commands
+    // ("Preparing multiple commands is currently not supported"). We therefore use
+    // three sequential prepare→sign→execute rounds: allocation → Order → ExchangeAllocation.
+    // The frontend already chains when execute-place returns requiresSignature again.
     // ═══════════════════════════════════════════════════════════════════
-    console.log(`[OrderService] 🔄 Preparing interactive submission: Allocation only (step 1 of 2)`);
+    const orderStatus = orderMode === 'STOP_LOSS' ? 'PENDING_TRIGGER' : 'OPEN';
+    const orderCreateArgs = {
+      orderId,
+      owner: partyId,
+      orderType: orderType.toUpperCase(),
+      orderMode: orderMode.toUpperCase(),
+      tradingPair,
+      price: orderMode.toUpperCase() === 'LIMIT' && price ? String(price) : null,
+      quantity: String(quantity),
+      filled: '0.0',
+      status: orderStatus,
+      timestamp,
+      operator: operatorPartyId,
+      allocationCid: orderId,
+      stopPrice: stopPrice ? String(stopPrice) : null,
+    };
 
+    const exchangeAllocationCreateArgs = {
+      allocationId: `ea-${orderId}`,
+      orderId,
+      owner: partyId,
+      executor: operatorPartyId,
+      amount: String(lockInfo.amount),
+      instrumentSymbol: lockInfo.asset,
+      side: orderType.toUpperCase(),
+      tradingPair,
+      status: 'PENDING',
+      createdAt: timestamp,
+    };
+
+    const placementContext = {
+      packageId,
+      readAs,
+      synchronizerId,
+      disclosedContracts,
+      orderCreateArgs,
+      exchangeAllocationCreateArgs,
+      executorPartyId,
+      /** Same as orderCreateArgs.operator — needed for actAs on Order create (multi-signatory on deployed DAR). */
+      operatorPartyId,
+    };
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 1-TX PLACEMENT — ExerciseCommand on OrderPlacerFactory::PlaceOrder
+    //
+    // Client requirement: order placement = 1 user-signed TX.
+    //
+    // WHY NOT CreateAndExercise:
+    //   CreateAndExercise produces 2 root nodes (Create + Exercise).
+    //   Canton interactive submission only supports 1 root node → rejected.
+    //
+    // FIX (mirrors ExchangeSettlerHub for settlement):
+    //   Operator pre-creates one OrderPlacerFactory contract per user.
+    //   User exercises nonconsuming PlaceOrder on the existing factory.
+    //   ExerciseCommand on pre-existing contract = 1 root node ✓
+    //
+    // DAML auth: PlaceOrder.controller = user satisfies:
+    //   AllocationFactory_Allocate.controller = user (sender = receiver) ✓
+    //   Order.create signatory = user (owner) ✓
+    //   ExchangeAllocation.create signatory = user (owner) ✓
+    // ═══════════════════════════════════════════════════════════════════
+    const allocExercise = allocationCommand?.ExerciseCommand || allocationCommand;
+    const factoryCid    = allocExercise?.contractId;
+    const allocArgs     = allocExercise?.choiceArgument || {};
+
+    if (!factoryCid) {
+      throw new Error('Could not extract allocation factory CID from allocation command');
+    }
+
+    // Get or create the per-user OrderPlacerFactory contract (operator-signed singleton)
+    const placerFactoryCid = await this._getOrCreateOrderPlacerFactory(partyId, operatorPartyId, packageId, serviceToken);
+
+    const exerciseCmd = {
+      ExerciseCommand: {
+        templateId:  `${packageId}:Settlement:OrderPlacerFactory`,
+        contractId:  placerFactoryCid,
+        choice:      'PlaceOrder',
+        choiceArgument: {
+          orderId,
+          allocFactory:     factoryCid,
+          expectedAdmin:    allocArgs.expectedAdmin,
+          allocationSpec:   allocArgs.allocation,
+          inputHoldingCids: allocArgs.inputHoldingCids,
+          allocExtraArgs:   allocArgs.extraArgs,
+          orderType:        orderType.toUpperCase(),
+          orderMode:        orderMode.toUpperCase(),
+          tradingPair,
+          price:     (orderMode.toUpperCase() === 'LIMIT' && price)
+                       ? price.toString() : null,
+          quantity:  quantity.toString(),
+          stopPrice: stopPrice ? stopPrice.toString() : null,
+          lockAmount:       lockInfo.amount.toString(),
+          instrumentSymbol: lockInfo.asset,
+        },
+      },
+    };
+
+    console.log(`[OrderService] 🔄 Preparing 1-TX placement: ExerciseCommand OrderPlacerFactory::PlaceOrder (1 root node, 1 user signature)`);
     const prepareResult = await cantonService.prepareInteractiveSubmission({
       token: interactiveLedgerToken,
       actAsParty: [partyId],
-      commands: [allocationCommand],
+      commands: [exerciseCmd],
       readAs,
       synchronizerId,
       disclosedContracts,
@@ -748,25 +955,25 @@ class OrderService {
       throw new Error('Prepare returned incomplete result: missing preparedTransaction or preparedTransactionHash');
     }
 
-    console.log(`[OrderService] ✅ Allocation prepared (type: ${allocationType}). Hash to sign: ${prepareResult.preparedTransactionHash.substring(0, 40)}...`);
+    console.log(`[OrderService] ✅ 1-TX placement prepared. Hash to sign: ${prepareResult.preparedTransactionHash.substring(0, 40)}...`);
 
     return {
       requiresSignature: true,
-      step: 'ALLOCATION_PREPARED',
+      step:  'PLACEMENT_STEP_1_COMPLETE',
+      stage: 'PLACEMENT_STEP_1_COMPLETE',
       orderId,
       tradingPair,
       orderType: orderType.toUpperCase(),
       orderMode: orderMode.toUpperCase(),
-      price: orderMode.toUpperCase() === 'LIMIT' && price ? price.toString() : (stopPrice ? stopPrice.toString() : null),
-      quantity: quantity.toString(),
+      price:     orderMode.toUpperCase() === 'LIMIT' && price ? price.toString() : (stopPrice ? stopPrice.toString() : null),
+      quantity:  quantity.toString(),
       stopPrice: stopPrice || null,
-      preparedTransaction: prepareResult.preparedTransaction,
+      preparedTransaction:     prepareResult.preparedTransaction,
       preparedTransactionHash: prepareResult.preparedTransactionHash,
-      hashingSchemeVersion: prepareResult.hashingSchemeVersion,
+      hashingSchemeVersion:    prepareResult.hashingSchemeVersion,
       partyId,
       lockInfo,
       executorPartyId,
-      stage: 'ALLOCATION_PREPARED',
       allocationType,
     };
   }
@@ -837,8 +1044,20 @@ class OrderService {
     const operatorPartyId = config.canton.operatorPartyId;
     
     try {
-      console.log(`[OrderService] EXECUTE order placement for ${partyId.substring(0, 30)}... (stage: ${orderMeta?.stage || 'ALLOCATION_AND_ORDER_PREPARED'})`);
-      
+      const stage = orderMeta?.stage || 'PLACEMENT_STEP_1_ALLOCATION';
+      console.log(`[OrderService] EXECUTE order placement for ${partyId.substring(0, 30)}... (stage: ${stage})`);
+
+      if (stage === 'ALLOCATION_AND_ORDER_PREPARED') {
+        throw new ValidationError(
+          'Order placement format is outdated. Please place the order again (three signing steps).'
+        );
+      }
+      if (stage === 'ALLOCATION_PREPARED') {
+        throw new ValidationError(
+          'Legacy placement step is no longer supported. Please place the order again.'
+        );
+      }
+
       const partySignatures = {
         signatures: [
           {
@@ -852,253 +1071,335 @@ class OrderService {
           }
         ]
       };
-      
+
+      const sigParty = partySignatures.signatures[0]?.party;
+      if (sigParty !== partyId) {
+        throw new ValidationError('Placement execute: signature entry must be for the requesting user party only.');
+      }
+
       const result = await cantonService.executeInteractiveSubmission({
         preparedTransaction,
         partySignatures,
         hashingSchemeVersion,
       }, interactiveLedgerToken);
-      
-      const stage = orderMeta?.stage || 'ALLOCATION_AND_ORDER_PREPARED';
 
-      // Extract created contract IDs from executed transaction
-      let contractId = null;
-      let allocationContractId = null;
+      const parsed = this._parseCreatedCidsFromInteractiveExecute(result);
 
-      const isAllocationOnlyTx = (stage === 'ALLOCATION_PREPARED');
+      // ─── Step 1 done: allocation on-chain → prepare Order create ───
+      if (stage === 'PLACEMENT_STEP_1_ALLOCATION') {
+        let allocationContractId = parsed.lockAllocationCid
+          || this._extractAllocationCidFromExecuteResult(result);
 
-      if (result.transaction?.events) {
-        for (const event of result.transaction.events) {
-          const created = event.created || event.CreatedEvent;
-          if (!created?.contractId) continue;
-          const templateId = this._templateIdToString(created?.templateId);
-          if (!contractId && templateId.includes(':Order:Order')) {
-            contractId = created.contractId;
-          }
-          if (!allocationContractId && templateId.includes('Allocation')) {
-            allocationContractId = created.contractId;
-          }
-          // For a pure allocation TX, the first created contract IS the allocation
-          if (!allocationContractId && isAllocationOnlyTx) {
-            allocationContractId = created.contractId;
-          }
-        }
-      }
-
-      // Fallback: extract from nested payload structure
-      if (!allocationContractId) {
-        allocationContractId = this._extractAllocationCidFromExecuteResult(result);
-      }
-      
-      if (orderMeta.orderId && allocationContractId) {
-        const allocType = orderMeta.allocationType || null;
-        await setAllocationContractIdForOrder(orderMeta.orderId, allocationContractId, allocType);
-        console.log(`[OrderService] ✅ Allocation linked to order ${orderMeta.orderId}: ${allocationContractId.substring(0, 30)}... (type: ${allocType || 'auto'})`);
-
-        try {
-          const sdkClient = getCantonSDKClient();
-          const holdingState = await sdkClient.verifyHoldingState(partyId, orderMeta.lockInfo?.asset);
-          console.log(`[OrderService] Holding verification after allocation: ${holdingState.totalAvailable} available, ${holdingState.totalLocked} locked (${orderMeta.lockInfo?.asset})`);
-        } catch (verifyErr) {
-          console.warn(`[OrderService] Post-allocation holding verification skipped: ${verifyErr.message}`);
-        }
-      }
-
-      // ═══ 2-TX PATTERN: Both Allocation + Order Create in ONE submission ═══
-      if (stage === 'ALLOCATION_AND_ORDER_PREPARED') {
-        // If Canton execute response didn't include allocation CID in events,
-        // actively search for it so the matching engine can find it later.
         if (!allocationContractId && orderMeta.orderId) {
-          console.log(`[OrderService] Combined TX: allocation CID not in events, searching...`);
+          console.log(`[OrderService] Step 1: allocation CID not in events, searching...`);
           try {
             allocationContractId = await this._findAllocationCidForOrder(orderMeta.orderId, partyId, serviceToken);
           } catch (searchErr) {
             console.warn(`[OrderService] Allocation CID search failed: ${searchErr.message}`);
           }
         }
-        if (allocationContractId && orderMeta.orderId) {
+
+        if (!allocationContractId) {
+          throw new ValidationError('Could not resolve allocation contract id after step 1. Try again.');
+        }
+
+        if (orderMeta.orderId) {
           const allocType = orderMeta.allocationType || null;
           await setAllocationContractIdForOrder(orderMeta.orderId, allocationContractId, allocType);
-          console.log(`[OrderService] ✅ Combined TX: allocation CID stored for matching: ${allocationContractId.substring(0, 30)}...`);
-        } else {
-          console.warn(`[OrderService] ⚠️ Combined TX: could not resolve allocation CID for ${orderMeta.orderId} — matching engine will retry via DB lookup`);
-        }
-        console.log(`[OrderService] ✅ Order placement complete in SINGLE TX (2-TX lifecycle): Allocation + Order Create for ${orderMeta.orderId}`);
-        // Fall through to success path
-      } else if (stage === 'ALLOCATION_PREPARED') {
-        // ═══════════════════════════════════════════════════════════════════
-        // TX 1 DONE (user’s interactive signature). The allocation is now committed.
-        //
-        // TX 2: Operator creates the Order contract via regular submit-and-wait.
-        // Since Order signatory is now ‘operator’ (not ‘owner’), the operator can
-        // create it alone — no second user signature needed. This keeps the
-        // entire order placement at exactly 2 ledger transactions:
-        //   TX1 = AllocationFactory_Allocate (user’s interactive submission)
-        //   TX2 = Order:Order create         (operator’s regular submission)
-        //
-        // ExchangeAllocation: removed — settlement uses ExchangeSettlerHub instead.
-        // ═══════════════════════════════════════════════════════════════════
-        const packageId = config.canton.packageIds.clobExchange;
-        if (!packageId) {
-          throw new Error('CLOB_EXCHANGE_PACKAGE_ID is not configured');
-        }
+          console.log(`[OrderService] ✅ Step 1: allocation linked to order ${orderMeta.orderId}: ${allocationContractId.substring(0, 30)}...`);
 
-        let effectiveAllocationCid = orderMeta.allocationContractId || allocationContractId;
-        if (!effectiveAllocationCid) {
-          effectiveAllocationCid = await this._findAllocationCidForOrder(orderMeta.orderId, partyId, serviceToken);
-        }
-        // Store it so matching engine can find it
-        if (effectiveAllocationCid && orderMeta.orderId) {
-          const allocType = orderMeta.allocationType || null;
-          await setAllocationContractIdForOrder(orderMeta.orderId, effectiveAllocationCid, allocType);
-          console.log(`[OrderService] ✅ Allocation CID stored for ${orderMeta.orderId}: ${effectiveAllocationCid.substring(0, 30)}...`);
-        }
-
-        // Build Order create arguments
-        const orderStatus = orderMeta.orderMode === 'STOP_LOSS' ? 'PENDING_TRIGGER' : 'OPEN';
-        const orderCreateArgs = {
-          orderId: orderMeta.orderId,
-          owner: partyId,
-          orderType: orderMeta.orderType,
-          orderMode: orderMeta.orderMode,
-          tradingPair: orderMeta.tradingPair,
-          price: orderMeta.price ? String(orderMeta.price) : null,
-          quantity: String(orderMeta.quantity),
-          filled: '0.0',
-          status: orderStatus,
-          timestamp: new Date().toISOString(),
-          operator: operatorPartyId,
-          allocationCid: effectiveAllocationCid || orderMeta.orderId,
-          stopPrice: orderMeta.stopPrice || null,
-        };
-
-        console.log(`[OrderService] 🔄 TX2: Operator creating Order contract via regular submit-and-wait...`);
-        let step2Result;
-        try {
-          step2Result = await cantonService.createContract({
-            token: serviceToken,
-            actAsParty: operatorPartyId,
-            templateId: `${packageId}:Order:Order`,
-            createArguments: orderCreateArgs,
-            readAs: [partyId],
-            synchronizerId: config.canton.synchronizerId,
-          });
-          console.log(`[OrderService] ✅ TX2 complete: Order:Order created for ${orderMeta.orderId}`);
-        } catch (orderCreateErr) {
-          console.error(`[OrderService] ❌ Order create failed: ${orderCreateErr.message}`);
-          // Still release reservation on failure
-          await releaseReservation(orderMeta.orderId);
-          throw orderCreateErr;
-        }
-
-        // Extract contract ID from step2 result
-        let orderContractId = null;
-        const step2Events = step2Result?.transaction?.events || step2Result?.events || [];
-        for (const event of step2Events) {
-          const created = event.created || event.CreatedEvent;
-          const tmplId = this._templateIdToString(created?.templateId);
-          if (created?.contractId && tmplId.includes(':Order:Order')) {
-            orderContractId = created.contractId;
-            break;
+          try {
+            const sdkClient = getCantonSDKClient();
+            const holdingState = await sdkClient.verifyHoldingState(partyId, orderMeta.lockInfo?.asset);
+            console.log(`[OrderService] Holding verification after allocation: ${holdingState.totalAvailable} available, ${holdingState.totalLocked} locked (${orderMeta.lockInfo?.asset})`);
+          } catch (verifyErr) {
+            console.warn(`[OrderService] Post-allocation holding verification skipped: ${verifyErr.message}`);
           }
         }
-        contractId = orderContractId || contractId;
 
-        console.log(`[OrderService] ✅ Order placement complete (2-TX lifecycle): TX1=Allocation (user), TX2=Order (operator) for ${orderMeta.orderId}`);
-      } // end ALLOCATION_PREPARED branch
-
-      // Canton interactive execute may not return created contract IDs.
-      // Instead of blocking with a polling loop, we return immediately.
-      // The WebSocket streaming model will receive the real contract from
-      // Canton and emit 'orderCreated', which triggers matching via the
-      // event-driven wiring in app.js.
-      if (!contractId) {
-        const txUpdateId = result.transaction?.updateId || result.updateId;
-        if (txUpdateId && /^[0-9a-f]{40,}$/i.test(txUpdateId)) {
-          contractId = txUpdateId;
+        const ctx = orderMeta.placementContext;
+        if (!ctx?.packageId || !ctx.orderCreateArgs) {
+          throw new ValidationError('Missing placementContext from place step — please place the order again.');
         }
-      }
 
-      const hasRealCid = !!contractId;
-      if (!contractId) {
-        contractId = `${orderMeta.orderId}-pending`;
-      }
-      
-      console.log(`[OrderService] ✅ Order placed via interactive submission: ${orderMeta.orderId} (cid: ${hasRealCid ? contractId.substring(0, 30) + '...' : 'pending — WebSocket will deliver'})`);
-      
-      const finalAllocationCid = orderMeta.allocationContractId || allocationContractId || null;
-      const orderRecord = {
-        contractId,
-        orderId: orderMeta.orderId,
-        owner: partyId,
-        tradingPair: orderMeta.tradingPair,
-        orderType: orderMeta.orderType,
-        orderMode: orderMeta.orderMode,
-        price: orderMeta.price,
-        stopPrice: orderMeta.stopPrice || null,
-        quantity: orderMeta.quantity,
-        filled: '0',
-        status: orderMeta.orderMode === 'STOP_LOSS' ? 'PENDING_TRIGGER' : 'OPEN',
-        timestamp: new Date().toISOString(),
-        lockId: null,
-        lockedAmount: orderMeta.lockInfo?.amount || '0',
-        lockedAsset: orderMeta.lockInfo?.asset || '',
-        allocationContractId: finalAllocationCid,
-      };
-      
-      if (orderRecord.status === 'OPEN') {
-        registerOpenOrders([orderRecord]);
-      }
-      
-      // Do NOT eagerly inject the order into the streaming read model or
-      // trigger matching here. The Canton WebSocket stream will deliver the
-      // confirmed Order contract, which the StreamingReadModel picks up and
-      // emits 'orderCreated'. That event (debounced 3s in app.js) triggers
-      // matching ONLY after Canton has fully committed the Order contract.
-      //
-      // Triggering matching before the Order contract is fully committed
-      // causes LOCKED_CONTRACTS errors because FillOrder races against the
-      // still-propagating CREATE transaction.
+        const mergedOrderArgs = {
+          ...ctx.orderCreateArgs,
+          allocationCid: allocationContractId,
+        };
 
-      if (global.broadcastWebSocket && orderRecord.status === 'OPEN') {
-        global.broadcastWebSocket(`orderbook:${orderMeta.tradingPair}`, {
-          type: 'NEW_ORDER',
+        // Order.daml has `signatory owner` (user), `observer operator`.
+        // Only the user (owner) needs to sign — operator is not a signatory.
+        // actAsParty must only include signatories; using interactiveLedgerToken
+        // which has CanActAs rights for external parties.
+        const readAsOrder = [...new Set([...(ctx.readAs || []), partyId, config.canton.operatorPartyId].filter(Boolean))];
+
+        console.log(`[OrderService] 🔄 Preparing interactive submission: step 2/3 — Order create (actAs: user only, signatory=owner)`);
+        const prepare2 = await cantonService.prepareInteractiveSubmission({
+          token: interactiveLedgerToken,
+          actAsParty: [partyId],
+          commands: [{
+            CreateCommand: {
+              templateId: `${ctx.packageId}:Order:Order`,
+              createArguments: mergedOrderArgs,
+            },
+          }],
+          readAs: readAsOrder,
+          synchronizerId: ctx.synchronizerId,
+          disclosedContracts: ctx.disclosedContracts,
+        });
+
+        return {
+          success: true,
+          requiresSignature: true,
+          usedInteractiveSubmission: true,
+          step: 'PLACEMENT_STEP_2_ORDER',
+          stage: 'PLACEMENT_STEP_2_ORDER',
+          preparedTransaction: prepare2.preparedTransaction,
+          preparedTransactionHash: prepare2.preparedTransactionHash,
+          hashingSchemeVersion: prepare2.hashingSchemeVersion,
           orderId: orderMeta.orderId,
-          contractId: contractId,
-          owner: partyId,
+          tradingPair: orderMeta.tradingPair,
           orderType: orderMeta.orderType,
           orderMode: orderMeta.orderMode,
           price: orderMeta.price,
           quantity: orderMeta.quantity,
-          remaining: orderMeta.quantity,
-          tradingPair: orderMeta.tradingPair,
-          timestamp: new Date().toISOString()
-        });
+          stopPrice: orderMeta.stopPrice || null,
+          lockInfo: orderMeta.lockInfo,
+          allocationType: orderMeta.allocationType,
+          allocationContractId,
+          placementContext: ctx,
+          partyId,
+        };
       }
-      
-      return {
-        success: true,
-        usedInteractiveSubmission: true,
-        orderId: orderMeta.orderId,
-        contractId,
-        status: orderRecord.status,
-        tradingPair: orderMeta.tradingPair,
-        orderType: orderMeta.orderType,
-        orderMode: orderMeta.orderMode,
-        price: orderMeta.price,
-        stopPrice: orderMeta.stopPrice || null,
-        quantity: orderMeta.quantity,
-        filled: '0',
-        remaining: orderMeta.quantity,
-        allocationContractId: finalAllocationCid,
-        timestamp: new Date().toISOString()
-      };
-      
+
+      // ─── Step 2 done: Order on-chain → prepare ExchangeAllocation create ───
+      if (stage === 'PLACEMENT_STEP_2_ORDER') {
+        let orderContractId = parsed.orderCid;
+        if (!orderContractId) {
+          const txUpdateId = result.transaction?.updateId || result.updateId;
+          if (txUpdateId && /^[0-9a-f]{40,}$/i.test(txUpdateId)) {
+            orderContractId = txUpdateId;
+          }
+        }
+        if (!orderContractId) {
+          orderContractId = `${orderMeta.orderId}-pending`;
+          console.warn(`[OrderService] Step 2: Order contract id not in events — using pending id until stream confirms`);
+        }
+
+        const ctx = orderMeta.placementContext;
+        if (!ctx?.packageId || !ctx.exchangeAllocationCreateArgs) {
+          throw new ValidationError('Missing placementContext — please place the order again.');
+        }
+
+        console.log(`[OrderService] 🔄 Preparing interactive submission: step 3/3 — ExchangeAllocation create`);
+        const prepare3 = await cantonService.prepareInteractiveSubmission({
+          token: interactiveLedgerToken,
+          actAsParty: [partyId],
+          commands: [{
+            CreateCommand: {
+              templateId: `${ctx.packageId}:Settlement:ExchangeAllocation`,
+              createArguments: ctx.exchangeAllocationCreateArgs,
+            },
+          }],
+          readAs: ctx.readAs,
+          synchronizerId: ctx.synchronizerId,
+          disclosedContracts: ctx.disclosedContracts,
+        });
+
+        return {
+          success: true,
+          requiresSignature: true,
+          usedInteractiveSubmission: true,
+          step: 'PLACEMENT_STEP_3_EXCHANGE',
+          stage: 'PLACEMENT_STEP_3_EXCHANGE',
+          preparedTransaction: prepare3.preparedTransaction,
+          preparedTransactionHash: prepare3.preparedTransactionHash,
+          hashingSchemeVersion: prepare3.hashingSchemeVersion,
+          orderId: orderMeta.orderId,
+          tradingPair: orderMeta.tradingPair,
+          orderType: orderMeta.orderType,
+          orderMode: orderMeta.orderMode,
+          price: orderMeta.price,
+          quantity: orderMeta.quantity,
+          stopPrice: orderMeta.stopPrice || null,
+          lockInfo: orderMeta.lockInfo,
+          allocationType: orderMeta.allocationType,
+          allocationContractId: orderMeta.allocationContractId,
+          orderContractId,
+          placementContext: ctx,
+          partyId,
+        };
+      }
+
+      // ─── Step 3 done: ExchangeAllocation on-chain → placement complete ───
+      if (stage === 'PLACEMENT_STEP_3_EXCHANGE') {
+        const orderContractId = orderMeta.orderContractId || null;
+        let contractId = orderContractId || `${orderMeta.orderId}-pending`;
+        const hasRealCid = !!(orderContractId && !String(orderContractId).endsWith('-pending'));
+        if (!orderContractId) {
+          console.warn(`[OrderService] Step 3: missing orderContractId in orderMeta — using pending id until stream confirms`);
+        }
+
+        console.log(`[OrderService] ✅ Order placement complete (3/3): ${orderMeta.orderId} (order cid: ${hasRealCid ? contractId.substring(0, 30) + '...' : 'pending — WebSocket will deliver'})`);
+
+        const finalAllocationCid = orderMeta.allocationContractId || null;
+        const orderRecord = {
+          contractId,
+          orderId: orderMeta.orderId,
+          owner: partyId,
+          tradingPair: orderMeta.tradingPair,
+          orderType: orderMeta.orderType,
+          orderMode: orderMeta.orderMode,
+          price: orderMeta.price,
+          stopPrice: orderMeta.stopPrice || null,
+          quantity: orderMeta.quantity,
+          filled: '0',
+          status: orderMeta.orderMode === 'STOP_LOSS' ? 'PENDING_TRIGGER' : 'OPEN',
+          timestamp: new Date().toISOString(),
+          lockId: null,
+          lockedAmount: orderMeta.lockInfo?.amount || '0',
+          lockedAsset: orderMeta.lockInfo?.asset || '',
+          allocationContractId: finalAllocationCid,
+        };
+
+        if (orderRecord.status === 'OPEN') {
+          registerOpenOrders([orderRecord]);
+        }
+
+        if (global.broadcastWebSocket && orderRecord.status === 'OPEN') {
+          global.broadcastWebSocket(`orderbook:${orderMeta.tradingPair}`, {
+            type: 'NEW_ORDER',
+            orderId: orderMeta.orderId,
+            contractId: contractId,
+            owner: partyId,
+            orderType: orderMeta.orderType,
+            orderMode: orderMeta.orderMode,
+            price: orderMeta.price,
+            quantity: orderMeta.quantity,
+            remaining: orderMeta.quantity,
+            tradingPair: orderMeta.tradingPair,
+            timestamp: new Date().toISOString()
+          });
+        }
+
+        return {
+          success: true,
+          usedInteractiveSubmission: true,
+          orderId: orderMeta.orderId,
+          contractId,
+          status: orderRecord.status,
+          tradingPair: orderMeta.tradingPair,
+          orderType: orderMeta.orderType,
+          orderMode: orderMeta.orderMode,
+          price: orderMeta.price,
+          stopPrice: orderMeta.stopPrice || null,
+          quantity: orderMeta.quantity,
+          filled: '0',
+          remaining: orderMeta.quantity,
+          allocationContractId: finalAllocationCid,
+          timestamp: new Date().toISOString()
+        };
+      }
+
+      // ─── 1-TX complete: all 3 ops happened in single CreateAndExercise TX ───
+      if (stage === 'PLACEMENT_STEP_1_COMPLETE') {
+        const parsed = this._parseCreatedCidsFromInteractiveExecute(result);
+
+        // Extract the Splice allocation CID — stored via Order.allocationCid (show allocCid)
+        // but also visible as a created Allocation contract in the TX events.
+        let allocationCid = parsed.lockAllocationCid
+          || await this._findAllocationCidForOrder(orderMeta.orderId, partyId, serviceToken).catch(() => null);
+
+        if (allocationCid && orderMeta.orderId) {
+          const allocType = orderMeta.allocationType || null;
+          await setAllocationContractIdForOrder(orderMeta.orderId, allocationCid, allocType);
+          console.log(`[OrderService] ✅ 1-TX: Splice alloc CID stored for ${orderMeta.orderId}: ${allocationCid.substring(0, 30)}...`);
+        }
+
+        const orderContractId = parsed.orderCid || `${orderMeta.orderId}-pending`;
+        const hasRealCid = !!(parsed.orderCid && !String(parsed.orderCid).endsWith('-pending'));
+        console.log(`[OrderService] ✅ 1-TX placement complete: order ${orderMeta.orderId} (cid: ${hasRealCid ? orderContractId.substring(0, 30) + '...' : 'pending — WebSocket will confirm'})`);
+
+        const orderStatus = orderMeta.orderMode === 'STOP_LOSS' ? 'PENDING_TRIGGER' : 'OPEN';
+        const orderRecord = {
+          contractId:          orderContractId,
+          orderId:             orderMeta.orderId,
+          owner:               partyId,
+          tradingPair:         orderMeta.tradingPair,
+          orderType:           orderMeta.orderType,
+          orderMode:           orderMeta.orderMode,
+          price:               orderMeta.price,
+          stopPrice:           orderMeta.stopPrice || null,
+          quantity:            orderMeta.quantity,
+          filled:              '0',
+          status:              orderStatus,
+          timestamp:           new Date().toISOString(),
+          allocationContractId: allocationCid,
+        };
+
+        if (orderStatus === 'OPEN') registerOpenOrders([orderRecord]);
+
+        if (global.broadcastWebSocket && orderStatus === 'OPEN') {
+          global.broadcastWebSocket(`orderbook:${orderMeta.tradingPair}`, {
+            type:       'NEW_ORDER',
+            orderId:    orderMeta.orderId,
+            contractId: orderContractId,
+            owner:      partyId,
+            orderType:  orderMeta.orderType,
+            orderMode:  orderMeta.orderMode,
+            price:      orderMeta.price,
+            quantity:   orderMeta.quantity,
+            remaining:  orderMeta.quantity,
+            tradingPair: orderMeta.tradingPair,
+            timestamp:  new Date().toISOString(),
+          });
+        }
+
+        // Register stop-loss monitoring if applicable
+        if (orderMeta.orderMode === 'STOP_LOSS' && orderMeta.stopPrice) {
+          try {
+            const { getStopLossService } = require('./stopLossService');
+            await getStopLossService().registerStopLoss({
+              orderContractId: orderContractId,
+              orderId:         orderMeta.orderId,
+              tradingPair:     orderMeta.tradingPair,
+              orderType:       orderMeta.orderType,
+              stopPrice:       orderMeta.stopPrice,
+              partyId,
+              quantity:        orderMeta.quantity,
+              allocationContractId: allocationCid,
+            });
+            console.log(`[OrderService] ✅ Stop-loss registered for ${orderMeta.orderId}`);
+          } catch (slErr) {
+            console.warn(`[OrderService] ⚠️ Stop-loss registration failed (non-critical): ${slErr.message}`);
+          }
+        }
+
+        return {
+          success:               true,
+          usedInteractiveSubmission: true,
+          requiresSignature:     false,        // ← 1 TX done, no more signing
+          orderId:               orderMeta.orderId,
+          contractId:            orderContractId,
+          status:                orderStatus,
+          tradingPair:           orderMeta.tradingPair,
+          orderType:             orderMeta.orderType,
+          orderMode:             orderMeta.orderMode,
+          price:                 orderMeta.price,
+          stopPrice:             orderMeta.stopPrice || null,
+          quantity:              orderMeta.quantity,
+          filled:                '0',
+          remaining:             orderMeta.quantity,
+          allocationContractId:  allocationCid,
+          timestamp:             new Date().toISOString(),
+        };
+      }
+
+      throw new ValidationError(`Unknown placement stage: ${stage}. Please place the order again.`);
     } catch (error) {
       console.error('[OrderService] Failed to execute order placement:', error.message);
-      
-      // Release reservation on failure
-      if (orderMeta.orderId && orderMeta.stage !== 'ORDER_CREATE_PREPARED') {
+
+      if (orderMeta.orderId) {
         await releaseReservation(orderMeta.orderId);
       }
       throw error;
@@ -1357,6 +1658,10 @@ class OrderService {
           }
         ]
       };
+
+      if (partySignatures.signatures[0]?.party !== partyId) {
+        throw new ValidationError('Cancel execute: signature entry must be for the requesting user party only.');
+      }
       
       const result = await cantonService.executeInteractiveSubmission({
         preparedTransaction,

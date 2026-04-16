@@ -26,8 +26,8 @@ router.post('/create-preapproval', onboardingController.createPreapproval);
 // GET /api/onboarding/discover-synchronizer - Get synchronizerId
 router.get('/discover-synchronizer', onboardingController.discoverSynchronizer);
 
-// POST /api/onboarding/store-signing-key - Store signing key for interactive settlement
-// Body: { partyId, signingKeyBase64, publicKeyFingerprint }
-router.post('/store-signing-key', onboardingController.storeSigningKey);
+// NOTE: /store-signing-key has been removed.
+// Private keys must never be stored server-side. Order placement uses
+// client-side signing: frontend signs the hash, sends only the signature.
 
 module.exports = router;

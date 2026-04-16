@@ -389,6 +389,17 @@ async function startServer() {
   const { app, server } = createApp();
   const PORT = config.server.port;
 
+  // Executor ledger rights backfill must run before accepting HTTP — otherwise O(parties)
+  // gRPC work interleaves with live API traffic and wastes N× ListUserRights.
+  try {
+    const OnboardingService = require('./services/onboarding-service');
+    const onboardingService = new OnboardingService();
+    await onboardingService.grantExecutorRightsToAllParties();
+    console.log('🔑 Executor rights backfill completed (before listen)');
+  } catch (err) {
+    console.warn('⚠️  Executor rights backfill failed (non-fatal):', err.message);
+  }
+
   // Listen on all interfaces
   server.listen(PORT, '0.0.0.0', async () => {
     console.log('');
@@ -398,6 +409,12 @@ async function startServer() {
     console.log('╚═══════════════════════════════════════════════════════════════╝');
     console.log('');
     console.log(`✅ Server running on port ${PORT}`);
+    console.log(`✅ CWD: ${process.cwd()}`);
+    try {
+      console.log(`✅ order-service loaded from: ${require.resolve('./services/order-service.js')}`);
+    } catch (e) {
+      console.warn('⚠️  Could not resolve order-service path:', e.message);
+    }
     console.log(`✅ Real-time updates via WebSocket streaming (polling as fallback)`);
     console.log(`✅ Environment: ${config.server.env}`);
     console.log('');
@@ -463,18 +480,6 @@ async function startServer() {
       console.log('✅ ACS Cleanup Service started (archives FILLED/CANCELLED orders, old trades)');
     } catch (error) {
       console.warn('⚠️  ACS Cleanup service not available:', error.message);
-    }
-
-    // Retroactively grant executor (cardiv) actAs rights to all existing parties.
-    // This is a one-time backfill for users onboarded before the executor-rights fix.
-    // MUST complete before Auto-Accept service starts to avoid race condition on ACS scan.
-    try {
-      const OnboardingService = require('./services/onboarding-service');
-      const onboardingService = new OnboardingService();
-      await onboardingService.grantExecutorRightsToAllParties();
-      console.log('🔑 Executor rights backfill completed');
-    } catch (err) {
-      console.warn('⚠️  Could not start executor rights backfill:', err.message);
     }
 
     // Auto-Accept Incoming Transfers Service

@@ -1,0 +1,108 @@
+module AssetHolding where
+
+import DA.Map as Map
+import DA.Optional (fromOptional)
+
+-- | Tracks a party's asset holdings (wallet/portfolio)
+template AssetHolding
+  with
+    operator : Party
+    party : Party
+    assets : Map.Map Text Decimal  -- Symbol -> Available Amount
+    lockedAssets : Map.Map Text Decimal  -- Symbol -> Locked Amount
+  where
+    signatory operator, party
+
+    -- | Update available balance
+    choice UpdateAvailable : ContractId AssetHolding
+      with
+        symbol : Text
+        delta : Decimal  -- Positive = add, Negative = subtract
+      controller operator
+      do
+        let currentAvailable = fromOptional 0.0 (Map.lookup symbol assets)
+        let newAvailable = currentAvailable + delta
+        assertMsg "Insufficient available balance" (newAvailable >= 0.0)
+
+        let newAssets = Map.insert symbol newAvailable assets
+        create this with assets = newAssets
+
+    -- | Lock assets for an order
+    choice LockAssets : ContractId AssetHolding
+      with
+        symbol : Text
+        amount : Decimal
+      controller operator
+      do
+        let currentAvailable = fromOptional 0.0 (Map.lookup symbol assets)
+        assertMsg "Insufficient available balance to lock" (currentAvailable >= amount)
+
+        let currentLocked = fromOptional 0.0 (Map.lookup symbol lockedAssets)
+        let newAvailable = currentAvailable - amount
+        let newLocked = currentLocked + amount
+
+        let newAssets = Map.insert symbol newAvailable assets
+        let newLockedAssets = Map.insert symbol newLocked lockedAssets
+
+        create this with
+          assets = newAssets
+          lockedAssets = newLockedAssets
+
+    -- | Unlock assets (e.g., order cancelled)
+    choice UnlockAssets : ContractId AssetHolding
+      with
+        symbol : Text
+        amount : Decimal
+      controller operator
+      do
+        let currentLocked = fromOptional 0.0 (Map.lookup symbol lockedAssets)
+        assertMsg "Insufficient locked balance to unlock" (currentLocked >= amount)
+
+        let currentAvailable = fromOptional 0.0 (Map.lookup symbol assets)
+        let newLocked = currentLocked - amount
+        let newAvailable = currentAvailable + amount
+
+        let newAssets = Map.insert symbol newAvailable assets
+        let newLockedAssets = Map.insert symbol newLocked lockedAssets
+
+        create this with
+          assets = newAssets
+          lockedAssets = newLockedAssets
+
+    -- | Transfer locked assets to another party (settlement)
+    choice SettleLockedTransfer : (ContractId AssetHolding, ContractId AssetHolding)
+      with
+        symbol : Text
+        amount : Decimal
+        recipientHoldingCid : ContractId AssetHolding
+      controller operator
+      do
+        -- Reduce locked balance from sender
+        let currentLocked = fromOptional 0.0 (Map.lookup symbol lockedAssets)
+        assertMsg "Insufficient locked balance" (currentLocked >= amount)
+
+        let newLocked = currentLocked - amount
+        let newLockedAssets = Map.insert symbol newLocked lockedAssets
+
+        senderHolding <- create this with lockedAssets = newLockedAssets
+
+        -- Add to recipient's available balance
+        recipientHolding <- fetch recipientHoldingCid
+        archive recipientHoldingCid
+
+        let recipientAvailable = fromOptional 0.0 (Map.lookup symbol recipientHolding.assets)
+        let newRecipientAvailable = recipientAvailable + amount
+        let newRecipientAssets = Map.insert symbol newRecipientAvailable recipientHolding.assets
+
+        recipientHoldingNew <- create recipientHolding with assets = newRecipientAssets
+
+        return (senderHolding, recipientHoldingNew)
+
+-- | Initialize asset holding for a new party
+createAssetHolding : Party -> Party -> Update (ContractId AssetHolding)
+createAssetHolding operator party = do
+  create AssetHolding with
+    operator = operator
+    party = party
+    assets = Map.empty
+    lockedAssets = Map.empty

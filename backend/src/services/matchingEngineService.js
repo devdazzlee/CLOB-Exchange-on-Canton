@@ -305,21 +305,25 @@ class MatchingEngineService {
         readAs: [operatorPartyId, sellOrder.owner]
       });
 
-      // Create Trade record
+      // Create Trade record — uses Settlement:Trade (signatory operator)
+      const [baseSymbol, quoteSymbol] = (buyOrder.tradingPair || 'CC/CBTC').split('/');
       await cantonService.createContractWithTransaction({
         token,
         actAsParty: operatorPartyId,
-        templateId: `${packageId}:Trade:Trade`,
+        templateId: `${packageId}:Settlement:Trade`,
         createArguments: {
           tradeId,
+          operator: operatorPartyId,
           buyer: buyOrder.owner,
           seller: sellOrder.owner,
-          tradingPair: buyOrder.tradingPair,
+          baseInstrumentId: { issuer: operatorPartyId, symbol: baseSymbol || 'CC', version: '1' },
+          quoteInstrumentId: { issuer: operatorPartyId, symbol: quoteSymbol || 'CBTC', version: '1' },
+          baseAmount: tradeQuantity.toString(),
+          quoteAmount: quoteAmount.toString(),
           price: tradePrice.toString(),
-          quantity: tradeQuantity.toString(),
-          timestamp: new Date().toISOString(),
           buyOrderId: buyOrder.orderId,
-          sellOrderId: sellOrder.orderId
+          sellOrderId: sellOrder.orderId,
+          timestamp: new Date().toISOString(),
         },
         readAs: [operatorPartyId, buyOrder.owner, sellOrder.owner]
       });

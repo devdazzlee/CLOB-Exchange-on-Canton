@@ -1,21 +1,37 @@
 module Trade where
 
--- Trade template for recording executed trades (historical record)
+import Instrument (InstrumentId)
+
+-- | Trade - Historical record of an executed trade.
+--
+-- NOTE: The active matching engine creates Trade contracts via the
+-- Settlement module (Settlement:Trade). This module is kept for
+-- standalone use and as a named export for the package.
+--
+-- IMPORTANT: signatory must be operator (exchange), NOT buyer/seller.
+-- The matching engine submits trade creation with actAs=[operator].
+-- If signatory were buyer/seller, the create would fail because only
+-- the operator key is present at match time.
 template Trade
   with
     tradeId : Text
+    operator : Party         -- Exchange operator (signatory)
     buyer : Party
     seller : Party
-    tradingPair : Text
+    baseInstrumentId : InstrumentId
+    quoteInstrumentId : InstrumentId
+    baseAmount : Decimal
+    quoteAmount : Decimal
     price : Decimal
-    quantity : Decimal
-    timestamp : Time
     buyOrderId : Text
     sellOrderId : Text
+    timestamp : Time
   where
-    signatory buyer, seller
+    signatory operator
     observer buyer, seller
 
-    -- No choices needed - this is just a historical record
-    -- Trades are immutable once created
-
+    -- Archive this trade record to free ACS space.
+    -- Call ONLY after persisting trade to off-ledger storage.
+    choice ArchiveTrade : ()
+      controller operator
+      do return ()

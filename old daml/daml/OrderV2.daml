@@ -1,0 +1,101 @@
+-- | Order template with real asset locking using Asset contracts
+module OrderV2 where
+
+import Asset
+import AssetHolding
+import DA.Optional
+
+-- | Order template for individual buy/sell orders with real asset locking
+template OrderV2
+  with
+    orderId : Text
+    owner : Party
+    orderType : Text  -- "BUY" or "SELL"
+    orderMode : Text  -- "LIMIT" or "MARKET"
+    tradingPair : Text  -- e.g., "BTC/USDT"
+    price : Optional Decimal  -- None for market orders
+    quantity : Decimal
+    filled : Decimal
+    status : Text  -- "OPEN", "FILLED", "CANCELLED"
+    timestamp : Time
+    operator : Party
+    -- Asset locking references
+    holdingCid : ContractId AssetHolding  -- Reference to owner's asset holding
+    lockedSymbol : Text  -- Which asset is locked (e.g., "USDT" for buy, "BTC" for sell)
+    lockedAmount : Decimal  -- Amount locked
+  where
+    signatory owner
+    observer operator
+
+    ensure quantity > 0.0 && filled >= 0.0 && filled <= quantity && lockedAmount > 0.0
+
+    -- | Cancel an open order and unlock assets
+    choice CancelOrderV2 : ContractId AssetHolding
+      controller owner
+      do
+        assertMsg "Order must be open to cancel" (status == "OPEN")
+
+        -- Unlock the remaining locked assets
+        holding <- fetch holdingCid
+        archive holdingCid
+
+        let remainingLocked = lockedAmount * (quantity - filled) / quantity
+
+        newHolding <- exercise holdingCid UnlockAssets with
+          symbol = lockedSymbol
+          amount = remainingLocked
+
+        -- Mark order as cancelled
+        _ <- create this with status = "CANCELLED"
+
+        return newHolding
+
+    -- | Fill the order (partially or fully)
+    choice FillOrderV2 : ContractId OrderV2
+      with
+        fillQuantity : Decimal
+      controller operator
+      do
+        assertMsg "Order must be open to fill" (status == "OPEN")
+        assertMsg "Fill quantity must be positive" (fillQuantity > 0.0)
+        assertMsg "Cannot fill more than remaining" (filled + fillQuantity <= quantity)
+
+        let newFilled = filled + fillQuantity
+        let newStatus = if newFilled >= quantity then "FILLED" else "OPEN"
+
+        create this with
+          filled = newFilled
+          status = newStatus
+
+    -- | Get remaining quantity to fill
+    nonconsuming choice GetRemainingQuantityV2 : Decimal
+      controller owner, operator
+      do
+        return (quantity - filled)
+
+-- | Create an order with asset locking
+createOrderWithLocking : Party -> Party -> ContractId AssetHolding -> Text -> Text -> Text -> Optional Decimal -> Decimal -> Text -> Decimal -> Time -> Update (ContractId OrderV2, ContractId AssetHolding)
+createOrderWithLocking owner operator holdingCid orderId orderType tradingPair price quantity lockedSymbol lockedAmount timestamp = do
+  -- Lock the required assets
+  newHolding <- exercise holdingCid LockAssets with
+    symbol = lockedSymbol
+    amount = lockedAmount
+
+  -- Create the order
+  orderId <- create OrderV2 with
+    orderId = orderId
+    owner = owner
+    orderType = orderType
+    orderMode = if isSome price then "LIMIT" else "MARKET"
+    tradingPair = tradingPair
+    price = price
+    quantity = quantity
+    filled = 0.0
+    status = "OPEN"
+    timestamp = timestamp
+    operator = operator
+    holdingCid = newHolding
+    lockedSymbol = lockedSymbol
+    lockedAmount = lockedAmount
+
+  return (orderId, newHolding)

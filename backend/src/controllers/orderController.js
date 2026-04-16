@@ -11,6 +11,7 @@ const OrderService = require('../services/order-service');
 const { success } = require('../utils/response');
 const asyncHandler = require('../middleware/asyncHandler');
 const { ValidationError } = require('../utils/errors');
+const { rejectPrivateKeyMaterialInBody } = require('../utils/nonCustodial');
 const userRegistry = require('../state/userRegistry');
 
 class OrderController {
@@ -71,6 +72,8 @@ class OrderController {
       stopPrice,
     } = req.body;
 
+    rejectPrivateKeyMaterialInBody(req.body, 'POST /api/orders/place');
+
     const effectivePartyId = await this.resolveEffectivePartyId(req, partyId);
 
     if (!tradingPair || !orderType || !orderMode || !quantity) {
@@ -128,6 +131,8 @@ class OrderController {
         stage: result.stage || null,
         step: result.step || null,
         allocationType: result.allocationType || null,
+        placementContext: result.placementContext || null,
+        executorPartyId: result.executorPartyId || null,
       }, 'Transaction prepared. Sign the hash and call /execute-place.');
     }
 
@@ -172,6 +177,8 @@ class OrderController {
       partyId,
       tradingPair
     } = req.body;
+
+    rejectPrivateKeyMaterialInBody(req.body, 'POST /api/orders/cancel');
 
     const effectivePartyId = await this.resolveEffectivePartyId(req, partyId);
 
@@ -226,20 +233,19 @@ class OrderController {
    * Body: { preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, orderMeta }
    */
   executePlace = asyncHandler(async (req, res) => {
-    const { preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, orderMeta, signingKeyBase64 } = req.body;
+    const { preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, orderMeta } = req.body;
+
+    rejectPrivateKeyMaterialInBody(req.body, 'POST /api/orders/execute-place');
 
     if (!preparedTransaction || !partyId || !signatureBase64 || !signedBy) {
       throw new ValidationError('preparedTransaction, partyId, signatureBase64, and signedBy are required');
     }
 
-    console.log(`[OrderController] EXECUTE place for ${partyId.substring(0, 30)}... signedBy: ${signedBy.substring(0, 20)}...`);
-
-    // Store signing key for server-side settlement (if provided)
-    if (signingKeyBase64 && typeof signingKeyBase64 === 'string' && signingKeyBase64.trim()) {
-      const userRegistry = require('../state/userRegistry');
-      await userRegistry.storeSigningKey(partyId, signingKeyBase64.trim(), signedBy);
-      console.log(`[OrderController] 🔑 Signing key stored for interactive settlement`);
+    if (orderMeta?.partyId && orderMeta.partyId !== partyId) {
+      throw new ValidationError('orderMeta.partyId must match partyId (user-signed placement).');
     }
+
+    console.log(`[OrderController] EXECUTE place for ${partyId.substring(0, 30)}... signedBy: ${signedBy.substring(0, 20)}...`);
 
     const result = await this.orderService.executeOrderPlacement(
       preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, orderMeta || {}
@@ -248,6 +254,26 @@ class OrderController {
     if (result?.requiresSignature) {
       console.log(`[OrderController] External party — returning next prepared step for signing (${result.step})`);
       return success(res, result, 'Step prepared. Sign the next hash and call /execute-place again.');
+    }
+
+    if (orderMeta?.orderMode === 'STOP_LOSS' && result?.contractId && orderMeta?.orderId) {
+      try {
+        const { getStopLossService } = require('../services/stopLossService');
+        const stopLossService = getStopLossService();
+        await stopLossService.registerStopLoss({
+          orderContractId: result.contractId,
+          orderId: orderMeta.orderId,
+          tradingPair: orderMeta.tradingPair,
+          orderType: orderMeta.orderType,
+          stopPrice: orderMeta.stopPrice,
+          partyId,
+          quantity: orderMeta.quantity?.toString() || '0',
+          allocationContractId: result.allocationContractId || null,
+        });
+        console.log(`[OrderController] ✅ Stop-loss registered for ${orderMeta.orderId} after execute-place`);
+      } catch (slErr) {
+        console.warn(`[OrderController] ⚠️ Failed to register stop-loss after execute-place: ${slErr.message}`);
+      }
     }
 
     console.log(`[OrderController] ✅ Order placed via interactive submission: ${result.orderId}`);
@@ -282,6 +308,8 @@ class OrderController {
   executeCancel = asyncHandler(async (req, res) => {
     const { preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion, cancelMeta } = req.body;
 
+    rejectPrivateKeyMaterialInBody(req.body, 'POST /api/orders/execute-cancel');
+
     if (!preparedTransaction || !partyId || !signatureBase64 || !signedBy) {
       throw new ValidationError('preparedTransaction, partyId, signatureBase64, and signedBy are required');
     }
@@ -303,6 +331,9 @@ class OrderController {
    */
   cancelOrderById = asyncHandler(async (req, res) => {
     const { orderId } = req.params;
+
+    rejectPrivateKeyMaterialInBody(req.body, 'POST /api/orders/:orderId/cancel');
+
     const partyId = await this.resolveEffectivePartyId(req, req.body?.partyId);
 
     if (!orderId) {

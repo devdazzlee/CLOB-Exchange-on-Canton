@@ -14,7 +14,8 @@ const asyncHandler = require('../middleware/asyncHandler');
 const { getTransferOfferService } = require('../services/transferOfferService');
 const tokenProvider = require('../services/tokenProvider');
 const { success } = require('../utils/response');
-const { ValidationError } = require('../middleware/errorHandler');
+const { ValidationError } = require('../utils/errors');
+const { rejectPrivateKeyMaterialInBody } = require('../utils/nonCustodial');
 
 /**
  * GET /api/transfers/offers/:partyId
@@ -147,6 +148,8 @@ router.post('/prepare-accept', asyncHandler(async (req, res) => {
  * hashingSchemeVersion: From the prepare response (echoed back)
  */
 router.post('/execute-accept', asyncHandler(async (req, res) => {
+  rejectPrivateKeyMaterialInBody(req.body, 'POST /api/transfers/execute-accept');
+
   const { preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion } = req.body;
   
   if (!preparedTransaction || !partyId || !signatureBase64 || !signedBy) {
@@ -155,12 +158,11 @@ router.post('/execute-accept', asyncHandler(async (req, res) => {
   
   console.log(`[Transfers] EXECUTE accept for ${partyId.substring(0, 30)}... signedBy: ${signedBy.substring(0, 20)}...`);
   
-  const adminToken = await tokenProvider.getServiceToken();
   const transferService = getTransferOfferService();
   await transferService.initialize();
   
   const result = await transferService.executeTransferAccept(
-    preparedTransaction, partyId, signatureBase64, signedBy, adminToken, hashingSchemeVersion
+    preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion
   );
   
   return success(res, result, 'Transfer accepted via interactive submission');

@@ -1,0 +1,385 @@
+-- | Settlement.daml - Delivery vs Payment (DvP) atomic settlement
+--
+-- This enables atomic swaps: buyer gets tokens, seller gets payment,
+-- or the entire transaction rolls back. No partial state.
+--
+-- Flow:
+--   1. Matching engine finds crossing orders
+--   2. Creates SettlementInstruction with both locked Holdings
+--   3. Operator executes settlement atomically
+--   4. Holdings are transferred, Trade contract created
+--
+-- AllocationRecord:
+--   Fallback for when the Splice Allocation Factory API is unavailable.
+--   Tracks locked funds on the CLOB exchange's own Canton contracts.
+--   Primary path uses the SDK's Allocation Factory; this is the direct fallback.
+--
+module Settlement where
+
+import Instrument (InstrumentId)
+import Holding
+import DA.Action (when)
+
+-- | Settlement status
+data SettlementStatus 
+  = SettlementPending
+  | SettlementExecuted
+  | SettlementFailed Text
+  | SettlementCancelled
+  deriving (Eq, Show)
+
+-- | Allocation status for AllocationRecord
+data AllocationStatus
+  = AllocationPending     -- Funds locked, awaiting match
+  | AllocationExecuted    -- Match found, funds transferred
+  | AllocationCancelled   -- Order cancelled, funds returned
+  deriving (Eq, Show)
+
+-- | Settlement leg - one side of the trade
+data SettlementLeg = SettlementLeg
+  with
+    party : Party
+    instrumentId : InstrumentId
+    amount : Decimal
+    holdingCid : ContractId Holding
+  deriving (Eq, Show)
+
+-- | SettlementInstruction - Pending atomic settlement
+--
+-- Created by matching engine when orders cross.
+-- Holds references to both parties' locked holdings.
+template SettlementInstruction
+  with
+    operator : Party
+    buyer : Party
+    seller : Party
+    baseInstrumentId : InstrumentId     -- What's being bought (e.g., cBTC)
+    quoteInstrumentId : InstrumentId    -- What's being paid (e.g., USDT)
+    baseAmount : Decimal                 -- Amount of base (e.g., 0.5 BTC)
+    quoteAmount : Decimal                -- Amount of quote (e.g., 25,000 USDT)
+    price : Decimal                      -- Trade price
+    buyerHoldingCid : ContractId Holding  -- Buyer's locked USDT
+    sellerHoldingCid : ContractId Holding -- Seller's locked BTC
+    buyOrderId : Text
+    sellOrderId : Text
+    timestamp : Time
+    status : SettlementStatus
+  where
+    signatory operator
+    observer buyer, seller
+
+    -- Execute the settlement atomically
+    choice Settlement_Execute : (ContractId Holding, ContractId Holding, ContractId Trade)
+      controller operator
+      do
+        -- Fetch both holdings to verify they exist and are locked
+        buyerHolding <- fetch buyerHoldingCid
+        sellerHolding <- fetch sellerHoldingCid
+        
+        -- Verify holdings are properly locked
+        assertMsg "Buyer holding not locked" (buyerHolding.lock /= None)
+        assertMsg "Seller holding not locked" (sellerHolding.lock /= None)
+        
+        -- Verify amounts match
+        assertMsg "Buyer holding insufficient" (buyerHolding.amount >= quoteAmount)
+        assertMsg "Seller holding insufficient" (sellerHolding.amount >= baseAmount)
+        
+        -- Execute atomic swap:
+        -- 1. Transfer base (e.g., BTC) from seller to buyer
+        -- 2. Transfer quote (e.g., USDT) from buyer to seller
+        
+        -- Archive old holdings
+        archive buyerHoldingCid
+        archive sellerHoldingCid
+        
+        -- Create new holdings for buyer (receives base token)
+        buyerNewHolding <- create Holding with
+          owner = buyer
+          instrumentId = baseInstrumentId
+          amount = baseAmount
+          lock = None
+          custodian = operator
+        
+        -- Create new holdings for seller (receives quote token)
+        sellerNewHolding <- create Holding with
+          owner = seller
+          instrumentId = quoteInstrumentId
+          amount = quoteAmount
+          lock = None
+          custodian = operator
+        
+        -- Handle any remainder (partial fills)
+        -- If buyer had more locked than needed, return change
+        when (buyerHolding.amount > quoteAmount) do
+          _ <- create Holding with
+            owner = buyer
+            instrumentId = quoteInstrumentId
+            amount = buyerHolding.amount - quoteAmount
+            lock = None
+            custodian = operator
+          return ()
+        
+        -- If seller had more locked than needed, return change
+        when (sellerHolding.amount > baseAmount) do
+          _ <- create Holding with
+            owner = seller
+            instrumentId = baseInstrumentId
+            amount = sellerHolding.amount - baseAmount
+            lock = None
+            custodian = operator
+          return ()
+        
+        -- Create trade record
+        trade <- create Trade with
+          tradeId = buyOrderId <> "-" <> sellOrderId <> "-" <> show timestamp
+          operator = operator
+          buyer = buyer
+          seller = seller
+          baseInstrumentId = baseInstrumentId
+          quoteInstrumentId = quoteInstrumentId
+          baseAmount = baseAmount
+          quoteAmount = quoteAmount
+          price = price
+          buyOrderId = buyOrderId
+          sellOrderId = sellOrderId
+          timestamp = timestamp
+        
+        return (buyerNewHolding, sellerNewHolding, trade)
+
+    -- Cancel settlement (returns locked funds)
+    choice Settlement_Cancel : ()
+      with
+        reason : Text
+      controller operator
+      do
+        -- Unlock both holdings
+        buyerHolding <- fetch buyerHoldingCid
+        sellerHolding <- fetch sellerHoldingCid
+        
+        archive buyerHoldingCid
+        archive sellerHoldingCid
+        
+        -- Return unlocked holdings
+        _ <- create buyerHolding with lock = None
+        _ <- create sellerHolding with lock = None
+        
+        return ()
+
+-- | Trade - Record of an executed trade
+-- 
+-- ACS Optimization: Trade contracts remain active for history queries.
+-- The operator can archive old trades via ArchiveTrade to keep the
+-- Active Contract Set lean. Archived trades should first be persisted
+-- to the file-backed cache (cantonUpdateStream.js) before archival.
+template Trade
+  with
+    tradeId : Text
+    operator : Party
+    buyer : Party
+    seller : Party
+    baseInstrumentId : InstrumentId
+    quoteInstrumentId : InstrumentId
+    baseAmount : Decimal
+    quoteAmount : Decimal
+    price : Decimal
+    buyOrderId : Text
+    sellOrderId : Text
+    timestamp : Time
+  where
+    signatory operator
+    observer buyer, seller
+
+    -- Archive this trade record to free ACS space.
+    -- Call ONLY after the trade has been persisted to off-ledger storage
+    -- (file cache, database, etc.) to avoid data loss.
+    choice ArchiveTrade : ()
+      controller operator
+      do return ()
+
+-- | Batch settlement for multiple trades
+template BatchSettlement
+  with
+    operator : Party
+    settlements : [ContractId SettlementInstruction]
+    timestamp : Time
+  where
+    signatory operator
+
+    -- Execute all settlements atomically
+    choice BatchSettlement_Execute : [ContractId Trade]
+      controller operator
+      do
+        -- Execute each settlement
+        results <- forA settlements \settlementCid -> do
+          (_, _, tradeCid) <- exercise settlementCid Settlement_Execute
+          return tradeCid
+        return results
+
+-- =============================================================================
+-- EXCHANGE ALLOCATION — Propose-Accept Pattern for External Parties
+-- =============================================================================
+--
+-- Solves the Canton protocol limitation:
+--   "Only transactions requiring authorization from a single party are supported"
+--   for external parties.
+--
+-- The Splice DvpLegAllocation contract requires BOTH operator AND external party
+-- to co-authorize Allocation_ExecuteTransfer. Canton cannot do this when one
+-- party is external (hosted as CPN, not SPN).
+--
+-- PROPOSE-ACCEPT PATTERN:
+--   Step 1 (PROPOSE): External party creates ExchangeAllocation at ORDER TIME.
+--     → Single-party tx by external party (user signs via interactive submission).
+--     → User's consent is embedded on-chain as the contract's signatory.
+--
+--   Step 2 (ACCEPT): Operator exercises Execute_Settlement at MATCH TIME.
+--     → Single-party tx by operator (non-interactive, Keycloak token).
+--     → Operator is the controller. Owner's authorization carries forward from
+--       being signatory of the consumed contract (DAML authorization rule).
+--     → NO external party key needed at settlement.
+--
+-- This replaces:
+--   - Splice AllocationFactory_Allocate + DvpLegAllocation (broken for ext parties)
+--   - AllocationRecord (operator-only signatory, no user consent on-chain)
+--
+-- @see https://docs.digitalasset.com/build/3.4/sdlc-howtos/smart-contracts/develop/patterns/propose-accept.html
+--
+template ExchangeAllocation
+  with
+    allocationId : Text       -- Unique allocation ID (e.g., "alloc-order-123")
+    orderId : Text            -- The exchange order this allocation belongs to
+    owner : Party             -- The order placer (external party) — SIGNATORY
+    executor : Party          -- The exchange operator — CONTROLLER of Execute
+    amount : Decimal          -- Amount locked/committed
+    instrumentSymbol : Text   -- Token symbol (e.g., "CC", "CBTC")
+    side : Text               -- "BUY" or "SELL"
+    tradingPair : Text        -- e.g., "CC/CBTC"
+    status : Text             -- "PENDING", "EXECUTED", "CANCELLED"
+    createdAt : Text          -- ISO timestamp
+  where
+    -- CRITICAL: owner (external party) is the SOLE signatory.
+    -- This means the external party can create this contract alone (single-party tx).
+    -- The operator's authorization is NOT needed at creation time.
+    signatory owner
+    observer executor
+
+    -- Execute the settlement at MATCH TIME.
+    --
+    -- The operator (executor) exercises this choice as a single-party tx.
+    -- DAML authorization rule: inside a choice body, the controller (executor)
+    -- AND all signatories of the consumed contract (owner) have authorization.
+    -- This gives combined authorization WITHOUT co-submission.
+    --
+    -- The choice is CONSUMING: the original ExchangeAllocation is archived.
+    --
+    -- PARTIAL FILLS: If matchQuantity < amount, two contracts are created:
+    --   1. EXECUTED allocation for the filled portion
+    --   2. PENDING allocation for the remaining amount (returned as result)
+    -- This allows subsequent matches to settle the remainder.
+    --
+    -- FULL FILLS: If matchQuantity >= amount, one EXECUTED contract is created.
+    --
+    -- Returns the PENDING remainder contract (for partial fills),
+    -- or the EXECUTED contract (for full fills).
+    choice Execute_Settlement : ContractId ExchangeAllocation
+      with
+        matchPrice : Decimal    -- The price the trade executed at
+        matchQuantity : Decimal -- Quantity matched
+        counterparty : Text     -- Party ID of the counterparty
+        tradeId : Text          -- Reference to the Trade record
+      controller executor
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        assertMsg "Match quantity must be positive" (matchQuantity > 0.0)
+
+        let remainingAmount = amount - matchQuantity
+
+        if remainingAmount > 0.0
+          then do
+            -- PARTIAL FILL: create EXECUTED record for filled portion
+            _ <- create this with
+              status = "EXECUTED"
+              amount = matchQuantity
+
+            -- Create PENDING remainder for subsequent matches
+            create this with
+              allocationId = allocationId <> "-remainder-" <> tradeId
+              amount = remainingAmount
+              status = "PENDING"
+          else do
+            -- FULL FILL: mark entire allocation as EXECUTED
+            create this with status = "EXECUTED"
+
+    -- Owner cancels their own allocation (e.g., user cancels order).
+    -- Single-party tx by the external party (owner signs alone).
+    choice Cancel_Settlement : ContractId ExchangeAllocation
+      controller owner
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        create this with status = "CANCELLED"
+
+    -- Operator cancels (e.g., expired allocation, ACS cleanup, order rejection).
+    -- Single-party tx by the operator.
+    --
+    -- DAML authorization: executor is controller, owner is signatory of the
+    -- consumed contract. Creating a new contract with signatory = owner is
+    -- allowed because owner's auth carries forward.
+    choice Operator_Cancel_Settlement : ContractId ExchangeAllocation
+      controller executor
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        create this with status = "CANCELLED"
+
+    -- Archive a completed allocation to free ACS space.
+    -- Only EXECUTED or CANCELLED allocations can be archived.
+    choice Archive_ExchangeAllocation : ()
+      controller executor
+      do
+        assertMsg "Can only archive completed allocations" (status == "EXECUTED" || status == "CANCELLED")
+
+
+-- =============================================================================
+-- LEGACY: ALLOCATION RECORD (kept for backward compatibility)
+-- =============================================================================
+-- NOTE: New code should use ExchangeAllocation (Propose-Accept) above.
+-- AllocationRecord is kept for existing contracts in the ACS.
+--
+template AllocationRecord
+  with
+    allocationId : Text
+    orderId : Text
+    sender : Party
+    receiver : Text
+    executor : Party
+    amount : Text
+    instrument : Text
+    holdingCids : [Text]
+    status : Text
+    createdAt : Text
+    operator : Party
+  where
+    signatory operator
+    observer sender, executor
+
+    choice ExecuteAllocation : ContractId AllocationRecord
+      controller executor
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        create this with status = "EXECUTED"
+
+    choice CancelAllocation : ContractId AllocationRecord
+      controller executor
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        create this with status = "CANCELLED"
+
+    choice SenderCancelAllocation : ContractId AllocationRecord
+      controller sender
+      do
+        assertMsg "Allocation not in PENDING status" (status == "PENDING")
+        create this with status = "CANCELLED"
+
+    choice ArchiveAllocation : ()
+      controller operator
+      do
+        assertMsg "Can only archive completed allocations" (status == "EXECUTED" || status == "CANCELLED")

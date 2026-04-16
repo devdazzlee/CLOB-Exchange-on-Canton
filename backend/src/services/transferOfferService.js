@@ -223,14 +223,15 @@ class TransferOfferService {
   // STEP 2: Execute prepared transfer accept with user signature
   // ═══════════════════════════════════════════════════════════════════════════
 
-  async executeTransferAccept(preparedTransaction, partyId, signatureBase64, signedBy, token, hashingSchemeVersion = 1) {
+  async executeTransferAccept(preparedTransaction, partyId, signatureBase64, signedBy, hashingSchemeVersion = 1) {
     await this.initialize();
 
     try {
       console.log(`[TransferOfferService] EXECUTE transfer accept for ${partyId.substring(0, 30)}...`);
 
-      // Must match prepareTransferAccept (executor OAuth client — onboarding grants).
-      const adminToken = token || await tokenProvider.getExecutorToken();
+      // MUST match prepareTransferAccept: same OAuth user (EXECUTOR / cardiv) that called prepare.
+      // Using getServiceToken() here causes HTTP 403 "security-sensitive" (PERMISSION_DENIED) on execute.
+      const adminToken = await tokenProvider.getExecutorToken();
 
       const partySignatures = {
         signatures: [{

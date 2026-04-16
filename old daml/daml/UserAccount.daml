@@ -1,0 +1,94 @@
+module UserAccount where
+
+import qualified DA.Map as Map
+
+-- Helper to get balance, defaulting to 0.0 if not found
+getBalanceDefault : Map.Map Text Decimal -> Text -> Decimal
+getBalanceDefault balances token = case Map.lookup token balances of
+  None -> 0.0
+  Some b -> b
+
+-- User account template for managing token balances
+template UserAccount
+  with
+    party : Party
+    balances : Map.Map Text Decimal
+    operator : Party
+  where
+    signatory operator
+    observer party
+
+    -- Deposit tokens into the account
+    choice Deposit : ()
+      with
+        token : Text
+        amount : Decimal
+      controller party
+      do
+        assert (amount > 0.0)
+        let newBalances = Map.insertWith (+) token amount balances
+        _ <- create this with balances = newBalances
+        return ()
+
+    -- Withdraw tokens from the account
+    choice Withdraw : ()
+      with
+        token : Text
+        amount : Decimal
+      controller party
+      do
+        assert (amount > 0.0)
+        let currentBalance = getBalanceDefault balances token
+        assert (currentBalance >= amount)
+        -- FIXED: insertWith f(new, old) so we use flip (-) to get old - new
+        let newBalances = Map.insertWith (\new old -> old - new) token amount balances
+        _ <- create this with balances = newBalances
+        return ()
+
+    -- Get current balance for a token
+    choice GetBalance : Decimal
+      with
+        token : Text
+      controller party
+      do
+        return (getBalanceDefault balances token)
+
+    -- Get all balances
+    choice GetAllBalances : Map.Map Text Decimal
+      with
+      controller party
+      do
+        return balances
+
+    -- Update balances after a trade (called by operator after trade execution)
+    -- For BUY orders: buyer receives base token (e.g., BTC), pays quote token (e.g., USDT)
+    -- For SELL orders: seller receives quote token (e.g., USDT), pays base token (e.g., BTC)
+    choice UpdateAfterTrade : ()
+      with
+        baseToken : Text  -- e.g., "BTC"
+        quoteToken : Text  -- e.g., "USDT"
+        baseAmount : Decimal  -- Amount of base token (positive for buyer, negative for seller)
+        quoteAmount : Decimal  -- Amount of quote token (negative for buyer, positive for seller)
+      controller operator
+      do
+        -- Update base token balance
+        let newBalances1 = Map.insertWith (+) baseToken baseAmount balances
+        -- Update quote token balance
+        let newBalances2 = Map.insertWith (+) quoteToken quoteAmount newBalances1
+        _ <- create this with balances = newBalances2
+        return ()
+
+    -- Merge balances (useful for UTXO consolidation after order cancellation)
+    -- This consolidates the balance map, which may help with UTXO merging at the ledger level
+    -- Note: Actual UTXO merging happens at the Canton ledger level, not in DAML contracts
+    -- This choice ensures the balance map is clean and consolidated
+    choice MergeBalances : ()
+      controller party
+      do
+        -- Simply recreate the contract with the same balances
+        -- This may trigger ledger-level UTXO consolidation
+        -- The balances map is already consolidated (Map doesn't create separate UTXOs)
+        -- but recreating the contract may help consolidate underlying token UTXOs
+        _ <- create this with balances = balances
+        return ()
+

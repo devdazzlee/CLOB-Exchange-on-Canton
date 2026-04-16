@@ -49,3 +49,6 @@ frontend/build/
 **/.user-registry.json
 .signing-keys.json
 
+# Local client chat / notes (not part of the codebase)
+docs/clientchat.txt
+

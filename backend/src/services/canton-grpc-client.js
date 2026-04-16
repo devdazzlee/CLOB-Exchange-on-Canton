@@ -23,6 +23,33 @@ const CANTON_LEDGER_API_URL = CANTON_LEDGER_API_HOST && CANTON_LEDGER_API_PORT
   ? `${CANTON_LEDGER_API_HOST}:${CANTON_LEDGER_API_PORT}`
   : null;
 
+/** Canton participant limit on user rights — expected in large dev setups; not a bug. */
+function isTooManyUserRightsError(error) {
+  const msg = `${error?.message || ''} ${error?.details || ''}`;
+  return msg.includes('TOO_MANY_USER_RIGHTS');
+}
+
+/** ListUserRights response: true if user already has can_act_as for this party */
+function userHasCanActAsForParty(listResponse, partyId) {
+  if (!listResponse?.rights?.length || !partyId) return false;
+  for (const right of listResponse.rights) {
+    const p = right.can_act_as?.party ?? right.canActAs?.party;
+    if (p === partyId) return true;
+  }
+  return false;
+}
+
+/** All parties the user may act as (from one ListUserRights snapshot) — for batch backfill without N list calls */
+function collectCanActAsPartyIds(listResponse) {
+  const set = new Set();
+  if (!listResponse?.rights?.length) return set;
+  for (const right of listResponse.rights) {
+    const p = right.can_act_as?.party ?? right.canActAs?.party;
+    if (p) set.add(p);
+  }
+  return set;
+}
+
 class CantonGrpcClient {
   constructor() {
     this.client = null;
@@ -175,14 +202,18 @@ class CantonGrpcClient {
 
         this.client.GrantUserRights(request, this.metadata, { deadline }, (error, response) => {
           if (error) {
-            // Log detailed error for debugging
-            console.error('[gRPC] GrantUserRights failed:', {
+            const payload = {
               code: error.code,
               message: error.message,
               details: error.details,
               userId,
               partyId
-            });
+            };
+            if (isTooManyUserRightsError(error)) {
+              console.warn('[gRPC] GrantUserRights: participant user-rights limit (TOO_MANY_USER_RIGHTS)', payload);
+            } else {
+              console.error('[gRPC] GrantUserRights failed:', payload);
+            }
             reject(new Error(`gRPC call failed (${error.code}): ${error.message}`));
           } else {
             console.log('[gRPC] GrantUserRights succeeded:', response);
@@ -197,6 +228,25 @@ class CantonGrpcClient {
   }
 
   /**
+   * Grant can_act_as / can_read_as for party only if not already present.
+   * Avoids redundant GrantUserRights calls and reduces TOO_MANY_USER_RIGHTS noise.
+   * If ListUserRights fails, falls back to GrantUserRights (same as before).
+   */
+  async grantUserRightsIfMissing(userId, partyId, token) {
+    try {
+      await this.initialize(token);
+      const existing = await this.listUserRights(userId, token);
+      if (userHasCanActAsForParty(existing, partyId)) {
+        return { skipped: true };
+      }
+    } catch (listErr) {
+      console.warn('[gRPC] listUserRights before grant failed; attempting GrantUserRights anyway:', listErr.message);
+    }
+    await this.grantUserRights(userId, partyId, token);
+    return { skipped: false };
+  }
+
+  /**
    * List user rights via gRPC
    */
   async listUserRights(userId, token) {
@@ -204,7 +254,8 @@ class CantonGrpcClient {
       await this.initialize(token);
 
       const request = {
-        user_id: userId
+        user_id: userId,
+        identity_provider_id: ''
       };
 
       return new Promise((resolve, reject) => {
@@ -395,3 +446,5 @@ class CantonGrpcClient {
 }
 
 module.exports = CantonGrpcClient;
+module.exports.userHasCanActAsForParty = userHasCanActAsForParty;
+module.exports.collectCanActAsPartyIds = collectCanActAsPartyIds;

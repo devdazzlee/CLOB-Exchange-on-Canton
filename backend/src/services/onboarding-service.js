@@ -831,8 +831,13 @@ class OnboardingService {
       
       // ── 1. Grant to validator-operator (best effort — may hit TOO_MANY_USER_RIGHTS) ──
       try {
-        await grpcClient.grantUserRights(userId, partyId, adminToken);
-        console.log('[Onboarding] Granted rights for new party to validator-operator:', partyId);
+        const vo = await grpcClient.grantUserRightsIfMissing(userId, partyId, adminToken);
+        console.log(
+          vo?.skipped
+            ? '[Onboarding] Validator-operator already had can_act_as for new party (skipped grant):'
+            : '[Onboarding] Granted rights for new party to validator-operator:',
+          partyId
+        );
       } catch (err) {
         if (err.message && err.message.includes('TOO_MANY_USER_RIGHTS')) {
           console.warn(`[Onboarding] TOO_MANY_USER_RIGHTS for validator-operator — skipping (executor will handle interactive submissions)`);
@@ -853,8 +858,13 @@ class OnboardingService {
         const executorUserId = execPayload.sub;
 
         if (executorUserId && executorUserId !== userId) {
-          await grpcClient.grantUserRights(executorUserId, partyId, adminToken);
-          console.log('[Onboarding] ✅ Granted actAs rights for new party to executor (cardiv):', partyId.substring(0, 40));
+          const ex = await grpcClient.grantUserRightsIfMissing(executorUserId, partyId, adminToken);
+          console.log(
+            ex?.skipped
+              ? '[Onboarding] Executor already had can_act_as for new party (skipped grant):'
+              : '[Onboarding] ✅ Granted actAs rights for new party to executor (cardiv):',
+            partyId.substring(0, 40)
+          );
         } else if (executorUserId === userId) {
           console.log('[Onboarding] Executor and validator-operator are the same user — rights already handled above');
         }
@@ -871,8 +881,13 @@ class OnboardingService {
       if (operatorPartyId && operatorPartyId !== partyId) {
         try {
           // Grant to validator-operator
-          await grpcClient.grantUserRights(userId, operatorPartyId, adminToken);
-          console.log('[Onboarding] Granted rights for operator party to validator-operator:', operatorPartyId);
+          const opVo = await grpcClient.grantUserRightsIfMissing(userId, operatorPartyId, adminToken);
+          console.log(
+            opVo?.skipped
+              ? '[Onboarding] Validator-operator already had can_act_as for operator party (skipped grant):'
+              : '[Onboarding] Granted rights for operator party to validator-operator:',
+            operatorPartyId
+          );
         } catch (opError) {
           if (opError.message && (opError.message.includes('NOT_FOUND') || opError.message.includes('PARTIES'))) {
              // expected if domain party
@@ -888,8 +903,13 @@ class OnboardingService {
           const execPayload = JSON.parse(Buffer.from(executorToken.split('.')[1], 'base64').toString());
           const executorUserId = execPayload.sub;
           if (executorUserId && executorUserId !== userId) {
-            await grpcClient.grantUserRights(executorUserId, operatorPartyId, adminToken);
-            console.log('[Onboarding] ✅ Granted rights for operator party to executor (cardiv):', operatorPartyId);
+            const opEx = await grpcClient.grantUserRightsIfMissing(executorUserId, operatorPartyId, adminToken);
+            console.log(
+              opEx?.skipped
+                ? '[Onboarding] Executor already had can_act_as for operator party (skipped grant):'
+                : '[Onboarding] ✅ Granted rights for operator party to executor (cardiv):',
+              operatorPartyId
+            );
           }
         } catch (opExecError) {
           if (!opExecError.message.includes('NOT_FOUND')) {
@@ -907,14 +927,19 @@ class OnboardingService {
   }
 
   /**
-   * Retroactively grant executor (cardiv) actAs rights for ALL existing user parties.
-   * Called once at server startup to fix parties onboarded before the executor-rights fix.
-   * Runs in the background — does not block startup.
+   * Retroactively grant executor (cardiv) CanActAs for all registered parties.
+   * Called once from app startup **before** HTTP listen (see app.js).
+   *
+   * Uses a single ListUserRights snapshot + Set membership — not N× listUserRights
+   * (which was hammering the participant and interleaving with API traffic when run
+   * after listen).
    */
   async grantExecutorRightsToAllParties() {
-    console.log('[Onboarding] 🔄 Retroactive executor rights grant — starting background job...');
+    console.log('[Onboarding] 🔄 Executor rights backfill (single ledger snapshot)...');
     try {
       const userRegistry = require('../state/userRegistry');
+      const { collectCanActAsPartyIds } = require('./canton-grpc-client');
+
       const partyIds = await userRegistry.getAllPartyIds();
       if (!partyIds || partyIds.length === 0) {
         console.log('[Onboarding] No existing parties to backfill');
@@ -935,37 +960,65 @@ class OnboardingService {
       const CantonGrpcClient = require('./canton-grpc-client');
       const grpcClient = new CantonGrpcClient();
 
-      // Ensure the executor has rights for the operator party!
-      const operatorPartyId = config.canton.operatorPartyId;
-      if (operatorPartyId) {
-        try {
-          await grpcClient.grantUserRights(executorUserId, operatorPartyId, adminToken);
-          console.log('[Onboarding] Granted operator party rights to executor.');
-        } catch (err) {
-          console.warn('[Onboarding] Operator party grant to executor failed (may be domain party or already exists):', err.message);
-        }
+      let listSnap;
+      try {
+        listSnap = await grpcClient.listUserRights(executorUserId, adminToken);
+      } catch (listErr) {
+        console.warn('[Onboarding] ListUserRights for executor failed — cannot backfill safely:', listErr.message);
+        return;
       }
 
-      let granted = 0, skipped = 0, failed = 0;
-      for (const partyId of partyIds) {
+      const hasActAs = collectCanActAsPartyIds(listSnap);
+      let granted = 0;
+      let skipped = 0;
+      let failed = 0;
+
+      const tryGrant = async (partyId, label) => {
+        if (!partyId || hasActAs.has(partyId)) {
+          skipped++;
+          return;
+        }
         try {
           await grpcClient.grantUserRights(executorUserId, partyId, adminToken);
+          hasActAs.add(partyId);
           granted++;
         } catch (err) {
           const msg = err.message || '';
           if (msg.includes('TOO_MANY_USER_RIGHTS')) {
-            console.warn('[Onboarding] Executor hit TOO_MANY_USER_RIGHTS during backfill — stopping');
-            break;
-          } else if (msg.includes('already') || msg.includes('duplicate') || msg.includes('ALREADY_EXISTS')) {
-            skipped++; // Rights already exist — not an error
-          } else {
-            failed++;
-            console.warn(`[Onboarding] Backfill failed for ${partyId.substring(0, 30)}...: ${msg}`);
+            console.warn(`[Onboarding] TOO_MANY_USER_RIGHTS while granting ${label} — stopping backfill`);
+            throw err;
+          }
+          if (msg.includes('already') || msg.includes('duplicate') || msg.includes('ALREADY_EXISTS')) {
+            skipped++;
+            return;
+          }
+          failed++;
+          console.warn(`[Onboarding] Backfill failed for ${label} ${partyId.substring(0, 30)}...: ${msg}`);
+        }
+      };
+
+      const operatorPartyId = config.canton.operatorPartyId;
+      if (operatorPartyId) {
+        try {
+          await tryGrant(operatorPartyId, 'operator');
+        } catch (e) {
+          if ((e.message || '').includes('TOO_MANY_USER_RIGHTS')) {
+            console.log(`[Onboarding] ✅ Executor rights backfill partial: granted=${granted}, already_existed≈${skipped}, failed=${failed}`);
+            return;
           }
         }
       }
 
-      console.log(`[Onboarding] ✅ Executor rights backfill complete: granted=${granted}, already_existed=${skipped}, failed=${failed}`);
+      for (const partyId of partyIds) {
+        if (operatorPartyId && partyId === operatorPartyId) continue;
+        try {
+          await tryGrant(partyId, 'party');
+        } catch (e) {
+          if ((e.message || '').includes('TOO_MANY_USER_RIGHTS')) break;
+        }
+      }
+
+      console.log(`[Onboarding] ✅ Executor rights backfill complete: granted=${granted}, skipped_already=${skipped}, failed=${failed}`);
     } catch (err) {
       console.warn('[Onboarding] Executor rights backfill error (non-fatal):', err.message);
     }
