@@ -27,12 +27,24 @@ class StopLossService extends EventEmitter {
   constructor() {
     super();
     this.isRunning = false;
-    this.checkInterval = null;
-    this.checkIntervalMs = 5000;
+    this._onTradeCreated = null;
   }
 
   /**
    * Start the stop-loss monitoring service.
+   *
+   * Pure event-driven — NO setInterval, NO polling, NO DB cost when idle.
+   *
+   *   Trigger 1 → StreamingReadModel emits 'tradeCreated' on every Canton
+   *               trade event received via WebSocket → checkTriggers() fires.
+   *   Trigger 2 → Matching engine calls checkTriggers() directly after every
+   *               settlement (already wired in executeMatch).
+   *   Trigger 3 → On reconnect, app.js listens to streaming.on('ready') and
+   *               calls syncFromReadModel() to reload any pending stop-losses.
+   *
+   * setInterval removed entirely — it was polling DB every N seconds for no
+   * benefit over the event-driven paths above, and caused error spam on any
+   * transient DB connection drop.
    */
   async start() {
     if (this.isRunning) {
@@ -40,33 +52,44 @@ class StopLossService extends EventEmitter {
       return;
     }
 
-    console.log('[StopLoss] Starting stop-loss monitoring service...');
     this.isRunning = true;
 
-    this.checkInterval = setInterval(() => {
-      this._periodicCheck().catch(err => {
-        console.error('[StopLoss] Periodic check error:', err.message);
-      });
-    }, this.checkIntervalMs);
-
-    console.log('[StopLoss] ✅ Service started');
+    try {
+      const { getStreamingReadModel } = require('./streamingReadModel');
+      const streaming = getStreamingReadModel();
+      if (streaming) {
+        this._onTradeCreated = (trade) => {
+          if (!trade?.tradingPair || !trade?.price) return;
+          this.checkTriggers(trade.tradingPair, trade.price).catch(() => {});
+        };
+        streaming.on('tradeCreated', this._onTradeCreated);
+        console.log('[StopLoss] ✅ Started — listening to WebSocket trade events (pure event-driven, no polling)');
+      } else {
+        console.warn('[StopLoss] ⚠️ Streaming model not available — stop-loss triggers via matching engine only');
+      }
+    } catch (_) {
+      console.warn('[StopLoss] ⚠️ Could not subscribe to streaming trade events');
+    }
   }
 
   /**
-   * Stop the stop-loss monitoring service
+   * Stop the stop-loss monitoring service.
    */
   stop() {
     if (!this.isRunning) return;
 
-    console.log('[StopLoss] Stopping stop-loss monitoring service...');
     this.isRunning = false;
 
-    if (this.checkInterval) {
-      clearInterval(this.checkInterval);
-      this.checkInterval = null;
-    }
+    try {
+      const { getStreamingReadModel } = require('./streamingReadModel');
+      const streaming = getStreamingReadModel();
+      if (streaming && this._onTradeCreated) {
+        streaming.off('tradeCreated', this._onTradeCreated);
+        this._onTradeCreated = null;
+      }
+    } catch (_) {}
 
-    console.log('[StopLoss] ✅ Service stopped');
+    console.log('[StopLoss] ✅ Stopped');
   }
 
   /**
@@ -321,83 +344,6 @@ class StopLossService extends EventEmitter {
     console.log(`[StopLoss] ✅ Stop-loss ${orderId} triggered and converted to market order`);
   }
 
-  /**
-   * Backup periodic check
-   */
-  async _periodicCheck() {
-    try {
-      const db = getDb();
-      const distinctPairs = await db.stopLossOrder.findMany({
-        where: { status: 'PENDING_TRIGGER' },
-        select: { tradingPair: true },
-        distinct: ['tradingPair'],
-      });
-
-      if (distinctPairs.length === 0) return;
-
-      for (const { tradingPair } of distinctPairs) {
-        try {
-          const price = await this._getMarketPrice(tradingPair);
-          if (price && price > 0) {
-            await this.checkTriggers(tradingPair, price);
-          }
-        } catch (err) {
-          // Suppress
-        }
-      }
-    } catch (dbErr) {
-      if (!dbErr.message?.includes('10054')) {
-        console.warn(`[StopLoss] DB check skipped (transient error):`, dbErr.message);
-      }
-    }
-  }
-
-  /**
-   * Get current market price for a trading pair.
-   */
-  async _getMarketPrice(tradingPair) {
-    try {
-      const { getStreamingReadModel } = require('./streamingReadModel');
-      const streaming = getStreamingReadModel();
-      if (streaming?.isReady()) {
-        const book = streaming.getOrderBook(tradingPair);
-        if (book.buyOrders?.length > 0 && book.sellOrders?.length > 0) {
-          const bestBid = parseFloat(book.buyOrders[0]?.price || 0);
-          const bestAsk = parseFloat(book.sellOrders[0]?.price || 0);
-          if (bestBid > 0 && bestAsk > 0) return (bestBid + bestAsk) / 2;
-          if (bestBid > 0) return bestBid;
-          if (bestAsk > 0) return bestAsk;
-        }
-
-        const trades = streaming.getTradesForPair(tradingPair, 1);
-        if (trades.length > 0 && trades[0].price) {
-          return parseFloat(trades[0].price);
-        }
-      }
-    } catch (err) {
-      // Suppress
-    }
-
-    try {
-      const { getOrderBookService } = require('./orderBookService');
-      const orderBookService = getOrderBookService();
-      const orderBook = await orderBookService.getOrderBook(tradingPair);
-
-      if (orderBook.buyOrders?.length > 0 && orderBook.sellOrders?.length > 0) {
-        const bestBid = parseFloat(orderBook.buyOrders[0]?.price || 0);
-        const bestAsk = parseFloat(orderBook.sellOrders[0]?.price || 0);
-        if (bestBid > 0 && bestAsk > 0) return (bestBid + bestAsk) / 2;
-        if (bestBid > 0) return bestBid;
-        if (bestAsk > 0) return bestAsk;
-      }
-
-      if (orderBook.lastPrice) return parseFloat(orderBook.lastPrice);
-    } catch (err) {
-      // Suppress
-    }
-
-    return null;
-  }
 
   /**
    * Get pending stop-loss orders for a party.
@@ -453,12 +399,6 @@ class StopLossService extends EventEmitter {
     });
   }
 
-  /**
-   * Legacy API: checkStopLosses (backward compat for periodic check)
-   */
-  async checkStopLosses() {
-    return this._periodicCheck();
-  }
 }
 
 // Singleton instance

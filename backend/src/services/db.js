@@ -24,10 +24,21 @@ function getDb() {
       ],
     });
     
-    // Filter out noisy transient network errors (like os error 10054)
+    // Suppress transient network errors — these are handled by each caller's try/catch.
+    // Logging them here produces duplicate spam since the global handler fires before
+    // the caller's catch block can suppress them.
     prisma.$on('error', (e) => {
-      if (!e.message.includes('10054') && !e.message.includes('Connection reset')) {
-        console.error(`[Prisma Error] ${e.target}: ${e.message}`);
+      const msg = e.message || '';
+      const isTransientNetwork =
+        msg.includes('10054') ||
+        msg.includes('Connection reset') ||
+        msg.includes("Can't reach database server") ||
+        msg.includes('connect ECONNREFUSED') ||
+        msg.includes('connection refused') ||
+        msg.includes('ECONNRESET') ||
+        msg.includes('socket hang up');
+      if (!isTransientNetwork) {
+        console.error(`[Prisma Error] ${e.target}: ${msg}`);
       }
     });
 

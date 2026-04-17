@@ -130,12 +130,79 @@ class MatchingEngine {
     }
     this.isRunning = true;
     console.log(`[MatchingEngine] Started (interval: ${this.pollingInterval}ms, pairs: ${this.tradingPairs.join(', ')}) [Allocation-based settlement]`);
+
+    // ── Strategy 1: Active Invalidation Watchdog ──────────────────────────
+    // When StreamingReadModel detects an allocation is archived on Canton,
+    // immediately evict any order in memory whose allocationCid matches.
+    // This kills zombie orders before the matching engine ever tries to settle them.
+    const streaming = this._getStreamingModel();
+    if (streaming) {
+      streaming.on('allocationArchived', (archivedCid) => {
+        this._archivedAllocationCids.add(archivedCid);
+        // Scan all in-memory orders for this CID and evict them instantly
+        let evicted = 0;
+        for (const order of streaming.orders.values()) {
+          if (order.allocationCid === archivedCid || order.allocationContractId === archivedCid) {
+            streaming.evictOrder(order.contractId);
+            this.invalidSettlementContracts.set(order.contractId, { at: Date.now(), reason: 'Allocation archived (watchdog)' });
+            evicted++;
+          }
+        }
+        if (evicted > 0) {
+          console.warn(`[MatchingEngine] 🐕 Watchdog: allocation ${archivedCid.substring(0, 24)}... archived → evicted ${evicted} linked order(s)`);
+        }
+      });
+    }
+
+    // ── Strategy 4: Periodic Zombie Reconciliation ───────────────────────
+    // Every 5 minutes: scan all OPEN orders. If an order's allocationCid no
+    // longer exists in streaming.allocations (and streaming has had 60s+ to
+    // bootstrap all live contracts), that order is a zombie — purge it.
+    this._reconciliationInterval = setInterval(() => {
+      this._reconcileZombieOrders();
+    }, 5 * 60 * 1000); // 5 minutes
+
     this.matchLoop();
   }
 
   stop() {
     console.log('[MatchingEngine] Stopping...');
     this.isRunning = false;
+    if (this._reconciliationInterval) {
+      clearInterval(this._reconciliationInterval);
+      this._reconciliationInterval = null;
+    }
+  }
+
+  /**
+   * Strategy 4 — Periodic Zombie Reconciliation.
+   * Compares in-memory OPEN orders against streaming.allocations.
+   * Any order whose allocation no longer exists in the live ACS (via WebSocket)
+   * is a zombie — evict it so the engine never attempts to settle it.
+   */
+  _reconcileZombieOrders() {
+    const streaming = this._getStreamingModel();
+    if (!streaming || !streaming.isReady()) return;
+    // Only run if streaming has been up long enough to have received all ACS events
+    if (streaming.allocations.size === 0) return;
+
+    let purged = 0;
+    for (const order of streaming.orders.values()) {
+      if (order.status !== 'OPEN') continue;
+      const allocCid = order.allocationCid || order.allocationContractId;
+      if (!allocCid) continue;
+      // If the allocation CID is not in the live streaming model and is not a
+      // recently created one (give 90s grace for Canton to propagate), it's stale.
+      if (!streaming.allocations.has(allocCid) && !this._recentlyCreatedAllocs?.has(allocCid)) {
+        this._archivedAllocationCids.add(allocCid);
+        streaming.evictOrder(order.contractId);
+        this.invalidSettlementContracts.set(order.contractId, { at: Date.now(), reason: 'Zombie: allocation not in live ACS' });
+        purged++;
+      }
+    }
+    if (purged > 0) {
+      console.warn(`[MatchingEngine] 🧹 Reconciliation: purged ${purged} zombie order(s) whose allocations are no longer in live ACS`);
+    }
   }
 
   async matchLoop() {
@@ -687,6 +754,32 @@ class MatchingEngine {
         if (sellOrder.allocationContractId && this._archivedAllocationCids.has(sellOrder.allocationContractId)) {
           this._markInvalidSettlementOrder(sellOrder, 'Allocation archived (blacklisted)');
           continue;
+        }
+
+        // ═══ Strategy 3: Sanity Check — verify allocations still exist in live ACS ═══
+        // StreamingReadModel.allocations is populated via WebSocket from Canton.
+        // If an allocation CID is no longer in the live set, it was archived/consumed.
+        // This check fires BEFORE any registry API call, preventing 404 errors entirely.
+        {
+          const streamSnap = this._getStreamingModel();
+          if (streamSnap && streamSnap.allocations.size > 0) {
+            const buyAllocCid = buyOrder.allocationContractId;
+            const sellAllocCid = sellOrder.allocationContractId;
+            if (buyAllocCid && !streamSnap.allocations.has(buyAllocCid)) {
+              console.warn(`[MatchingEngine] 🔍 Pre-flight: BUY order allocation not in live ACS — likely archived. Quarantining.`);
+              this._archivedAllocationCids.add(buyAllocCid);
+              this._markInvalidSettlementOrder(buyOrder, 'Pre-flight: allocation not in live ACS');
+              this.recentlyMatchedOrders.delete(matchKey);
+              continue;
+            }
+            if (sellAllocCid && !streamSnap.allocations.has(sellAllocCid)) {
+              console.warn(`[MatchingEngine] 🔍 Pre-flight: SELL order allocation not in live ACS — likely archived. Quarantining.`);
+              this._archivedAllocationCids.add(sellAllocCid);
+              this._markInvalidSettlementOrder(sellOrder, 'Pre-flight: allocation not in live ACS');
+              this.recentlyMatchedOrders.delete(matchKey);
+              continue;
+            }
+          }
         }
 
         try {

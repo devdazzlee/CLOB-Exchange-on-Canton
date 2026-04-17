@@ -562,6 +562,9 @@ class StreamingReadModel extends EventEmitter {
       this._removeTrade(contractId);
     } else if (this.allocations.has(contractId)) {
       this.allocations.delete(contractId);
+      // Strategy 1 — Active Invalidation: notify matching engine that this allocation is gone.
+      // Any order whose allocationCid points to this CID is now a zombie.
+      this.emit('allocationArchived', contractId);
     }
   }
 
