@@ -546,7 +546,7 @@ class CantonService {
       const timeout = setTimeout(() => {
         ws.close();
         resolve(contracts);
-      }, 60000);
+      }, 15000);
 
       ws.on('open', () => {
         ws.send(JSON.stringify({

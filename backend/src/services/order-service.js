@@ -1305,15 +1305,28 @@ class OrderService {
       if (stage === 'PLACEMENT_STEP_1_COMPLETE') {
         const parsed = this._parseCreatedCidsFromInteractiveExecute(result);
 
-        // Extract the Splice allocation CID — stored via Order.allocationCid (show allocCid)
-        // but also visible as a created Allocation contract in the TX events.
-        let allocationCid = parsed.lockAllocationCid
-          || await this._findAllocationCidForOrder(orderMeta.orderId, partyId, serviceToken).catch(() => null);
+        // Extract the Splice allocation CID from the execute response events (fast path).
+        // If not present, launch a background lookup — do NOT await it here because the
+        // fallback uses a WebSocket ACS query that can take up to 60 s to resolve, which
+        // would hold the HTTP response past the frontend's 60 s axios timeout.
+        let allocationCid = parsed.lockAllocationCid;
 
         if (allocationCid && orderMeta.orderId) {
           const allocType = orderMeta.allocationType || null;
           await setAllocationContractIdForOrder(orderMeta.orderId, allocationCid, allocType);
           console.log(`[OrderService] ✅ 1-TX: Splice alloc CID stored for ${orderMeta.orderId}: ${allocationCid.substring(0, 30)}...`);
+        } else if (orderMeta.orderId) {
+          // Fire-and-forget: resolve allocation CID in background after TX confirms on ledger.
+          const _bgOrderId = orderMeta.orderId;
+          const _bgAllocType = orderMeta.allocationType || null;
+          this._findAllocationCidForOrder(_bgOrderId, partyId, serviceToken)
+            .then(async (cid) => {
+              if (cid) {
+                await setAllocationContractIdForOrder(_bgOrderId, cid, _bgAllocType).catch(() => {});
+                console.log(`[OrderService] ✅ 1-TX (async): alloc CID stored for ${_bgOrderId}: ${cid.substring(0, 30)}...`);
+              }
+            })
+            .catch(() => {});
         }
 
         const orderContractId = parsed.orderCid || `${orderMeta.orderId}-pending`;
