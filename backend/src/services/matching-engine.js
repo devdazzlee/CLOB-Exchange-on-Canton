@@ -815,23 +815,45 @@ class MatchingEngine {
 
           // ═══ ALLOCATION NOT FOUND (HTTP 404) — PERMANENT, do NOT trip circuit breaker ═══
           // `fetchAllocationExtraArgs` returns 404 when the allocation was already archived.
-          // This is a stale data issue (order's allocationContractId points to an old CID).
-          // Quarantine both orders, blacklist CIDs, and continue — never retry a 404.
+          // Only quarantine the ORDER whose allocation CID appears in the error body.
+          // The OTHER side's allocation is fine — let it match with a different counterparty.
           const isAllocationNotFound =
             error.response?.status === 404 ||
             (fullErrBody?.includes('not found') && fullErrBody?.includes('Allocation'));
           if (isAllocationNotFound) {
             console.warn(`[MatchingEngine] ⚠️ Allocation not found (HTTP 404) — stale allocationContractId. Quarantining orders and blacklisting CIDs.`);
             if (fullErrBody) console.warn(`[MatchingEngine]    Registry response: ${fullErrBody}`);
-            if (buyOrder.allocationContractId) this._archivedAllocationCids.add(buyOrder.allocationContractId);
-            if (sellOrder.allocationContractId) this._archivedAllocationCids.add(sellOrder.allocationContractId);
-            this._markInvalidSettlementOrder(buyOrder, 'Allocation not found (archived)');
-            this._markInvalidSettlementOrder(sellOrder, 'Allocation not found (archived)');
+
+            // Determine which side's allocation CID appears in the 404 error body.
+            // Error body format: {"error":"Allocation (00abc...) not found"}
+            const failedCidMatch = fullErrBody?.match(/Allocation \(([0-9a-f]+)\)/i);
+            const failedCid = failedCidMatch?.[1];
+
+            const buyAllocFailed = failedCid
+              ? buyOrder.allocationContractId?.includes(failedCid)
+              : !!(buyOrder.allocationContractId); // fallback: blame buyer if can't parse
+            const sellAllocFailed = failedCid
+              ? sellOrder.allocationContractId?.includes(failedCid)
+              : false; // default: don't blame seller unless clearly identified
+
+            // If we can't identify either side from CID, quarantine both (safe fallback).
+            const quarantineBoth = !failedCid || (!buyAllocFailed && !sellAllocFailed);
+
             const streaming = this._getStreamingModel();
-            if (streaming) {
-              streaming.evictOrder(buyOrder.contractId);
-              streaming.evictOrder(sellOrder.contractId);
+
+            if (quarantineBoth || buyAllocFailed) {
+              if (buyOrder.allocationContractId) this._archivedAllocationCids.add(buyOrder.allocationContractId);
+              this._markInvalidSettlementOrder(buyOrder, 'Allocation not found (archived)');
+              if (streaming) streaming.evictOrder(buyOrder.contractId);
+              console.warn(`[MatchingEngine]    ↳ Quarantined BUYER order ${buyOrder.orderId}`);
             }
+            if (quarantineBoth || sellAllocFailed) {
+              if (sellOrder.allocationContractId) this._archivedAllocationCids.add(sellOrder.allocationContractId);
+              this._markInvalidSettlementOrder(sellOrder, 'Allocation not found (archived)');
+              if (streaming) streaming.evictOrder(sellOrder.contractId);
+              console.warn(`[MatchingEngine]    ↳ Quarantined SELLER order ${sellOrder.orderId}`);
+            }
+
             this.recentlyMatchedOrders.delete(matchKey);
             // Do NOT increment failure counter — this is stale data, not a Canton failure
             continue;

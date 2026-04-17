@@ -1352,17 +1352,19 @@ class OrderService {
 
         if (orderStatus === 'OPEN') registerOpenOrders([orderRecord]);
 
-        if (global.broadcastWebSocket && orderStatus === 'OPEN') {
+        if (global.broadcastWebSocket) {
           global.broadcastWebSocket(`orderbook:${orderMeta.tradingPair}`, {
-            type:       'NEW_ORDER',
+            type:       orderStatus === 'PENDING_TRIGGER' ? 'STOP_LOSS_PLACED' : 'NEW_ORDER',
             orderId:    orderMeta.orderId,
             contractId: orderContractId,
             owner:      partyId,
             orderType:  orderMeta.orderType,
             orderMode:  orderMeta.orderMode,
             price:      orderMeta.price,
+            stopPrice:  orderMeta.stopPrice || null,
             quantity:   orderMeta.quantity,
             remaining:  orderMeta.quantity,
+            status:     orderStatus,
             tradingPair: orderMeta.tradingPair,
             timestamp:  new Date().toISOString(),
           });
@@ -1782,8 +1784,13 @@ class OrderService {
           if (effectiveStatus === 'OPEN' && engine.invalidSettlementContracts.has(c.contractId)) {
             effectiveStatus = 'EXPIRED';
           }
-          
-          return status === 'ALL' || effectiveStatus === status;
+
+          // OPEN requests also include PENDING_TRIGGER (stop-loss orders awaiting trigger)
+          // so they appear in Active Orders and can be cancelled by the user.
+          const isActive = status === 'ALL'
+            || effectiveStatus === status
+            || (status === 'OPEN' && effectiveStatus === 'PENDING_TRIGGER');
+          return isActive;
         })
         .map(c => {
           const payload = c.payload || c.createArgument || {};

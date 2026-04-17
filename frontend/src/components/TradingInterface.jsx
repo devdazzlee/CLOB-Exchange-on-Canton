@@ -332,9 +332,10 @@ export default function TradingInterface({ partyId }) {
       });
       setShowOrderSuccess(true);
       
-      // Refresh data after order placement
+      // Refresh data after order placement (multiple attempts to handle Canton eventual-consistency lag)
       setTimeout(() => refreshAllData(orderData.tradingPair || tradingPair), 1000);
       setTimeout(() => refreshAllData(orderData.tradingPair || tradingPair), 3000);
+      setTimeout(() => refreshAllData(orderData.tradingPair || tradingPair), 6000);
 
       // Trigger matching engine so allocations get executed promptly
       setTimeout(() => {
@@ -529,6 +530,7 @@ export default function TradingInterface({ partyId }) {
           
           setTimeout(() => refreshAllData(od.tradingPair || tradingPair), 1000);
           setTimeout(() => refreshAllData(od.tradingPair || tradingPair), 3000);
+          setTimeout(() => refreshAllData(od.tradingPair || tradingPair), 6000);
 
           // Trigger matching engine so allocations get executed promptly
           setTimeout(() => {

@@ -63,6 +63,16 @@ class StopLossService extends EventEmitter {
           this.checkTriggers(trade.tradingPair, trade.price).catch(() => {});
         };
         streaming.on('tradeCreated', this._onTradeCreated);
+
+        // Sync any PENDING_TRIGGER orders that are on-ledger but missing from DB.
+        // This covers the case where the backend restarted and lost in-memory state,
+        // or where a registration upsert was dropped due to a transient DB error.
+        if (streaming.isReady()) {
+          this._syncFromStreaming(streaming).catch(() => {});
+        } else {
+          streaming.once('ready', () => this._syncFromStreaming(streaming).catch(() => {}));
+        }
+
         console.log('[StopLoss] ✅ Started — listening to WebSocket trade events (pure event-driven, no polling)');
       } else {
         console.warn('[StopLoss] ⚠️ Streaming model not available — stop-loss triggers via matching engine only');
@@ -70,6 +80,69 @@ class StopLossService extends EventEmitter {
     } catch (_) {
       console.warn('[StopLoss] ⚠️ Could not subscribe to streaming trade events');
     }
+  }
+
+  /**
+   * Sync PENDING_TRIGGER orders from the streaming model into the stopLossOrder DB table.
+   * Called on startup so the DB is always consistent with what's on the Canton ledger.
+   */
+  async _syncFromStreaming(streaming) {
+    let synced = 0;
+    const db = getDb();
+
+    // First, remove DB entries whose Canton contract no longer exists (stale rows).
+    try {
+      const dbRows = await db.stopLossOrder.findMany({ where: { status: 'PENDING_TRIGGER' } });
+      for (const row of dbRows) {
+        const stillOnLedger = row.orderContractId && streaming.orders.has(row.orderContractId);
+        if (!stillOnLedger) {
+          // Verify by orderId across all streaming orders
+          const matchByOrderId = [...streaming.orders.values()].some(o => o.orderId === row.orderId && o.status === 'PENDING_TRIGGER');
+          if (!matchByOrderId) {
+            await db.stopLossOrder.delete({ where: { orderId: row.orderId } }).catch(() => {});
+            console.log(`[StopLoss] 🗑️ Removed stale DB entry: ${row.orderId} (not on ledger)`);
+          }
+        }
+      }
+    } catch (_) {}
+
+    for (const [contractId, order] of streaming.orders) {
+      if (order.status !== 'PENDING_TRIGGER') continue;
+      if (!order.orderId || !order.tradingPair) continue;
+
+      // For stop-loss orders, Canton stores the stop price in the `price` field.
+      // `order.stopPrice` (from payload.stopPrice) may be null if Daml doesn't
+      // expose it as a separate field — fall back to `order.price` in that case.
+      const stopPriceRaw = order.stopPrice || order.price;
+      if (!stopPriceRaw) continue;
+
+      try {
+        await db.stopLossOrder.upsert({
+          where: { orderId: order.orderId },
+          create: {
+            orderId: order.orderId,
+            orderContractId: contractId,
+            tradingPair: order.tradingPair,
+            orderType: (order.orderType || 'SELL').toUpperCase(),
+            stopPrice: stopPriceRaw.toString(),
+            quantity: order.quantity?.toString() || '0',
+            allocationContractId: order.allocationCid || null,
+            partyId: order.owner || null,
+            status: 'PENDING_TRIGGER',
+          },
+          update: {
+            orderContractId: contractId,
+            status: 'PENDING_TRIGGER',
+            stopPrice: stopPriceRaw.toString(),
+          },
+        });
+        console.log(`[StopLoss] 🔄 Synced stop-loss ${order.orderId} (pair=${order.tradingPair}, stopPrice=${stopPriceRaw}, type=${order.orderType})`);
+        synced++;
+      } catch (e) {
+        console.warn(`[StopLoss] ⚠️ Sync failed for ${order.orderId}: ${e.message}`);
+      }
+    }
+    console.log(`[StopLoss] 🔄 Sync complete — ${synced} PENDING_TRIGGER order(s) synced from ledger`);
   }
 
   /**
@@ -169,28 +242,73 @@ class StopLossService extends EventEmitter {
 
   /**
    * PRIMARY TRIGGER: Called by the matching engine after every successful trade.
+   *
+   * Source of truth priority:
+   *   1. StreamingReadModel (in-memory, always in sync with Canton ledger via WebSocket)
+   *   2. PostgreSQL DB (fallback only — used when streaming model not ready)
+   *
+   * This matches professional exchange design: active order state lives in memory,
+   * not in a relational DB. The DB is for trade history / audit only.
    */
   async checkTriggers(tradingPair, lastTradePrice) {
-    const db = getDb();
-    const pendingOrders = await db.stopLossOrder.findMany({
-      where: { tradingPair, status: 'PENDING_TRIGGER' },
-    });
+    // ── PRIMARY: streaming model (in-memory, zero DB cost, always in sync) ──
+    let pendingOrders = [];
+    try {
+      const { getStreamingReadModel } = require('./streamingReadModel');
+      const streaming = getStreamingReadModel();
+      const ready = streaming?.isReady();
+      // Always log streaming state for diagnosis
+      const totalOrders = streaming?.orders?.size ?? 'N/A';
+      const allPendingAll = streaming?.orders ? [...streaming.orders.values()].filter(o => o.status === 'PENDING_TRIGGER') : [];
+      console.log(`[StopLoss] 🔎 checkTriggers(${tradingPair}, ${lastTradePrice}) ready=${ready} totalOrders=${totalOrders} pendingInStreaming=${allPendingAll.length}`);
+      if (allPendingAll.length > 0) {
+        console.log(`[StopLoss] 🔍 PENDING_TRIGGER orders: ${allPendingAll.map(o => `${o.orderId}(pair=${o.tradingPair},stop=${o.stopPrice||o.price},type=${o.orderType})`).join(', ')}`);
+      }
+      if (ready) {
+        for (const [contractId, order] of streaming.orders) {
+          if (order.tradingPair !== tradingPair) continue;
+          if (order.status !== 'PENDING_TRIGGER') continue;
+          // stopPrice is stored in order.stopPrice OR order.price (Canton stores it in price field)
+          const stopPriceRaw = order.stopPrice || order.price;
+          if (!stopPriceRaw || !order.orderId || !order.orderType) continue;
+          pendingOrders.push({
+            orderId:             order.orderId,
+            orderContractId:     contractId,
+            tradingPair:         order.tradingPair,
+            orderType:           order.orderType,
+            stopPrice:           stopPriceRaw.toString(),
+            quantity:            order.quantity || '0',
+            allocationContractId: order.allocationCid || null,
+            partyId:             order.owner || null,
+          });
+        }
+      }
+    } catch (diagErr) {
+      console.error(`[StopLoss] ❌ checkTriggers diagnostic error: ${diagErr.message}`);
+    }
 
+    // ── FALLBACK: DB (only if streaming not ready) ──
+    if (pendingOrders.length === 0) {
+      try {
+        const db = getDb();
+        const rows = await db.stopLossOrder.findMany({
+          where: { tradingPair, status: 'PENDING_TRIGGER' },
+        });
+        pendingOrders = rows;
+      } catch (_) {}
+    }
+
+    console.log(`[StopLoss] checkTriggers(${tradingPair}, ${lastTradePrice}) → ${pendingOrders.length} pending order(s)`);
     if (pendingOrders.length === 0) return;
 
     const price = new Decimal(lastTradePrice);
     const triggered = [];
 
     for (const entry of pendingOrders) {
-      let shouldTrigger = false;
       const stopPrice = new Decimal(entry.stopPrice);
-
-      if (entry.orderType === 'SELL' && price.lte(stopPrice)) {
-        shouldTrigger = true;
-      }
-      if (entry.orderType === 'BUY' && price.gte(stopPrice)) {
-        shouldTrigger = true;
-      }
+      const shouldTrigger =
+        (entry.orderType === 'SELL' && price.lte(stopPrice)) ||
+        (entry.orderType === 'BUY'  && price.gte(stopPrice));
 
       if (shouldTrigger) {
         triggered.push({ orderId: entry.orderId, entry, triggerPrice: price.toString() });
@@ -276,11 +394,24 @@ class StopLossService extends EventEmitter {
       throw new Error(`TriggerStopLoss failed for ${orderId}: ${choiceErr.message}`);
     }
 
-    // Update DB
+    // Update DB (upsert — row may not exist if order came from StreamingReadModel without prior DB registration)
     const db = getDb();
-    await db.stopLossOrder.update({
+    await db.stopLossOrder.upsert({
       where: { orderId },
-      data: {
+      create: {
+        orderId,
+        orderContractId: entry?.orderContractId || null,
+        tradingPair: entry?.tradingPair || 'UNKNOWN',
+        orderType: (entry?.orderType || 'SELL').toUpperCase(),
+        stopPrice: entry?.stopPrice?.toString() || '0',
+        quantity: entry?.quantity?.toString() || '0',
+        allocationContractId: entry?.allocationContractId || null,
+        partyId: entry?.partyId || null,
+        status: 'TRIGGERED',
+        triggeredAt: new Date(),
+        triggerPrice,
+      },
+      update: {
         status: 'TRIGGERED',
         triggeredAt: new Date(),
         triggerPrice,
@@ -347,23 +478,51 @@ class StopLossService extends EventEmitter {
 
   /**
    * Get pending stop-loss orders for a party.
+   * Primary: StreamingReadModel (in-memory, always in sync with Canton).
+   * Fallback: PostgreSQL DB.
    */
   async getPendingStopOrders(partyId = null, tradingPair = null) {
+    try {
+      const { getStreamingReadModel } = require('./streamingReadModel');
+      const streaming = getStreamingReadModel();
+      if (streaming?.isReady()) {
+        const results = [];
+        for (const [contractId, order] of streaming.orders) {
+          if (order.status !== 'PENDING_TRIGGER') continue;
+          if (partyId && order.owner !== partyId) continue;
+          if (tradingPair && order.tradingPair !== tradingPair) continue;
+          const stopPriceRaw = order.stopPrice || order.price;
+          results.push({
+            orderId:             order.orderId,
+            orderContractId:     contractId,
+            tradingPair:         order.tradingPair,
+            orderType:           order.orderType,
+            stopPrice:           stopPriceRaw?.toString() || null,
+            quantity:            order.quantity || '0',
+            status:              'PENDING_TRIGGER',
+            registeredAt:        order.timestamp || null,
+            allocationContractId: order.allocationCid || null,
+          });
+        }
+        return results;
+      }
+    } catch (_) {}
+
+    // Fallback: DB
     const db = getDb();
     const where = { status: 'PENDING_TRIGGER' };
     if (partyId) where.partyId = partyId;
     if (tradingPair) where.tradingPair = tradingPair;
-
     const rows = await db.stopLossOrder.findMany({ where });
     return rows.map(entry => ({
-      orderId: entry.orderId,
-      orderContractId: entry.orderContractId,
-      tradingPair: entry.tradingPair,
-      orderType: entry.orderType,
-      stopPrice: entry.stopPrice,
-      quantity: entry.quantity,
-      status: entry.status,
-      registeredAt: entry.registeredAt?.toISOString(),
+      orderId:             entry.orderId,
+      orderContractId:     entry.orderContractId,
+      tradingPair:         entry.tradingPair,
+      orderType:           entry.orderType,
+      stopPrice:           entry.stopPrice,
+      quantity:            entry.quantity,
+      status:              entry.status,
+      registeredAt:        entry.registeredAt?.toISOString(),
       allocationContractId: entry.allocationContractId,
     }));
   }

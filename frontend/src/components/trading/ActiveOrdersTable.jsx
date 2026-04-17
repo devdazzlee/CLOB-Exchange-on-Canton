@@ -3,7 +3,31 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Button } from '../ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card';
 import { cn } from '@/lib/utils';
-import { Loader2, AlertTriangle, X, ShieldAlert } from 'lucide-react';
+import { Loader2, AlertTriangle, X, ShieldAlert, TrendingUp, BarChart2, Shield } from 'lucide-react';
+
+// Badge showing order mode (LIMIT / MARKET / STOP_LOSS) with distinct colours + icon
+function ModeBadge({ mode }) {
+  if (mode === 'STOP_LOSS') {
+    return (
+      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-black uppercase tracking-wider bg-amber-500/10 text-amber-400 border border-amber-500/20">
+        <Shield className="w-2.5 h-2.5" />Stop
+      </span>
+    );
+  }
+  if (mode === 'MARKET') {
+    return (
+      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-black uppercase tracking-wider bg-purple-500/10 text-purple-400 border border-purple-500/20">
+        <BarChart2 className="w-2.5 h-2.5" />Mkt
+      </span>
+    );
+  }
+  // LIMIT (default)
+  return (
+    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-black uppercase tracking-wider bg-sky-500/10 text-sky-400 border border-sky-500/20">
+      <TrendingUp className="w-2.5 h-2.5" />Lmt
+    </span>
+  );
+}
 
 // Cancel Confirmation Modal
 function CancelOrderModal({ isOpen, onClose, onConfirm, order, isLoading }) {
@@ -218,7 +242,7 @@ export default function ActiveOrdersTable({ orders, onCancelOrder }) {
                         <td className={cn("py-3 px-4 text-[11px] font-bold", order.type === 'BUY' ? 'text-green-500' : 'text-red-500')}>
                           {order.type}
                         </td>
-                        <td className="py-3 px-4 text-muted-foreground text-[11px] font-medium uppercase">{order.mode}</td>
+                        <td className="py-3 px-4"><ModeBadge mode={order.mode} /></td>
                         <td className="py-3 px-4 text-white font-mono text-[11px] font-bold">{formatOrderPrice(order)}</td>
                         <td className="py-3 px-4 text-white text-[11px] font-mono">{quantity.toFixed(4)}</td>
                         <td className="py-3 px-4 text-white text-[11px] font-mono">{filled.toFixed(4)}</td>
@@ -287,13 +311,14 @@ export default function ActiveOrdersTable({ orders, onCancelOrder }) {
                   >
                     {/* Card Header */}
                     <div className="flex items-center justify-between pb-2 border-b border-[#30363d]/50">
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-1.5 flex-wrap">
                         <span className={cn(
                           "px-2 py-0.5 rounded-md text-[10px] font-black uppercase tracking-widest border",
                           order.type === 'BUY' ? 'bg-green-500/10 text-green-500 border-green-500/20' : 'bg-red-500/10 text-red-500 border-red-500/20'
                         )}>
-                          {order.type} {order.mode}
+                          {order.type}
                         </span>
+                        <ModeBadge mode={order.mode} />
                         <span className="text-white text-[11px] font-bold uppercase tracking-wider">{order.tradingPair || 'BTC/USDT'}</span>
                       </div>
                       <span className={cn(
