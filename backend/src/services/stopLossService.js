@@ -28,6 +28,8 @@ class StopLossService extends EventEmitter {
     super();
     this.isRunning = false;
     this._onTradeCreated = null;
+    // Prevents concurrent duplicate TriggerStopLoss submissions for the same order
+    this._inFlightTriggers = new Set();
   }
 
   /**
@@ -69,8 +71,15 @@ class StopLossService extends EventEmitter {
         // or where a registration upsert was dropped due to a transient DB error.
         if (streaming.isReady()) {
           this._syncFromStreaming(streaming).catch(() => {});
+          // Immediately check triggers using last known trade prices from streaming model.
+          // Handles the case where stop conditions were already met during bootstrap
+          // (historical tradeCreated events fired with ready=false, so were skipped).
+          this._checkTriggersOnReady(streaming).catch(() => {});
         } else {
-          streaming.once('ready', () => this._syncFromStreaming(streaming).catch(() => {}));
+          streaming.once('ready', () => {
+            this._syncFromStreaming(streaming).catch(() => {});
+            this._checkTriggersOnReady(streaming).catch(() => {});
+          });
         }
 
         console.log('[StopLoss] ✅ Started — listening to WebSocket trade events (pure event-driven, no polling)');
@@ -143,6 +152,55 @@ class StopLossService extends EventEmitter {
       }
     }
     console.log(`[StopLoss] 🔄 Sync complete — ${synced} PENDING_TRIGGER order(s) synced from ledger`);
+  }
+
+  /**
+   * After ACS bootstrap completes (streaming model is ready), check all pending
+   * stop-loss orders against the last known trade price for each pair.
+   *
+   * This is necessary because during ACS bootstrap the 'tradeCreated' events
+   * for historical Trade contracts fire with ready=false, causing checkTriggers
+   * to skip the streaming path. Once bootstrap is done this method fires the
+   * check against the most recent trade price available in the streaming model.
+   */
+  async _checkTriggersOnReady(streaming) {
+    // Collect unique trading pairs that have PENDING_TRIGGER orders
+    const pendingPairs = new Map(); // pair → latest trade price
+    for (const [, order] of streaming.orders) {
+      if (order.status !== 'PENDING_TRIGGER') continue;
+      if (!order.tradingPair) continue;
+      if (!pendingPairs.has(order.tradingPair)) {
+        pendingPairs.set(order.tradingPair, null);
+      }
+    }
+
+    if (pendingPairs.size === 0) {
+      console.log('[StopLoss] _checkTriggersOnReady: no PENDING_TRIGGER orders — skipping');
+      return;
+    }
+
+    // For each pair, find the most recent trade price from streaming model
+    for (const [pair] of pendingPairs) {
+      const trades = streaming.getTradesForPair(pair);
+      if (trades.length > 0) {
+        const lastPrice = trades[0].price; // sorted desc by timestamp
+        if (lastPrice) {
+          pendingPairs.set(pair, lastPrice);
+        }
+      }
+    }
+
+    console.log(`[StopLoss] 🔔 _checkTriggersOnReady: checking ${pendingPairs.size} pair(s) with PENDING_TRIGGER orders`);
+    for (const [pair, lastPrice] of pendingPairs) {
+      if (!lastPrice) {
+        console.log(`[StopLoss]   ${pair}: no recent trade price — skipping`);
+        continue;
+      }
+      console.log(`[StopLoss]   ${pair}: lastTradePrice=${lastPrice} — running checkTriggers`);
+      await this.checkTriggers(pair, lastPrice).catch(err =>
+        console.warn(`[StopLoss]   ${pair}: checkTriggers error: ${err.message}`)
+      );
+    }
   }
 
   /**
@@ -320,11 +378,19 @@ class StopLossService extends EventEmitter {
     }
 
     for (const { orderId, entry, triggerPrice } of triggered) {
+      // Guard: skip if another concurrent checkTriggers call is already triggering this order
+      if (this._inFlightTriggers.has(orderId)) {
+        console.log(`[StopLoss] ⏭️ ${orderId} trigger already in-flight — skipping duplicate`);
+        continue;
+      }
+      this._inFlightTriggers.add(orderId);
       try {
         await this.triggerOrder(orderId, entry, triggerPrice);
       } catch (err) {
         console.error(`[StopLoss] ❌ Failed to trigger stop-loss ${orderId}: ${err.message}`);
         this.emit('stopLossError', { orderId, error: err });
+      } finally {
+        this._inFlightTriggers.delete(orderId);
       }
     }
   }
@@ -336,7 +402,7 @@ class StopLossService extends EventEmitter {
     console.log(`[StopLoss] 🎯 Triggering stop-loss: ${orderId} at ${triggerPrice}`);
     console.log(`  Side: ${entry.orderType}, Stop Price: ${entry.stopPrice.toString()}`);
 
-    const token = await tokenProvider.getServiceToken();
+    let token = await tokenProvider.getServiceToken();
     const packageId = config.canton.packageIds.clobExchange;
     const operatorPartyId = config.canton.operatorPartyId;
 
@@ -375,23 +441,41 @@ class StopLossService extends EventEmitter {
       }
     }
 
-    try {
-      await cantonService.exerciseChoice({
-        token,
-        actAsParty: [operatorPartyId],
-        templateId: `${packageId}:Order:Order`,
-        contractId: resolvedContractId,
-        choice: 'TriggerStopLoss',
-        choiceArgument: {
-          triggeredAt: new Date().toISOString(),
-          triggerPrice: triggerPrice.toString(),
-        },
-        readAs: [operatorPartyId, entry.partyId],
-      });
-      console.log(`[StopLoss] ✅ Order ${orderId} status updated to OPEN on Canton`);
-    } catch (choiceErr) {
-      console.warn(`[StopLoss] ⚠️ TriggerStopLoss choice failed: ${choiceErr.message}`);
-      throw new Error(`TriggerStopLoss failed for ${orderId}: ${choiceErr.message}`);
+    // Attempt TriggerStopLoss with one retry for LOCAL_VERDICT_LOCKED_CONTRACTS.
+    // Locked contract means another submission is racing — wait briefly and retry once.
+    let triggerAttempt = 0;
+    while (true) {
+      triggerAttempt++;
+      try {
+        await cantonService.exerciseChoice({
+          token,
+          actAsParty: [operatorPartyId],
+          templateId: `${packageId}:Order:Order`,
+          contractId: resolvedContractId,
+          choice: 'TriggerStopLoss',
+          choiceArgument: {
+            triggeredAt: new Date().toISOString(),
+            triggerPrice: triggerPrice.toString(),
+          },
+          readAs: [operatorPartyId, entry.partyId],
+        });
+        console.log(`[StopLoss] ✅ Order ${orderId} status updated to OPEN on Canton`);
+        break; // success
+      } catch (choiceErr) {
+        const isLocked = choiceErr.message?.includes('LOCAL_VERDICT_LOCKED_CONTRACTS') ||
+          choiceErr.message?.includes('LOCKED_CONTRACTS');
+        if (isLocked && triggerAttempt === 1) {
+          // Contract is locked by a concurrent submission. Wait 2s and retry once —
+          // the lock will be released when the first submission completes or aborts.
+          console.warn(`[StopLoss] ⚠️ Contract locked for ${orderId} — waiting 2s then retrying`);
+          await new Promise(r => setTimeout(r, 2000));
+          // Re-fetch a fresh token before retry
+          token = await tokenProvider.getServiceToken();
+          continue;
+        }
+        console.warn(`[StopLoss] ⚠️ TriggerStopLoss choice failed (attempt ${triggerAttempt}): ${choiceErr.message}`);
+        throw new Error(`TriggerStopLoss failed for ${orderId}: ${choiceErr.message}`);
+      }
     }
 
     // Update DB (upsert — row may not exist if order came from StreamingReadModel without prior DB registration)

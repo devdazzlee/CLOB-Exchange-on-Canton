@@ -562,11 +562,11 @@ class MatchingEngine {
         }
         if (!allocationCid) {
           const rawAllocationCid = payload.allocationCid || '';
+          // Token Standard allocation CIDs are hex strings (no '::') — only Order/Party IDs have '::'
           const isValidCid = rawAllocationCid
             && rawAllocationCid !== 'FILL_ONLY'
             && rawAllocationCid !== 'NONE'
             && !rawAllocationCid.startsWith('#')
-            && rawAllocationCid.includes('::')  // Canton CIDs always have '::' separator
             && rawAllocationCid.length >= 10;
           if (isValidCid) allocationCid = rawAllocationCid;
         }

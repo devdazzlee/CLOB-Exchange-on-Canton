@@ -188,10 +188,10 @@ async function setAllocationContractIdForOrder(orderId, allocationContractId, al
   try {
     const data = { allocationContractId: allocationContractId || null };
     if (allocationType) data.allocationType = allocationType;
-    await db.orderReservation.update({
-      where: { orderId },
-      data,
-    });
+    // updateMany silently no-ops if no row exists — avoids missing required fields (partyId/asset/amount)
+    // on create. Interactive-submission orders have no DB reservation row; their allocationCid
+    // is served from the streaming model's payload.allocationCid instead.
+    await db.orderReservation.updateMany({ where: { orderId }, data });
   } catch (err) {
     console.warn(`[BalanceReservation] setAllocationContractId failed for ${orderId}: ${err.message}`);
   }
@@ -1412,6 +1412,19 @@ class OrderService {
 
       throw new ValidationError(`Unknown placement stage: ${stage}. Please place the order again.`);
     } catch (error) {
+      // SUBMISSION_ALREADY_IN_FLIGHT means the user double-submitted the same command.
+      // The first submission already succeeded on Canton — treat this as success by
+      // returning a synthetic "placed" response so the frontend doesn't show an error.
+      if (error.code === 'SUBMISSION_ALREADY_IN_FLIGHT' || error.message?.includes('SUBMISSION_ALREADY_IN_FLIGHT')) {
+        console.warn(`[OrderService] ⚠️ SUBMISSION_ALREADY_IN_FLIGHT for ${orderMeta.orderId || 'unknown'} — order already placed, ignoring duplicate.`);
+        return {
+          status:  'placed',
+          orderId: orderMeta.orderId || null,
+          message: 'Order already submitted (duplicate request ignored)',
+          duplicate: true,
+        };
+      }
+
       console.error('[OrderService] Failed to execute order placement:', error.message);
 
       if (orderMeta.orderId) {
